@@ -1,0 +1,29 @@
+# test_main_menu.txt — Verify main menu loads, then try NEW GAME
+#
+# Triggers run in parallel with the sequential script below.
+# They auto-skip FMVs by pressing CROSS 60 frames (~1s) after FMV starts.
+
+# Default trigger settings — apply to all triggers unless overridden per-trigger
+set trigger_delay 60
+set trigger_once on
+
+# FMV1 (loading_complete flag set during FMV playback)
+trigger skip_fmv1 when_mem8 0x1CE 1 press CROSS
+
+# Sequential script
+turbo on
+log Waiting for main menu (TCB[0]+0x48 == 4)...
+wait_mem16 0x1FD848 4
+turbo off
+assert_mem16 0x1FD848 4 main_menu_active
+log Main menu confirmed!
+screenshot main_menu.png
+wait 30
+press CROSS
+log Pressed CROSS — expecting NEW GAME transition
+turbo on
+wait 120
+turbo off
+screenshot after_new_game.png
+log Done — check after_new_game.png for result
+exit 0

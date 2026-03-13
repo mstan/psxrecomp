@@ -1,0 +1,12 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_INSTR_CATEGORY(name) RABBITIZER_INSTRCAT_##name,
+
+typedef enum RabbitizerInstrCategory {
+    #include "InstrCategory.inc"
+
+    RABBITIZER_DEF_INSTR_CATEGORY(MAX)
+} RabbitizerInstrCategory;
+
+#undef RABBITIZER_DEF_INSTR_CATEGORY

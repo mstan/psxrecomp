@@ -1,0 +1,14 @@
+{
+    // https://github.com/DavidAnson/markdownlint/blob/main/doc/md024.md
+    // MD024 - Multiple headings with the same content
+    "MD024": {
+        "siblings_only": true
+    },
+
+    // https://github.com/DavidAnson/markdownlint/blob/main/doc/md013.md
+    // MD013 - Line length
+    "MD013": {
+        "code_block_line_length": 120,
+        "headings": false
+    }
+}

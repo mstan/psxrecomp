@@ -1,0 +1,10 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_INSTR_CATEGORY(name) [RABBITIZER_INSTRCAT_##name] = #name,
+
+const char *const RabbitizerInstrCategory_Names[] = {
+#include "InstrCategory.inc"
+};
+
+#undef RABBITIZER_DEF_INSTR_CATEGORY

@@ -1,0 +1,81 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_REG(prefix, name, numeric, ...) \
+    prefix##_##name,
+
+#define RABBITIZER_DEF_REG_NODOLLAR(prefix, name, numeric, ...) \
+    prefix##_##name,
+
+    namespace Cpu {
+        enum class GprO32 {
+            #include "registers/RabbitizerRegister_GprO32.inc"
+        };
+
+        enum class GprN32 {
+            #include "registers/RabbitizerRegister_GprN32.inc"
+        };
+
+
+        enum class Cop0 {
+            #include "registers/RabbitizerRegister_Cop0.inc"
+        };
+
+        // Float registers
+        enum class Cop1O32 {
+            #include "registers/RabbitizerRegister_Cop1O32.inc"
+        };
+
+        enum class Cop1N32 {
+            #include "registers/RabbitizerRegister_Cop1N32.inc"
+        };
+
+        enum class Cop1N64 {
+            #include "registers/RabbitizerRegister_Cop1N64.inc"
+        };
+
+        enum class Cop1Control {
+            #include "registers/RabbitizerRegister_Cop1Control.inc"
+        };
+
+        enum class Cop2 {
+            #include "registers/RabbitizerRegister_Cop2.inc"
+        };
+    };
+
+
+    namespace Rsp {
+        enum class Gpr {
+            #include "registers/RabbitizerRegister_RspGpr.inc"
+        };
+
+        enum class Cop0 {
+            #include "registers/RabbitizerRegister_RspCop0.inc"
+        };
+
+        enum class Cop2 {
+            #include "registers/RabbitizerRegister_RspCop2.inc"
+        };
+
+        enum class Cop2Control {
+            #include "registers/RabbitizerRegister_RspCop2Control.inc"
+        };
+
+        enum class Vector {
+            #include "registers/RabbitizerRegister_RspVector.inc"
+        };
+    };
+
+
+    namespace R5900 {
+        enum class VF {
+            #include "registers/RabbitizerRegister_R5900VF.inc"
+        };
+
+        enum class VI {
+            #include "registers/RabbitizerRegister_R5900VI.inc"
+        };
+    };
+
+#undef RABBITIZER_DEF_REG
+#undef RABBITIZER_DEF_REG_NODOLLAR

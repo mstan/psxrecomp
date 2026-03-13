@@ -1,0 +1,15 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RAB_DEF_OPERAND(prefix, operand) \
+    RAB_OPERAND_##prefix##_##operand,
+
+typedef enum RabbitizerOperandType {
+    RAB_DEF_OPERAND(ALL, INVALID)
+
+    #include "OperandTypes.inc"
+
+    RAB_DEF_OPERAND(ALL, MAX)
+} RabbitizerOperandType;
+
+#undef RAB_DEF_OPERAND

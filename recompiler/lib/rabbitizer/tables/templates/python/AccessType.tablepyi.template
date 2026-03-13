@@ -1,0 +1,15 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+from __future__ import annotations
+
+from .Enum import Enum
+
+#define RAB_DEF_ACCESSTYPE(name) name: Enum
+
+class AccessType:
+    #include "AccessType.inc"
+
+    MAX: Enum
+
+#undef RAB_DEF_ACCESSTYPE

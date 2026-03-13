@@ -1,0 +1,11 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_INSTR_ID_TYPE(prefix, name) \
+    [RAB_INSTR_ID_TYPE_##prefix##_##name] = #prefix "_" #name,
+
+const char *RabInstrIdType_Names[] = {
+    #include "InstrIdType.inc"
+};
+
+#undef RABBITIZER_DEF_INSTR_ID_TYPE

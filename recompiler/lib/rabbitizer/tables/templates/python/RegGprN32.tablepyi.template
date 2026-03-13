@@ -1,0 +1,18 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+from __future__ import annotations
+
+from .Enum import Enum
+
+#define RABBITIZER_DEF_REG(prefix, name, numeric, ...) \
+    name: Enum
+
+#define RABBITIZER_DEF_REG_NODOLLAR(prefix, name, numeric, ...) \
+    RABBITIZER_DEF_REG(prefix, name, numeric, __VA_ARGS__)
+
+class RegGprN32:
+    #include "registers/RabbitizerRegister_GprN32.inc"
+
+#undef RABBITIZER_DEF_REG_NODOLLAR
+#undef RABBITIZER_DEF_REG

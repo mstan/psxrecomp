@@ -1,0 +1,42 @@
+name: Build and upload Rust crate
+
+# Build on every branch push, tag push, and pull request change:
+on: [push, pull_request]
+
+jobs:
+  build_rust:
+    name: Build Rust stuff and run Rust tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout reposistory
+      uses: actions/checkout@v4
+
+    - name: Setup Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Check format
+      run: cargo fmt --check
+
+    - name: Setup clippy
+      run: rustup component add clippy
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build Rust package
+      run: cargo build --release --workspace
+
+    - name: Build Rust tests
+      run: cargo test --workspace
+
+    - name: Publish dry run
+      if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+      run: cargo publish --dry-run
+
+    - name: Upload crate
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

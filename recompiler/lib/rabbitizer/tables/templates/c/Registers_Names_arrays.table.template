@@ -1,0 +1,81 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_REG(prefix, name, numeric, ...) \
+    [RABBITIZER_REG_##prefix##_##name] = { "$" #numeric, "$" #name },
+
+#define RABBITIZER_DEF_REG_NODOLLAR(prefix, name, numeric, ...) \
+    [RABBITIZER_REG_##prefix##_##name] = { "$" #numeric, #name },
+
+// numeric, named
+
+const char *RabbitizerRegister_GprO32_Names[][2] = {
+#include "registers/RabbitizerRegister_GprO32.inc"
+};
+
+const char *RabbitizerRegister_GprN32_Names[][2] = {
+#include "registers/RabbitizerRegister_GprN32.inc"
+};
+
+const char *RabbitizerRegister_Cop0_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop0.inc"
+};
+
+const char *RabbitizerRegister_Cop1O32_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop1O32.inc"
+};
+
+const char *RabbitizerRegister_Cop1N32_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop1N32.inc"
+};
+
+const char *RabbitizerRegister_Cop1N64_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop1N64.inc"
+};
+
+const char *RabbitizerRegister_Cop1Control_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop1Control.inc"
+};
+
+const char *RabbitizerRegister_Cop2_Names[][2] = {
+#include "registers/RabbitizerRegister_Cop2.inc"
+};
+
+/* RSP */
+
+const char *RabbitizerRegister_RspGpr_Names[][2] = {
+#include "registers/RabbitizerRegister_RspGpr.inc"
+};
+
+const char *RabbitizerRegister_RspCop0_Names[][2] = {
+#include "registers/RabbitizerRegister_RspCop0.inc"
+};
+
+const char *RabbitizerRegister_RspCop2_Names[][2] = {
+#include "registers/RabbitizerRegister_RspCop2.inc"
+};
+
+const char *RabbitizerRegister_RspCop2Control_Names[][2] = {
+#include "registers/RabbitizerRegister_RspCop2Control.inc"
+};
+
+const char *RabbitizerRegister_RspVector_Names[][2] = {
+#include "registers/RabbitizerRegister_RspVector.inc"
+};
+
+/* RSP */
+
+/* R5900 */
+
+const char *RabbitizerRegister_R5900VF_Names[][2] = {
+#include "registers/RabbitizerRegister_R5900VF.inc"
+};
+
+const char *RabbitizerRegister_R5900VI_Names[][2] = {
+#include "registers/RabbitizerRegister_R5900VI.inc"
+};
+
+/* R5900 */
+
+#undef RABBITIZER_DEF_REG
+#undef RABBITIZER_DEF_REG_NODOLLAR

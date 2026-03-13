@@ -1,0 +1,18 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define HASH #
+#define HASH_EXPANSION(x) x
+#define SPECIAL_RS_TAG(...) HASH_EXPANSION(HASH)[__VA_ARGS__]
+
+#define RABBITIZER_DEF_INSTR_ID_TYPE(prefix, name) \
+    prefix##_##name,
+
+SPECIAL_RS_TAG(repr(u32))
+SPECIAL_RS_TAG(derive(Debug, Copy, Clone, Hash, PartialEq, Eq))
+SPECIAL_RS_TAG(allow(non_camel_case_types))
+pub enum InstrIdType {
+    #include "InstrIdType.inc"
+}
+
+#undef RABBITIZER_DEF_INSTR_ID_TYPE

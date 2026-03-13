@@ -1,0 +1,79 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RABBITIZER_DEF_REG(prefix, name, numeric, ...) \
+    [RABBITIZER_REG_##prefix##_##name] = { __VA_ARGS__ },
+
+#define RABBITIZER_DEF_REG_NODOLLAR(prefix, name, numeric, ...) \
+    RABBITIZER_DEF_REG(prefix, name, numeric, __VA_ARGS__)
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_GprO32_Descriptors[] = {
+#include "registers/RabbitizerRegister_GprO32.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_GprN32_Descriptors[] = {
+#include "registers/RabbitizerRegister_GprN32.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop0_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop0.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop1O32_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop1O32.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop1N32_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop1N32.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop1N64_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop1N64.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop1Control_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop1Control.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_Cop2_Descriptors[] = {
+#include "registers/RabbitizerRegister_Cop2.inc"
+};
+
+/* RSP */
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_RspGpr_Descriptors[] = {
+#include "registers/RabbitizerRegister_RspGpr.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_RspCop0_Descriptors[] = {
+#include "registers/RabbitizerRegister_RspCop0.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_RspCop2_Descriptors[] = {
+#include "registers/RabbitizerRegister_RspCop2.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_RspCop2Control_Descriptors[] = {
+#include "registers/RabbitizerRegister_RspCop2Control.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_RspVector_Descriptors[] = {
+#include "registers/RabbitizerRegister_RspVector.inc"
+};
+
+/* RSP */
+
+/* R5900 */
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_R5900VF_Descriptors[] = {
+#include "registers/RabbitizerRegister_R5900VF.inc"
+};
+
+const RabbitizerRegisterDescriptor RabbitizerRegister_R5900VI_Descriptors[] = {
+#include "registers/RabbitizerRegister_R5900VI.inc"
+};
+
+/* R5900 */
+
+#undef RABBITIZER_DEF_REG
+#undef RABBITIZER_DEF_REG_NODOLLAR

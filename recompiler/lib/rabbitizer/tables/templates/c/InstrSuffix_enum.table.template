@@ -1,0 +1,14 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RAB_DEF_INSTRSUFFIX(prefix, name) RABINSTRSUFFIX_##prefix##_##name,
+
+typedef enum RabbitizerInstrSuffix {
+    RAB_DEF_INSTRSUFFIX(ALL, NONE)
+
+    #include "InstrSuffix.inc"
+
+    RAB_DEF_INSTRSUFFIX(ALL, MAX)
+} RabbitizerInstrSuffix;
+
+#undef RAB_DEF_INSTRSUFFIX

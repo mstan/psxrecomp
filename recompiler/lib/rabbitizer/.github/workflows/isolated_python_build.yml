@@ -1,0 +1,22 @@
+name: Build Python package in isolated environment
+
+# Build on every branch push, tag push, and pull request change:
+on: [push, pull_request]
+
+jobs:
+  buildstuff:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout reposistory
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt update && sudo apt install -y python3-venv
+
+    - name: Install build module
+      run: pip install build -U
+
+    - name: Build
+      run: python3 -m build

@@ -1,0 +1,24 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+from __future__ import annotations
+
+from .Enum import Enum
+
+#define RABBITIZER_DEF_INSTR_ID(prefix, caseBits, name, ...) \
+    prefix##_##name: Enum
+
+#define RABBITIZER_DEF_INSTR_ID_ALTNAME(prefix, caseBits, name, altname, ...) \
+    RABBITIZER_DEF_INSTR_ID(prefix, caseBits, name, __VA_ARGS__)
+
+#define INSTRID_AVOID_USERDEF
+
+class InstrId:
+    #include "InstrIds.inc"
+
+    RABBITIZER_DEF_INSTR_ID(ALL, , MAX)
+
+#undef INSTRID_AVOID_USERDEF
+
+#undef RABBITIZER_DEF_INSTR_ID
+#undef RABBITIZER_DEF_INSTR_ID_ALTNAME

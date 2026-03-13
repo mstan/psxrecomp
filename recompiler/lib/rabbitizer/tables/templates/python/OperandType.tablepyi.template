@@ -1,0 +1,18 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+from __future__ import annotations
+
+from .Enum import Enum
+
+#define RAB_DEF_OPERAND(prefix, operand) \
+    prefix##_##operand: Enum
+
+class OperandType:
+    RAB_DEF_OPERAND(ALL, INVALID)
+
+    #include "OperandTypes.inc"
+
+    RAB_DEF_OPERAND(ALL, MAX)
+
+#undef RAB_DEF_OPERAND

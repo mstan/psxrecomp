@@ -1,0 +1,12 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RAB_DEF_ACCESSTYPE(name) name,
+
+enum class AccessType {
+    #include "AccessType.inc"
+
+    RAB_DEF_ACCESSTYPE(MAX)
+};
+
+#undef RAB_DEF_ACCESSTYPE

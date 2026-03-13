@@ -1,0 +1,137 @@
+# runtime.log — audit trail for runtime.c
+# Format:
+#   [function_name]
+#   Ghidra: <what the decompiler showed at that address>
+#   Rationale: <why implemented this way>
+#
+# Nothing is implemented until the game crashes and demands it.
+# Every entry must have a corresponding Ghidra lookup before implementation.
+
+[psx_set_pad1]
+Ghidra: FUN_80019e68 case 3 reads _DAT_1f8001fc directly (scratchpad[0x1FC]).
+  Bit masks: &0x80=Up menu, &0x20=Down menu, &0x4008=Cross/Start confirm (1=pressed format).
+  FUN_80028D70 (addr=0x80028D70) is the BIOS pad poll — called each frame by FUN_800223e0.
+  FUN_8001a51c (game entry after menu confirm) also clears _DAT_1f8001fc=0 at startup.
+Rationale: Write current GLFW key state to g_scratch[0x1FC/0x1FD] from psx_present_frame().
+  1-frame delay is imperceptible. FUN_80028D70 stub keeps returning v0=0 (no DAT_8009c9d8 noise).
+  Key map: GLFW_KEY_UP=0x0080, GLFW_KEY_DOWN=0x0020, GLFW_KEY_ENTER/Z=0x4008, Esc=close.
+
+[FUN_8001EFE8 sound trigger fix]
+Ghidra: FUN_8001efe8 contains conditional sound trigger:
+  if (DAT_1f8001cd==0x15 && TCB+0x68==0 && frame_counter>0xe)
+      FUN_80020af0(0)  → FUN_8006bb4c → sets _DAT_8009e46c bit → activates music sequence
+Rationale: Our FUN_8001EFE8 intercept returns 1 (fully handled) so the compiled
+  function never runs. The sound trigger was silently skipped. Fix: replicate the
+  trigger in the intercept — after 14 FMV ticks with scene=0x15, call FUN_80020AF0(0)
+  via psx_dispatch_compiled. Result: KON_lo=0x0003, voices 0+1 key on with
+  start=0x48250 ADSR=0x1FC080FF — music plays during WhoopEeCamp FMV and static screen.
+
+[FUN_8004f3dc prim loop guard — fix #40]
+Ghidra: FUN_8004f3dc is a sprite/primitive batch builder. Loads loop count from
+  entity data: s3 = lh *(*(entity+0x18) + index*4). do-while loop (bne s3, zero)
+  decrements s3 and renders one sprite per iteration.
+  When entity data is uninitialized (overlay tick functions not yet dispatched),
+  count=0 causes 2^32 iterations (~282 seconds). entity=0x00000001 (garbage),
+  base=0x08000000 (unmapped mirror). Reads from wild KUSEG addresses (0x243C4FF2 etc.)
+  returning 0, building garbage GPU primitives.
+Rationale: Add psx_override_dispatch guard — validate count before entering loop.
+  If count <= 0, skip entirely (return 1). This prevents the stall without affecting
+  correctly-initialized entities. The skip fires ~5 times near f1706-f1722 then stops
+  (entity gets properly initialized by overlay dispatch). Result: gameplay runs stable
+  at 16ms/frame through 1000+ frames with no stalls.
+
+[FUN_8003B860 — VM conditional branch handler — fix #41]
+Ghidra: FUN_8003b860 is a ~264-byte function handling VM opcodes 8-16 (conditional branches).
+  Switch on opcode: 8=always, 9/B=flag==0, A/C=flag!=0, D=flag==1, E=flag==2, F=flag!=2, 10=flag!=1.
+  Flag at context+0x89, IP at context+0x8A. If condition true → IP = bytecode[IP+1..IP+2].
+  If false → IP += 3.
+  Context pointer at DAT_8009e458, bytecode base at DAT_8009c974.
+Recompiler bug: Split function at 0x8003B880 (beq delay slot). func_8003B860 = 32 bytes (loads
+  a0, a3, a1 then returns). func_8003B880 = 280 bytes (actual switch/branch logic, never called).
+  MIPS disasm shows: beq at 0x8003B87C, delay slot addiu sp,-8 at 0x8003B880.
+Rationale: Override in runtime.c implements full branch evaluation. Reads context+0x89 flag,
+  evaluates condition per opcode, updates context+0x8A IP. Returns 1 (fully handled).
+  Result: VM completes in 27 ops (was stuck at 500/yield). Intro cutscene sprites spawn.
+
+[FUN_80018248 — entity pending list processor]
+Ghidra: Not recognised as function (recompiler missed entry). Called from overlay code
+  only (ra=0x80104694, 0x800F3A6C). Manual hex decode of 160 bytes:
+  lh v0, scratchpad[0x236]   → count
+  blez v0, return_0          → empty list: return 0
+  lw a0, scratchpad[0x204]   → list pointer (array of entity ptrs)
+  lhu v1, scratchpad[0x1c8]  → flag
+  sh count-1, scratchpad[0x236]       ; decrement
+  sw pointer+4, scratchpad[0x204]     ; advance
+  lw a0, 0(pointer)          → entity_ptr (dereference)
+  bne flag&1, 0, L_FLAG
+  addiu v0, a0, 0x10         (delay slot)
+  flag==0: sw v0, a0[0x40];  v0=a0+0x18;  sw v0, a0[0x44]
+  flag!=0: sw v0, a0[0x44];  v0=a0+0x18;  sw v0, a0[0x40]
+  returns 0 always (v0 cleared before jr ra)
+Rationale: Projectiles/thrown pigs vanish because this function was UNKNOWN — entity
+  [0x40]/[0x44] never initialized. Stub implemented in call_by_address: decrements
+  scratchpad[0x236] count, advances scratchpad[0x204] pointer by 4, dereferences to
+  get entity_ptr, sets entity_ptr[0x40]=entity_ptr+0x10 and [0x44]=entity_ptr+0x18
+  (swapped if scratchpad[0x1c8]&1). Returns 0.
+
+[SysEnqIntRP / SysDeqIntRP — C(02)/C(03) BIOS stubs]
+Ghidra: FUN_800691d8 (streaming init) calls SysEnqIntRP C(02) with priority=2, queue_ptr=0x8009B2E0.
+  Queue struct at 0x8009B2E0: +0 next_ptr, +4 handler_func (FUN_80069058). Priority 2 = CD-ROM IRQ.
+  FUN_80068fc4 sets queue struct fields before calling SysEnqIntRP.
+  SysDeqIntRP called with same args during teardown (FUN_800691d8 preamble calls SysDeqIntRP C(03)).
+Rationale: Was no-op. Now maintains g_int_chains[4] linked list per PS1 BIOS spec.
+  SysEnqIntRP: writes old head into queue[0] (next ptr), sets g_int_chains[prio]=queue_ptr.
+  SysDeqIntRP: unlinks target entry by walking chain and splicing out (head or interior).
+  fire_interrupt_chain() helper walks chain and calls each handler[+4] via call_by_address.
+  NOTE: fire_interrupt_chain NOT called from CdRead — FUN_80069058 polls 0x1F801044 (CD hardware)
+  in a spin loop when called outside real CD interrupt context → deadlock. The interrupt chain
+  is correctly populated (SysEnqIntRP now works) but can only be fired safely when CD hardware
+  emulation is present. Lazy injection at 0x800E75CC remains the mechanism for the streaming fix.
+
+[options_screen_cd_streaming]
+Ghidra: FUN_80028728 calls FUN_8006a9ec (init streaming struct at 0x8009B3A0) then
+  FUN_80068a1c→FUN_800691d8 which calls SysEnqIntRP C(02) to register FUN_80069058
+  as the CD-ROM interrupt handler via queue at 0x8009B2E0. FUN_80069058 drives the
+  CD streaming state machine; FUN_8006b3b8 sets status byte at 0x8009B3E9=2 after 2+
+  CD completion interrupts. The options screen overlay (0x800E75CC) polls FUN_80068aa8
+  which reads 0x8009B3E9; returns the byte directly when no busy flags set. Sub_state=0
+  handler needs return==2 to advance past the wait loop.
+Rationale: SysEnqIntRP was a no-op — CD interrupt FUN_80069058 never registered/fired.
+  With no CD-ROM hardware emulation the streaming queue status stays at 0 forever.
+  Fix: in INTERP handler for 0x800E75CC, if streaming is enabled (g_ram[0x97548]!=0)
+  and status still 0, inject g_ram[0x9B3E9]=2 to simulate CD drive ready.
+  Lazy injection is safe: nothing overwrites the byte (no CD interrupts, slot init
+  FUN_8006ab4c returns immediately when status==0, never clears our injected value).
+  Result: DrawOTag went from 1 nonempty entry to 123 nonempty entries; options screen
+  renders correctly with OPTION menu items visible.
+
+[read_word / GPUREAD port 0x1F801810]
+Ghidra: N/A (hardware register, not a PS1 binary function).
+Rationale: read_word(0x1F801810) returned 0 instead of GPUREAD data.
+  The PS1's equipment menu CLUT save/restore sequence uses CPU poll reads from
+  port 0x1F801810 to transfer the first N pixels of a VRAM region before the DMA.
+  Specifically: game issues C0h VRAMToCPU to fill GPUREAD buffer, CPU reads 8 words
+  via LW from 0x1F801810 (pixels 0-15 of terrain CLUT), then DMA reads the remaining
+  736 words. On restore: game writes those 8 saved words back via SW to GP0, then DMA
+  sends the 736 words. With zero returns the saved values were all 0x0000, corrupting
+  the terrain CLUT pixels 0-15 and shifting the entire CLUT by 16 entries.
+  Fix: added `if (phys == 0x1F801810) { val = gpu_read_word(); }` in read_word().
+  Result: menu close restores correct terrain colors — grass green, no garbling.
+
+[save-flow investigation — session 8 2026-03-11]
+Ghidra: 0x8005BA04 — falls within the strlen (FUN_8005B9D4) region; Ghidra did not
+  separate it as a function. Bytecode: BEQ $zero,$zero,+26 (unconditional forward
+  branch) with delay slot move $v0,$zero → always returns 0.  Not a write-buffer
+  setup function; is a utility stub (string/status utility) called during save
+  filename preparation.  0x8005BAF0 (strncpy/strcpy area) similarly handles string
+  copy operations for the 3-block filename chain.
+  INTERP-CALL trace shows: no B(0x35) write() call during any phase of the save
+  sequence.  Kernel-area watchpoints (0x0000-0x7FFF) confirmed no BIOS MC buffer
+  writes during frames 3400-3510.  Conclusion: game writes MC data via hardware SIO
+  (direct register access), not via BIOS B(0x35).  B(0x35) write path in overlay code
+  only triggers when O_CREAT fails; our O_CREAT always returns success so that path
+  is never taken.
+Rationale: Issue #2 "Save Error!" was fixed in session 7 by making FUN_B4CC/nextfile
+  return success (faking directory management).  Actual data persistence requires SIO
+  MC hardware emulation — deferred.  Diagnostic watchpoints KERN-WW/WH/WB and
+  OPEN-DUMP commented out after yielding their data.

@@ -1,0 +1,10 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define RAB_DEF_OPERAND(prefix, operand) [RAB_OPERAND_##prefix##_##operand] = RabbitizerOperandType_process_##prefix##_##operand,
+
+const OperandCallback instrOpercandCallbacks[] = {
+#include "OperandTypes.inc"
+};
+
+#undef RAB_DEF_OPERAND

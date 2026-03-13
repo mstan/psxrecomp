@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "type": "sse",
+      "url": "http://localhost:8080/sse"
+    },
+    "pcsx-redux": {
+      "type": "sse",
+      "url": "http://localhost:8078/sse"
+    }
+  }
+}

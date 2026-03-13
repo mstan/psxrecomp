@@ -1,0 +1,45 @@
+# Build artifacts
+build/
+
+# Generated output (reproducible — run PSXRecomp.exe to regenerate)
+generated/
+
+# Game ISOs / disc images (copyrighted)
+isos/
+
+# Editor / OS
+.vs/
+*.user
+Thumbs.db
+.DS_Store
+
+# Debug screenshots / captures
+*.png
+*.bmp
+fmv_err.txt
+
+# External tools / deps not part of this repo
+FFmpeg/
+Severed-Chains/
+
+# Reference emulator (binary distribution, not source)
+pcsx-redux/
+# Crash telemetry blobs
+.sentry-native/
+# Internal AI session memory
+memory/
+# Empty debug artifacts
+build_log.txt
+
+# Test / analysis scripts
+test_fmv_decode.py
+src/analyze_audio.py
+src/*.mp3
+
+# Save state WIP (not yet shipped)
+runner/include/savestate.h
+runner/src/savestate.cpp
+runner/src/savestate.log
+
+# Scripted input (internal testing)
+runner/assets/scripts/

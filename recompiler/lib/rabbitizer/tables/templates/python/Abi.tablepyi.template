@@ -1,0 +1,16 @@
+/* SPDX-FileCopyrightText: © 2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+from __future__ import annotations
+
+from .Enum import Enum
+
+#define RABBITIZER_DEF_ABI(name) name: Enum
+
+class Abi:
+    #include "Abi.inc"
+
+    @staticmethod
+    def fromStr(name: str | None) -> Enum: ...
+
+#undef RAB_DEF_ACCESSTYPE

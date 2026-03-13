@@ -1,0 +1,26 @@
+/* SPDX-FileCopyrightText: © 2022-2023 Decompollaborate */
+/* SPDX-License-Identifier: MIT */
+
+#define HASH #
+#define HASH_EXPANSION(x) x
+#define SPECIAL_RS_TAG(...) HASH_EXPANSION(HASH)[__VA_ARGS__]
+
+#define RABBITIZER_DEF_INSTR_ID(prefix, caseBits, name, ...) \
+    prefix##_##name,
+
+#define RABBITIZER_DEF_INSTR_ID_ALTNAME(prefix, caseBits, name, altname, ...) \
+    RABBITIZER_DEF_INSTR_ID(prefix, caseBits, name, __VA_ARGS__)
+
+SPECIAL_RS_TAG(repr(u32))
+SPECIAL_RS_TAG(derive(Debug, Copy, Clone, Hash, PartialEq, Eq))
+SPECIAL_RS_TAG(allow(non_camel_case_types))
+pub enum InstrId {
+    #include "InstrIds.inc"
+}
+
+impl InstrId {
+    pub const ALL_MAX: InstrId = InstrId::r5900_MAX;
+}
+
+#undef RABBITIZER_DEF_INSTR_ID
+#undef RABBITIZER_DEF_INSTR_ID_ALTNAME

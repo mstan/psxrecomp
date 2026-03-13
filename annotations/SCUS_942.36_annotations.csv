@@ -1,0 +1,38 @@
+# Tomba! (SCUS_942.36) — function annotations for PSXRecomp code generator
+#
+# Format: address, note
+#   address: hex with 0x prefix (e.g. 0x8001dfd4)
+#   note:    free text; may contain commas; emitted as [NOTE] comment in generated C
+#
+# Workflow: when a function's purpose is confirmed via Ghidra, document it here.
+# The comment appears above the function signature in tomba_full.c without ever
+# having to read the whole file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Threading / scheduler ────────────────────────────────────────────────────
+
+0x80017024, PS1 cooperative thread scheduler — iterates TCB array at 0x801FD800 (stride 0x70), dispatches threads with state=2 (ready). Leaves loop-end value in scratchpad after each call. VBlank ISR would reset state 4→2 on real hardware; we do it on fiber yield instead.
+0x8005b40c, ChangeThread(handle) — cooperative fiber switch; suspends caller, resumes target thread
+
+# ── Entity system ─────────────────────────────────────────────────────────────
+
+0x8001dfd4, entity tick dispatcher — iterates 200 entity slots at 0x800A5970 (stride 0xD4); dispatches each active entity's handler
+0x8002d784, camera entity handler — reads from camera entity at 0x800A38B8; confirmed working
+0x80018248, entity_ptr helper — returns entity pointer (not 0); required for pig-throw to work correctly
+0x80017d70, entity pool initializer — sets entity[0x1C]=1, pushes to pending list at scratchpad[0x204]
+
+# ── Secondary entity / projectile pool ───────────────────────────────────────
+
+0x8003f1d4, secondary entity dispatcher — iterates 0x800B07D8 pool (4 slots, stride 0xEC); checks entity[0]!=0, dispatches via table_8007d6a4[entity[2]]; handles projectiles and thrown weapons
+0x80034524, weapon/projectile chain entry — calls FUN_8001ac00; part of the throw/attack dispatch path
+0x8001ac00, weapon/projectile dispatch chain — called from FUN_80034524; routes weapon attack logic
+
+# ── Terrain / zone ───────────────────────────────────────────────────────────
+
+0x8004637c, terrain gate check — reads DAT_800a5399; mode in DAT_800a539a (0=compiled, 1-3=overlay); controls zone boundary transitions
+
+# ── Display / GPU ─────────────────────────────────────────────────────────────
+
+0x800191e0, display thread entry — state machine (states 9→10→0xB→0→1→4); TCB[0] display fiber. TCB[0]+0x48/0x58 = draw callback pointers for buffer A/B, not state values once running.
+0x80019630, draw callback for display buffer B — updated every frame by display state machine
+0x800197b8, draw callback for display buffer A

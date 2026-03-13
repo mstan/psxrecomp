@@ -1,0 +1,26 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+include/generated/* linguist-generated=true
+cplusplus/include/generated/* linguist-generated=true
+
+rust/src/abi_enum.rs linguist-generated=true
+rust/src/access_type_enum.rs linguist-generated=true
+rust/src/instr_category_enum.rs linguist-generated=true
+rust/src/instr_id_enum.rs linguist-generated=true
+rust/src/instr_id_type_enum.rs linguist-generated=true
+rust/src/instr_suffix_enum.rs linguist-generated=true
+rust/src/operand_type_enum.rs linguist-generated=true
+rust/src/registers_enum.rs linguist-generated=true
+
+rabbitizer/Abi.pyi linguist-generated=true
+rabbitizer/AccessType.pyi linguist-generated=true
+rabbitizer/InstrCategory.pyi linguist-generated=true
+rabbitizer/InstrId.pyi linguist-generated=true
+rabbitizer/InstrIdType.pyi linguist-generated=true
+rabbitizer/OperandType.pyi linguist-generated=true
+rabbitizer/RegGprO32.pyi linguist-generated=true
+rabbitizer/RegGprN32.pyi linguist-generated=true
+rabbitizer/RegCop1O32.pyi linguist-generated=true
+rabbitizer/RegCop1N32.pyi linguist-generated=true
+rabbitizer/RegCop1N64.pyi linguist-generated=true

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: © 2022-2023 Decompollaborate
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "rabbitizer"
+# Version should be synced with include/common/RabbitizerVersion.h
+version = "1.7.10"
+edition = "2021"
+authors = ["Anghelo Carvajal <angheloalf95@gmail.com>"]
+description = "MIPS instruction decoder"
+readme = "README.md"
+homepage = "https://github.com/Decompollaborate/rabbitizer"
+repository = "https://github.com/Decompollaborate/rabbitizer"
+license = "MIT"
+keywords = ["MIPS", "decoder"]
+build = "rust/build.rs"
+include = ["/rust/src", "/rust/build.rs", "/src", "/include", "/tables"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+path = "rust/src/lib.rs"
+
+[dependencies]
+num_enum = "0.5.7"
+
+[build-dependencies]
+cc = "1.0.78"
+glob = "0.3.0"

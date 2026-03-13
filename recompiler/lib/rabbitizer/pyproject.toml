@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: © 2022-2023 Decompollaborate
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "rabbitizer"
+# Version should be synced with include/common/RabbitizerVersion.h
+version = "1.7.10"
+description = "MIPS instruction decoder"
+# license = "MIT"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [
+    { name="Anghelo Carvajal", email="angheloalf95@gmail.com" },
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Decompollaborate/rabbitizer"
+"Bug Tracker" = "https://github.com/Decompollaborate/rabbitizer/issues"
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["rabbitizer"]
+
+[tool.setuptools.package-data]
+rabbitizer = ["py.typed", "*.pyi", "**/*.pyi"]
+
+[tool.cibuildwheel]
+skip = ["cp36-*"]

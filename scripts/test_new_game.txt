@@ -1,0 +1,221 @@
+# test_new_game.txt — Boot → skip FMVs → main menu → NEW GAME → observe gameplay
+#
+# Strategy: hold CROSS through boot to skip all FMVs, press CROSS for NEW GAME,
+# then press START once to skip the NEW GAME intro FMV, wait for gameplay.
+
+turbo on
+log === Boot sequence starting ===
+
+# Hold CROSS through the entire boot sequence — skips FMV1, FMV2, and attract mode
+wait 10
+log Holding CROSS to skip all FMVs and attract mode...
+hold CROSS
+
+# Wait for the first state=4 (boot entry's state machine)
+log Waiting for first state=4 (boot entry)...
+wait_mem16 0x1FD848 4
+
+# Fiber restart happens here (0x800191E0 → 0x80019844).
+# State drops to 0.  Keep holding CROSS — it will skip the attract FMV
+# when state reaches 3, forcing state=4 immediately.
+log First state=4 reached, waiting for fiber restart + second state=4...
+wait 5
+
+# Wait for state to drop (fiber restart sets state=0)
+wait_mem16 0x1FD848 0
+log State dropped to 0 (fiber restarted at FUN_80019844)
+
+# Now wait for state=4 again — CROSS being held will skip attract FMV (state=3)
+wait_mem16 0x1FD848 4
+log Second state=4 reached (main menu)!
+
+# Release CROSS and wait long enough for edge detection to clear
+release CROSS
+wait 30
+
+# Verify we're at the interactive menu
+turbo off
+assert_mem16 0x1FD848 4 main_menu_interactive
+log Main menu confirmed — taking screenshot
+screenshot 01_main_menu.png
+
+# Wait a few more frames to be sure pad is flushed
+wait 30
+log Pressing CROSS for NEW GAME...
+press CROSS
+
+# Wait for state to change from 4 (menu) — NEW GAME starts, fiber restarts
+turbo on
+wait 30
+
+# Press START briefly once per frame for a few frames to skip the intro FMV
+# (Rather than holding START which also triggers the pause menu in gameplay)
+log Pressing START to skip NEW GAME FMV...
+press START
+wait 5
+press START
+wait 5
+press START
+wait 5
+press START
+wait 5
+press START
+
+# Wait for sub (0x1FD84A) to become 1 — that means gameplay dispatch is active
+log Waiting for sub=1 (gameplay dispatch)...
+wait_mem16 0x1FD84A 1
+
+log Gameplay sub=1 reached!
+# Do NOT hold or press START — let the game run without pause
+wait 60
+
+# Dismiss the intro dialogue "Hey, you with the pink hair!" by pressing CROSS.
+# The NPC script (FUN_8002fa24) advances on CROSS edge events (_DAT_1f8001fc = held & ~prev).
+# Script opcodes: 0xA=wait-for-button (sets b5=1), 0xFFFF=done (sets NPC b4=2 -> dismiss).
+# b5=4 handler (overlay 0x80113524) checks NPC b4==2, not CROSS directly.
+# Strategy: press CROSS every 5 frames (turbo on) to catch each wait state quickly.
+# ~60 presses = 300 frames at 5f intervals drives through all script wait points.
+log Pressing CROSS rapidly to drive NPC script to completion...
+turbo on
+# Wait for dialogue to appear (~60f after sub=1), then start pressing
+wait 60
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+press CROSS
+wait 5
+log Post-dialogue wait (bca7 should be 0, player movement unblocked)...
+turbo off
+wait 60
+
+# Now observe gameplay — wait and take screenshots
+log Observing gameplay (turbo off for accurate screenshots)...
+wait 120
+screenshot 02_gameplay_120f.png
+
+# Hold RIGHT for 180 frames to test player movement
+log Holding RIGHT to test player movement...
+hold RIGHT
+wait 180
+release RIGHT
+wait 30
+screenshot 03_gameplay_move.png
+
+wait 300
+screenshot 04_gameplay_420f.png
+
+wait 300
+screenshot 05_gameplay_720f.png
+log === Script complete ===
+exit 0

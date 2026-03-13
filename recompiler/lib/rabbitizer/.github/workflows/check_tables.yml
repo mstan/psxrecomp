@@ -1,0 +1,36 @@
+name: Check for ungenerated tables
+
+# Build on every branch push, tag push, and pull request change:
+on: [push, pull_request]
+
+jobs:
+  check_tables:
+    name: Check tables
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout reposistory
+      uses: actions/checkout@v4
+
+    - name: Setup Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: clean tables
+      run: make -C tables -j $(nproc) distclean
+
+    - name: make tables
+      run: make -C tables -j $(nproc)
+
+    - name: Check if there are tables changes
+      id: tables_changes
+      uses: tj-actions/verify-changed-files@v14
+
+    - name: tables changes
+      if: steps.tables_changes.outputs.files_changed == 'true'
+      run: |
+        echo "Changed files: ${{ steps.tables_changes.outputs.changed_files }}"
+        echo "Please run \`make -C tables distclean && make -C tables tables\` and commit the result"
+        exit 1
