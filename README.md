@@ -196,4 +196,4 @@ are not included in this repository.
 
 ---
 
-<sub>If this project was useful or interesting to you: [ko-fi.com/gamemaster1379](https://ko-fi.com/gamemaster1379)</sub>
+<sub>[Buy me a coffee](https://ko-fi.com/gamemaster1379)</sub>
