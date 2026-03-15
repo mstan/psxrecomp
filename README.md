@@ -1,12 +1,8 @@
 # PSXRecomp
 
-**Static recompiler for PlayStation 1 games — MIPS R3000A → C → native x64**
-
-> Tech demo — not intended to be a complete or fully playable experience. Tomba! (USA) boots to gameplay with most core systems working.
+**Generic static recompiler framework for PlayStation 1 games — MIPS R3000A -> C -> native x64**
 
 *Read about how it was built: [I Built a PS1 Static Recompiler With No Prior Experience (and Claude Code)](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)*
-
-[![PSXRecomp gameplay demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
 
 ---
 
@@ -19,139 +15,132 @@ audio, and BIOS services.
 This is **not** an emulator. There is no interpreter loop, no cycle counting, no accuracy
 trade-offs. Every JAL in the MIPS binary becomes a direct C function call.
 
-**Reference game: Tomba! (SCUS-94236, USA)**
+PSXRecomp is a **framework** — it provides the recompiler and the runtime. Each game gets its own
+repository that pulls in PSXRecomp as a submodule and supplies game-specific configuration.
 
-The recompiler is the product. Tomba! is the vehicle that drives its development.
+### Applied example
 
----
+**[TombaRecomp](https://github.com/mstan/TombaRecomp)** — Tomba! (SCUS-94236, USA) running on PSXRecomp. Boots to gameplay with main menu, FMV, audio, movement, combat, and camera all working.
 
-## Current status
-
-**Working:**
-- Main menu, attract FMV, SPU audio
-- New Game → gameplay
-- Tomba movement, jumping, and camera
-- Pig grab and throw
-- Mace weapon attack (swing, trail, hit)
-- Equipment menu
-
-**Known issues:**
-- Wrong sound effects play in some situations; music can sound slightly off
-- Some entities don't render fully correctly (e.g. parts of swingable objects)
-- Save system is buggy — saves to all slots instead of the selected slot, loading a save goes to a black screen, saves are not persisted to disk
-- Many softlock conditions exist (e.g. discovering an objective while already holding the required key item)
-
-This is a tech demo. It is not intended to be exhaustive or fully playable.
+[![PSXRecomp gameplay demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
 
 ---
 
-## How it works
+## Architecture
 
 ```
-recompiler/          MIPS→C static recompiler
-  src/                 Code generator, control flow analysis, MIPS decoder
-  lib/                 rabbitizer (MIPS disassembler), ELFIO, fmt
+recompiler/              MIPS->C static recompiler
+  src/                     Code generator, control flow analysis, MIPS decoder
+  lib/                     rabbitizer (MIPS disassembler), ELFIO, fmt
 
-runner/              Native PC runtime
+runner/                  Native PC runtime (linked by game repos)
   src/
-    main_runner.cpp    GLFW window, game loop, frame throttle
-    runtime.c          PS1 memory map, BIOS stubs, fiber scheduler
-    gpu_interpreter.cpp  GP0/GP1 command parser
-    opengl_renderer.cpp  OpenGL 3.3 GPU backend (triangles, textures, VRAM)
-    gte.cpp            GTE coprocessor (geometry transform engine)
-    spu.cpp            SPU audio (24-voice ADPCM, WinMM output)
-    xa_audio.cpp       XA-ADPCM streaming audio from disc
-    fmv_player.cpp     STR v2 FMV video decoder
-    cdrom_stub.cpp     CD-ROM command emulation
-  include/             Headers
-  lib/                 GLAD (OpenGL loader)
+    launcher.c             Disc picker, disc.cfg persistence, CRC verification
+    main_runner.cpp        GLFW window, game loop, frame throttle
+    runtime.c              PS1 memory map, BIOS stubs, fiber scheduler
+    gpu_interpreter.cpp    GP0/GP1 command parser
+    opengl_renderer.cpp    OpenGL 3.3 GPU backend (triangles, textures, VRAM)
+    gte.cpp                GTE coprocessor (geometry transform engine)
+    spu.cpp                SPU audio (24-voice ADPCM, WinMM output)
+    xa_audio.cpp           XA-ADPCM streaming audio from disc
+    fmv_player.cpp         STR v2 FMV video decoder
+    cdrom_stub.cpp         CD-ROM command emulation
+  include/
+    game_extras.h          Interface that game repos implement
+  lib/                     GLAD (OpenGL loader)
   assets/
-    keyconfig.ini      Default key bindings + audio volume
+    keyconfig.ini          Default key bindings + audio volume
+  runner.cmake             Include this from your game's CMakeLists.txt
 
-generated/           Output from recompiler (not checked in)
-  tomba_full.c         All recompiled game functions (~200K lines, 2955 functions)
-  tomba_dispatch.c     Dynamic call dispatch table
-
-tools/               Developer tooling
-  pcsx_redux_mcp/      MCP server integration for PCSX-Redux (reference emulator)
+tools/                   Developer tooling
+  pcsx_redux_mcp/          MCP server for PCSX-Redux (reference emulator)
 ```
 
-The recompiler (`PSXRecomp.exe`) reads the raw PS1 EXE and emits `tomba_full.c`. The runner
-links that C with the runtime, renderer, and audio into `PSXRecompGame.exe`. Overlay code
-(loaded at runtime from the disc) is handled by a MIPS interpreter in `runtime.c`.
+The recompiler reads a raw PS1 EXE and emits `<serial>_full.c` (all recompiled game functions)
+and `<serial>_dispatch.c` (dynamic call dispatch table). The game repo links these with the
+runtime into a native executable. Overlay code (loaded at runtime from disc) runs through a
+MIPS interpreter in `runtime.c`.
 
 ---
 
-## Requirements
+## Making a game project
 
-- **OS**: Windows 10+ (64-bit)
-- **Compiler**: MinGW-w64 GCC (C++20, C17) via MSYS2
-- **Build system**: CMake 3.20+ with Ninja
-- **GPU**: OpenGL 3.3+ capable graphics card
-- **FFmpeg DLLs**: Required for FMV playback — download a Windows build from [ffmpeg.org](https://ffmpeg.org/download.html) and place `avcodec-*.dll`, `avformat-*.dll`, `avutil-*.dll`, `swresample-*.dll`, and `swscale-*.dll` next to `PSXRecompGame.exe`
-- **Game disc**: Tomba! (USA) — `SCUS_942.36` — you must provide your own legally obtained copy
-
----
-
-## Disc image setup
-
-The runner needs two files from your Tomba! disc image:
-
-1. **The PS1 executable** (headerless) — `SCUS_942.36_no_header`
-2. **The disc image** in BIN/CUE format — e.g. `Tomba.bin` + `Tomba.cue`
-
-### Preparing the headerless executable
-
-```bash
-# Strip the 2048-byte PS1 EXE header:
-dd if=SCUS_942.36 of=SCUS_942.36_no_header bs=2048 skip=1
-```
-
-Or use a hex editor to remove the first 2048 bytes.
-
-### Directory layout
-
-Place your files in the `isos/` directory (already in `.gitignore`):
+Each game gets its own repository structured like this:
 
 ```
-psxrecomp/
-  isos/
-    SCUS_942.36           # Original PS1 executable (for recompiler)
-    SCUS_942.36_no_header # Headerless binary (for Ghidra analysis)
-    Tomba.bin             # Raw disc image
-    Tomba.cue             # CUE sheet
+MyGameRecomp/
+  psxrecomp/             <- git submodule pointing to this repo
+  extras.cpp             <- implements game_extras.h hooks
+  CMakeLists.txt         <- pulls in runner.cmake, adds generated code
+  annotations/           <- per-function and per-instruction notes (CSV)
+  generated/             <- output from the recompiler (gitignored)
+  isos/                  <- game disc images (gitignored)
 ```
+
+### game_extras.h hooks
+
+Your `extras.cpp` must implement these functions:
+
+```c
+const char *game_get_name(void);           // window title
+uint32_t    game_get_display_entry(void);  // PS1 address of display thread
+const char *game_get_exe_filename(void);   // e.g. "SCUS_942.36_no_header"
+uint32_t    game_get_expected_crc32(void); // 0 = skip verification
+void        game_on_init(void);            // called after runtime init
+void        game_on_frame(uint32_t frame); // called every PS1 frame
+int         game_handle_arg(const char *key, const char *val);
+const char *game_arg_usage(void);
+```
+
+### Annotations
+
+Place a CSV at `annotations/<serial>_annotations.csv`:
+
+```
+# Format: address, note
+0x8001dfd4, entity tick dispatcher — iterates 200 entity slots
+0x8002a100, jump table for menu state machine
+```
+
+Annotations appear as `/* [NOTE] ... */` in the generated C — both at function start and
+inline at instruction addresses.
+
+### Launcher
+
+Double-click the built exe: a file dialog asks for the CUE file on first run, then
+saves the path to `disc.cfg` for subsequent launches. The EXE file is found automatically
+in the same directory as the CUE. Old-style CLI (`game.exe <exe> <cue>`) still works.
 
 ---
 
 ## Building
 
+### Requirements
+
+- **OS**: Windows 10+ (64-bit)
+- **Compiler**: MinGW-w64 GCC (C++20, C17) via MSYS2
+- **Build system**: CMake 3.20+ with Ninja
+- **GPU**: OpenGL 3.3+
+- **FFmpeg DLLs**: For FMV playback — place `avcodec-*.dll`, `avformat-*.dll`, `avutil-*.dll`, `swresample-*.dll`, `swscale-*.dll` next to the game exe
+
 ### 1. Build the recompiler
 
 ```bash
-cmake -S recompiler -B build/recompiler -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S recompiler -B build/recompiler -G Ninja
 ninja -C build/recompiler
 ```
 
-### 2. Generate the translated C code
+### 2. Generate translated C (from your game repo)
 
 ```bash
-build/recompiler/PSXRecomp.exe isos/SCUS_942.36
+path/to/PSXRecomp.exe isos/SCUS_942.36
 ```
 
-This produces `generated/tomba_full.c` and `generated/tomba_dispatch.c`.
-
-### 3. Build the runner
+### 3. Build the game
 
 ```bash
-cmake -S runner -B build/runner -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build/runner
-```
-
-### 4. Run
-
-```bash
-build/runner/PSXRecompGame.exe isos/SCUS_942.36_no_header isos/Tomba.cue
+cmake -B build -G Ninja
+ninja -C build
 ```
 
 ---
@@ -176,29 +165,15 @@ Default key bindings (configurable via `keyconfig.ini` next to the executable):
 
 ## AI-assisted development
 
-This project was developed entirely using [Claude Code](https://claude.ai/code) (Anthropic) as
+This project was developed using [Claude Code](https://claude.ai/code) (Anthropic) as
 an AI pair programmer, with [Ghidra](https://ghidra-sre.org/) as the decompiler and ground
 truth for PS1 code.
 
-The development loop:
+### Tooling
 
-1. Build the runner
-2. Run the game, observe the screenshot
-3. Compare against the reference (main menu / gameplay)
-4. Identify the bug: wrong colors → shader; wrong geometry → GPU decode; crash → Ghidra
-5. Ghidra the relevant PS1 function to understand what it actually does
-6. Fix `opengl_renderer.cpp`, `gpu_interpreter.cpp`, or `runtime.c`
-7. Repeat
-
-`CLAUDE.md` in the repo root documents the exact rules and methodology that govern each
-session. It is the system prompt that made this workflow reliable.
-
-### Reproducing the setup
-
-- [Claude Code](https://claude.ai/code) — the AI coding agent
+- [Claude Code](https://claude.ai/code) — AI coding agent
 - [Ghidra](https://ghidra-sre.org/) with the [Ghidra MCP server](https://github.com/LaurieWired/GhidraMCP) — decompiler integration
-- `tools/pcsx_redux_mcp/` — MCP server for [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux) (reference PS1 emulator, used as ground truth)
-- Your own Tomba! (USA) disc
+- `tools/pcsx_redux_mcp/` — MCP server for [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux) (reference PS1 emulator)
 
 ---
 
@@ -212,7 +187,7 @@ session. It is the system prompt that made this workflow reliable.
 ## License
 
 PSXRecomp is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for
-non-commercial use with attribution. 
+non-commercial use with attribution.
 
 Third-party libraries retain their own licenses (see `recompiler/lib/` subdirectories).
 
@@ -221,4 +196,4 @@ are not included in this repository.
 
 ---
 
-<sub>If this project was useful or interesting to you: [☕ ko-fi.com/gamemaster1379](https://ko-fi.com/gamemaster1379)</sub>
+<sub>If this project was useful or interesting to you: [ko-fi.com/gamemaster1379](https://ko-fi.com/gamemaster1379)</sub>
