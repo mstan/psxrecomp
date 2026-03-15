@@ -680,7 +680,7 @@ extern "C" void psx_present_frame(void) {
 /* ---------------------------------------------------------------------------
  * main
  * --------------------------------------------------------------------------- */
-int main(int argc, char* argv[]) {
+extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     /* Parse CLI arguments: positional exe_path + cue_path, optional --script/--mmio-trace */
     const char* exe_path = NULL;
     const char* cue_path = NULL;
@@ -706,7 +706,7 @@ int main(int argc, char* argv[]) {
     }
     if (!exe_path || !cue_path) {
         fprintf(stderr, "Usage: PSXRecompGame <exe> <cue> [--script <file>] [--record <file>]\n");
-        return 1;
+        exit(1);
     }
 
     printf("=== PSXRecomp v2 ===\n");
@@ -739,12 +739,12 @@ int main(int argc, char* argv[]) {
     /* Initialize CD-ROM reader */
     if (!psx_cdrom_init(cue_path)) {
         fprintf(stderr, "ERROR: Failed to open CD image: %s\n", cue_path);
-        return 1;
+        exit(1);
     }
 
     /* Load PS1 EXE — auto-detect and skip PS-X header if present */
     FILE* f = fopen(exe_path, "rb");
-    if (!f) { perror("fopen"); return 1; }
+    if (!f) { perror("fopen"); exit(1); }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -779,7 +779,7 @@ int main(int argc, char* argv[]) {
 
     if (!renderer.Initialize()) {
         fprintf(stderr, "Renderer init failed\n");
-        return 1;
+        exit(1);
     }
     printf("Renderer ready\n\n");
 
@@ -788,14 +788,14 @@ int main(int argc, char* argv[]) {
         FILE* sf = fopen(s_snap_load_path, "rb");
         if (!sf) {
             fprintf(stderr, "[SNAP] ERROR: cannot open %s\n", s_snap_load_path);
-            return 1;
+            exit(1);
         }
         char magic[4]; uint32_t version = 0, saved_frame = 0;
         fread(magic, 4, 1, sf); fread(&version, 4, 1, sf); fread(&saved_frame, 4, 1, sf);
         fclose(sf);
         if (memcmp(magic, "SNAP", 4) != 0 || version != 1) {
             fprintf(stderr, "[SNAP] ERROR: invalid snapshot file %s\n", s_snap_load_path);
-            return 1;
+            exit(1);
         }
         printf("[SNAP] Snapshot ready (saved frame %u) — press F7 to apply\n", saved_frame);
         fflush(stdout);
@@ -805,7 +805,7 @@ int main(int argc, char* argv[]) {
     if (s_script_path) {
         if (!script_load(s_script_path)) {
             fprintf(stderr, "Failed to load script: %s\n", s_script_path);
-            return 1;
+            exit(1);
         }
         /* Minimize window when running automated scripts so it doesn't
          * cover the user's windows or steal mouse focus.
@@ -841,5 +841,4 @@ int main(int argc, char* argv[]) {
 
     renderer.Shutdown();
     printf("\nDone. Frames: %d\n", frame);
-    return 0;
 }

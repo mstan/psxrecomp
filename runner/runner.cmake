@@ -2,6 +2,8 @@
 # Requires PSXRECOMP_ROOT to be set to the psxrecomp directory.
 
 set(PSXRECOMP_RUNNER_SOURCES
+    ${PSXRECOMP_ROOT}/runner/src/launcher.c
+    ${PSXRECOMP_ROOT}/runner/src/crc32.c
     ${PSXRECOMP_ROOT}/runner/src/main_runner.cpp
     ${PSXRECOMP_ROOT}/runner/src/runtime.c
     ${PSXRECOMP_ROOT}/runner/src/gte.cpp
