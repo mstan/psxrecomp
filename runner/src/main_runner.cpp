@@ -330,13 +330,13 @@ extern "C" void psx_present_frame(void) {
         if (glfwGetKey(win, g_key_config.r1)       == GLFW_PRESS) pad |= 0x0800;
         if (glfwGetKey(win, g_key_config.r2)       == GLFW_PRESS) pad |= 0x0200;
 
-        /* Debug: log any non-zero pad state so we can verify GLFW sees keypresses */
+        /* [PAD] pad-change log — re-enable when debugging input:
         static uint16_t s_last_pad = 0;
         if (pad != s_last_pad) {
             printf("[PAD] 0x%04X\n", pad);
             fflush(stdout);
             s_last_pad = pad;
-        }
+        } */
 
         if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS ||
             glfwWindowShouldClose(win)) {
@@ -474,7 +474,7 @@ extern "C" void psx_present_frame(void) {
         g_renderer->SetDisplayMode(g_fmv_disp_w, g_fmv_disp_h, false, false);
     }
 
-    /* Debug: log present state transitions around FMV end */
+    /* [PRESENT-DBG] FMV→normal transition — re-enable when debugging FMV:
     {
         static bool s_was_fmv = false;
         bool is_fmv = fmv_player_is_active() != 0;
@@ -483,7 +483,7 @@ extern "C" void psx_present_frame(void) {
             fflush(stdout);
         }
         s_was_fmv = is_fmv;
-    }
+    } */
 
 
     g_renderer->Present();
@@ -529,7 +529,7 @@ extern "C" void psx_present_frame(void) {
         s_last = now;
     }
 
-    /* FPS counter — print actual frame rate every 60 frames (works in turbo too) */
+    /* [FPS] periodic FPS counter — re-enable when debugging performance:
     {
         static LARGE_INTEGER s_freq2 = {};
         static LARGE_INTEGER s_fps_t = {};
@@ -546,14 +546,14 @@ extern "C" void psx_present_frame(void) {
             QueryPerformanceCounter(&now2);
             double secs = (double)(now2.QuadPart - s_fps_t.QuadPart) / (double)s_freq2.QuadPart;
             double fps = 60.0 / secs;
-            if (secs >= 2.0) {  /* print at most once per 2 wall-clock seconds */
+            if (secs >= 2.0) {
                 printf("[FPS] %.1f (f%u%s)\n", fps, g_ps1_frame, g_turbo ? " turbo" : "");
                 fflush(stdout);
             }
             s_fps_count = 0;
             s_fps_t = now2;
         }
-    }
+    } */
 
     /* Snapshot save — triggered at a specific frame by --save-snapshot FRAME FILE */
     if (s_snap_save_path && g_ps1_frame == s_snap_save_frame) {

@@ -1,0 +1,4 @@
+# Select "New Game" from the main menu
+# Use with: --state main_menu --script scripts/new_game.txt
+wait 30
+press CROSS

@@ -398,7 +398,7 @@ void OpenGLRenderer::DrawRectangle(int x, int y, int w, int h,
 
     static uint32_t s_rect_count = 0;
     ++s_rect_count;
-    // Log only the first few rects (startup diagnostics only — never per-frame)
+    /* [DrawRect] first 3 — re-enable when debugging rectangle rendering:
     if (s_rect_count <= 3) {
         printf("[DrawRect] #%u: pos=(%d,%d) size=%dx%d tex=%d semi=%d "
                "clut=(%d,%d) tpg=(%d,%d) depth=%d uv=(%d,%d) rgb=(%d,%d,%d)\n",
@@ -408,7 +408,7 @@ void OpenGLRenderer::DrawRectangle(int x, int y, int w, int h,
                state.texture_depth,
                (int)u0, (int)v0, (int)r, (int)g, (int)b);
         fflush(stdout);
-    }
+    } */
 
     // Rectangles are rendered as triangles
     if (!vertex_buffer_.empty() && primitive_type_ != GL_TRIANGLES) {

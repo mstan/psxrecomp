@@ -1,0 +1,17 @@
+[savestate_save / savestate_load]
+Rationale: Flat binary format, no compression. ~3.5MB reads in <1ms from SSD.
+Sections: RAM (2MB), Scratchpad (1KB), Runtime globals, GPU state, VRAM (1MB), SPU (512KB+voices), XA LBA.
+Save point is after Present() in psx_present_frame() — clean frame boundary.
+
+[psx_recreate_fibers]
+Rationale: Windows Fibers can't be serialized (native C stack). On load, delete existing fibers
+and recreate from saved entry points. Compiled functions are infinite loops that read all state
+from g_ram/g_scratch each iteration — re-entering at function entry with correct RAM state works.
+
+[script_load / script_poll]
+Rationale: Simple text format for automated input sequences. "press X" = hold 1 frame + release.
+Frame counter advances on each poll (once per psx_present_frame). OR'd into keyboard pad mask.
+
+[s_fmv_init / s_snd_ticks / s_snd_done promoted to file scope]
+Rationale: Were block-scope statics inside the addr==0x8001EFE8 block. Need file-scope visibility
+for savestate accessor functions. Identical runtime behavior — static lifetime unchanged.

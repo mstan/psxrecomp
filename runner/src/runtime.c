@@ -144,9 +144,10 @@ void psx_watchdog_reset(void) {
                     memcpy(&reg0, &g_ram[ctx + 0x1190], 4);
                 }
             }
+            /* [BCA7-CHANGE] — re-enable when debugging zone script state:
             printf("[BCA7-CHANGE] f%u: %u->%u ca04=0x%08X ec30=%u ctx=0x%08X pc=%u reg0=0x%X\n",
                    g_ps1_frame, s_prev_bca7, cur, ca04, ec30, ctx_ptr, script_pc, reg0);
-            fflush(stdout);
+            fflush(stdout); */
             if (cur == 1) s_bca7_set_frame = g_ps1_frame;
             s_prev_bca7 = cur;
         }
@@ -157,9 +158,10 @@ void psx_watchdog_reset(void) {
                 uint16_t script_pc2 = 0;
                 memcpy(&script_pc2, &g_ram[0x9EC32], 2);  /* ctx+0x8a = 0x9EBA8+0x8a */
                 if (script_pc2 != s_prev_script_pc) {
+                    /* [PC-CHANGE] — re-enable when debugging zone script PC:
                     printf("[PC-CHANGE] f%u: %u->%u ec30=%u\n",
                            g_ps1_frame, s_prev_script_pc, script_pc2, g_ram[0x9EC30]);
-                    fflush(stdout);
+                    fflush(stdout); */
                     s_prev_script_pc = script_pc2;
                 }
             } else if (cur == 0) {
@@ -213,12 +215,13 @@ static void watchdog_check(uint32_t addr, int width) {
             if (width == 32) memcpy(&val, &g_scratch[off], 4);
             else { uint16_t h; memcpy(&h, &g_scratch[off], 2); val = h; }
         }
+        /* [WATCHDOG] — re-enable when debugging spin loops:
         if (!g_wd_fired || (g_wd_reads & 0x3FFFFF) == 0) {
             printf("[WATCHDOG] f%u  %.1fs  addr=0x%08X val=0x%08X w=%d  ra=0x%08X sp=0x%08X  reads=%llu\n",
                    g_wd_frame, elapsed, addr, val, width,
                    ra, sp, (unsigned long long)g_wd_reads);
             fflush(stdout);
-        }
+        } */
         g_wd_fired = 1;
     }
 }
@@ -633,6 +636,7 @@ static void write_word(uint32_t addr, uint32_t value) {
         }
         */
         /* Watchpoint: UI entry[3-9] corruption tracker (word writes), post-f1673 only */
+        /* [UI-WW] UI entry corruption tracker — re-enable when debugging UI:
         if (phys >= 0x0A567Cu && phys < 0x0A5800u && g_ps1_frame > 1673u && DIAG_ENABLED()) {
             uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
             static uint32_t _ui_ww_cnt = 0;
@@ -641,7 +645,7 @@ static void write_word(uint32_t addr, uint32_t value) {
                        addr, value, g_ps1_frame, ra);
                 fflush(stdout);
             }
-        }
+        } */
         /* [KERN-WW] kernel-area write watchpoint — result: NO writes to 0x0000-0x7FFF
          * during save sequence.  BIOS MC buffer is not in low kernel RAM.
          * Re-enable: remove the comment-out below and set frame window as needed.
@@ -760,11 +764,12 @@ static void write_word(uint32_t addr, uint32_t value) {
         uint32_t sync = (value >> 9) & 3u;
         uint32_t dir  =  value       & 1u;
         static uint32_t s_dma2_calls = 0;
+        /* [DMA2-CHCR] — re-enable when debugging GPU DMA:
         if ((value & 0x01000000u) && (s_dma2_calls < 5 || DIAG_ENABLED())) {
             printf("[DMA2-CHCR] #%u: value=0x%08X sync=%u dir=%u madr=0x%08X bcr=0x%08X\n",
                    s_dma2_calls + 1, value, sync, dir, s_dma2_madr, s_dma2_bcr);
             fflush(stdout);
-        }
+        } */
         if ((value & 0x01000000u) && sync == 1u && dir == 1u) {
             /* Block mode, RAM→GPU (dir=1 = to-device): forward every word to the GPU interpreter */
             uint32_t block_size  = s_dma2_bcr & 0xFFFFu;
@@ -827,8 +832,9 @@ static void write_word(uint32_t addr, uint32_t value) {
         } else if (value & 0x01000000u) {
             /* Unhandled DMA2 mode — log and do nothing */
             ++s_dma2_calls;
+            /* [DMA2-IGN] — re-enable when debugging DMA:
             printf("[DMA2-IGN] sync=%u dir=%u value=0x%08X\n", sync, dir, value);
-            fflush(stdout);
+            fflush(stdout); */
         }
         return;
     }
@@ -864,6 +870,7 @@ static uint16_t read_half(uint32_t addr) {
         if (phys >= 0x1F801C00u && phys < 0x1F801E00u)
             val = spu_read_half(addr);
         /* SIO0 registers — log first access to confirm game uses SIO0 for MC */
+        /* [SIO0-R] — re-enable when debugging memory card SIO:
         else if (phys >= 0x1F801040u && phys <= 0x1F80105Eu) {
             static uint32_t s_sio_log_cnt = 0;
             if (s_sio_log_cnt < 20) {
@@ -872,6 +879,9 @@ static uint16_t read_half(uint32_t addr) {
                        g_diag_cpu ? g_diag_cpu->ra : 0, s_sio_log_cnt);
                 if (++s_sio_log_cnt == 20) printf("[SIO0-R] (further SIO0 reads suppressed)\n");
             }
+        } */
+        else if (phys >= 0x1F801040u && phys <= 0x1F80105Eu) {
+            /* SIO0 reads — silenced, see above */
         }
         /* Half-word reads of MMIO registers (lower 16 bits) */
         else if (phys == 0x1F801070u) val = g_i_stat & 0xFFFF;
@@ -920,47 +930,18 @@ static void write_half(uint32_t addr, uint16_t value) {
                 printf("[KERN-WH] addr=0x%08X val=0x%04X f%u ra=0x%08X\n",
                        addr, (unsigned)value, g_ps1_frame, rah);
         } */
-        /* Frame-gated: track sub (game_struct+74), sub2 (game_struct+76), sub3 (game_struct+78) */
+        /* [SUB/NEXT/GATE/1C6H/1CCH/1F8] scratchpad watchpoints — re-enable when debugging state:
         if (DIAG_ENABLED()) {
             uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
-            if (phys == 0x1FD84Au) {
-                printf("[SUB]  f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            if (phys == 0x1FD84Cu) {
-                printf("[SUB2] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            if (phys == 0x1FD84Eu) {
-                printf("[SUB3] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            /* scratchpad[0x1DC]: next-state signal written by gameplay sub-functions */
-            if (phys == 0x1F8001DCu) {
-                printf("[NEXT] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            /* scratchpad[0x1CE]: ready flag gating state transitions */
-            if (phys == 0x1F8001CEu) {
-                printf("[GATE] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            /* scratchpad[0x1C6]: entity dispatch gate (half writes) */
-            if (phys == 0x1F8001C6u) {
-                printf("[1C6H] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            /* scratchpad[0x1CC]: loading flag (half writes) */
-            if (phys == 0x1F8001CCu) {
-                printf("[1CCH] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-            /* scratchpad[0x1F8]: per-frame counter before entity dispatch path */
-            if (phys == 0x1F8001F8u) {
-                printf("[1F8]  f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra);
-                fflush(stdout);
-            }
-        }
+            if (phys == 0x1FD84Au)   { printf("[SUB]  f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1FD84Cu)   { printf("[SUB2] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1FD84Eu)   { printf("[SUB3] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1F8001DCu) { printf("[NEXT] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1F8001CEu) { printf("[GATE] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1F8001C6u) { printf("[1C6H] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1F8001CCu) { printf("[1CCH] f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+            if (phys == 0x1F8001F8u) { printf("[1F8]  f%u val=0x%04X ra=0x%08X\n", g_ps1_frame, (uint32_t)value, ra); fflush(stdout); }
+        } */
         /* [WP-TOGGLE-H] OT toggle — re-enable with LOG_ON_CHANGE((uint32_t)value, "WP-TOGGLE-H", ...) */
         /* [CAM-WP] camera position — re-enable with LOG_ON_CHANGE((uint32_t)value, "CAM-WP", ...) */
         /* [BCA2-WH] player control flag — re-enable with LOG_ON_CHANGE((uint32_t)value, "BCA2-WH", ...) */
@@ -1000,6 +981,7 @@ static void write_byte(uint32_t addr, uint8_t value) {
     mmio_trace("W", addr, value, 8);
     /* SIO0 TX register write — log to see if game uses SIO0 for MC */
     uint32_t phys8 = addr & 0x1FFFFFFFu;
+    /* [SIO0-W] — re-enable when debugging memory card SIO:
     if (phys8 >= 0x1F801040u && phys8 <= 0x1F80105Eu) {
         static uint32_t s_sio_w_cnt = 0;
         if (s_sio_w_cnt < 20) {
@@ -1008,7 +990,7 @@ static void write_byte(uint32_t addr, uint8_t value) {
                    g_diag_cpu ? g_diag_cpu->ra : 0, s_sio_w_cnt);
             if (++s_sio_w_cnt == 20) printf("[SIO0-W] (further SIO0 writes suppressed)\n");
         }
-    }
+    } */
 }
 static uint32_t do_lwl(uint32_t addr, uint32_t rt) {
     uint32_t aligned = addr & ~3u;
@@ -1027,10 +1009,11 @@ static uint32_t do_lwr(uint32_t addr, uint32_t rt) {
 static void do_swl(uint32_t addr, uint32_t rt) {
     uint32_t aligned = addr & ~3u;
     uint32_t aphys = aligned & 0x1FFFFFFFu;
+    /* [WATCHPOINT] do_swl — re-enable when debugging entity corruption:
     if (aphys == 0x1FD874u) {
         static uint32_t s_swl_wp = 0;
         if (++s_swl_wp <= 10) { printf("[WATCHPOINT] do_swl addr=0x%08X rt=0x%08X\n", addr, rt); fflush(stdout); }
-    }
+    } */
     uint32_t word; memcpy(&word, &g_ram[aligned & 0x1FFFFF], 4);
     int shift = (addr & 3) * 8;
     uint32_t mask = 0xFFFFFFFFu >> (24 - shift);
@@ -1040,9 +1023,10 @@ static void do_swl(uint32_t addr, uint32_t rt) {
 static void do_swr(uint32_t addr, uint32_t rt) {
     uint32_t aligned = addr & ~3u;
     uint32_t aphys = aligned & 0x1FFFFFFFu;
+    /* [WATCHPOINT] do_swr — re-enable when debugging entity corruption:
     if (aphys == 0x1FD874u) {
         printf("[WATCHPOINT] do_swr addr=0x%08X rt=0x%08X\n", addr, rt); fflush(stdout);
-    }
+    } */
     uint32_t word; memcpy(&word, &g_ram[aligned & 0x1FFFFF], 4);
     int shift = (addr & 3) * 8;
     uint32_t mask = 0xFFFFFFFFu << shift;
@@ -1295,6 +1279,7 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     /* [INTERP] enter — first 8: printf("[INTERP] enter 0x%08X ra=0x%08X\n", start_pc, cpu->ra); */
 
     /* Trace calls to 0x800022C4 (kernel RAM function called from Tomba tick) */
+    /* [0x22C4] kernel RAM function trace — re-enable when debugging tick dispatch:
     if (start_pc == 0x800022C4u) {
         static uint32_t s_22c4 = 0;
         if (++s_22c4 <= 5) {
@@ -1304,7 +1289,7 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                    s_22c4, g_ps1_frame, instr0, instr1, cpu->ra, cpu->a0);
             fflush(stdout);
         }
-    }
+    } */
 
     /* Tomba entity tick (type 0x18) — trace first 20 calls + every 100 + attack window */
     if (start_pc == 0x801139DCu) {
@@ -1348,12 +1333,13 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
          * = pc+8 in the JALR case, so we want to continue from there). */
         if (target == 0 || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)) {
             if (is_link) {
+                /* [NULL-JALR] — re-enable when debugging null function pointers:
                 static uint32_t s_null_jalr = 0;
                 if (++s_null_jalr <= 20) {
                     printf("[NULL-JALR] #%u f%u pc=0x%08X ra=0x%08X — null call skipped\n",
                            s_null_jalr, g_ps1_frame, pc, cpu->ra);
                     fflush(stdout);
-                }
+                } */
                 pc = pc + 8;  /* skip past JALR+delay-slot, treat call as no-op */
                 continue;
             }
@@ -1395,7 +1381,8 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         s_seen[s_seen_n].from = pc;
                         s_seen[s_seen_n].to   = target;
                         s_seen_n++;
-                        printf("[INTERP-CALL] f%u 0x%08X → compiled 0x%08X\n", g_ps1_frame, pc, target);
+                        /* [INTERP-CALL] — re-enable when debugging overlay→compiled calls:
+                        printf("[INTERP-CALL] f%u 0x%08X → compiled 0x%08X\n", g_ps1_frame, pc, target); */
                     }
                 }
                 call_by_address(cpu, target);
@@ -1421,7 +1408,8 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                     if (!jt_dup && s_jt_n < 64) {
                         s_jt_seen[s_jt_n].from = pc; s_jt_seen[s_jt_n].to = target; s_jt_n++;
-                        printf("[INTERP-TAIL] f%u 0x%08X → compiled 0x%08X\n", g_ps1_frame, pc, target);
+                        /* [INTERP-TAIL] — re-enable when debugging overlay→compiled tail calls:
+                        printf("[INTERP-TAIL] f%u 0x%08X → compiled 0x%08X\n", g_ps1_frame, pc, target); */
                     }
                 }
                 call_by_address(cpu, target);
@@ -1433,12 +1421,13 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         }
     }
 
+    /* [INTERP-GUARD] — re-enable when debugging interpreter loop limits:
     static uint32_t s_guard_hit = 0;
     if (++s_guard_hit <= 50) {
         printf("[INTERP-GUARD] #%u guard at PC=0x%08X entry=0x%08X f%u\n",
                s_guard_hit, pc, start_pc, g_ps1_frame);
         fflush(stdout);
-    }
+    } */
 }
 
 /* ---------------------------------------------------------------------------
@@ -1487,12 +1476,13 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
      * MIPS interpreter at the bottom of this function. */
     if (addr != 0xA0u && addr != 0xB0u && addr != 0xC0u &&
         (kseg0 < 0x80010000u || kseg0 > 0x801FFFFFu)) {
+        /* [OOR-CALL] — re-enable when debugging out-of-range calls:
         static uint32_t s_oor = 0;
         if (++s_oor <= 20) {
             printf("[OOR-CALL] #%u skip out-of-range 0x%08X  (ra=0x%08X)\n",
                    s_oor, addr, cpu->ra);
             fflush(stdout);
-        }
+        } */
         return;
     }
 
@@ -1646,18 +1636,19 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 return;
             }
             default:
+                /* [BIOS A()] — re-enable when debugging unknown BIOS A calls:
                 printf("[BIOS A(0x%02X)] a0=0x%08X a1=0x%08X\n", func, cpu->a0, cpu->a1);
-                fflush(stdout);
+                fflush(stdout); */
                 return;
         }
     }
 
     /* --- BIOS Function Table B (addr=0xB0) -------------------------------- */
     if (addr == 0xB0) {
-        /* Trace MC-relevant B0 calls (not noisy 0x0B/0x10) at any frame */
+        /* [B0] — re-enable when debugging BIOS B calls:
         if (func != 0x0B && func != 0x10) {
             printf("[B0] f%u B(0x%02X) ra=0x%08X\n", g_ps1_frame, func, cpu->ra);
-        }
+        } */
         switch (func) {
             case 0x08: /* OpenEvent(class,spec,mode,func) → event handle */
                 /* Minimal stub: return a non-zero handle so callers don't treat it as error */
@@ -1684,18 +1675,20 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                         g_fiber_loading = CreateFiber(512 * 1024, fiber_loading_func, (PVOID)cpu);
                     } else {
                         /* Restart — game starting a new loading batch */
+                        /* [OpenThread] RESTART — re-enable when debugging fiber lifecycle:
                         printf("[OpenThread] RESTART loading fiber entry=0x%08X sp=0x%08X\n",
                                cpu->a0, cpu->a1);
-                        fflush(stdout);
+                        fflush(stdout); */
                         DeleteFiber(g_fiber_loading);
                         g_fiber_loading = NULL;
                         g_loading_entry = cpu->a0;
                         if (cpu->a1 >= 0x80080000u && cpu->a1 <= 0x801FF000u) {
                             g_loading_sp = cpu->a1;
                         } else {
+                            /* [OpenThread] WARNING — re-enable when debugging fiber lifecycle:
                             printf("[OpenThread] WARNING: invalid sp=0x%08X, reusing 0x%08X\n",
                                    cpu->a1, g_loading_sp);
-                            fflush(stdout);
+                            fflush(stdout); */
                         }
                         memset(g_loading_saved, 0, sizeof(g_loading_saved));
                         g_fiber_loading = CreateFiber(512 * 1024, fiber_loading_func, (PVOID)cpu);

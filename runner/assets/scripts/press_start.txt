@@ -1,0 +1,4 @@
+# Press Start to skip FMV / advance past title screen
+# Use with: --state main_menu --script scripts/press_start.txt
+wait 30
+press START

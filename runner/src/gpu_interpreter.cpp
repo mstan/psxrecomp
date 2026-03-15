@@ -482,6 +482,7 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
 
     // Log semi-transparent non-textured quads — catch the screen-darkening subtractive blend.
     // Only log the first 20 unique occurrences to avoid spam.
+    /* [SEMI-QUAD] — re-enable when debugging semi-transparent rendering:
     if (semi_transparent && !textured && quad) {
         static uint32_t s_sub_count = 0;
         if (++s_sub_count <= 20) {
@@ -493,7 +494,7 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
                    verts[2].x, verts[2].y, verts[3].x, verts[3].y);
             fflush(stdout);
         }
-    }
+    } */
 
     // Render polygon(s)
     if (renderer) {
