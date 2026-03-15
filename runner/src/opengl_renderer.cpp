@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 
+extern int      g_debug_mode;
 extern uint32_t g_ps1_frame;
 uint32_t g_pre_shot_flush = 0;
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -934,8 +935,11 @@ bool OpenGLRenderer::InitializeWindow() {
     // Make the OpenGL context current
     glfwMakeContextCurrent(window_);
 
-    // Show the window minimized so it doesn't steal focus during automated runs
-    glfwIconifyWindow(window_);
+    // In debug mode, start minimized so it doesn't steal focus during automated runs.
+    // Normal mode: show the window normally.
+    if (g_debug_mode) {
+        glfwIconifyWindow(window_);
+    }
     glfwShowWindow(window_);
 
     // Disable driver VSync — we use our own 30 FPS software throttle.

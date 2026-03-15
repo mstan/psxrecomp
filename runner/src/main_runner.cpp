@@ -23,6 +23,7 @@ using namespace PS1;
 /* ---------------------------------------------------------------------------
  * Automation globals (declared in automation.h)
  * --------------------------------------------------------------------------- */
+int      g_debug_mode = 0;
 int      g_turbo    = 0;
 uint32_t g_ps1_frame = 0;
 int      g_snap_inject_requested = 0;
@@ -698,6 +699,8 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
             s_snap_load_path = argv[++i];
         } else if (!strcmp(argv[i], "--mmio-trace")) {
             mmio_trace = 1;
+        } else if (!strcmp(argv[i], "--debug")) {
+            g_debug_mode = 1;
         } else if (!exe_path) {
             exe_path = argv[i];
         } else if (!cue_path) {

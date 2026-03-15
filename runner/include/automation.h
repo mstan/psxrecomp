@@ -7,6 +7,7 @@
 extern "C" {
 #endif
 
+extern int      g_debug_mode;         /* 0=normal, 1=debug (window starts minimized) */
 extern int      g_turbo;              /* 0=normal, 1=uncapped. Toggled by F5 or script */
 extern uint32_t g_ps1_frame;          /* promoted from static in psx_present_frame */
 extern int      g_snap_inject_requested; /* set by script inject-snapshot; cleared by main loop */
