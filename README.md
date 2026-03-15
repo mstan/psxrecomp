@@ -212,7 +212,7 @@ session. It is the system prompt that made this workflow reliable.
 ## License
 
 PSXRecomp is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for
-non-commercial use with attribution. For commercial licensing, contact [1379.tech](https://1379.tech).
+non-commercial use with attribution. 
 
 Third-party libraries retain their own licenses (see `recompiler/lib/` subdirectories).
 
