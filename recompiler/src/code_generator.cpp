@@ -855,6 +855,13 @@ std::string CodeGenerator::translate_basic_block(
             ss << fmt::format("block_{:08X}:;\n", addr);
         }
 
+        // Instruction-level annotation (skipped at function start — already shown above signature)
+        if (annotations_ && addr != cfg.function_start) {
+            const std::string& inote = annotations_->lookup(addr);
+            if (!inote.empty())
+                ss << config_.indent << fmt::format("/* [NOTE] {} */\n", inote);
+        }
+
         if (!is_cf) {
             ss << translate_instruction(addr, instr) << "\n";
         } else {
