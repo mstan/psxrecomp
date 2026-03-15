@@ -12,6 +12,7 @@
 #include <signal.h>
 
 #include "diag_log.h"
+#include "game_extras.h"
 
 /* ---------------------------------------------------------------------------
  * PS1 memory regions
@@ -459,7 +460,7 @@ static uint32_t g_secondary_sp    = 0;
 static uint32_t g_secondary_entry = 0;
 
 /* Display fiber entry — starts as FUN_800191E0, switches to FUN_80019844 after first load */
-static uint32_t g_display_entry = 0x800191E0u;
+static uint32_t g_display_entry = 0;  /* set by game_get_display_entry() in runtime_init */
 
 /* Display-ready flag: 1 when display fiber has yielded back to main and is
  * waiting to be dispatched again.  The game's main loop writes GPU setup data
@@ -1071,6 +1072,8 @@ void psx_runtime_init(CPUState* cpu) {
     cpu->lwr        = do_lwr;
     cpu->swl        = do_swl;
     cpu->swr        = do_swr;
+
+    g_display_entry = game_get_display_entry();
 }
 
 void psx_runtime_load(uint32_t addr, const uint8_t* data, uint32_t size) {

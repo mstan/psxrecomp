@@ -277,7 +277,7 @@ int main(int argc, char** argv) {
     // Silently skipped if the file doesn't exist.
     PSXRecomp::AnnotationTable annotations;
     {
-        std::string stem = exe_path.stem().string();
+        std::string stem = exe_path.filename().string();
         std::string ann_path = "annotations/" + stem + "_annotations.csv";
         if (annotations.load(ann_path.c_str()))
             fmt::print("✓ Loaded {} annotations from {}\n\n", annotations.count(), ann_path);
@@ -308,12 +308,14 @@ int main(int argc, char** argv) {
     }
 
     // Generate full C file and save to the generated directory
-    // Use argv[2] as output path if provided, otherwise use the default generated path
+    // Use argv[2] as output path if provided, otherwise derive from input filename
+    // Use filename() not stem() because ".36" in SCUS_942.36 is part of the serial, not an extension
+    std::string exe_stem = exe_path.filename().string();
     std::string output_filename;
     if (argc >= 3) {
         output_filename = argv[2];
     } else {
-        output_filename = "F:\\Projects\\psxrecomp-v2\\generated\\tomba_full.c";
+        output_filename = "generated/" + exe_stem + "_full.c";
     }
     fmt::print("Generating complete C file: {}\n", output_filename);
 
@@ -334,7 +336,7 @@ int main(int argc, char** argv) {
     // This maps PS1 addresses to compiled C functions so call_by_address() can
     // dispatch dynamic jalr/jr calls to the right compiled function.
     {
-        std::string dispatch_filename = "F:\\Projects\\psxrecomp-v2\\generated\\tomba_dispatch.c";
+        std::string dispatch_filename = "generated/" + exe_stem + "_dispatch.c";
         fmt::print("Generating dispatch table: {}\n", dispatch_filename);
 
         std::ostringstream ds;

@@ -1,4 +1,5 @@
 #include "opengl_renderer.h"
+#include "game_extras.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -923,7 +924,7 @@ bool OpenGLRenderer::InitializeWindow() {
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
     // Create window
-    window_ = glfwCreateWindow(window_width_, window_height_, "Tomba!", nullptr, nullptr);
+    window_ = glfwCreateWindow(window_width_, window_height_, game_get_name(), nullptr, nullptr);
     if (!window_) {
         printf("[OpenGLRenderer] ERROR: Failed to create GLFW window\n");
         glfwTerminate();

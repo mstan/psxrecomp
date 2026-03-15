@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cctype>
+#include "game_extras.h"
 #include <windows.h>
 #include <timeapi.h>    /* timeBeginPeriod / timeEndPeriod */
 
@@ -351,11 +352,12 @@ extern "C" void psx_present_frame(void) {
             exit(0);
         }
 
-        /* F6 = save snapshot to C:/temp/tomba_snap.bin */
+        /* F6 = save snapshot */
         static bool s_f6_prev = false;
         bool f6 = glfwGetKey(win, GLFW_KEY_F6) == GLFW_PRESS;
         if (f6 && !s_f6_prev) {
-            const char* snap_path = "C:/temp/tomba_snap.bin";
+            static char snap_path[256];
+            snprintf(snap_path, sizeof(snap_path), "C:/temp/%s_snap.bin", game_get_name());
             g_renderer->FlushPrimitives();
             uint16_t* vram_buf = (uint16_t*)malloc(1024 * 512 * 2);
             if (vram_buf) {
