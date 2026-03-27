@@ -5,9 +5,9 @@
 #include <string>
 #include <thread>
 
-extern int      g_debug_mode;
-extern uint32_t g_ps1_frame;
-uint32_t g_pre_shot_flush = 0;
+extern "C" int      g_debug_mode;
+extern "C" uint32_t g_ps1_frame;
+extern "C" uint32_t g_pre_shot_flush = 0;
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 

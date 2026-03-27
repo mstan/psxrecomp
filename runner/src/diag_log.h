@@ -29,7 +29,11 @@
 #include <stdio.h>
 #include <time.h>
 
+#ifdef __cplusplus
+extern "C" unsigned int g_ps1_frame;
+#else
 extern unsigned int g_ps1_frame;
+#endif
 
 /* Fire exactly once per call-site. */
 #define LOG_ONCE(tag, fmt, ...)                                                \

@@ -24,10 +24,10 @@ using namespace PS1;
 /* ---------------------------------------------------------------------------
  * Automation globals (declared in automation.h)
  * --------------------------------------------------------------------------- */
-int      g_debug_mode = 0;
-int      g_turbo    = 0;
-uint32_t g_ps1_frame = 0;
-int      g_snap_inject_requested = 0;
+extern "C" int      g_debug_mode = 0;
+extern "C" int      g_turbo    = 0;
+extern "C" uint32_t g_ps1_frame = 0;
+extern "C" int      g_snap_inject_requested = 0;
 static const char* s_script_path  = NULL;
 static const char* s_record_path  = NULL;
 static FILE*       s_record_file  = NULL;
@@ -470,7 +470,7 @@ extern "C" void psx_present_frame(void) {
             char shot[512];
             if (script_wants_screenshot(shot, sizeof(shot)) && g_renderer) {
                 /* Flush pending vertices to VRAM now so Present() blits the full frame. */
-                extern uint32_t g_pre_shot_flush;
+                extern "C" uint32_t g_pre_shot_flush;
                 g_pre_shot_flush = 1;
                 g_renderer->FlushPrimitives();
                 g_pre_shot_flush = 0;

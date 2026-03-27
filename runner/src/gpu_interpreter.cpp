@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <cstring>
 
-extern uint32_t g_ps1_frame;
+extern "C" uint32_t g_ps1_frame;
 
 namespace PS1 {
 
