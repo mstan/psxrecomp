@@ -1,0 +1,3 @@
+[submodule "tools/interp"]
+	path = tools/interp
+	url = https://github.com/allkern/psxe.git
