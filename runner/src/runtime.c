@@ -34,13 +34,26 @@ static uint8_t g_ram[2 * 1024 * 1024];   /* 2MB main RAM */
 static uint8_t g_scratch[1024];           /* 1KB scratchpad */
 
 /* Global CPU pointer for watchpoint diagnostics */
-static CPUState* g_diag_cpu = NULL;
+CPUState* g_diag_cpu = NULL;
+
+/* Current pad1 button state (active-high), exposed for debug_server.c */
+uint16_t g_pad1_state = 0;
 
 /* Scripting VM per-frame opcode counter (reset each VM entry, used to force yield) */
 uint32_t g_vm_ops_this_frame = 0;
 
 /* Current CDROM seek position (LBA), set by CdlSeekL intercept */
 static uint32_t g_cdrom_lba = 0;
+
+/* Dispatch miss tracking */
+#define MAX_DISPATCH_MISS_UNIQUE 256
+static uint32_t s_dispatch_miss_count = 0;
+static uint32_t s_dispatch_miss_addrs[MAX_DISPATCH_MISS_UNIQUE];
+static int      s_dispatch_miss_unique_count = 0;
+
+uint32_t psx_get_dispatch_miss_count(void) {
+    return s_dispatch_miss_count;
+}
 
 /* ---------------------------------------------------------------------------
  * PS1 BIOS interrupt handler chains
@@ -2572,13 +2585,30 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
 
     /* --- Unknown call --- */
     {
-        static uint32_t s_unk_count = 0;
-        ++s_unk_count;
+        ++s_dispatch_miss_count;
         /* Suppress log after first 50 to avoid flooding; print summary every 1000 */
-        if (s_unk_count <= 50 || s_unk_count % 1000 == 0) {
+        if (s_dispatch_miss_count <= 50 || s_dispatch_miss_count % 1000 == 0) {
             printf("[UNKNOWN CALL] #%u 0x%08X  (t1=0x%08X  a0=0x%08X  ra=0x%08X  sp=0x%08X)\n",
-                   s_unk_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
+                   s_dispatch_miss_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
             fflush(stdout);
+        }
+
+        /* Track unique dispatch misses and log to file */
+        {
+            int found = -1;
+            for (int i = 0; i < s_dispatch_miss_unique_count; i++) {
+                if (s_dispatch_miss_addrs[i] == addr) { found = i; break; }
+            }
+            if (found < 0 && s_dispatch_miss_unique_count < MAX_DISPATCH_MISS_UNIQUE) {
+                found = s_dispatch_miss_unique_count++;
+                s_dispatch_miss_addrs[found] = addr;
+                /* Log new unique miss to file */
+                FILE *mf = fopen("dispatch_misses.log", "a");
+                if (mf) {
+                    fprintf(mf, "0x%08X  ra=0x%08X  frame=%u\n", addr, cpu->ra, g_ps1_frame);
+                    fclose(mf);
+                }
+            }
         }
     }
     return;
@@ -4995,6 +5025,7 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
  * We write ~buttons (active-low) to g_ram[0x9eb5a] so FUN_80028D70 returns
  * the correct active-high bitmask after inversion. */
 void psx_set_pad1(uint16_t buttons) {
+    g_pad1_state = buttons;
     /* Arm INTERP-CALL trace window on Circle (0x2000) or Square (0x8000) press */
     static uint16_t s_prev_buttons = 0;
     uint16_t newly_pressed = buttons & ~s_prev_buttons;

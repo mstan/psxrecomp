@@ -91,6 +91,12 @@ public:
     void SaveVRAMDumpBMP(const char* path);    // Auto: dump full 1024x512 VRAM as PNG
     void FlushPrimitives();  // Flush pending vertices to VRAM (public for pre-screenshot sync)
 
+    // Debug server state accessors
+    int GetDisplayAreaX() const { return display_area_x_; }
+    int GetDisplayAreaY() const { return display_area_y_; }
+    int GetDrawOffsetX() const { return drawing_offset_.x; }
+    int GetDrawOffsetY() const { return drawing_offset_.y; }
+
 private:
     // Initialization helpers
     bool InitializeWindow();

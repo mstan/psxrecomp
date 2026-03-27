@@ -30,6 +30,20 @@ const char *game_get_exe_filename(void);
 /* Expected CRC32 of the disc image. Return 0 to skip verification. */
 uint32_t game_get_expected_crc32(void);
 
+/* Fill game-specific data in the debug frame record.
+ * Called each frame from debug_server_record_frame().
+ * Cast record to PSXFrameRecord* and write up to 32 bytes into game_data[]. */
+void game_fill_frame_record(void *record);
+
+/* Handle a game-specific TCP debug command.
+ * Returns 1 if handled, 0 if not recognized.
+ * Use debug_server_send_fmt() to send responses. */
+int game_handle_debug_cmd(const char *cmd, int id, const char *json);
+
+/* Called every frame after debug_server_record_frame + watchpoint checks.
+ * For game-specific post-frame diagnostics. */
+void game_post_frame(uint32_t frame_count);
+
 #ifdef __cplusplus
 }
 #endif
