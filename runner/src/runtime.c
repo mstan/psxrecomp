@@ -577,6 +577,12 @@ static uint32_t read_word(uint32_t addr) {
         }
         if (addr == s_last_addr) {
             ++s_repeat;
+#ifdef INTERPRETER_ONLY
+            if (s_repeat >= 50000u && s_repeat % 50000u == 0) {
+                extern void psx_present_frame(void);
+                psx_present_frame();
+            }
+#endif
             if (s_repeat == 1000000u) {
                 uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
                 uint32_t sp = g_diag_cpu ? g_diag_cpu->sp : 0;
@@ -859,12 +865,23 @@ static void write_word(uint32_t addr, uint32_t value) {
 }
 static uint16_t read_half(uint32_t addr) {
     watchdog_check(addr, 16);
-    /* Spin detector for halfword reads */
+    /* Spin detector for halfword reads — yields a frame when stuck in a
+     * hardware polling loop.  Generic: any address polled 50K times with
+     * no change triggers psx_present_frame() so BIOS stubs, debug server,
+     * and GLFW events get a chance to run. */
     {
         static uint32_t s_last_rh = 0;
         static uint32_t s_rh_rep = 0;
         if (addr == s_last_rh) {
-            if (++s_rh_rep == 1000000u) {
+            ++s_rh_rep;
+#ifdef INTERPRETER_ONLY
+            if (s_rh_rep >= 50000u) {
+                extern void psx_present_frame(void);
+                psx_present_frame();
+                s_rh_rep = 0;
+            }
+#endif
+            if (s_rh_rep == 1000000u) {
                 uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
                 uint32_t sp = g_diag_cpu ? g_diag_cpu->sp : 0;
                 uint8_t* pp = addr_ptr(addr);
