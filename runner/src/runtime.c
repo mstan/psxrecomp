@@ -1099,7 +1099,7 @@ static uint32_t g_heap_ptr  = 0;  /* next free PS1 address */
  * --------------------------------------------------------------------------- */
 
 /* Forward declaration — mips_interpret calls call_by_address for compiled fns */
-static void mips_interpret(CPUState* cpu, uint32_t start_pc);
+void mips_interpret(CPUState* cpu, uint32_t start_pc);
 
 /* Returns 1 if addr is in the statically-compiled region */
 #ifdef INTERPRETER_ONLY
