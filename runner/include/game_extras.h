@@ -30,6 +30,10 @@ const char *game_get_exe_filename(void);
 /* Expected CRC32 of the disc image. Return 0 to skip verification. */
 uint32_t game_get_expected_crc32(void);
 
+/* PS1 address of the game entry point function (e.g., 0x8006B58C for Tomba).
+ * Used by interpreter-only mode to start execution. */
+uint32_t game_get_entry_point(void);
+
 /* Fill game-specific data in the debug frame record.
  * Called each frame from debug_server_record_frame().
  * Cast record to PSXFrameRecord* and write up to 32 bytes into game_data[]. */

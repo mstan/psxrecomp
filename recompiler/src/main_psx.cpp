@@ -19,12 +19,19 @@ int main(int argc, char** argv) {
     fmt::print("============================================\n\n");
 
     if (argc < 2) {
-        fmt::print("Usage: {} <PS1-EXE file>\n", argv[0]);
-        fmt::print("Example: {} SLUS_006.30\n\n", argv[0]);
+        fmt::print("Usage: {} <PS1-EXE file> [--extra-funcs <file>]\n", argv[0]);
+        fmt::print("Example: {} SLUS_006.30\n", argv[0]);
+        fmt::print("         {} SLUS_006.30 --extra-funcs discovered_functions.log\n\n", argv[0]);
         return 0;
     }
 
     std::filesystem::path exe_path = argv[1];
+    const char* extra_funcs_path = nullptr;
+    for (int i = 2; i < argc; i++) {
+        if (std::string(argv[i]) == "--extra-funcs" && i + 1 < argc) {
+            extra_funcs_path = argv[++i];
+        }
+    }
 
     // Parse the PS1-EXE file
     std::string error_msg;
@@ -152,6 +159,26 @@ int main(int argc, char** argv) {
     // 0x8006B58C: game entrypoint (main boot sequence, called from test harness
     //             and dispatch table; absorbed into func_8006B4EC without this).
     analyzer.add_forced_entry(0x8006B58Cu);
+
+    /* Load extra function addresses from discovered_functions.log */
+    if (extra_funcs_path) {
+        std::ifstream ef(extra_funcs_path);
+        if (ef.is_open()) {
+            std::string line;
+            int extra_count = 0;
+            while (std::getline(ef, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
+                if (addr >= 0x80010000u && addr < 0x80200000u) {
+                    analyzer.add_forced_entry(addr);
+                    extra_count++;
+                }
+            }
+            fmt::print("Loaded {} extra function addresses from {}\n", extra_count, extra_funcs_path);
+        } else {
+            fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
+        }
+    }
 
     auto analysis_result = analyzer.analyze();
 

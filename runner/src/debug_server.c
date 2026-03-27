@@ -13,6 +13,7 @@
 #include "debug_server.h"
 #include "game_extras.h"
 #include "psx_runtime.h"
+#include "func_logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -666,9 +667,37 @@ static void handle_first_failure(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"frame\":-1,\"message\":\"verify mode not available\"}", id);
 }
 
+static void handle_discovered_functions(int id, const char *json)
+{
+    (void)json;
+    int count = func_logger_count();
+    /* Build JSON response with function list */
+    char *buf = (char *)malloc(count * 16 + 256);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 128, "{\"id\":%d,\"ok\":true,\"count\":%d,\"addrs\":", id, count);
+    pos += func_logger_json(buf + pos, count * 16 + 128);
+    pos += snprintf(buf + pos, 8, "}");
+    send_line(buf);
+    free(buf);
+}
+
+static void handle_dump_functions(int id, const char *json)
+{
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strcpy(path, "discovered_functions.log");
+    func_logger_dump(path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"path\":\"%s\"}",
+             id, func_logger_count(), path);
+}
+
 static void handle_quit(int id, const char *json)
 {
     (void)json;
+    /* Dump discovered functions before quitting */
+    if (func_logger_count() > 0)
+        func_logger_dump("discovered_functions.log");
     send_ok(id);
     debug_server_shutdown();
     exit(0);
@@ -705,6 +734,8 @@ static const CmdEntry s_commands[] = {
     { "frame_range",       handle_frame_range },
     { "frame_timeseries",  handle_frame_timeseries },
     { "first_failure",     handle_first_failure },
+    { "discovered_functions", handle_discovered_functions },
+    { "dump_functions",    handle_dump_functions },
     { "quit",              handle_quit },
     { NULL, NULL }
 };

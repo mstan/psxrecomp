@@ -4,6 +4,7 @@
 #include "cdrom_stub.h"
 #include "spu.h"
 #include "automation.h"
+#include "func_logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1097,9 +1098,16 @@ static uint32_t g_heap_ptr  = 0;  /* next free PS1 address */
 static void mips_interpret(CPUState* cpu, uint32_t start_pc);
 
 /* Returns 1 if addr is in the statically-compiled region */
+#ifdef INTERPRETER_ONLY
+static int is_compiled_addr(uint32_t addr) {
+    (void)addr;
+    return 0;  /* nothing is compiled in interpreter-only mode */
+}
+#else
 static int is_compiled_addr(uint32_t addr) {
     return (addr >= 0x80010000u && addr < 0x80098000u);
 }
+#endif
 
 /* Execute one MIPS instruction (inline, no branch handling).
  * Sets *branch_out and *target_out if the instruction is a branch/jump.
@@ -1274,7 +1282,7 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
     }
 }
 
-static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
+void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     /* Register pointer array — builds once per call depth */
     uint32_t zero_sink = 0;
     uint32_t* R[32];
@@ -1315,7 +1323,11 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     uint32_t pc = start_pc;
     int guard;
 
+#ifdef INTERPRETER_ONLY
+    for (guard = 0; guard < 100000000; guard++) {
+#else
     for (guard = 0; guard < 10000; guard++) {
+#endif
         cpu->zero = 0;
         uint32_t instr = cpu->read_word(pc);
         int  is_link = 0, is_jr31 = 0;
@@ -1374,6 +1386,17 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         if (is_link) {
             /* JAL / JALR — cpu->ra already set to pc+8 inside mips_exec_one */
             uint32_t ret_pc = pc + 8;
+#ifdef INTERPRETER_ONLY
+            /* Log every function call target for discovery */
+            if (target >= 0x80010000u && target < 0x80200000u)
+                func_logger_log(target, pc);
+            if (target == 0xA0u || target == 0xB0u || target == 0xC0u)
+                call_by_address(cpu, target);  /* BIOS dispatch */
+            else
+                mips_interpret(cpu, target);   /* always interpret */
+            pc = ret_pc;
+            continue;
+#endif
             if (is_compiled_addr(target)) {
                 if ((g_ps1_frame >= 3400u && g_ps1_frame < 4200u) ||
                     (g_attack_trace_end_frame > 0 && g_ps1_frame < g_attack_trace_end_frame)) {
@@ -1405,6 +1428,13 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             pc = ret_pc;
         } else {
             /* J / JR $tx — unconditional jump (or fall-through to pc+8) */
+#ifdef INTERPRETER_ONLY
+            /* In interpreter-only mode, all jumps stay in the interpreter */
+            if (target >= 0x80010000u && target < 0x80200000u)
+                func_logger_log(target, pc);
+            pc = target;
+            continue;
+#endif
             if (target == pc + 8) {
                 /* Branch not taken (BEQ/BNE etc.) — fall through after delay slot */
                 pc = target;
