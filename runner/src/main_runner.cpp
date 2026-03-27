@@ -116,7 +116,9 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 /* ---------------------------------------------------------------------------
  * Generated entry point (in generated/tomba_full.c)
  * --------------------------------------------------------------------------- */
-#ifndef INTERPRETER_ONLY
+#ifdef INTERPRETER_ONLY
+extern "C" void mips_interpret(CPUState* cpu, uint32_t start_pc);
+#else
 extern "C" void func_8006B58C(CPUState* cpu);
 #endif
 
@@ -899,7 +901,6 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     func_logger_init();
     printf("[INTERP] Starting interpreter-only mode at 0x%08X...\n", game_get_entry_point());
     fflush(stdout);
-    extern "C" void mips_interpret(CPUState* cpu, uint32_t start_pc);
     mips_interpret(&cpu, game_get_entry_point());
     printf("[INTERP] Interpreter returned. Dumping discovered functions...\n");
     func_logger_dump("discovered_functions.log");
