@@ -66,8 +66,8 @@ def send_cmd(sock, cmd_dict):
 
 def pretty_regs(resp):
     if not resp.get("ok"):
-        return str(resp)
-    lines = [f"  PC: {resp['pc']}  HI: {resp['hi']}  LO: {resp['lo']}"]
+        return json.dumps(resp, indent=2)
+    lines = [f"  PC: {resp.get('pc','?')}  HI: {resp.get('hi','?')}  LO: {resp.get('lo','?')}"]
     regs = resp.get("regs", {})
     for i in range(0, 32, 4):
         parts = []
