@@ -1,5 +1,6 @@
 #include "gte.h"
 #include "psx_runtime.h"
+#include "automation.h"
 #include <algorithm>
 #include <cstdio>
 
@@ -812,7 +813,7 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
 
     /* Diagnostic: log when RTPS/RTPT produces FLAG error bit (bit 31) */
-    extern "C" uint32_t g_ps1_frame;
+    extern uint32_t g_ps1_frame;
     if ((func == 0x01 || func == 0x30) && (cpu->gte_ctrl[31] & 0x80000000u)) {
         static int s_flag_err = 0;
         if (++s_flag_err <= 30) {

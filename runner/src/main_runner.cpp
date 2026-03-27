@@ -346,6 +346,7 @@ static void LoadKeyConfig(const char* path) {
 extern "C" void psx_set_pad1(uint16_t buttons);
 
 extern "C" void psx_watchdog_reset(void);
+extern "C" uint32_t g_pre_shot_flush;
 
 extern "C" void psx_present_frame(void) {
     ++g_ps1_frame;
@@ -470,7 +471,6 @@ extern "C" void psx_present_frame(void) {
             char shot[512];
             if (script_wants_screenshot(shot, sizeof(shot)) && g_renderer) {
                 /* Flush pending vertices to VRAM now so Present() blits the full frame. */
-                extern "C" uint32_t g_pre_shot_flush;
                 g_pre_shot_flush = 1;
                 g_renderer->FlushPrimitives();
                 g_pre_shot_flush = 0;
