@@ -116,11 +116,7 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 /* ---------------------------------------------------------------------------
  * Generated entry point (in generated/tomba_full.c)
  * --------------------------------------------------------------------------- */
-#ifdef INTERPRETER_ONLY
-extern "C" void mips_interpret(CPUState* cpu, uint32_t start_pc);
-#else
 extern "C" void func_8006B58C(CPUState* cpu);
-#endif
 
 /* ---------------------------------------------------------------------------
  * GPU hook — called by runtime when DMA submits GPU packets.
@@ -897,21 +893,11 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     cpu.gp = 0x0u;         /* GP set by game init */
 
     /* Run game entry point */
-#ifdef INTERPRETER_ONLY
-    func_logger_init();
-    printf("[INTERP] Starting interpreter-only mode at 0x%08X...\n", game_get_entry_point());
-    fflush(stdout);
-    mips_interpret(&cpu, game_get_entry_point());
-    printf("[INTERP] Interpreter returned. Dumping discovered functions...\n");
-    func_logger_dump("discovered_functions.log");
-    fflush(stdout);
-#else
     printf("Calling func_8006B58C (entry point)...\n");
     fflush(stdout);
     func_8006B58C(&cpu);
     printf("Entry point returned.\n");
     fflush(stdout);
-#endif
 
     /* Minimal render loop — present frames until window closed */
     GLFWwindow* win = (GLFWwindow*)renderer.GetWindow();

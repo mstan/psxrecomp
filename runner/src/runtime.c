@@ -502,14 +502,10 @@ static int g_frame_flip_running = 0;
 extern int psx_dispatch_compiled(CPUState* cpu, uint32_t addr);
 
 /* Display thread entry function — defined in tomba_full.c */
-#ifndef INTERPRETER_ONLY
 extern void func_800191E0(CPUState* cpu);
-#endif
 
 /* Gameplay state handler — needs callee-save wrapper (see 0x8001a954 case) */
-#ifndef INTERPRETER_ONLY
 extern void func_8001A954(CPUState* cpu);
-#endif
 
 static VOID WINAPI fiber_display_func(PVOID param) {
     CPUState* cpu = (CPUState*)param;
@@ -577,12 +573,6 @@ static uint32_t read_word(uint32_t addr) {
         }
         if (addr == s_last_addr) {
             ++s_repeat;
-#ifdef INTERPRETER_ONLY
-            if (s_repeat >= 50000u && s_repeat % 50000u == 0) {
-                extern void psx_present_frame(void);
-                psx_present_frame();
-            }
-#endif
             if (s_repeat == 1000000u) {
                 uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
                 uint32_t sp = g_diag_cpu ? g_diag_cpu->sp : 0;
@@ -865,23 +855,12 @@ static void write_word(uint32_t addr, uint32_t value) {
 }
 static uint16_t read_half(uint32_t addr) {
     watchdog_check(addr, 16);
-    /* Spin detector for halfword reads — yields a frame when stuck in a
-     * hardware polling loop.  Generic: any address polled 50K times with
-     * no change triggers psx_present_frame() so BIOS stubs, debug server,
-     * and GLFW events get a chance to run. */
+    /* Spin detector for halfword reads */
     {
         static uint32_t s_last_rh = 0;
         static uint32_t s_rh_rep = 0;
         if (addr == s_last_rh) {
-            ++s_rh_rep;
-#ifdef INTERPRETER_ONLY
-            if (s_rh_rep >= 50000u) {
-                extern void psx_present_frame(void);
-                psx_present_frame();
-                s_rh_rep = 0;
-            }
-#endif
-            if (s_rh_rep == 1000000u) {
+            if (++s_rh_rep == 1000000u) {
                 uint32_t ra = g_diag_cpu ? g_diag_cpu->ra : 0;
                 uint32_t sp = g_diag_cpu ? g_diag_cpu->sp : 0;
                 uint8_t* pp = addr_ptr(addr);
@@ -1119,16 +1098,9 @@ static uint32_t g_heap_ptr  = 0;  /* next free PS1 address */
 void mips_interpret(CPUState* cpu, uint32_t start_pc);
 
 /* Returns 1 if addr is in the statically-compiled region */
-#ifdef INTERPRETER_ONLY
-static int is_compiled_addr(uint32_t addr) {
-    (void)addr;
-    return 0;  /* nothing is compiled in interpreter-only mode */
-}
-#else
 static int is_compiled_addr(uint32_t addr) {
     return (addr >= 0x80010000u && addr < 0x80098000u);
 }
-#endif
 
 /* Execute one MIPS instruction (inline, no branch handling).
  * Sets *branch_out and *target_out if the instruction is a branch/jump.
@@ -1344,11 +1316,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     uint32_t pc = start_pc;
     int guard;
 
-#ifdef INTERPRETER_ONLY
-    for (guard = 0; guard < 100000000; guard++) {
-#else
     for (guard = 0; guard < 10000; guard++) {
-#endif
         cpu->zero = 0;
         uint32_t instr = cpu->read_word(pc);
         int  is_link = 0, is_jr31 = 0;
@@ -1407,17 +1375,6 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         if (is_link) {
             /* JAL / JALR — cpu->ra already set to pc+8 inside mips_exec_one */
             uint32_t ret_pc = pc + 8;
-#ifdef INTERPRETER_ONLY
-            /* Log every function call target for discovery */
-            if (target >= 0x80010000u && target < 0x80200000u)
-                func_logger_log(target, pc);
-            if (target == 0xA0u || target == 0xB0u || target == 0xC0u)
-                call_by_address(cpu, target);  /* BIOS dispatch */
-            else
-                mips_interpret(cpu, target);   /* always interpret */
-            pc = ret_pc;
-            continue;
-#endif
             if (is_compiled_addr(target)) {
                 if ((g_ps1_frame >= 3400u && g_ps1_frame < 4200u) ||
                     (g_attack_trace_end_frame > 0 && g_ps1_frame < g_attack_trace_end_frame)) {
@@ -1449,13 +1406,6 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             pc = ret_pc;
         } else {
             /* J / JR $tx — unconditional jump (or fall-through to pc+8) */
-#ifdef INTERPRETER_ONLY
-            /* In interpreter-only mode, all jumps stay in the interpreter */
-            if (target >= 0x80010000u && target < 0x80200000u)
-                func_logger_log(target, pc);
-            pc = target;
-            continue;
-#endif
             if (target == pc + 8) {
                 /* Branch not taken (BEQ/BNE etc.) — fall through after delay slot */
                 pc = target;
@@ -3415,11 +3365,7 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 uint32_t save_s2 = cpu->s2, save_s3 = cpu->s3;
                 uint32_t save_s4 = cpu->s4, save_s5 = cpu->s5;
                 uint32_t save_s6 = cpu->s6, save_s7 = cpu->s7;
-#ifdef INTERPRETER_ONLY
-                mips_interpret(cpu, 0x8001A954u);
-#else
                 func_8001A954(cpu);
-#endif
                 if (cpu->s0 != save_s0 || cpu->s1 != save_s1 ||
                     cpu->sp != save_sp) {
                     static uint32_t s_fix = 0;

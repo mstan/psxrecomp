@@ -1,8 +1,6 @@
 # runner.cmake — include this from your game's CMakeLists.txt
 # Requires PSXRECOMP_ROOT to be set to the psxrecomp directory.
 
-option(INTERPRETER_ONLY "Run entire game through MIPS interpreter for function discovery" OFF)
-
 set(PSXRECOMP_RUNNER_SOURCES
     ${PSXRECOMP_ROOT}/runner/src/launcher.c
     ${PSXRECOMP_ROOT}/runner/src/crc32.c
