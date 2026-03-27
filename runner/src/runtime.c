@@ -502,10 +502,14 @@ static int g_frame_flip_running = 0;
 extern int psx_dispatch_compiled(CPUState* cpu, uint32_t addr);
 
 /* Display thread entry function — defined in tomba_full.c */
+#ifndef INTERPRETER_ONLY
 extern void func_800191E0(CPUState* cpu);
+#endif
 
 /* Gameplay state handler — needs callee-save wrapper (see 0x8001a954 case) */
+#ifndef INTERPRETER_ONLY
 extern void func_8001A954(CPUState* cpu);
+#endif
 
 static VOID WINAPI fiber_display_func(PVOID param) {
     CPUState* cpu = (CPUState*)param;
@@ -3394,7 +3398,11 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 uint32_t save_s2 = cpu->s2, save_s3 = cpu->s3;
                 uint32_t save_s4 = cpu->s4, save_s5 = cpu->s5;
                 uint32_t save_s6 = cpu->s6, save_s7 = cpu->s7;
+#ifdef INTERPRETER_ONLY
+                mips_interpret(cpu, 0x8001A954u);
+#else
                 func_8001A954(cpu);
+#endif
                 if (cpu->s0 != save_s0 || cpu->s1 != save_s1 ||
                     cpu->sp != save_sp) {
                     static uint32_t s_fix = 0;
