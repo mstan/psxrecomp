@@ -76,7 +76,7 @@ static uint32_t g_int_chains[4] = {0};
 
 /* ---------------------------------------------------------------------------
  * Memory card file I/O — backs B(0x32-0x36) BIOS calls with flat files on disk.
- * Save files are stored in C:/temp/memcard/ named by slot and game path.
+ * Save files are stored in memcard/ named by slot and game path.
  * --------------------------------------------------------------------------- */
 /* Real PS1 BIOS allows at most 2 simultaneously open memory card files.
  * open() returns 0 or 1 on success, -1 if both slots are full.
@@ -87,6 +87,11 @@ typedef struct { FILE* fp; char path[256]; } mc_fd_t;
 static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free */
 static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
 static char    s_last_mc_name[21] = {0}; /* last O_CREAT filename (PS1 name part, e.g. BASCUS-94236TOMBA-00) */
+
+/* firstfile/nextfile directory scan state */
+static char s_ff_names[15][24];  /* up to 15 files per card */
+static int  s_ff_count = 0;
+static int  s_ff_index = 0;
 
 /* Memcard activity log — queryable via TCP debug server "memcard_log" command */
 #define MC_LOG_CAP 32
@@ -133,7 +138,7 @@ const void* psx_mc_log_entry(int i) {
 }
 
 static void mc_ensure_dir(void) {
-    CreateDirectoryA("C:/temp/memcard", NULL);  /* no-op if exists */
+    CreateDirectoryA("memcard", NULL);  /* no-op if exists */
 }
 
 /* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename.
@@ -2100,7 +2105,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 return;
             }
             /* Memory card file I/O — B(0x32) open, B(0x33) lseek, B(0x34) read,
-             * B(0x35) write, B(0x36) close.  Backed by flat files in C:/temp/memcard/. */
+             * B(0x35) write, B(0x36) close.  Backed by flat files in memcard/. */
             case 0x32: {  /* open(path, flags) → fd or -1 */
                 uint32_t pa = cpu->a0 & 0x1FFFFFFFu;
                 uint32_t flags = cpu->a1;
@@ -2132,7 +2137,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 }
                 mc_ensure_dir();
                 char filepath[256];
-                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_%s.bin", slot, name);
+                snprintf(filepath, sizeof(filepath), "memcard/slot%d_%s.bin", slot, name);
                 /* flags: bit 9 (0x200) = O_CREAT, bit 1 (0x2) = write, bit 0 (0x1) = read
                  * PS1 O_CREAT = create if not exists, open if exists (no truncation).
                  * Real PS1 BIOS: repeated O_CREAT to the same path returns same fd (slot reuse). */
@@ -2186,7 +2191,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                         if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] == '0' && name[nlen-1] == '0') {
                             for (int blk = 1; blk <= 2; blk++) {
                                 char comp_path[256];
-                                snprintf(comp_path, sizeof(comp_path), "C:/temp/memcard/slot%d_%s.bin", slot, name);
+                                snprintf(comp_path, sizeof(comp_path), "memcard/slot%d_%s.bin", slot, name);
                                 int clen = (int)strlen(comp_path);
                                 comp_path[clen - 5] = '0' + blk;  /* -00.bin → -01.bin / -02.bin */
                                 FILE *cfp = fopen(comp_path, "r+b");
@@ -2296,35 +2301,118 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x17: return;  /* ReturnFromException — no-op in recompiler */
             case 0x18: return;  /* SetDefaultExitFromException — no-op */
             case 0x19: return;  /* SetCustomExitFromException — no-op */
-            case 0x42: printf("[BIOS B(0x42)] firstfile a0=0x%08X a1=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->ra); fflush(stdout); cpu->v0 = 0; return; /* firstfile — NULL = no files found */
-            case 0x43: /* nextfile — simulate 3-block chain: return a0 for remain>0, then 0.
-                         * Update attr and name for blocks 2/3 (remain=2→0xA1, remain=1→0xA2). */
-                if (cpu->a0 != 0 && s_nextfile_remain > 0) {
-                    --s_nextfile_remain;
-                    cpu->v0 = cpu->a0;
-                    if (cpu->a0 >= 0x80000000u) {
-                        uint32_t _s = cpu->a0 - 0x80000000u;
-                        uint32_t attr = (s_nextfile_remain > 0) ? 0xA1u : 0xA2u;
-                        *(uint32_t*)&g_ram[_s + 0x14] = attr;
-                        *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
-                        /* Update name suffix: block2="-01", block3="-02" */
-                        if (s_last_mc_name[0]) {
-                            strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
-                            int nlen = (int)strlen(s_last_mc_name);
-                            if (nlen >= 2) {
-                                int blk = (s_nextfile_remain > 0) ? 1 : 2;
-                                g_ram[_s + nlen - 2] = '0' + (blk / 10);
-                                g_ram[_s + nlen - 1] = '0' + (blk % 10);
-                            }
-                        }
-                    }
-                } else {
-                    s_nextfile_remain = 0;
-                    cpu->v0 = 0;
+            case 0x42: { /* firstfile(pattern, direntry) → direntry ptr or 0 */
+                /* Scan memcard/ directory for files matching the pattern.
+                 * Pattern format: "bu00:*" or "bu00:BASCUS-94236*"
+                 * DIRENTRY layout: +0x00 name[20], +0x14 attr(u32), +0x18 size(u32), +0x1C next(u32) */
+                uint32_t pat_addr = cpu->a0 & 0x1FFFFFFFu;
+                uint32_t de_addr  = cpu->a1 & 0x1FFFFFFFu;
+                const char *pattern = (pat_addr < sizeof(g_ram)) ? (const char*)&g_ram[pat_addr] : "";
+
+                /* Parse slot from pattern (bu00: = slot 0, bu10: = slot 1) */
+                int slot = 0;
+                const char *file_pat = pattern;
+                if (strncmp(pattern, "bu", 2) == 0) {
+                    slot = (pattern[2] == '1') ? 1 : 0;
+                    const char *colon = strchr(pattern, ':');
+                    if (colon) file_pat = colon + 1;
                 }
-                printf("[BIOS B(0x43)] nextfile a0=0x%08X -> v0=0x%08X remain=%d\n",
-                       cpu->a0, cpu->v0, s_nextfile_remain);
+
+                /* Scan memcard/ for matching files */
+                s_ff_count = 0;
+                s_ff_index = 0;
+
+                WIN32_FIND_DATAA fdata;
+                char search[256];
+                snprintf(search, sizeof(search), "memcard/slot%d_*.bin", slot);
+                HANDLE hFind = FindFirstFileA(search, &fdata);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (s_ff_count >= 15) break;
+                        /* Extract PS1 name from filename: "slot0_BASCUS-94236TOMBA-00.bin" → "BASCUS-94236TOMBA-00" */
+                        const char *start = fdata.cFileName;
+                        /* Skip "slot0_" prefix */
+                        const char *p = strchr(start, '_');
+                        if (p) p++; else p = start;
+                        /* Remove ".bin" suffix */
+                        int len = (int)strlen(p);
+                        if (len > 4 && strcmp(p + len - 4, ".bin") == 0) len -= 4;
+                        if (len > 20) len = 20;
+                        memset(s_ff_names[s_ff_count], 0, 24);
+                        memcpy(s_ff_names[s_ff_count], p, len);
+
+                        /* Check if matches pattern (simple wildcard: "BASCUS*" or just "*") */
+                        int match = 0;
+                        if (file_pat[0] == '*') {
+                            match = 1;
+                        } else {
+                            /* Match prefix up to '*' */
+                            const char *star = strchr(file_pat, '*');
+                            int prefix_len = star ? (int)(star - file_pat) : (int)strlen(file_pat);
+                            match = (strncmp(s_ff_names[s_ff_count], file_pat, prefix_len) == 0);
+                        }
+                        if (match) s_ff_count++;
+                    } while (FindNextFileA(hFind, &fdata));
+                    FindClose(hFind);
+                }
+
+                if (s_ff_count == 0) {
+                    cpu->v0 = 0;  /* no files found */
+                    return;
+                }
+
+                /* Fill first DIRENTRY */
+                if (de_addr + 0x20 <= sizeof(g_ram)) {
+                    memset(&g_ram[de_addr], 0, 0x2C);
+                    strncpy((char*)&g_ram[de_addr], s_ff_names[0], 20);
+                    /* attr: 0x51 = first block of used file */
+                    *(uint32_t*)&g_ram[de_addr + 0x14] = 0x51u;
+                    /* size: read actual file size */
+                    char fpath[256];
+                    snprintf(fpath, sizeof(fpath), "memcard/slot%d_%s.bin", slot, s_ff_names[0]);
+                    FILE *sf = fopen(fpath, "rb");
+                    uint32_t fsize = 0;
+                    if (sf) { fseek(sf, 0, SEEK_END); fsize = (uint32_t)ftell(sf); fclose(sf); }
+                    *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
+                }
+                s_ff_index = 1;
+                s_nextfile_remain = s_ff_count - 1;
+                strncpy(s_last_mc_name, s_ff_names[0], sizeof(s_last_mc_name) - 1);
+                cpu->v0 = cpu->a1;  /* return direntry pointer */
                 return;
+            }
+            case 0x43: { /* nextfile(direntry) → direntry ptr or 0 */
+                /* The s_ff_names/s_ff_index/s_ff_count statics are set by firstfile (case 0x42) above. */
+                if (s_ff_index < s_ff_count && cpu->a0 != 0) {
+                    uint32_t de = cpu->a0 & 0x1FFFFFFFu;
+                    if (de + 0x20 <= sizeof(g_ram)) {
+                        memset(&g_ram[de], 0, 0x2C);
+                        strncpy((char*)&g_ram[de], s_ff_names[s_ff_index], 20);
+                        /* Determine attr: check if name ends in -01/-02 (continuation blocks) */
+                        const char *nm = s_ff_names[s_ff_index];
+                        int nlen = (int)strlen(nm);
+                        uint32_t attr = 0x51u; /* default: first block */
+                        if (nlen >= 3 && nm[nlen-3] == '-') {
+                            int blk = (nm[nlen-2] - '0') * 10 + (nm[nlen-1] - '0');
+                            if (blk == 1) attr = 0xA1u;      /* middle block */
+                            else if (blk >= 2) attr = 0xA2u;  /* last block */
+                        }
+                        *(uint32_t*)&g_ram[de + 0x14] = attr;
+                        /* size */
+                        char fpath[256];
+                        snprintf(fpath, sizeof(fpath), "memcard/slot0_%s.bin", s_ff_names[s_ff_index]);
+                        FILE *sf = fopen(fpath, "rb");
+                        uint32_t fsize = 0;
+                        if (sf) { fseek(sf, 0, SEEK_END); fsize = (uint32_t)ftell(sf); fclose(sf); }
+                        *(uint32_t*)&g_ram[de + 0x18] = fsize;
+                    }
+                    s_ff_index++;
+                    cpu->v0 = cpu->a0;
+                } else {
+                    cpu->v0 = 0;  /* no more files */
+                }
+                return;
+            }
             case 0x47: return;  /* AddCDRomDevice — no-op */
             case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=success */
                 uint32_t channel = cpu->a0;  /* 0x00=slot1, 0x10=slot2 */
@@ -2338,7 +2426,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 }
                 mc_ensure_dir();
                 char filepath[256];
-                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_raw.mcd", slot);
+                snprintf(filepath, sizeof(filepath), "memcard/slot%d_raw.mcd", slot);
                 FILE *fp = fopen(filepath, "r+b");
                 if (!fp) {
                     /* Create empty 128KB card image */
@@ -2368,7 +2456,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     cpu->v0 = 0; return;
                 }
                 char filepath[256];
-                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_raw.mcd", slot);
+                snprintf(filepath, sizeof(filepath), "memcard/slot%d_raw.mcd", slot);
                 FILE *fp = fopen(filepath, "rb");
                 if (!fp) {
                     /* No card image yet — return zeros */
