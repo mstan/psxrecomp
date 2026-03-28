@@ -294,25 +294,7 @@ const void* psx_mc_log_entry(int i) {
     return &s_mc_log[i % MC_LOG_CAP];
 }
 
-static void mc_ensure_dir(void) {
-    CreateDirectoryA("memcard", NULL);  /* no-op if exists */
-}
-
-/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename.
- * Returns 0 on success, -1 on bad format. */
-static int mc_parse_path(const char* path, int* slot_out, char* name_out, int name_max) {
-    if (!path || path[0] != 'b' || path[1] != 'u') return -1;
-    *slot_out = (path[3] == '1') ? 1 : 0;
-    /* skip past ':' and optional backslash */
-    const char* p = strchr(path + 4, ':');
-    if (p) p++;
-    else    p = path + 4;
-    if (*p == '\\' || *p == '/') p++;
-    int i = 0;
-    while (*p && i < name_max - 1) { name_out[i++] = *p++; }
-    name_out[i] = '\0';
-    return (i > 0) ? 0 : -1;
-}
+/* Old mc_ensure_dir and mc_parse_path moved to new memcard section above */
 
 /* ---------------------------------------------------------------------------
  * Frame-gated diagnostic logging — fires only during DIAG_FRAME_START..END
