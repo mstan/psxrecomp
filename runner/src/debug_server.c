@@ -667,6 +667,60 @@ static void handle_first_failure(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"frame\":-1,\"message\":\"verify mode not available\"}", id);
 }
 
+/* ---- Memcard log query ---- */
+extern int psx_mc_log_count(void);
+extern const void* psx_mc_log_entry(int i);
+
+/* mc_log_entry_t layout: frame(4) bios_fn(4) a0(4) a1(4) a2(4) a3(4) ret(4) ra(4) buf_head(16) buf_nonzero(4) = 52 bytes */
+typedef struct {
+    uint32_t frame, bios_fn, a0, a1, a2, a3, ret, ra;
+    uint8_t  buf_head[16];
+    int      buf_nonzero;
+} mc_entry_t;
+
+static void handle_memcard_log(int id, const char *json)
+{
+    (void)json;
+    int count = psx_mc_log_count();
+    int start = count > 32 ? count - 32 : 0;
+
+    char *buf = (char *)malloc(32 * 512 + 256);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 128, "{\"id\":%d,\"ok\":true,\"count\":%d,\"entries\":[", id, count);
+
+    static const char *fn_names[] = { "open", "lseek", "read", "write", "close" };
+    int first = 1;
+    for (int i = start; i < count; i++) {
+        const mc_entry_t *e = (const mc_entry_t *)psx_mc_log_entry(i);
+        if (!e) continue;
+        if (!first) buf[pos++] = ',';
+        first = 0;
+
+        char hex[33];
+        for (int j = 0; j < 16; j++)
+            snprintf(hex + j * 2, 3, "%02x", e->buf_head[j]);
+
+        const char *name = "?";
+        if (e->bios_fn >= 0x32 && e->bios_fn <= 0x36)
+            name = fn_names[e->bios_fn - 0x32];
+
+        pos += snprintf(buf + pos, 512,
+            "{\"frame\":%u,\"fn\":\"%s\",\"fn_id\":\"0x%02X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
+            "\"ret\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"buf_head\":\"%s\",\"buf_nonzero\":%d}",
+            e->frame, name, e->bios_fn,
+            e->a0, e->a1, e->a2,
+            e->ret, e->ra,
+            hex, e->buf_nonzero);
+    }
+
+    pos += snprintf(buf + pos, 8, "]}");
+    send_line(buf);
+    free(buf);
+}
+
 static void handle_discovered_functions(int id, const char *json)
 {
     (void)json;
@@ -734,6 +788,7 @@ static const CmdEntry s_commands[] = {
     { "frame_range",       handle_frame_range },
     { "frame_timeseries",  handle_frame_timeseries },
     { "first_failure",     handle_first_failure },
+    { "memcard_log",         handle_memcard_log },
     { "discovered_functions", handle_discovered_functions },
     { "dump_functions",    handle_dump_functions },
     { "quit",              handle_quit },

@@ -88,6 +88,50 @@ static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free 
 static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
 static char    s_last_mc_name[21] = {0}; /* last O_CREAT filename (PS1 name part, e.g. BASCUS-94236TOMBA-00) */
 
+/* Memcard activity log — queryable via TCP debug server "memcard_log" command */
+#define MC_LOG_CAP 32
+typedef struct {
+    uint32_t frame;
+    uint32_t bios_fn;   /* 0x32=open, 0x33=lseek, 0x34=read, 0x35=write, 0x36=close */
+    uint32_t a0, a1, a2, a3;
+    uint32_t ret;       /* v0 return value */
+    uint32_t ra;
+    uint8_t  buf_head[16]; /* first 16 bytes of buffer (for write/read) */
+    int      buf_nonzero;  /* count of non-zero bytes in buffer */
+} mc_log_entry_t;
+static mc_log_entry_t s_mc_log[MC_LOG_CAP];
+static int s_mc_log_count = 0;
+
+static void mc_log_push(uint32_t fn, CPUState* cpu, uint32_t ret, uint32_t buf_addr, uint32_t buf_len) {
+    int idx = s_mc_log_count % MC_LOG_CAP;
+    mc_log_entry_t *e = &s_mc_log[idx];
+    e->frame = g_ps1_frame;
+    e->bios_fn = fn;
+    e->a0 = cpu->a0; e->a1 = cpu->a1; e->a2 = cpu->a2; e->a3 = cpu->a3;
+    e->ret = ret;
+    e->ra = cpu->ra;
+    memset(e->buf_head, 0, 16);
+    e->buf_nonzero = 0;
+    if (buf_addr > 0 && buf_len > 0) {
+        uint32_t phys = buf_addr & 0x1FFFFFFFu;
+        if (phys + buf_len <= sizeof(g_ram)) {
+            for (uint32_t i = 0; i < buf_len && i < 16; i++)
+                e->buf_head[i] = g_ram[phys + i];
+            for (uint32_t i = 0; i < buf_len && i < 8192; i++)
+                if (g_ram[phys + i]) e->buf_nonzero++;
+        }
+    }
+    s_mc_log_count++;
+}
+
+/* Exposed for debug_server.c */
+int psx_mc_log_count(void) { return s_mc_log_count; }
+const void* psx_mc_log_entry(int i) {
+    if (i < 0 || i >= s_mc_log_count) return NULL;
+    if (s_mc_log_count > MC_LOG_CAP && i < s_mc_log_count - MC_LOG_CAP) return NULL;
+    return &s_mc_log[i % MC_LOG_CAP];
+}
+
 static void mc_ensure_dir(void) {
     CreateDirectoryA("C:/temp/memcard", NULL);  /* no-op if exists */
 }
@@ -2156,7 +2200,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 /* Track the PS1 name for firstfile/nextfile direntry population */
                 if (create) strncpy(s_last_mc_name, name, sizeof(s_last_mc_name) - 1);
                 cpu->v0 = (uint32_t)fd;
-                printf("[MEMCARD open] fd=%d %s flags=0x%05X ra=0x%08X\n", fd, filepath, flags, cpu->ra);
+                mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                 return;
             }
             case 0x33: {  /* lseek(fd, offset, whence) → new position */
@@ -2173,11 +2217,18 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 int fd = (int)cpu->a0;
                 uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
                 uint32_t len = cpu->a2;
-                printf("[MEMCARD read] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
+                    mc_log_push(0x34, cpu, (uint32_t)-1, cpu->a1, len);
+                    cpu->v0 = (uint32_t)-1; return;
+                }
+                if (buf + len > sizeof(g_ram)) {
+                    mc_log_push(0x34, cpu, (uint32_t)-1, cpu->a1, len);
+                    cpu->v0 = (uint32_t)-1; return;
+                }
                 size_t n = fread(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n; return;
+                cpu->v0 = (uint32_t)n;
+                mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
+                return;
             }
             case 0x35: {  /* write(fd, buf, len) → bytes written */
                 int fd = (int)cpu->a0;
@@ -2188,23 +2239,19 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     if (buf < sizeof(g_ram) && len > 0) fwrite(&g_ram[buf], 1, len, stdout);
                     cpu->v0 = len; return;
                 }
-                {
-                    /* Trace: log first 16 bytes of buffer + check if all zeros */
-                    int all_zero = 1;
-                    for (uint32_t i = 0; i < len && i < 128 && buf + i < sizeof(g_ram); i++)
-                        if (g_ram[buf + i]) { all_zero = 0; break; }
-                    printf("[MEMCARD write] fd=%d buf=0x%08X len=%u ra=0x%08X data=%s first16=",
-                           fd, cpu->a1, len, cpu->ra, all_zero ? "ALL-ZEROS" : "HAS-DATA");
-                    for (int i = 0; i < 16 && (uint32_t)i < len; i++)
-                        printf("%02x", g_ram[buf + i]);
-                    printf(" fpos=%ld\n", s_mc_fds[fd].fp ? ftell(s_mc_fds[fd].fp) : -1L);
-                    fflush(stdout);
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
+                    mc_log_push(0x35, cpu, (uint32_t)-1, cpu->a1, len);
+                    cpu->v0 = (uint32_t)-1; return;
                 }
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
+                if (buf + len > sizeof(g_ram)) {
+                    mc_log_push(0x35, cpu, (uint32_t)-1, cpu->a1, len);
+                    cpu->v0 = (uint32_t)-1; return;
+                }
                 size_t n = fwrite(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
                 fflush(s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n; return;
+                cpu->v0 = (uint32_t)n;
+                mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
+                return;
             }
             case 0x36: {  /* close(fd) → 0 */
                 int fd = (int)cpu->a0;
