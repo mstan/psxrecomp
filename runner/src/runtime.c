@@ -2244,7 +2244,62 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                        cpu->a0, cpu->v0, s_nextfile_remain);
                 return;
             case 0x47: return;  /* AddCDRomDevice — no-op */
-            case 0x4E: printf("[BIOS B(0x4E)] card_write a0=0x%08X a1=0x%08X a2=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->a2, cpu->ra); cpu->v0 = (uint32_t)-1; return; /* card_write — not yet implemented */
+            case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=success */
+                uint32_t channel = cpu->a0;  /* 0x00=slot1, 0x10=slot2 */
+                uint32_t sector  = cpu->a1;
+                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
+                int slot = (channel >= 0x10) ? 1 : 0;
+                printf("[MEMCARD card_write] slot=%d sector=%u buf=0x%08X ra=0x%08X\n",
+                       slot, sector, cpu->a2, cpu->ra);
+                if (sector >= 1024 || buf + 128 > sizeof(g_ram)) {
+                    cpu->v0 = 0; return;
+                }
+                mc_ensure_dir();
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_raw.mcd", slot);
+                FILE *fp = fopen(filepath, "r+b");
+                if (!fp) {
+                    /* Create empty 128KB card image */
+                    fp = fopen(filepath, "w+b");
+                    if (fp) {
+                        uint8_t zeros[128] = {0};
+                        for (int i = 0; i < 1024; i++) fwrite(zeros, 1, 128, fp);
+                        rewind(fp);
+                    }
+                }
+                if (!fp) { cpu->v0 = 0; return; }
+                fseek(fp, sector * 128, SEEK_SET);
+                fwrite(&g_ram[buf], 1, 128, fp);
+                fflush(fp);
+                fclose(fp);
+                cpu->v0 = 1;
+                return;
+            }
+            case 0x4F: {  /* _card_read(channel, sector, buffer) → 1=success */
+                uint32_t channel = cpu->a0;
+                uint32_t sector  = cpu->a1;
+                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
+                int slot = (channel >= 0x10) ? 1 : 0;
+                printf("[MEMCARD card_read] slot=%d sector=%u buf=0x%08X ra=0x%08X\n",
+                       slot, sector, cpu->a2, cpu->ra);
+                if (sector >= 1024 || buf + 128 > sizeof(g_ram)) {
+                    cpu->v0 = 0; return;
+                }
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_raw.mcd", slot);
+                FILE *fp = fopen(filepath, "rb");
+                if (!fp) {
+                    /* No card image yet — return zeros */
+                    memset(&g_ram[buf], 0, 128);
+                    cpu->v0 = 1; return;
+                }
+                fseek(fp, sector * 128, SEEK_SET);
+                size_t n = fread(&g_ram[buf], 1, 128, fp);
+                if (n < 128) memset(&g_ram[buf + n], 0, 128 - n);
+                fclose(fp);
+                cpu->v0 = 1;
+                return;
+            }
             case 0x4A: cpu->v0 = 1; return;  /* InitCard — stub success */
             case 0x4B: cpu->v0 = 1; return;  /* StartCard — stub success */
             case 0x4C: cpu->v0 = 1; return;  /* StopCard — stub success */
