@@ -2270,43 +2270,83 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                         mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                         return;
                     }
-                    /* Allocate blocks for new file */
-                    int blocks_needed = (file_size + MC_BLOCK_SIZE - 1) / MC_BLOCK_SIZE;
-                    if (blocks_needed < 1) blocks_needed = 1;
-                    if (blocks_needed > 15) blocks_needed = 15;
-                    int allocated[15];
-                    int alloc_count = 0;
-                    for (int b = 1; b <= 15 && alloc_count < blocks_needed; b++) {
-                        uint8_t *de = mc_dir_entry(slot, b);
-                        uint32_t st = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
-                        if (st == 0xA0 || st == 0x00)
-                            allocated[alloc_count++] = b;
+
+                    /* Check if this is a continuation block (name ends in -01, -02, etc.)
+                     * If so, link it to the parent -00 block instead of creating independently. */
+                    int nlen = (int)strlen(name);
+                    int is_continuation = 0;
+                    int parent_block = -1;
+                    int block_index = 0;  /* 0=first, 1=second, 2=third... */
+                    if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] >= '0' && name[nlen-1] >= '0') {
+                        block_index = (name[nlen-2] - '0') * 10 + (name[nlen-1] - '0');
+                        if (block_index > 0) {
+                            is_continuation = 1;
+                            /* Find the parent -00 block */
+                            char parent_name[64];
+                            strncpy(parent_name, name, sizeof(parent_name) - 1);
+                            parent_name[nlen-2] = '0'; parent_name[nlen-1] = '0';
+                            parent_block = mc_find_file(slot, parent_name);
+                        }
                     }
-                    if (alloc_count < blocks_needed) {
+
+                    /* Allocate one free block */
+                    int new_block = mc_find_free_block(slot);
+                    if (new_block < 0) {
                         cpu->v0 = (uint32_t)-1;  /* card full */
                         mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                         return;
                     }
-                    /* Write directory entries */
-                    for (int i = 0; i < alloc_count; i++) {
-                        uint8_t *de = mc_dir_entry(slot, allocated[i]);
-                        memset(de, 0, MC_SECTOR_SIZE);
-                        uint32_t state = (i == 0) ? 0x51 : (i < alloc_count - 1) ? 0xA1 : 0xA2;
+
+                    /* Write directory entry */
+                    uint8_t *de = mc_dir_entry(slot, new_block);
+                    memset(de, 0, MC_SECTOR_SIZE);
+
+                    if (is_continuation && parent_block >= 0) {
+                        /* Continuation block: state = 0xA1 (middle) or 0xA2 (last, we'll set A2 for now) */
+                        uint32_t state = 0xA2;  /* assume last; if another -0N follows it updates to A1 */
                         de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
                         de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
-                        /* Size (only in first block entry) */
-                        if (i == 0) {
-                            de[4] = file_size & 0xFF; de[5] = (file_size>>8)&0xFF;
-                            de[6] = (file_size>>16)&0xFF; de[7] = (file_size>>24)&0xFF;
+                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (last block) */
+                        mc_update_dir_checksum(slot, new_block);
+
+                        /* Walk the chain from parent to find the last block, then link to us */
+                        int prev = parent_block;
+                        while (1) {
+                            uint8_t *pde = mc_dir_entry(slot, prev);
+                            uint16_t pnext = pde[8] | (pde[9] << 8);
+                            if (pnext == 0xFFFF) break;
+                            prev = (int)(pnext + 1);
+                            if (prev < 1 || prev > 15) break;
                         }
-                        /* Next block pointer */
-                        uint16_t next = (i < alloc_count - 1) ? (uint16_t)(allocated[i+1] - 1) : 0xFFFF;
-                        de[8] = next & 0xFF; de[9] = (next >> 8) & 0xFF;
-                        /* Filename (only in first block) */
-                        if (i == 0) strncpy((char*)&de[0x0A], name, 20);
-                        mc_update_dir_checksum(slot, allocated[i]);
+                        /* Link previous last block to this new block */
+                        uint8_t *pde = mc_dir_entry(slot, prev);
+                        uint16_t link = (uint16_t)(new_block - 1);
+                        pde[8] = link & 0xFF; pde[9] = (link >> 8) & 0xFF;
+                        /* Update previous block state: if it was 0xA2 (last), change to 0xA1 (middle) */
+                        uint32_t prev_state = pde[0] | (pde[1]<<8) | (pde[2]<<16) | (pde[3]<<24);
+                        if (prev_state == 0xA2) {
+                            pde[0] = 0xA1; pde[1] = 0; pde[2] = 0; pde[3] = 0;
+                        }
+                        mc_update_dir_checksum(slot, prev);
+
+                        /* Update parent's size to reflect total */
+                        uint8_t *parent_de = mc_dir_entry(slot, parent_block);
+                        uint32_t total_size = (block_index + 1) * MC_BLOCK_SIZE;
+                        parent_de[4] = total_size & 0xFF; parent_de[5] = (total_size>>8)&0xFF;
+                        parent_de[6] = (total_size>>16)&0xFF; parent_de[7] = (total_size>>24)&0xFF;
+                        mc_update_dir_checksum(slot, parent_block);
+                    } else {
+                        /* First block of a new file */
+                        uint32_t state = 0x51;
+                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
+                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
+                        de[4] = file_size & 0xFF; de[5] = (file_size>>8)&0xFF;
+                        de[6] = (file_size>>16)&0xFF; de[7] = (file_size>>24)&0xFF;
+                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (single block for now) */
+                        strncpy((char*)&de[0x0A], name, 20);
+                        mc_update_dir_checksum(slot, new_block);
                     }
-                    existing_block = allocated[0];
+                    existing_block = new_block;
                 }
 
                 if (existing_block < 0) {
