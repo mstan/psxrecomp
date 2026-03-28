@@ -2188,7 +2188,18 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     if (buf < sizeof(g_ram) && len > 0) fwrite(&g_ram[buf], 1, len, stdout);
                     cpu->v0 = len; return;
                 }
-                printf("[MEMCARD write] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
+                {
+                    /* Trace: log first 16 bytes of buffer + check if all zeros */
+                    int all_zero = 1;
+                    for (uint32_t i = 0; i < len && i < 128 && buf + i < sizeof(g_ram); i++)
+                        if (g_ram[buf + i]) { all_zero = 0; break; }
+                    printf("[MEMCARD write] fd=%d buf=0x%08X len=%u ra=0x%08X data=%s first16=",
+                           fd, cpu->a1, len, cpu->ra, all_zero ? "ALL-ZEROS" : "HAS-DATA");
+                    for (int i = 0; i < 16 && (uint32_t)i < len; i++)
+                        printf("%02x", g_ram[buf + i]);
+                    printf(" fpos=%ld\n", s_mc_fds[fd].fp ? ftell(s_mc_fds[fd].fp) : -1L);
+                    fflush(stdout);
+                }
                 if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
                 if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
                 size_t n = fwrite(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
