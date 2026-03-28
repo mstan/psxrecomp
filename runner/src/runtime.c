@@ -4717,34 +4717,8 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             cpu->t1 = 0x43; call_by_address(cpu, 0xB0); return 1;
         case 0x8005B4ACu: /* B(0x45) delete */
             cpu->t1 = 0x45; call_by_address(cpu, 0xB0); return 1;
-        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — searches BIOS dir table at
-                           * g_ram[0x150] which we never populate; return a1 (the info-struct ptr)
-                           * as a non-zero "file found" result so game proceeds to O_WRONLY.
-                           * Set s_nextfile_remain=2 so nextfile pretends 3 linked blocks exist.
-                           * Fill in DIRENTRY struct with valid MC data so game logic passes. */
-            cpu->v0 = cpu->a1 ? cpu->a1 : 1u;
-            s_nextfile_remain = 2;
-            if (cpu->a1 >= 0x80000000u) {
-                uint32_t _s = cpu->a1 - 0x80000000u;
-                /* Populate full DIRENTRY struct as firstfile() would:
-                 * name[0x00-0x13]: 20-byte PS1 filename (from last O_CREAT)
-                 * attr[0x14]: 0x51 = first linked block
-                 * size[0x18]: 0x6000 = 3×8KB
-                 * next[0x1C]: 0 (nextfile handles traversal)
-                 * count[0x20]: 0 */
-                memset(&g_ram[_s], 0, 0x24);
-                strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
-                *(uint32_t*)&g_ram[_s + 0x14] = 0x51u;
-                *(uint32_t*)&g_ram[_s + 0x18] = 0x6000u;
-                *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
-                *(uint32_t*)&g_ram[_s + 0x20] = 0u;
-                printf("[MEMCARD FUN_B4CC] a0='%s' -> name='%s' attr=0x51 size=0x6000\n",
-                       (cpu->a0 >= 0x80000000u) ? (char*)&g_ram[cpu->a0 - 0x80000000u] : "?",
-                       s_last_mc_name);
-            } else {
-                printf("[MEMCARD FUN_B4CC] a0=0x%08X a1=0x%08X -> v0=0x%08X\n", cpu->a0, cpu->a1, cpu->v0);
-            }
-            return 1;
+        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — route to firstfile (B(0x42)) */
+            cpu->t1 = 0x42; call_by_address(cpu, 0xB0); return 1;
         case 0x8005CCACu: /* B(0x4E) card_write */
             cpu->t1 = 0x4E; call_by_address(cpu, 0xB0); return 1;
         case 0x8005CCBCu: /* B(0x50) */
