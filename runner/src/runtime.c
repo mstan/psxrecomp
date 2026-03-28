@@ -2358,6 +2358,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
 
                 if (s_ff_count == 0) {
                     cpu->v0 = 0;  /* no files found */
+                    mc_log_push(0x42, cpu, 0, 0, 0);
                     return;
                 }
 
@@ -2379,6 +2380,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 s_nextfile_remain = s_ff_count - 1;
                 strncpy(s_last_mc_name, s_ff_names[0], sizeof(s_last_mc_name) - 1);
                 cpu->v0 = cpu->a1;  /* return direntry pointer */
+                mc_log_push(0x42, cpu, cpu->v0, 0, s_ff_count);
                 return;
             }
             case 0x43: { /* nextfile(direntry) → direntry ptr or 0 */
