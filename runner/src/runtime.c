@@ -75,23 +75,180 @@ uint32_t psx_get_dispatch_miss_count(void) {
 static uint32_t g_int_chains[4] = {0};
 
 /* ---------------------------------------------------------------------------
- * Memory card file I/O — backs B(0x32-0x36) BIOS calls with flat files on disk.
- * Save files are stored in memcard/ named by slot and game path.
+ * Memory card — proper 128KB raw card image with PS1 directory structure.
+ *
+ * Layout: 1024 sectors × 128 bytes = 128KB
+ *   Block 0 (sectors 0-63):  Directory block
+ *     Sector 0:    Header ("MC" + padding + XOR checksum)
+ *     Sectors 1-15: Directory entries (one per data block 1-15)
+ *       +0x00  uint32_t state  (0x51=first, 0xA1=mid, 0xA2=last, 0xA0=deleted, 0x00=free)
+ *       +0x04  uint32_t size   (file size in bytes)
+ *       +0x08  uint16_t next   (next block, 0xFFFF=last)
+ *       +0x0A  char     name[21] (ASCII, null-terminated)
+ *       +0x7F  uint8_t  xor    (XOR checksum of bytes 0-126)
+ *     Sectors 16-35: Broken sector list (unused, zeroed)
+ *     Sectors 36-62: Broken sector replacement (unused)
+ *     Sector 63: Write test sector
+ *   Blocks 1-15 (sectors 64-1023): Data blocks, 64 sectors (8KB) each
+ *
+ * Reference: nocash PSX specs — Memory Card I/O Ports
  * --------------------------------------------------------------------------- */
-/* Real PS1 BIOS allows at most 2 simultaneously open memory card files.
- * open() returns 0 or 1 on success, -1 if both slots are full.
- * Repeated O_CREAT to the SAME file path returns the SAME fd (BIOS slot reuse).
- * O_WRONLY to the same file allocates a second fd (separate write handle). */
-#define MEMCARD_MAX_FD 8
-typedef struct { FILE* fp; char path[256]; } mc_fd_t;
-static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free */
-static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
-static char    s_last_mc_name[21] = {0}; /* last O_CREAT filename (PS1 name part, e.g. BASCUS-94236TOMBA-00) */
 
-/* firstfile/nextfile directory scan state */
-static char s_ff_names[15][24];  /* up to 15 files per card */
-static int  s_ff_count = 0;
-static int  s_ff_index = 0;
+#define MC_SECTOR_SIZE  128
+#define MC_SECTORS      1024
+#define MC_CARD_SIZE    (MC_SECTOR_SIZE * MC_SECTORS)  /* 128KB */
+#define MC_BLOCK_SIZE   (MC_SECTOR_SIZE * 64)          /* 8KB */
+#define MC_NUM_BLOCKS   16  /* block 0 = directory, 1-15 = data */
+
+/* In-memory card images (loaded from disk on init) */
+static uint8_t s_card[2][MC_CARD_SIZE];  /* slot 0 and slot 1 */
+static int     s_card_loaded[2] = {0, 0};
+static char    s_card_path[2][256];
+
+static void mc_card_path(int slot, char *out, int max) {
+    snprintf(out, max, "memcard/slot%d.mcd", slot);
+}
+
+static void mc_ensure_dir(void) {
+    CreateDirectoryA("memcard", NULL);
+}
+
+/* Initialize a blank card with proper header */
+static void mc_format_card(uint8_t *card) {
+    memset(card, 0, MC_CARD_SIZE);
+    /* Sector 0: header */
+    card[0] = 'M'; card[1] = 'C';
+    /* XOR checksum of sector 0 */
+    uint8_t xor = 0;
+    for (int i = 0; i < 127; i++) xor ^= card[i];
+    card[127] = xor;
+    /* Sectors 1-15: directory entries — mark all as free (0xA0 = freshly formatted) */
+    for (int i = 1; i <= 15; i++) {
+        uint8_t *de = &card[i * MC_SECTOR_SIZE];
+        de[0] = 0xA0; de[1] = 0x00; de[2] = 0x00; de[3] = 0x00; /* state = free/formatted */
+        de[8] = 0xFF; de[9] = 0xFF; /* next = none */
+        xor = 0;
+        for (int j = 0; j < 127; j++) xor ^= de[j];
+        de[127] = xor;
+    }
+}
+
+static void mc_load_card(int slot) {
+    if (s_card_loaded[slot]) return;
+    mc_ensure_dir();
+    mc_card_path(slot, s_card_path[slot], sizeof(s_card_path[slot]));
+    FILE *f = fopen(s_card_path[slot], "rb");
+    if (f) {
+        fread(s_card[slot], 1, MC_CARD_SIZE, f);
+        fclose(f);
+    } else {
+        mc_format_card(s_card[slot]);
+    }
+    s_card_loaded[slot] = 1;
+}
+
+static void mc_save_card(int slot) {
+    if (!s_card_loaded[slot]) return;
+    mc_ensure_dir();
+    FILE *f = fopen(s_card_path[slot], "wb");
+    if (f) {
+        fwrite(s_card[slot], 1, MC_CARD_SIZE, f);
+        fclose(f);
+    }
+}
+
+/* Low-level sector read/write — used by B(0x4E)/B(0x4F) and internally by _bu_* */
+static int mc_read_sector(int slot, uint32_t sector, uint8_t *buf) {
+    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
+    mc_load_card(slot);
+    memcpy(buf, &s_card[slot][sector * MC_SECTOR_SIZE], MC_SECTOR_SIZE);
+    return 1;
+}
+
+static int mc_write_sector(int slot, uint32_t sector, const uint8_t *buf) {
+    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
+    mc_load_card(slot);
+    memcpy(&s_card[slot][sector * MC_SECTOR_SIZE], buf, MC_SECTOR_SIZE);
+    mc_save_card(slot);  /* flush to disk after every write */
+    return 1;
+}
+
+/* Directory helpers */
+static uint8_t* mc_dir_entry(int slot, int block) {
+    /* block 1-15 → directory sector 1-15 */
+    if (block < 1 || block > 15) return NULL;
+    mc_load_card(slot);
+    return &s_card[slot][block * MC_SECTOR_SIZE];
+}
+
+static int mc_find_file(int slot, const char *name) {
+    /* Search directory entries (blocks 1-15) for a file with matching name */
+    for (int blk = 1; blk <= 15; blk++) {
+        uint8_t *de = mc_dir_entry(slot, blk);
+        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
+        if (state != 0x51) continue;  /* only first-block entries */
+        if (strncmp((const char *)&de[0x0A], name, 20) == 0)
+            return blk;
+    }
+    return -1; /* not found */
+}
+
+static int mc_find_free_block(int slot) {
+    for (int blk = 1; blk <= 15; blk++) {
+        uint8_t *de = mc_dir_entry(slot, blk);
+        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
+        if (state == 0xA0 || state == 0x00)
+            return blk;
+    }
+    return -1; /* card full */
+}
+
+static void mc_update_dir_checksum(int slot, int block) {
+    uint8_t *de = mc_dir_entry(slot, block);
+    uint8_t xor = 0;
+    for (int i = 0; i < 127; i++) xor ^= de[i];
+    de[127] = xor;
+    mc_save_card(slot);
+}
+
+/* Open file descriptor table */
+#define MC_MAX_FD 4
+typedef struct {
+    int  active;
+    int  slot;       /* card slot 0 or 1 */
+    int  block;      /* starting block (1-15) */
+    uint32_t size;   /* file size */
+    uint32_t pos;    /* current read/write position */
+    int  writable;
+} mc_fd_t;
+static mc_fd_t s_mc_fds[MC_MAX_FD];
+
+/* FDs 0-1 are reserved (stdin/stdout on real PS1), so use 2+ */
+#define MC_FD_BASE 2
+
+static int mc_alloc_fd(void) {
+    for (int i = 0; i < MC_MAX_FD; i++)
+        if (!s_mc_fds[i].active) return i;
+    return -1;
+}
+
+/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename */
+static int mc_parse_path(const char* path, int* slot_out, char* name_out, int name_max) {
+    if (strncmp(path, "bu", 2) != 0) return -1;
+    *slot_out = (path[2] == '1') ? 1 : 0;
+    const char* colon = strchr(path, ':');
+    if (!colon) return -1;
+    const char* name = colon + 1;
+    while (*name == '\\' || *name == '/') name++;
+    strncpy(name_out, name, name_max - 1);
+    name_out[name_max - 1] = '\0';
+    return 0;
+}
+
+/* firstfile/nextfile state */
+static int  s_ff_slot = 0;
+static int  s_ff_block = 0;  /* next block to check (1-15) */
+static char s_ff_pattern[32] = {0};
 
 /* Memcard activity log — queryable via TCP debug server "memcard_log" command */
 #define MC_LOG_CAP 32
@@ -2104,189 +2261,223 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 cpu->v0 = 0;
                 return;
             }
-            /* Memory card file I/O — B(0x32) open, B(0x33) lseek, B(0x34) read,
-             * B(0x35) write, B(0x36) close.  Backed by flat files in memcard/. */
-            case 0x32: {  /* open(path, flags) → fd or -1 */
+            /* Memory card I/O — proper 128KB raw card image implementation.
+             * B(0x32) open, B(0x33) lseek, B(0x34) read, B(0x35) write, B(0x36) close
+             * B(0x42) firstfile, B(0x43) nextfile
+             * B(0x4A) InitCard, B(0x4B) StartCard, B(0x4E) card_write, B(0x4F) card_read */
+            case 0x32: {  /* _bu_open(path, flags, size) → fd or -1 */
                 uint32_t pa = cpu->a0 & 0x1FFFFFFFu;
                 uint32_t flags = cpu->a1;
-                const char* path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
-                /* [OPEN-DUMP] one-shot overlay dump — data collected, no longer needed.
-                 * Result: a2=0x0C00 (save data size), ra=0x800E7BDC, overlay at 0x800E7BD0.
-                 * Re-enable: remove comment-out below.
-                if ((flags & 0x200u) && g_ps1_frame >= 3490u && g_ps1_frame <= 3510u) {
-                    static int s_dump_done = 0;
-                    if (!s_dump_done) {
-                        s_dump_done = 1;
-                        printf("[OPEN-DUMP] f%u a0=0x%08X(\"%s\") a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X\n",
-                               g_ps1_frame, cpu->a0, path, cpu->a1, cpu->a2, cpu->a3, cpu->ra);
-                        uint32_t dump_start = (cpu->ra - 0x30u) & 0x1FFFFFFFu;
-                        uint32_t dump_end   = (cpu->ra + 0x60u) & 0x1FFFFFFFu;
-                        printf("[OPEN-DUMP] overlay code 0x%08X - 0x%08X:\n", dump_start + 0x80000000u, dump_end + 0x80000000u);
-                        for (uint32_t i = dump_start; i < dump_end && i < sizeof(g_ram); i += 4) {
-                            uint32_t w = g_ram[i] | (g_ram[i+1]<<8) | (g_ram[i+2]<<16) | (g_ram[i+3]<<24);
-                            printf("  0x%08X: %08X\n", i + 0x80000000u, w);
-                        }
-                        fflush(stdout);
-                    }
-                } */
+                uint32_t file_size = cpu->a2;
+                const char *path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
                 int slot = 0;  char name[64] = {0};
                 if (mc_parse_path(path, &slot, name, sizeof(name)) < 0) {
                     cpu->v0 = (uint32_t)-1;
                     mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                     return;
                 }
-                mc_ensure_dir();
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "memcard/slot%d_%s.bin", slot, name);
-                /* flags: bit 9 (0x200) = O_CREAT, bit 1 (0x2) = write, bit 0 (0x1) = read
-                 * PS1 O_CREAT = create if not exists, open if exists (no truncation).
-                 * Real PS1 BIOS: repeated O_CREAT to the same path returns same fd (slot reuse). */
+                mc_load_card(slot);
                 int create = (flags & 0x200u) != 0;
-                int write  = (flags & 0x002u) != 0;
-                /* On O_CREAT: if path already open, return existing fd (PS1 BIOS slot reuse) */
+                int writable = (flags & 0x002u) != 0 || create;
+                int existing_block = mc_find_file(slot, name);
+
                 if (create) {
-                    for (int i = 0; i < MEMCARD_MAX_FD; i++) {
-                        if (s_mc_fds[i].fp && strcmp(s_mc_fds[i].path, filepath) == 0) {
-                            rewind(s_mc_fds[i].fp);  /* reset position on reuse */
-                            cpu->v0 = (uint32_t)i;
-                            mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                            return;
-                        }
-                    }
-                }
-                /* Find a free FD slot — PS1 BIOS uses 0 and 1 (no stdin/stdout reservation) */
-                int fd = -1;
-                for (int i = 0; i < MEMCARD_MAX_FD; i++) {
-                    if (!s_mc_fds[i].fp) { fd = i; break; }
-                }
-                if (fd < 0) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                    return;
-                }
-                if (create) {
-                    /* PS1 BIOS behavior: O_CREAT returns -1 if file already exists.
-                     * Game flow: create(-1=exists) → open(write) → write → close.
-                     * First save: create(fd=new) → close (BIOS initializes file). */
-                    FILE *existing = fopen(filepath, "rb");
-                    if (existing) {
-                        /* File already exists — return -1 per PS1 BIOS semantics */
-                        fclose(existing);
+                    if (existing_block >= 0) {
+                        /* File already exists — return -1 per PS1 BIOS O_CREAT semantics */
                         cpu->v0 = (uint32_t)-1;
                         mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                         return;
                     }
-                    /* New file: create and pre-fill */
-                    s_mc_fds[fd].fp = NULL;
-                    if (!s_mc_fds[fd].fp) {
-                        /* New file: create and pre-fill 8 KB with zeros so read-back verify returns data */
-                        static const char zeros[0x2000];
-                        s_mc_fds[fd].fp = fopen(filepath, "w+b");
-                        if (s_mc_fds[fd].fp) {
-                            fwrite(zeros, 1, sizeof(zeros), s_mc_fds[fd].fp);
-                            rewind(s_mc_fds[fd].fp);
-                        }
-                        /* If this is a "-00" block, also create companion "-01" and "-02" files */
-                        int nlen = (int)strlen(name);
-                        if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] == '0' && name[nlen-1] == '0') {
-                            for (int blk = 1; blk <= 2; blk++) {
-                                char comp_path[256];
-                                snprintf(comp_path, sizeof(comp_path), "memcard/slot%d_%s.bin", slot, name);
-                                int clen = (int)strlen(comp_path);
-                                comp_path[clen - 5] = '0' + blk;  /* -00.bin → -01.bin / -02.bin */
-                                FILE *cfp = fopen(comp_path, "r+b");
-                                if (!cfp) {
-                                    cfp = fopen(comp_path, "w+b");
-                                    if (cfp) {
-                                        fwrite(zeros, 1, sizeof(zeros), cfp);
-                                        printf("[MEMCARD create] companion %s\n", comp_path);
-                                        fclose(cfp);
-                                    }
-                                } else {
-                                    fclose(cfp);
-                                }
-                            }
-                        }
+                    /* Allocate blocks for new file */
+                    int blocks_needed = (file_size + MC_BLOCK_SIZE - 1) / MC_BLOCK_SIZE;
+                    if (blocks_needed < 1) blocks_needed = 1;
+                    if (blocks_needed > 15) blocks_needed = 15;
+                    int allocated[15];
+                    int alloc_count = 0;
+                    for (int b = 1; b <= 15 && alloc_count < blocks_needed; b++) {
+                        uint8_t *de = mc_dir_entry(slot, b);
+                        uint32_t st = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
+                        if (st == 0xA0 || st == 0x00)
+                            allocated[alloc_count++] = b;
                     }
-                } else if (write) {
-                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
-                    if (!s_mc_fds[fd].fp) s_mc_fds[fd].fp = fopen(filepath, "w+b");
-                } else {
-                    s_mc_fds[fd].fp = fopen(filepath, "rb");
+                    if (alloc_count < blocks_needed) {
+                        cpu->v0 = (uint32_t)-1;  /* card full */
+                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                        return;
+                    }
+                    /* Write directory entries */
+                    for (int i = 0; i < alloc_count; i++) {
+                        uint8_t *de = mc_dir_entry(slot, allocated[i]);
+                        memset(de, 0, MC_SECTOR_SIZE);
+                        uint32_t state = (i == 0) ? 0x51 : (i < alloc_count - 1) ? 0xA1 : 0xA2;
+                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
+                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
+                        /* Size (only in first block entry) */
+                        if (i == 0) {
+                            de[4] = file_size & 0xFF; de[5] = (file_size>>8)&0xFF;
+                            de[6] = (file_size>>16)&0xFF; de[7] = (file_size>>24)&0xFF;
+                        }
+                        /* Next block pointer */
+                        uint16_t next = (i < alloc_count - 1) ? (uint16_t)(allocated[i+1] - 1) : 0xFFFF;
+                        de[8] = next & 0xFF; de[9] = (next >> 8) & 0xFF;
+                        /* Filename (only in first block) */
+                        if (i == 0) strncpy((char*)&de[0x0A], name, 20);
+                        mc_update_dir_checksum(slot, allocated[i]);
+                    }
+                    existing_block = allocated[0];
                 }
-                if (!s_mc_fds[fd].fp) {
+
+                if (existing_block < 0) {
+                    cpu->v0 = (uint32_t)-1;  /* file not found */
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
+                }
+
+                /* Allocate fd */
+                int fdi = mc_alloc_fd();
+                if (fdi < 0) {
                     cpu->v0 = (uint32_t)-1;
                     mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                     return;
                 }
-                strncpy(s_mc_fds[fd].path, filepath, sizeof(s_mc_fds[fd].path) - 1);
-                /* Track the PS1 name for firstfile/nextfile direntry population */
-                if (create) strncpy(s_last_mc_name, name, sizeof(s_last_mc_name) - 1);
-                cpu->v0 = (uint32_t)fd;
+                s_mc_fds[fdi].active = 1;
+                s_mc_fds[fdi].slot = slot;
+                s_mc_fds[fdi].block = existing_block;
+                uint8_t *de = mc_dir_entry(slot, existing_block);
+                s_mc_fds[fdi].size = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                s_mc_fds[fdi].pos = 0;
+                s_mc_fds[fdi].writable = writable;
+                cpu->v0 = (uint32_t)(fdi + MC_FD_BASE);
                 mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                 return;
             }
             case 0x33: {  /* lseek(fd, offset, whence) → new position */
-                int fd = (int)cpu->a0;
+                int fdi = (int)cpu->a0 - MC_FD_BASE;
                 int32_t offset = (int32_t)cpu->a1;
                 int whence = (int)cpu->a2;
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
                     cpu->v0 = (uint32_t)-1;
                     mc_log_push(0x33, cpu, cpu->v0, 0, 0);
                     return;
                 }
-                int w = (whence == 0) ? SEEK_SET : (whence == 1) ? SEEK_CUR : SEEK_END;
-                fseek(s_mc_fds[fd].fp, offset, w);
-                cpu->v0 = (uint32_t)ftell(s_mc_fds[fd].fp);
+                uint32_t newpos = s_mc_fds[fdi].pos;
+                if (whence == 0) newpos = (uint32_t)offset;
+                else if (whence == 1) newpos = (uint32_t)((int32_t)newpos + offset);
+                else if (whence == 2) newpos = (uint32_t)((int32_t)s_mc_fds[fdi].size + offset);
+                s_mc_fds[fdi].pos = newpos;
+                cpu->v0 = newpos;
                 mc_log_push(0x33, cpu, cpu->v0, 0, 0);
                 return;
             }
             case 0x34: {  /* read(fd, buf, len) → bytes read */
-                int fd = (int)cpu->a0;
+                int fdi = (int)cpu->a0 - MC_FD_BASE;
                 uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
                 uint32_t len = cpu->a2;
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
-                    mc_log_push(0x34, cpu, (uint32_t)-1, cpu->a1, len);
-                    cpu->v0 = (uint32_t)-1; return;
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
+                    return;
                 }
-                if (buf + len > sizeof(g_ram)) {
-                    mc_log_push(0x34, cpu, (uint32_t)-1, cpu->a1, len);
-                    cpu->v0 = (uint32_t)-1; return;
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len); return; }
+                /* Read from card sectors: block N starts at sector N*64 */
+                uint32_t bytes_read = 0;
+                int slot = s_mc_fds[fdi].slot;
+                int blk = s_mc_fds[fdi].block;
+                uint32_t pos = s_mc_fds[fdi].pos;
+                while (bytes_read < len && blk >= 1 && blk <= 15) {
+                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
+                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
+                    uint32_t to_read = len - bytes_read;
+                    if (to_read > blk_remain) to_read = blk_remain;
+                    uint32_t sector_start = blk * 64 + blk_offset / MC_SECTOR_SIZE;
+                    uint32_t sec_offset = blk_offset % MC_SECTOR_SIZE;
+                    for (uint32_t i = 0; i < to_read; ) {
+                        uint8_t sec_buf[MC_SECTOR_SIZE];
+                        uint32_t sec = sector_start + (sec_offset + i) / MC_SECTOR_SIZE;
+                        mc_read_sector(slot, sec, sec_buf);
+                        uint32_t off_in_sec = (sec_offset + i) % MC_SECTOR_SIZE;
+                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
+                        if (chunk > to_read - i) chunk = to_read - i;
+                        memcpy(&g_ram[buf + bytes_read + i], &sec_buf[off_in_sec], chunk);
+                        i += chunk;
+                    }
+                    bytes_read += to_read;
+                    pos += to_read;
+                    if (pos % MC_BLOCK_SIZE == 0) {
+                        /* Move to next linked block */
+                        uint8_t *de = mc_dir_entry(slot, blk);
+                        uint16_t next = de[8] | (de[9] << 8);
+                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
+                    }
                 }
-                size_t n = fread(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n;
+                s_mc_fds[fdi].pos = pos;
+                cpu->v0 = bytes_read;
                 mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
                 return;
             }
             case 0x35: {  /* write(fd, buf, len) → bytes written */
-                int fd = (int)cpu->a0;
+                int fdi = (int)cpu->a0 - MC_FD_BASE;
                 uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
                 uint32_t len = cpu->a2;
-                /* stdout (fd=1) writes — only if fd=1 is NOT an open memcard file */
-                if (fd == 1 && (fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp)) {
+                /* stdout (fd=1) passthrough */
+                if (cpu->a0 == 1) {
                     if (buf < sizeof(g_ram) && len > 0) fwrite(&g_ram[buf], 1, len, stdout);
                     cpu->v0 = len; return;
                 }
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
-                    mc_log_push(0x35, cpu, (uint32_t)-1, cpu->a1, len);
-                    cpu->v0 = (uint32_t)-1; return;
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active || !s_mc_fds[fdi].writable) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
+                    return;
                 }
-                if (buf + len > sizeof(g_ram)) {
-                    mc_log_push(0x35, cpu, (uint32_t)-1, cpu->a1, len);
-                    cpu->v0 = (uint32_t)-1; return;
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len); return; }
+                /* Write to card sectors */
+                uint32_t bytes_written = 0;
+                int slot = s_mc_fds[fdi].slot;
+                int blk = s_mc_fds[fdi].block;
+                uint32_t pos = s_mc_fds[fdi].pos;
+                /* Walk linked blocks to find current position's block */
+                uint32_t skip_blocks = pos / MC_BLOCK_SIZE;
+                for (uint32_t i = 0; i < skip_blocks && blk >= 1 && blk <= 15; i++) {
+                    uint8_t *de = mc_dir_entry(slot, blk);
+                    uint16_t next = de[8] | (de[9] << 8);
+                    blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
                 }
-                size_t n = fwrite(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
-                fflush(s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n;
+                while (bytes_written < len && blk >= 1 && blk <= 15) {
+                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
+                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
+                    uint32_t to_write = len - bytes_written;
+                    if (to_write > blk_remain) to_write = blk_remain;
+                    /* Write sector by sector */
+                    uint32_t base_sector = blk * 64;
+                    for (uint32_t i = 0; i < to_write; ) {
+                        uint32_t off_in_blk = (blk_offset + i);
+                        uint32_t sec = base_sector + off_in_blk / MC_SECTOR_SIZE;
+                        uint32_t off_in_sec = off_in_blk % MC_SECTOR_SIZE;
+                        uint8_t sec_buf[MC_SECTOR_SIZE];
+                        mc_read_sector(slot, sec, sec_buf);
+                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
+                        if (chunk > to_write - i) chunk = to_write - i;
+                        memcpy(&sec_buf[off_in_sec], &g_ram[buf + bytes_written + i], chunk);
+                        mc_write_sector(slot, sec, sec_buf);
+                        i += chunk;
+                    }
+                    bytes_written += to_write;
+                    pos += to_write;
+                    if (pos % MC_BLOCK_SIZE == 0) {
+                        uint8_t *de = mc_dir_entry(slot, blk);
+                        uint16_t next = de[8] | (de[9] << 8);
+                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
+                    }
+                }
+                s_mc_fds[fdi].pos = pos;
+                cpu->v0 = bytes_written;
                 mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
                 return;
             }
             case 0x36: {  /* close(fd) → 0 */
-                int fd = (int)cpu->a0;
-                if (fd >= 0 && fd < MEMCARD_MAX_FD && s_mc_fds[fd].fp) {
-                    fclose(s_mc_fds[fd].fp);
-                    s_mc_fds[fd].fp = NULL;
-                    s_mc_fds[fd].path[0] = '\0';
+                int fdi = (int)cpu->a0 - MC_FD_BASE;
+                if (fdi >= 0 && fdi < MC_MAX_FD && s_mc_fds[fdi].active) {
+                    s_mc_fds[fdi].active = 0;
                 }
                 cpu->v0 = 0;
                 mc_log_push(0x36, cpu, cpu->v0, 0, 0);
@@ -2301,15 +2492,10 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x17: return;  /* ReturnFromException — no-op in recompiler */
             case 0x18: return;  /* SetDefaultExitFromException — no-op */
             case 0x19: return;  /* SetCustomExitFromException — no-op */
-            case 0x42: { /* firstfile(pattern, direntry) → direntry ptr or 0 */
-                /* Scan memcard/ directory for files matching the pattern.
-                 * Pattern format: "bu00:*" or "bu00:BASCUS-94236*"
-                 * DIRENTRY layout: +0x00 name[20], +0x14 attr(u32), +0x18 size(u32), +0x1C next(u32) */
+            case 0x42: {  /* firstfile(pattern, direntry) → direntry ptr or 0 */
                 uint32_t pat_addr = cpu->a0 & 0x1FFFFFFFu;
                 uint32_t de_addr  = cpu->a1 & 0x1FFFFFFFu;
                 const char *pattern = (pat_addr < sizeof(g_ram)) ? (const char*)&g_ram[pat_addr] : "";
-
-                /* Parse slot from pattern (bu00: = slot 0, bu10: = slot 1) */
                 int slot = 0;
                 const char *file_pat = pattern;
                 if (strncmp(pattern, "bu", 2) == 0) {
@@ -2317,164 +2503,115 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     const char *colon = strchr(pattern, ':');
                     if (colon) file_pat = colon + 1;
                 }
-
-                /* Scan memcard/ for matching files */
-                s_ff_count = 0;
-                s_ff_index = 0;
-
-                WIN32_FIND_DATAA fdata;
-                char search[256];
-                snprintf(search, sizeof(search), "memcard/slot%d_*.bin", slot);
-                HANDLE hFind = FindFirstFileA(search, &fdata);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        if (s_ff_count >= 15) break;
-                        /* Extract PS1 name from filename: "slot0_BASCUS-94236TOMBA-00.bin" → "BASCUS-94236TOMBA-00" */
-                        const char *start = fdata.cFileName;
-                        /* Skip "slot0_" prefix */
-                        const char *p = strchr(start, '_');
-                        if (p) p++; else p = start;
-                        /* Remove ".bin" suffix */
-                        int len = (int)strlen(p);
-                        if (len > 4 && strcmp(p + len - 4, ".bin") == 0) len -= 4;
-                        if (len > 20) len = 20;
-                        memset(s_ff_names[s_ff_count], 0, 24);
-                        memcpy(s_ff_names[s_ff_count], p, len);
-
-                        /* Check if matches pattern (simple wildcard: "BASCUS*" or just "*") */
-                        int match = 0;
-                        if (file_pat[0] == '*') {
-                            match = 1;
-                        } else {
-                            /* Match prefix up to '*' */
-                            const char *star = strchr(file_pat, '*');
-                            int prefix_len = star ? (int)(star - file_pat) : (int)strlen(file_pat);
-                            match = (strncmp(s_ff_names[s_ff_count], file_pat, prefix_len) == 0);
+                while (*file_pat == '\\' || *file_pat == '/') file_pat++;
+                mc_load_card(slot);
+                s_ff_slot = slot;
+                s_ff_block = 1;
+                strncpy(s_ff_pattern, file_pat, sizeof(s_ff_pattern) - 1);
+                /* Search directory for first matching file */
+                for (; s_ff_block <= 15; s_ff_block++) {
+                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
+                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
+                    if (state != 0x51) continue;
+                    const char *fname = (const char*)&de[0x0A];
+                    /* Pattern match: "*" matches all, "PREFIX*" matches prefix */
+                    int match = 0;
+                    if (s_ff_pattern[0] == '*') match = 1;
+                    else {
+                        const char *star = strchr(s_ff_pattern, '*');
+                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
+                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
+                    }
+                    if (match) {
+                        /* Fill DIRENTRY in game RAM */
+                        if (de_addr + 0x2C <= sizeof(g_ram)) {
+                            memset(&g_ram[de_addr], 0, 0x2C);
+                            strncpy((char*)&g_ram[de_addr], fname, 20);
+                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
+                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
                         }
-                        if (match) s_ff_count++;
-                    } while (FindNextFileA(hFind, &fdata));
-                    FindClose(hFind);
+                        s_ff_block++;  /* next search starts here */
+                        cpu->v0 = cpu->a1;
+                        mc_log_push(0x42, cpu, cpu->v0, 0, 0);
+                        return;
+                    }
                 }
-
-                if (s_ff_count == 0) {
-                    cpu->v0 = 0;  /* no files found */
-                    mc_log_push(0x42, cpu, 0, 0, 0);
-                    return;
-                }
-
-                /* Fill first DIRENTRY */
-                if (de_addr + 0x20 <= sizeof(g_ram)) {
-                    memset(&g_ram[de_addr], 0, 0x2C);
-                    strncpy((char*)&g_ram[de_addr], s_ff_names[0], 20);
-                    /* attr: 0x51 = first block of used file */
-                    *(uint32_t*)&g_ram[de_addr + 0x14] = 0x51u;
-                    /* size: read actual file size */
-                    char fpath[256];
-                    snprintf(fpath, sizeof(fpath), "memcard/slot%d_%s.bin", slot, s_ff_names[0]);
-                    FILE *sf = fopen(fpath, "rb");
-                    uint32_t fsize = 0;
-                    if (sf) { fseek(sf, 0, SEEK_END); fsize = (uint32_t)ftell(sf); fclose(sf); }
-                    *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
-                }
-                s_ff_index = 1;
-                s_nextfile_remain = s_ff_count - 1;
-                strncpy(s_last_mc_name, s_ff_names[0], sizeof(s_last_mc_name) - 1);
-                cpu->v0 = cpu->a1;  /* return direntry pointer */
-                mc_log_push(0x42, cpu, cpu->v0, 0, s_ff_count);
+                cpu->v0 = 0;  /* no files found */
+                mc_log_push(0x42, cpu, 0, 0, 0);
                 return;
             }
-            case 0x43: { /* nextfile(direntry) → direntry ptr or 0 */
-                /* The s_ff_names/s_ff_index/s_ff_count statics are set by firstfile (case 0x42) above. */
-                if (s_ff_index < s_ff_count && cpu->a0 != 0) {
-                    uint32_t de = cpu->a0 & 0x1FFFFFFFu;
-                    if (de + 0x20 <= sizeof(g_ram)) {
-                        memset(&g_ram[de], 0, 0x2C);
-                        strncpy((char*)&g_ram[de], s_ff_names[s_ff_index], 20);
-                        /* Determine attr: check if name ends in -01/-02 (continuation blocks) */
-                        const char *nm = s_ff_names[s_ff_index];
-                        int nlen = (int)strlen(nm);
-                        uint32_t attr = 0x51u; /* default: first block */
-                        if (nlen >= 3 && nm[nlen-3] == '-') {
-                            int blk = (nm[nlen-2] - '0') * 10 + (nm[nlen-1] - '0');
-                            if (blk == 1) attr = 0xA1u;      /* middle block */
-                            else if (blk >= 2) attr = 0xA2u;  /* last block */
-                        }
-                        *(uint32_t*)&g_ram[de + 0x14] = attr;
-                        /* size */
-                        char fpath[256];
-                        snprintf(fpath, sizeof(fpath), "memcard/slot0_%s.bin", s_ff_names[s_ff_index]);
-                        FILE *sf = fopen(fpath, "rb");
-                        uint32_t fsize = 0;
-                        if (sf) { fseek(sf, 0, SEEK_END); fsize = (uint32_t)ftell(sf); fclose(sf); }
-                        *(uint32_t*)&g_ram[de + 0x18] = fsize;
+            case 0x43: {  /* nextfile(direntry) → direntry ptr or 0 */
+                uint32_t de_addr = cpu->a0 & 0x1FFFFFFFu;
+                int slot = s_ff_slot;
+                for (; s_ff_block <= 15; s_ff_block++) {
+                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
+                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
+                    if (state != 0x51 && state != 0xA1 && state != 0xA2) continue;
+                    const char *fname = (const char*)&de[0x0A];
+                    int match = 0;
+                    if (s_ff_pattern[0] == '*') match = 1;
+                    else {
+                        const char *star = strchr(s_ff_pattern, '*');
+                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
+                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
                     }
-                    s_ff_index++;
-                    cpu->v0 = cpu->a0;
-                } else {
-                    cpu->v0 = 0;  /* no more files */
+                    if (match) {
+                        if (de_addr + 0x2C <= sizeof(g_ram)) {
+                            memset(&g_ram[de_addr], 0, 0x2C);
+                            /* For continuation blocks, name is in the first block's dir entry */
+                            if (state == 0x51) strncpy((char*)&g_ram[de_addr], fname, 20);
+                            else {
+                                /* Copy name from the DIRENTRY the game already has (it tracks it) */
+                                /* Just write the state/size, name stays from firstfile */
+                            }
+                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
+                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
+                        }
+                        s_ff_block++;
+                        cpu->v0 = cpu->a0;
+                        return;
+                    }
                 }
+                cpu->v0 = 0;
                 return;
             }
             case 0x47: return;  /* AddCDRomDevice — no-op */
-            case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=success */
-                uint32_t channel = cpu->a0;  /* 0x00=slot1, 0x10=slot2 */
-                uint32_t sector  = cpu->a1;
-                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
-                int slot = (channel >= 0x10) ? 1 : 0;
-                printf("[MEMCARD card_write] slot=%d sector=%u buf=0x%08X ra=0x%08X\n",
-                       slot, sector, cpu->a2, cpu->ra);
-                if (sector >= 1024 || buf + 128 > sizeof(g_ram)) {
-                    cpu->v0 = 0; return;
-                }
-                mc_ensure_dir();
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "memcard/slot%d_raw.mcd", slot);
-                FILE *fp = fopen(filepath, "r+b");
-                if (!fp) {
-                    /* Create empty 128KB card image */
-                    fp = fopen(filepath, "w+b");
-                    if (fp) {
-                        uint8_t zeros[128] = {0};
-                        for (int i = 0; i < 1024; i++) fwrite(zeros, 1, 128, fp);
-                        rewind(fp);
-                    }
-                }
-                if (!fp) { cpu->v0 = 0; return; }
-                fseek(fp, sector * 128, SEEK_SET);
-                fwrite(&g_ram[buf], 1, 128, fp);
-                fflush(fp);
-                fclose(fp);
-                cpu->v0 = 1;
-                return;
-            }
-            case 0x4F: {  /* _card_read(channel, sector, buffer) → 1=success */
+            case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=ok, 0=fail */
                 uint32_t channel = cpu->a0;
                 uint32_t sector  = cpu->a1;
                 uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
                 int slot = (channel >= 0x10) ? 1 : 0;
-                printf("[MEMCARD card_read] slot=%d sector=%u buf=0x%08X ra=0x%08X\n",
-                       slot, sector, cpu->a2, cpu->ra);
-                if (sector >= 1024 || buf + 128 > sizeof(g_ram)) {
+                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
                     cpu->v0 = 0; return;
                 }
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "memcard/slot%d_raw.mcd", slot);
-                FILE *fp = fopen(filepath, "rb");
-                if (!fp) {
-                    /* No card image yet — return zeros */
-                    memset(&g_ram[buf], 0, 128);
-                    cpu->v0 = 1; return;
+                mc_write_sector(slot, sector, &g_ram[buf]);
+                cpu->v0 = 1;
+                mc_log_push(0x4E, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
+                return;
+            }
+            case 0x4F: {  /* _card_read(channel, sector, buffer) → 1=ok, 0=fail */
+                uint32_t channel = cpu->a0;
+                uint32_t sector  = cpu->a1;
+                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
+                int slot = (channel >= 0x10) ? 1 : 0;
+                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
+                    cpu->v0 = 0; return;
                 }
-                fseek(fp, sector * 128, SEEK_SET);
-                size_t n = fread(&g_ram[buf], 1, 128, fp);
-                if (n < 128) memset(&g_ram[buf + n], 0, 128 - n);
-                fclose(fp);
+                mc_read_sector(slot, sector, &g_ram[buf]);
+                cpu->v0 = 1;
+                mc_log_push(0x4F, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
+                return;
+            }
+            case 0x4A: { /* InitCard */
+                mc_load_card(0);
+                mc_load_card(1);
                 cpu->v0 = 1;
                 return;
             }
-            case 0x4A: cpu->v0 = 1; return;  /* InitCard — stub success */
-            case 0x4B: cpu->v0 = 1; return;  /* StartCard — stub success */
-            case 0x4C: cpu->v0 = 1; return;  /* StopCard — stub success */
+            case 0x4B: cpu->v0 = 1; return;  /* StartCard — success */
+            case 0x4C: cpu->v0 = 1; return;  /* StopCard — success */
             case 0x56: /* GetC0Table — return pointer to dummy table in RAM */
                 cpu->v0 = 0x80000100u; /* point to zero-filled area near bottom of RAM */
                 return;
