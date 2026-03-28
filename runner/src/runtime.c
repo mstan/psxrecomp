@@ -2160,8 +2160,19 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     return;
                 }
                 if (create) {
-                    /* Try to open existing file first (r+b), fall back to create (w+b) */
-                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
+                    /* PS1 BIOS behavior: O_CREAT returns -1 if file already exists.
+                     * Game flow: create(-1=exists) → open(write) → write → close.
+                     * First save: create(fd=new) → close (BIOS initializes file). */
+                    FILE *existing = fopen(filepath, "rb");
+                    if (existing) {
+                        /* File already exists — return -1 per PS1 BIOS semantics */
+                        fclose(existing);
+                        cpu->v0 = (uint32_t)-1;
+                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                        return;
+                    }
+                    /* New file: create and pre-fill */
+                    s_mc_fds[fd].fp = NULL;
                     if (!s_mc_fds[fd].fp) {
                         /* New file: create and pre-fill 8 KB with zeros so read-back verify returns data */
                         static const char zeros[0x2000];
