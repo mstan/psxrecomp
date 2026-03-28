@@ -82,7 +82,7 @@ static uint32_t g_int_chains[4] = {0};
  * open() returns 0 or 1 on success, -1 if both slots are full.
  * Repeated O_CREAT to the SAME file path returns the SAME fd (BIOS slot reuse).
  * O_WRONLY to the same file allocates a second fd (separate write handle). */
-#define MEMCARD_MAX_FD 2
+#define MEMCARD_MAX_FD 8
 typedef struct { FILE* fp; char path[256]; } mc_fd_t;
 static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free */
 static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
@@ -2126,8 +2126,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 } */
                 int slot = 0;  char name[64] = {0};
                 if (mc_parse_path(path, &slot, name, sizeof(name)) < 0) {
-                    printf("[MEMCARD open] bad path a0=0x%08X flags=0x%05X\n", cpu->a0, flags);
-                    cpu->v0 = (uint32_t)-1; return;
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
                 }
                 mc_ensure_dir();
                 char filepath[256];
@@ -2141,8 +2142,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 if (create) {
                     for (int i = 0; i < MEMCARD_MAX_FD; i++) {
                         if (s_mc_fds[i].fp && strcmp(s_mc_fds[i].path, filepath) == 0) {
+                            rewind(s_mc_fds[i].fp);  /* reset position on reuse */
                             cpu->v0 = (uint32_t)i;
-                            printf("[MEMCARD open] fd=%d reuse %s flags=0x%05X ra=0x%08X\n", i, filepath, flags, cpu->ra);
+                            mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                             return;
                         }
                     }
@@ -2152,7 +2154,11 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 for (int i = 0; i < MEMCARD_MAX_FD; i++) {
                     if (!s_mc_fds[i].fp) { fd = i; break; }
                 }
-                if (fd < 0) { cpu->v0 = (uint32_t)-1; return; }
+                if (fd < 0) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
+                }
                 if (create) {
                     /* Try to open existing file first (r+b), fall back to create (w+b) */
                     s_mc_fds[fd].fp = fopen(filepath, "r+b");
@@ -2193,8 +2199,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     s_mc_fds[fd].fp = fopen(filepath, "rb");
                 }
                 if (!s_mc_fds[fd].fp) {
-                    printf("[MEMCARD open] FAIL %s flags=0x%05X\n", filepath, flags);
-                    cpu->v0 = (uint32_t)-1; return;
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
                 }
                 strncpy(s_mc_fds[fd].path, filepath, sizeof(s_mc_fds[fd].path) - 1);
                 /* Track the PS1 name for firstfile/nextfile direntry population */
@@ -2207,11 +2214,16 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 int fd = (int)cpu->a0;
                 int32_t offset = (int32_t)cpu->a1;
                 int whence = (int)cpu->a2;
-                printf("[MEMCARD lseek] fd=%d offset=%d whence=%d ra=0x%08X\n", fd, offset, whence, cpu->ra);
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x33, cpu, cpu->v0, 0, 0);
+                    return;
+                }
                 int w = (whence == 0) ? SEEK_SET : (whence == 1) ? SEEK_CUR : SEEK_END;
                 fseek(s_mc_fds[fd].fp, offset, w);
-                cpu->v0 = (uint32_t)ftell(s_mc_fds[fd].fp); return;
+                cpu->v0 = (uint32_t)ftell(s_mc_fds[fd].fp);
+                mc_log_push(0x33, cpu, cpu->v0, 0, 0);
+                return;
             }
             case 0x34: {  /* read(fd, buf, len) → bytes read */
                 int fd = (int)cpu->a0;
@@ -2255,13 +2267,14 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             }
             case 0x36: {  /* close(fd) → 0 */
                 int fd = (int)cpu->a0;
-                printf("[MEMCARD close] fd=%d ra=0x%08X\n", fd, cpu->ra);
                 if (fd >= 0 && fd < MEMCARD_MAX_FD && s_mc_fds[fd].fp) {
                     fclose(s_mc_fds[fd].fp);
                     s_mc_fds[fd].fp = NULL;
                     s_mc_fds[fd].path[0] = '\0';
                 }
-                cpu->v0 = 0; return;
+                cpu->v0 = 0;
+                mc_log_push(0x36, cpu, cpu->v0, 0, 0);
+                return;
             }
             case 0x3D: putchar(cpu->a0 & 0xFF); fflush(stdout); return;  /* putchar */
             case 0x3F: {  /* puts */
