@@ -9,6 +9,9 @@
  */
 
 #include "cpu_state.h"
+#include "dma.h"
+#include "gpu.h"
+#include "sio.h"
 #include "timers.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -30,12 +33,20 @@ static uint32_t ram_size_reg;   /* 0x1F801060 */
 /* Cache control register (KSEG2: 0xFFFE0130). */
 static uint32_t cache_ctrl;
 
+/* Pointer to cpu->cop0[12] (SR).  Set once at init.
+ * Used by write functions to check the IsC (Isolate Cache) bit.
+ * When IsC is set, RAM/scratchpad writes are silently dropped — the
+ * real R3000A sends them to the data cache only. */
+static const uint32_t *sr_ptr;
+
 /* Interrupt controller — non-static so hardware subsystems can set I_STAT bits. */
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
 /* SPU registers: 0x1F801C00..0x1F801FFF — store only, no semantic behavior. */
 static uint16_t spu_regs[512];  /* 0x200 halfwords covers 0x400 bytes */
+
+void memory_set_sr_ptr(const uint32_t *p) { sr_ptr = p; }
 
 void memory_init(const char* bios_path) {
     memset(ram, 0, sizeof(ram));
@@ -92,8 +103,7 @@ static uint32_t mmio_read32(uint32_t addr) {
     }
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
-        if (addr == 0x1F801044u) return 0x00000005u; /* SIO_STAT: TX ready + TX empty */
-        return 0;
+        return sio_read(addr);
     }
     /* RAM size: 0x1F801060 */
     if (addr == 0x1F801060u) {
@@ -102,10 +112,9 @@ static uint32_t mmio_read32(uint32_t addr) {
     /* Interrupts: 0x1F801070, 0x1F801074 */
     if (addr == 0x1F801070u) return i_stat;
     if (addr == 0x1F801074u) return i_mask;
-    /* DMA: 0x1F801080..0x1F8010FF — UNIMPLEMENTED */
+    /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
-        mmio_unimplemented(addr, "READ32 (DMA)");
-        return 0;
+        return dma_read(addr);
     }
     /* Timers: 0x1F801100..0x1F80112F */
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
@@ -115,9 +124,9 @@ static uint32_t mmio_read32(uint32_t addr) {
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         return 0;
     }
-    /* GPU: 0x1F801810, 0x1F801814 — UNIMPLEMENTED */
-    if (addr == 0x1F801810u) { mmio_unimplemented(addr, "READ32 (GPUREAD)"); return 0; }
-    if (addr == 0x1F801814u) { mmio_unimplemented(addr, "READ32 (GPUSTAT)"); return 0; }
+    /* GPU: 0x1F801810 (GPUREAD), 0x1F801814 (GPUSTAT) */
+    if (addr == 0x1F801810u) return gpu_read_gpuread();
+    if (addr == 0x1F801814u) return gpu_read_gpustat();
     /* MDEC: 0x1F801820, 0x1F801824 */
     if (addr == 0x1F801820u || addr == 0x1F801824u) return 0;
     /* SPU: 0x1F801C00..0x1F801FFF */
@@ -141,7 +150,8 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     }
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
-        return; /* acknowledge */
+        sio_write(addr, val);
+        return;
     }
     /* RAM size: 0x1F801060 */
     if (addr == 0x1F801060u) {
@@ -151,9 +161,9 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     /* Interrupts: 0x1F801070, 0x1F801074 */
     if (addr == 0x1F801070u) { i_stat &= val; return; } /* AND-acknowledge */
     if (addr == 0x1F801074u) { i_mask = val & 0x7FFu; return; }
-    /* DMA: 0x1F801080..0x1F8010FF — UNIMPLEMENTED */
+    /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
-        mmio_unimplemented(addr, "WRITE32 (DMA)");
+        dma_write(addr, val);
         return;
     }
     /* Timers: 0x1F801100..0x1F80112F */
@@ -165,9 +175,9 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         return;
     }
-    /* GPU GP0: 0x1F801810, GP1: 0x1F801814 — UNIMPLEMENTED */
-    if (addr == 0x1F801810u) { mmio_unimplemented(addr, "WRITE32 (GP0)"); return; }
-    if (addr == 0x1F801814u) { mmio_unimplemented(addr, "WRITE32 (GP1)"); return; }
+    /* GPU GP0: 0x1F801810, GP1: 0x1F801814 */
+    if (addr == 0x1F801810u) { gpu_write_gp0(val); return; }
+    if (addr == 0x1F801814u) { gpu_write_gp1(val); return; }
     /* MDEC: 0x1F801820, 0x1F801824 */
     if (addr == 0x1F801820u || addr == 0x1F801824u) return;
     /* SPU: 0x1F801C00..0x1F801FFF */
@@ -187,8 +197,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
 static uint16_t mmio_read16(uint32_t addr) {
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
-        if (addr == 0x1F801044u) return 0x0005u; /* SIO_STAT low half */
-        return 0;
+        return (uint16_t)sio_read(addr);
     }
     /* Interrupts */
     if (addr == 0x1F801070u) return (uint16_t)i_stat;
@@ -208,6 +217,7 @@ static uint16_t mmio_read16(uint32_t addr) {
 static void mmio_write16(uint32_t addr, uint16_t val) {
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+        sio_write(addr, val);
         return;
     }
     /* Interrupts */
@@ -294,6 +304,10 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
 
+    /* IsC (Isolate Cache): when set, writes go to D-cache only.
+     * We have no cache model, so silently discard RAM/scratchpad writes. */
+    if (sr_ptr && (*sr_ptr & 0x10000u)) return;
+
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -347,6 +361,8 @@ uint16_t psx_read_half(uint32_t addr) {
 }
 
 void psx_write_half(uint32_t addr, uint16_t val) {
+    if (sr_ptr && (*sr_ptr & 0x10000u)) return;
+
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -392,6 +408,8 @@ uint8_t psx_read_byte(uint32_t addr) {
 }
 
 void psx_write_byte(uint32_t addr, uint8_t val) {
+    if (sr_ptr && (*sr_ptr & 0x10000u)) return;
+
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {

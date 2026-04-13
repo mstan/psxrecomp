@@ -1,1 +1,172 @@
-[]
+[
+  {
+    "address": "0xBFC0233C",
+    "raw_word": "0x44801000",
+    "reason": "addr=0xBFC0233C raw=0x44801000 opcode=0x11: top-level opcode 0x11 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33CCC",
+    "raw_word": "0x012A4822",
+    "reason": "addr=0xBFC33CCC raw=0x012A4822 opcode=0x00: SPECIAL funct 0x22 not implemented in Phase 1a strict translator"
+  },
+  {
+    "address": "0xBFC33FBC",
+    "raw_word": "0x48C4C000",
+    "reason": "addr=0xBFC33FBC raw=0x48C4C000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FCC",
+    "raw_word": "0x48C4D000",
+    "reason": "addr=0xBFC33FCC raw=0x48C4D000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33F0C",
+    "raw_word": "0x48C46800",
+    "reason": "addr=0xBFC33F0C raw=0x48C46800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33F2C",
+    "raw_word": "0x48C4A800",
+    "reason": "addr=0xBFC33F2C raw=0x48C4A800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC3370C",
+    "raw_word": "0x48C8E800",
+    "reason": "addr=0xBFC3370C raw=0x48C8E800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B4C",
+    "raw_word": "0x48C88000",
+    "reason": "addr=0xBFC35B4C raw=0x48C88000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B1C",
+    "raw_word": "0x48C84000",
+    "reason": "addr=0xBFC35B1C raw=0x48C84000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35AEC",
+    "raw_word": "0x48C80000",
+    "reason": "addr=0xBFC35AEC raw=0x48C80000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B74",
+    "raw_word": "0x48C82800",
+    "reason": "addr=0xBFC35B74 raw=0x48C82800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC36740",
+    "raw_word": "0xC8800000",
+    "reason": "addr=0xBFC36740 raw=0xC8800000 opcode=0x32: top-level opcode 0x32 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC36068",
+    "raw_word": "0xC8800000",
+    "reason": "addr=0xBFC36068 raw=0xC8800000 opcode=0x32: top-level opcode 0x32 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC362D0",
+    "raw_word": "0x484D0000",
+    "reason": "addr=0xBFC362D0 raw=0x484D0000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FD8",
+    "raw_word": "0x48C4D800",
+    "reason": "addr=0xBFC33FD8 raw=0x48C4D800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FE4",
+    "raw_word": "0x48C4E000",
+    "reason": "addr=0xBFC33FE4 raw=0x48C4E000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33C98",
+    "raw_word": "0x4884F000",
+    "reason": "addr=0xBFC33C98 raw=0x4884F000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC0233C",
+    "raw_word": "0x44801000",
+    "reason": "addr=0xBFC0233C raw=0x44801000 opcode=0x11: top-level opcode 0x11 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC3370C",
+    "raw_word": "0x48C8E800",
+    "reason": "addr=0xBFC3370C raw=0x48C8E800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33C98",
+    "raw_word": "0x4884F000",
+    "reason": "addr=0xBFC33C98 raw=0x4884F000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33CCC",
+    "raw_word": "0x012A4822",
+    "reason": "addr=0xBFC33CCC raw=0x012A4822 opcode=0x00: SPECIAL funct 0x22 not implemented in Phase 1a strict translator"
+  },
+  {
+    "address": "0xBFC33F0C",
+    "raw_word": "0x48C46800",
+    "reason": "addr=0xBFC33F0C raw=0x48C46800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33F2C",
+    "raw_word": "0x48C4A800",
+    "reason": "addr=0xBFC33F2C raw=0x48C4A800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FBC",
+    "raw_word": "0x48C4C000",
+    "reason": "addr=0xBFC33FBC raw=0x48C4C000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FCC",
+    "raw_word": "0x48C4D000",
+    "reason": "addr=0xBFC33FCC raw=0x48C4D000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FD8",
+    "raw_word": "0x48C4D800",
+    "reason": "addr=0xBFC33FD8 raw=0x48C4D800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC33FE4",
+    "raw_word": "0x48C4E000",
+    "reason": "addr=0xBFC33FE4 raw=0x48C4E000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35AEC",
+    "raw_word": "0x48C80000",
+    "reason": "addr=0xBFC35AEC raw=0x48C80000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B1C",
+    "raw_word": "0x48C84000",
+    "reason": "addr=0xBFC35B1C raw=0x48C84000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B4C",
+    "raw_word": "0x48C88000",
+    "reason": "addr=0xBFC35B4C raw=0x48C88000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC35B74",
+    "raw_word": "0x48C82800",
+    "reason": "addr=0xBFC35B74 raw=0x48C82800 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC36068",
+    "raw_word": "0xC8800000",
+    "reason": "addr=0xBFC36068 raw=0xC8800000 opcode=0x32: top-level opcode 0x32 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC362D0",
+    "raw_word": "0x484D0000",
+    "reason": "addr=0xBFC362D0 raw=0x484D0000 opcode=0x12: top-level opcode 0x12 not implemented in Phase 1a"
+  },
+  {
+    "address": "0xBFC36740",
+    "raw_word": "0xC8800000",
+    "reason": "addr=0xBFC36740 raw=0xC8800000 opcode=0x32: top-level opcode 0x32 not implemented in Phase 1a"
+  }
+]

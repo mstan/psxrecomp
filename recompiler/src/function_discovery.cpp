@@ -44,6 +44,49 @@ static uint32_t normalize_address(uint32_t addr) {
     return phys;
 }
 
+// Relocated code (Shell, Kernel Part 2) runs at RAM addresses, not ROM
+// addresses. J/JAL targets use (PC & 0xF0000000) as the region base, so
+// when the instruction is analyzed at its ROM address the target lands in
+// 0xB0xxxxxx (KSEG1 expansion region) instead of the correct 0x80xxxxxx.
+// This mirrors full_function_emitter.cpp relocate_j_target, but converts
+// the resulting RAM address back to a ROM address so that function
+// discovery can follow it.
+static uint32_t remap_relocated_j_target(uint32_t target, uint32_t source_rom_addr) {
+    uint32_t src_phys = source_rom_addr & 0x1FFFFFFFu;
+
+    // Kernel Part 2: ROM 0x1FC10000..0x1FC17FFF → runs at RAM 0x500+
+    if (src_phys >= 0x1FC10000u && src_phys <= 0x1FC17FFFu) {
+        uint32_t runtime_addr = src_phys - 0x1FC10000u + 0x00000500u;
+        uint32_t ram_target = (runtime_addr & 0xF0000000u) | (target & 0x0FFFFFFFu);
+        uint32_t ram_phys = ram_target & 0x1FFFFFFFu;
+        // KP2 RAM → KP2 ROM
+        if (ram_phys >= 0x00000500u && ram_phys < 0x00008500u)
+            return 0xBFC10000u + (ram_phys - 0x00000500u);
+        // KP1 ROM (target already correct for 0x00 region)
+        if (ram_phys >= 0x1FC00000u && ram_phys < 0x1FC80000u)
+            return ram_target;
+        return target;
+    }
+
+    // Shell: ROM 0x1FC18000..0x1FC427FF → runs at RAM 0x80030000+
+    if (src_phys >= 0x1FC18000u && src_phys <= 0x1FC427FFu) {
+        uint32_t ram_target = 0x80000000u | (target & 0x0FFFFFFFu);
+        uint32_t ram_phys = ram_target & 0x1FFFFFFFu;
+        // Shell RAM → Shell ROM
+        if (ram_phys >= 0x00030000u && ram_phys < 0x0005A800u)
+            return 0xBFC18000u + (ram_phys - 0x00030000u);
+        // KP2 RAM → KP2 ROM
+        if (ram_phys >= 0x00000500u && ram_phys < 0x00008500u)
+            return 0xBFC10000u + (ram_phys - 0x00000500u);
+        // KP1 ROM range (Shell calling Kernel Part 1 — target already correct)
+        if (ram_phys >= 0x1FC00000u && ram_phys < 0x1FC10000u)
+            return 0xBFC00000u + (ram_phys - 0x1FC00000u);
+        return target;
+    }
+
+    return target;
+}
+
 FunctionDiscovery::CFInfo FunctionDiscovery::classify_control_flow(uint32_t raw, uint32_t addr) {
     CFInfo info{};
     info.kind = CFKind::Normal;
@@ -75,6 +118,7 @@ FunctionDiscovery::CFInfo FunctionDiscovery::classify_control_flow(uint32_t raw,
         uint32_t target26 = raw & 0x03FFFFFF;
         info.kind = CFKind::Jump;
         info.target = ((addr + 4) & 0xF0000000u) | (target26 << 2);
+        info.target = remap_relocated_j_target(info.target, addr);
         return info;
     }
 
@@ -83,6 +127,7 @@ FunctionDiscovery::CFInfo FunctionDiscovery::classify_control_flow(uint32_t raw,
         uint32_t target26 = raw & 0x03FFFFFF;
         info.kind = CFKind::Call;
         info.target = ((addr + 4) & 0xF0000000u) | (target26 << 2);
+        info.target = remap_relocated_j_target(info.target, addr);
         return info;
     }
 

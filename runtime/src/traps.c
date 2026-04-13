@@ -7,67 +7,111 @@
 #include "cpu_state.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* Forward declarations from interrupts.c */
+int psx_get_in_exception(void);
+void psx_exception_longjmp(void);
+
+static void trap_crash(const char* msg) {
+    FILE* cf = fopen("psx_crash.txt", "w");
+    if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }
+}
 
 void psx_syscall(CPUState* cpu, uint32_t code) {
     /*
      * PS1 BIOS SYSCALL convention:
      *   $a0 = 1: EnterCriticalSection — disable interrupts, return old SR
      *   $a0 = 2: ExitCriticalSection  — enable interrupts, return old SR
-     *   $a0 = 3: ReturnFromException  — RFE + return to EPC
+     *   $a0 = 3: ReturnFromException  — restore full TCB state + RFE
      *
-     * These are the only three SYSCALLs the PS1 BIOS defines. We handle
-     * them directly because the BIOS calls EnterCriticalSection during
-     * early init before its exception chain infrastructure is ready.
-     * Once chains are set up, the recompiled BIOS exception handler
-     * could handle these too, but direct handling is correct for all phases.
+     * Syscalls 1 and 2 are always handled directly — they only touch IEc
+     * in SR and don't need the full exception mechanism.
+     *
+     * Syscall 3 and unknown numbers route through the real BIOS exception
+     * handler once it's installed, because ReturnFromException must restore
+     * the full register state from the current thread's TCB (including the
+     * saved SR which carries IM[2]).
      */
     uint32_t func = cpu->gpr[4]; /* $a0 = syscall function number */
     uint32_t sr = cpu->cop0[12];
 
     switch (func) {
         case 1: /* EnterCriticalSection: disable interrupts */
-            cpu->cop0[12] = sr & ~0x0404u; /* clear IEc and IEp */
-            cpu->gpr[2] = (sr & 0x0404u) ? 1 : 0; /* return whether interrupts were enabled */
-            cpu->pc = 0; /* don't tail-call — return to caller */
+            cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
+            cpu->gpr[2] = sr & 1u; /* return old IEc */
+            cpu->pc = 0;
             return;
 
         case 2: /* ExitCriticalSection: enable interrupts */
-            cpu->cop0[12] = sr | 0x0404u; /* set IEc and IEp */
+            cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
-            cpu->pc = 0; /* don't tail-call — return to caller */
+            cpu->pc = 0;
             return;
 
-        case 3: /* ReturnFromException: RFE + return to EPC */
-            /* Pop SR exception stack */
+        case 3: { /* ReturnFromException: restore from TCB + RFE */
+            uint32_t tcb_ptr_addr = cpu->read_word(0x00000108u);
+            if (tcb_ptr_addr != 0) {
+                uint32_t save_area = cpu->read_word(tcb_ptr_addr);
+                if (save_area != 0) {
+                    save_area += 8; /* handler adds 8 before saving */
+                    uint32_t saved_epc = cpu->read_word(save_area + 128);
+                    uint32_t saved_sr  = cpu->read_word(save_area + 140);
+                    /* Restore ALL GPRs from TCB save area.
+                     * Layout: offset 0 = $zero (skip), 4 = $at, ... 124 = $ra,
+                     *         128 = EPC, 132 = HI, 136 = LO, 140 = SR. */
+                    for (int i = 1; i < 32; i++) {
+                        cpu->gpr[i] = cpu->read_word(save_area + i * 4);
+                    }
+                    cpu->hi = cpu->read_word(save_area + 132);
+                    cpu->lo = cpu->read_word(save_area + 136);
+                    /* RFE pop on saved SR (clears bits [5:0], shifts [5:2]→[3:0]). */
+                    cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
+                    cpu->pc = saved_epc;
+                    if (psx_get_in_exception()) {
+                        psx_exception_longjmp(); /* unwind handler */
+                    }
+                    return;
+                }
+            }
+            /* Fallback: simple RFE on current SR. */
             cpu->cop0[12] = (sr & ~0x0Fu) | ((sr >> 2) & 0x0Fu);
-            /* Dispatch to EPC */
             cpu->pc = cpu->cop0[14];
             return;
+        }
 
         default:
             break;
     }
 
-    /* For unknown syscall numbers, fall through to full exception dispatch.
-     * This path is taken once the BIOS has set up its exception chains. */
+    /* Unknown syscalls: route through the real BIOS exception handler. */
+    uint32_t handler_word = cpu->read_word(0x80000080u);
+    if (handler_word != 0) {
+        /* Route through the real BIOS exception handler. */
+        cpu->cop0[14] = cpu->pc;  /* EPC */
+        cpu->cop0[13] = (cpu->cop0[13] & ~0x7Cu) | (0x08u << 2); /* Cause: Syscall */
+        cpu->cop0[12] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2); /* SR push */
+        uint32_t vector = (sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;
+        psx_dispatch(cpu, vector);
+        return;
+    }
 
-    /* EPC = PC of the syscall instruction (set by generated code before call) */
-    cpu->cop0[14] = cpu->pc;  /* EPC */
+    /* Early boot fallback for syscall 3. */
+    if (func == 3) {
+        cpu->cop0[12] = (sr & ~0x0Fu) | ((sr >> 2) & 0x0Fu);
+        cpu->pc = cpu->cop0[14];
+        return;
+    }
 
-    /* Cause: preserve existing bits, set ExcCode = 0x08 (syscall) */
-    cpu->cop0[13] = (cpu->cop0[13] & ~0x7Cu) | (0x08u << 2);
-
-    /* SR interrupt stack push: bits [5:0] shift left by 2 */
-    cpu->cop0[12] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2);
-
-    /* Jump to exception vector. */
-    uint32_t vector = (sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;
-    psx_dispatch(cpu, vector);
-}
-
-static void trap_crash(const char* msg) {
-    FILE* cf = fopen("psx_crash.txt", "w");
-    if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }
+    /* Unknown syscall number and no handler — fatal. */
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SYSCALL %u with no handler @ PC=0x%08X",
+                 func, cpu->pc);
+        trap_crash(buf);
+        fprintf(stderr, "%s\n", buf); fflush(stderr);
+        exit(1);
+    }
 }
 
 void psx_break(CPUState* cpu, uint32_t code, uint32_t pc) {
@@ -87,14 +131,66 @@ void psx_arith_overflow(CPUState* cpu) {
 }
 
 void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "UNALIGNED @ addr=0x%08X, PC=0x%08X", addr, pc);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "UNALIGNED @ addr=0x%08X, PC=0x%08X\n"
+        "  $s3=0x%08X $s6=0x%08X $s4=0x%08X\n"
+        "  $k0=0x%08X $sp=0x%08X $ra=0x%08X\n"
+        "  RAM[0x100]=0x%08X RAM[0x108]=0x%08X\n"
+        "  SR=0x%08X Cause=0x%08X EPC=0x%08X\n"
+        "  in_exception=%d",
+        addr, pc,
+        cpu->gpr[19], cpu->gpr[22], cpu->gpr[20],
+        cpu->gpr[26], cpu->gpr[29], cpu->gpr[31],
+        cpu->read_word(0x100), cpu->read_word(0x108),
+        cpu->cop0[12], cpu->cop0[13], cpu->cop0[14],
+        psx_get_in_exception());
     trap_crash(buf);
     fprintf(stderr, "%s\n", buf); fflush(stderr);
     exit(1);
 }
 
 void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
+    /* Detect ReturnFromException: when the recompiled B0:0x17 function
+     * (or handler epilogue) has already restored all registers from the
+     * TCB and done RFE, it sets cpu->pc = saved_epc = our sentinel
+     * 0x80000048.  The dispatch loop tail-calls here.  If we're inside
+     * the exception handler, longjmp back to psx_check_interrupts to
+     * properly unwind the handler call tree. */
+    if (addr == 0x80000048u && psx_get_in_exception()) {
+        cpu->pc = 0;
+        psx_exception_longjmp(); /* does not return */
+    }
+
+    /* Reject non-word-aligned targets — corrupt function pointer. Hard fail. */
+    if (addr & 3) {
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+            "DISPATCH FATAL: misaligned target 0x%08X\n"
+            "  aligned form: 0x%08X\n"
+            "  physical:     0x%08X\n"
+            "  cpu->pc:      0x%08X\n"
+            "  $ra:          0x%08X\n"
+            "  $t9:          0x%08X\n"
+            "  $v0:          0x%08X\n"
+            "  $a0:          0x%08X\n"
+            "  $a1:          0x%08X\n"
+            "  $a2:          0x%08X\n"
+            "  $a3:          0x%08X\n"
+            "  COP0_EPC:     0x%08X\n"
+            "  COP0_SR:      0x%08X\n"
+            "  COP0_Cause:   0x%08X\n",
+            addr, addr & ~3u, phys,
+            cpu->pc, cpu->gpr[31], cpu->gpr[25],
+            cpu->gpr[2], cpu->gpr[4], cpu->gpr[5],
+            cpu->gpr[6], cpu->gpr[7],
+            cpu->cop0[14], cpu->cop0[12], cpu->cop0[13]);
+        trap_crash(buf);
+        fprintf(stderr, "%s", buf);
+        fflush(stderr);
+        exit(1);
+    }
+
     /*
      * The BIOS writes small jump trampolines into RAM at runtime
      * (e.g., at 0xA0, 0xB0, 0xC0 for the A0/B0/C0 vectors).
@@ -154,27 +250,38 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             }
         }
 
-        /* Pattern 4: lui rN, hi / addiu rN, rN, lo / jr rN */
+        /* Pattern 4: lui rN, hi / addiu|ori rN, rN, lo / jr rN / nop
+         * All three instructions must be present. Without the jr check,
+         * any function prologue that loads a constant via lui+ori would
+         * be misidentified as a trampoline (see 0xBFC3DF90 incident). */
         if (op0 == 0x0F) { /* LUI */
             uint32_t rt0 = (w0 >> 16) & 0x1F;
             uint32_t hi_val = (w0 & 0xFFFF) << 16;
+            uint32_t computed = 0;
+            int have_target = 0;
 
             if (op1 == 0x09) { /* ADDIU */
                 uint32_t rs1 = (w1 >> 21) & 0x1F;
                 uint32_t rt1 = (w1 >> 16) & 0x1F;
                 if (rs1 == rt0 && rt1 == rt0) {
                     int16_t lo_val = (int16_t)(w1 & 0xFFFF);
-                    uint32_t target = hi_val + (uint32_t)(int32_t)lo_val;
-                    cpu->pc = target;
-                    return;
+                    computed = hi_val + (uint32_t)(int32_t)lo_val;
+                    have_target = 1;
                 }
             }
-            if (op1 == 0x0D) { /* ORI */
+            if (!have_target && op1 == 0x0D) { /* ORI */
                 uint32_t rs1 = (w1 >> 21) & 0x1F;
                 uint32_t rt1 = (w1 >> 16) & 0x1F;
                 if (rs1 == rt0 && rt1 == rt0) {
-                    uint32_t target = hi_val | (w1 & 0xFFFF);
-                    cpu->pc = target;
+                    computed = hi_val | (w1 & 0xFFFF);
+                    have_target = 1;
+                }
+            }
+            /* Only resolve if w2 is jr rN targeting the same register. */
+            if (have_target && (w2 & 0xFC1FFFFF) == 0x00000008) {
+                uint32_t jr_rs = (w2 >> 21) & 0x1F;
+                if (jr_rs == rt0) {
+                    cpu->pc = computed;
                     return;
                 }
             }

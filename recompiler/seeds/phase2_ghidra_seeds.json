@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds",
-  "seed_count": 801,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
+  "seed_count": 823,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -97,11 +97,6 @@
       "address": "0xBFC01C8C",
       "label": "ghidra_BFC01C8C",
       "rationale": "Ghidra function start"
-    },
-    {
-      "address": "0xBFC01E24",
-      "label": "SysInitMemory",
-      "rationale": "Dispatch miss during boot — kernel init function"
     },
     {
       "address": "0xBFC01E5C",
@@ -3349,6 +3344,156 @@
       "rationale": "Ghidra function start"
     },
     {
+      "address": "0xBFC42380",
+      "label": "dmiss_BFC42380",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42844",
+      "label": "dmiss_BFC42844",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC38AD4",
+      "label": "dmiss_BFC38AD4",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42A90",
+      "label": "dmiss_BFC42A90",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42A10",
+      "label": "dmiss_BFC42A10",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC27FB0",
+      "label": "dmiss_BFC27FB0",
+      "rationale": "dispatch miss: Kernel Part 2 function, indirect call"
+    },
+    {
+      "address": "0xBFC36D48",
+      "label": "dmiss_BFC36D48",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC38AA4",
+      "label": "dmiss_BFC38AA4",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC1E3AC",
+      "label": "dmiss_BFC1E3AC",
+      "rationale": "dispatch miss: Shell function, called in vblank loop"
+    },
+    {
+      "address": "0xBFC3045C",
+      "label": "dmiss_BFC3045C",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30470",
+      "label": "dmiss_BFC30470",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30484",
+      "label": "dmiss_BFC30484",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30498",
+      "label": "dmiss_BFC30498",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30554",
+      "label": "dmiss_BFC30554",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30560",
+      "label": "dmiss_BFC30560",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC3056C",
+      "label": "dmiss_BFC3056C",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30578",
+      "label": "dmiss_BFC30578",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC36DD0",
+      "label": "dmiss_BFC36DD0",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC11840",
+      "label": "dmiss_BFC11840",
+      "rationale": "dispatch miss: KP2 function, indirect call"
+    },
+    {
+      "address": "0xBFC36DF8",
+      "label": "dmiss_BFC36DF8",
+      "rationale": "dispatch miss: Shell function, indirect call"
+    },
+    {
+      "address": "0xBFC11524",
+      "label": "dmiss_BFC11524",
+      "rationale": "dispatch miss: KP2 secondary entry point for exception handler, mid-function split of func_00001A00, called during VBlank"
+    },
+    {
+      "address": "0xBFC11610",
+      "label": "dmiss_BFC11610",
+      "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"
+    },
+    {
+      "address": "0xBFC0193C",
+      "label": "cache_flush_continuation",
+      "rationale": "Jump target of cache-flush jr k0 at BFC01938"
+    },
+    {
+      "address": "0xBFC01E24",
+      "label": "SysInitMemory",
+      "rationale": "Dispatch miss during boot \u00e2\u20ac\u201d kernel init function"
+    },
+    {
+      "address": "0xBFC02200",
+      "label": "jal_BFC02200",
+      "rationale": "JAL target from code region"
+    },
+    {
+      "address": "0xBFC03FC0",
+      "label": "jal_BFC03FC0",
+      "rationale": "JAL target from code region"
+    },
+    {
+      "address": "0xBFC06FDC",
+      "label": "indirect_BFC06FDC",
+      "rationale": "Reached via indirect dispatch during boot"
+    },
+    {
+      "address": "0xBFC0DA70",
+      "label": "jal_BFC0DA70",
+      "rationale": "JAL target from code region"
+    },
+    {
+      "address": "0xBFC0DA80",
+      "label": "jal_BFC0DA80",
+      "rationale": "JAL target from code region"
+    },
+    {
+      "address": "0xBFC0DA90",
+      "label": "jal_BFC0DA90",
+      "rationale": "JAL target from code region"
+    },
+    {
       "address": "0xBFC10000",
       "label": "kernel_trampoline_0",
       "rationale": "Trampoline to FileOpen (0x598)"
@@ -3429,6 +3574,11 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
+      "address": "0xBFC10780",
+      "label": "rmiss_BFC10780",
+      "rationale": "runtime dispatch miss"
+    },
+    {
       "address": "0xBFC109A0",
       "label": "kernel_BFC109A0",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
@@ -3454,6 +3604,11 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
+      "address": "0xBFC10B30",
+      "label": "rmiss_BFC10B30",
+      "rationale": "runtime dispatch miss"
+    },
+    {
       "address": "0xBFC10BB8",
       "label": "kernel_BFC10BB8",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
@@ -3462,6 +3617,11 @@
       "address": "0xBFC10BE0",
       "label": "kernel_BFC10BE0",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
+    },
+    {
+      "address": "0xBFC10BE4",
+      "label": "rmiss_BFC10BE4",
+      "rationale": "runtime dispatch miss"
     },
     {
       "address": "0xBFC10C3C",
@@ -3532,6 +3692,26 @@
       "address": "0xBFC11274",
       "label": "kernel_BFC11274",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
+    },
+    {
+      "address": "0xBFC1152C",
+      "label": "rmiss_BFC1152C",
+      "rationale": "runtime dispatch miss"
+    },
+    {
+      "address": "0xBFC11560",
+      "label": "rmiss_BFC11560",
+      "rationale": "runtime dispatch miss"
+    },
+    {
+      "address": "0xBFC115E8",
+      "label": "rmiss_BFC115E8",
+      "rationale": "runtime dispatch miss"
+    },
+    {
+      "address": "0xBFC115FC",
+      "label": "rmiss_BFC115FC",
+      "rationale": "runtime dispatch miss"
     },
     {
       "address": "0xBFC11644",
@@ -3664,6 +3844,11 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
+      "address": "0xBFC12BE4",
+      "label": "rmiss_BFC12BE4",
+      "rationale": "runtime dispatch miss"
+    },
+    {
       "address": "0xBFC12EA4",
       "label": "kernel_BFC12EA4",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
@@ -3687,6 +3872,21 @@
       "address": "0xBFC1372C",
       "label": "kernel_BFC1372C",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
+    },
+    {
+      "address": "0xBFC1376C",
+      "label": "rmiss_BFC1376C",
+      "rationale": "runtime dispatch miss"
+    },
+    {
+      "address": "0xBFC137B4",
+      "label": "indirect_BFC137B4",
+      "rationale": "Reached via indirect dispatch during boot (kernel relocated)"
+    },
+    {
+      "address": "0xBFC137BC",
+      "label": "rmiss_BFC137BC",
+      "rationale": "runtime dispatch miss"
     },
     {
       "address": "0xBFC138AC",
@@ -3899,6 +4099,11 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
+      "address": "0xBFC18000",
+      "label": "shell_entry",
+      "rationale": "Shell entry point at BFC18000, copied to RAM 0x80030000"
+    },
+    {
       "address": "0xBFC18788",
       "label": "kernel_BFC18788",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
@@ -3909,104 +4114,9 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
-      "address": "0xBFC0193C",
-      "label": "cache_flush_continuation",
-      "rationale": "Jump target of cache-flush jr k0 at BFC01938"
-    },
-    {
-      "address": "0xBFC02200",
-      "label": "jal_BFC02200",
-      "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC03FC0",
-      "label": "jal_BFC03FC0",
-      "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC0DA70",
-      "label": "jal_BFC0DA70",
-      "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC0DA80",
-      "label": "jal_BFC0DA80",
-      "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC0DA90",
-      "label": "jal_BFC0DA90",
-      "rationale": "JAL target from code region"
-    },
-    {
       "address": "0xBFC33CC0",
       "label": "jal_BFC33CC0",
       "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC06FDC",
-      "label": "indirect_BFC06FDC",
-      "rationale": "Reached via indirect dispatch during boot"
-    },
-    {
-      "address": "0xBFC137B4",
-      "label": "indirect_BFC137B4",
-      "rationale": "Reached via indirect dispatch during boot (kernel relocated)"
-    },
-    {
-      "address": "0xBFC12BE4",
-      "label": "rmiss_BFC12BE4",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC137BC",
-      "label": "rmiss_BFC137BC",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC1376C",
-      "label": "rmiss_BFC1376C",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC10B30",
-      "label": "rmiss_BFC10B30",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC10BE4",
-      "label": "rmiss_BFC10BE4",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC18000",
-      "label": "shell_entry",
-      "rationale": "Shell entry point at BFC18000, copied to RAM 0x80030000"
-    },
-    {
-      "address": "0xBFC10780",
-      "label": "rmiss_BFC10780",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC11560",
-      "label": "rmiss_BFC11560",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC115E8",
-      "label": "rmiss_BFC115E8",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC1152C",
-      "label": "rmiss_BFC1152C",
-      "rationale": "runtime dispatch miss"
-    },
-    {
-      "address": "0xBFC115FC",
-      "label": "rmiss_BFC115FC",
-      "rationale": "runtime dispatch miss"
     }
   ],
   "excluded": [

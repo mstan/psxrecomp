@@ -29,7 +29,7 @@ uint32_t FullFunctionEmitter::normalize_address(uint32_t addr) {
         phys = phys - 0x1FC10000u + 0x00000500u;
     }
     /* Shell: RAM 0x30000+ → ROM physical 0x1FC18000+ */
-    if (phys >= 0x00030000u && phys <= 0x0005A7FFu) {
+    if (phys >= 0x00030000u && phys <= 0x0005AFFFu) {
         phys = phys - 0x00030000u + 0x1FC18000u;
     }
     return phys;
@@ -155,6 +155,16 @@ bool FullFunctionEmitter::emit_function(
         }
     }
 
+    // Detect delay slots that fall outside this function's address range.
+    // These will never be visited by the emit loop, so their PendingBranch
+    // would silently vanish.  Collect them for immediate resolution.
+    std::set<uint32_t> orphaned_delay_slots;
+    for (const auto& [ds_addr, pb] : pending_at) {
+        if (addr_to_raw.count(ds_addr) == 0) {
+            orphaned_delay_slots.insert(pb.terminator_addr);
+        }
+    }
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -193,10 +203,56 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    int psx_taken_{:08X} = ({});\n", addr, cond);
             } else if (kind == "rfe") {
                 // RFE: emit cop0 stack pop immediately (no delay slot).
-                out += fmt::format("    {}\n", tr.c_code);
+                //
+                // HOWEVER: RFE is commonly used as the delay slot of
+                // `jr $k0` (exception return).  In MIPS the sequence is:
+                //     jr $k0          <- terminator, pending at addr
+                //     rfe             <- delay slot AND terminator
+                // The jr records a PendingBranch at addr (this address).
+                // If we just emit the RFE and `continue`, the jr's
+                // `cpu->pc = cpu->gpr[26]` is never emitted and the
+                // exception return address is lost.
+                //
+                // Fix: if this RFE address has a pending jr, emit the
+                // RFE SR manipulation WITHOUT the return, then emit the
+                // JR's pc-set + return instead.
+                if (pending_at.count(addr)) {
+                    const PendingBranch& pb = pending_at[addr];
+                    if (pb.kind == "jr") {
+                        // Emit RFE SR pop without return.
+                        out += "    { uint32_t sr = cpu->cop0[12]; "
+                               "cpu->cop0[12] = (sr & 0xFFFFFFC0u) | ((sr >> 2) & 0x0Fu); } /* rfe */\n";
+                        // Emit JR resolution.
+                        uint8_t rs = (pb.raw >> 21) & 0x1F;
+                        if (rs == 31) {
+                            out += "    return;\n";
+                        } else {
+                            out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+                                               static_cast<int>(rs));
+                        }
+                    } else {
+                        // Pending non-JR terminator (unexpected but safe).
+                        out += fmt::format("    {}\n", tr.c_code);
+                    }
+                } else {
+                    // Standalone RFE (no pending JR): emit as-is with return.
+                    out += fmt::format("    {}\n", tr.c_code);
+                }
             }
-            // For J/JAL/JALR/JR: nothing emitted at terminator address.
-            // Resolution happens after delay slot.
+            // For J/JAL/JALR/JR: normally nothing emitted at terminator
+            // address — resolution happens after delay slot.  But if the
+            // delay slot falls outside this function, resolve NOW (the
+            // delay-slot side effect is in the adjacent function and will
+            // execute when dispatch routes there).
+            if (orphaned_delay_slots.count(addr) && kind == "jr") {
+                uint8_t rs = (raw >> 21) & 0x1F;
+                if (rs == 31) {
+                    out += "    return;\n";
+                } else {
+                    out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+                                       static_cast<int>(rs));
+                }
+            }
             continue;
         }
 
@@ -334,7 +390,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "    if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu)\n";
     out += "        phys = phys - 0x1FC10000u + 0x00000500u;\n";
     out += "    /* Shell: RAM 0x30000+ -> ROM physical 0x1FC18000+ */\n";
-    out += "    if (phys >= 0x00030000u && phys <= 0x0005A7FFu)\n";
+    out += "    if (phys >= 0x00030000u && phys <= 0x0005AFFFu)\n";
     out += "        phys = phys - 0x00030000u + 0x1FC18000u;\n";
     out += "    return phys;\n";
     out += "}\n\n";

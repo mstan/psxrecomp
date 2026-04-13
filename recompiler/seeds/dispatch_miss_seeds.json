@@ -1,0 +1,29 @@
+{
+  "schema": "psxrecomp-v4 dispatch-miss seeds",
+  "source": "runtime dispatch miss log — functions called indirectly (JALR / function pointer tables)",
+  "note": "These functions have no static JAL callers and cannot be found by transitive discovery. They are reached at runtime via BIOS API dispatch tables (A0/B0/C0 vectors) or other indirect call mechanisms.",
+  "seeds": [
+    {"address": "0xBFC42380", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC42844", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC38AD4", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC42A90", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC42A10", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC27FB0", "rationale": "dispatch miss: Kernel Part 2 function, indirect call"},
+    {"address": "0xBFC36D48", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC38AA4", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC1E3AC", "rationale": "dispatch miss: Shell function, called in vblank loop"},
+    {"address": "0xBFC3045C", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30470", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30484", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30498", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30554", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30560", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC3056C", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC30578", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC36DD0", "rationale": "dispatch miss: Shell function, indirect call via table"},
+    {"address": "0xBFC11840", "rationale": "dispatch miss: KP2 function, indirect call"},
+    {"address": "0xBFC36DF8", "rationale": "dispatch miss: Shell function, indirect call"},
+    {"address": "0xBFC11524", "rationale": "dispatch miss: KP2 secondary entry point for exception handler, mid-function split of func_00001A00, called during VBlank"},
+    {"address": "0xBFC11610", "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"}
+  ]
+}

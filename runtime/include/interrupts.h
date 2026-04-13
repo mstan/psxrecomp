@@ -29,6 +29,14 @@ void interrupts_init(void);
  * pending + COP0 allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
 
+/* Query whether we are currently inside an exception handler dispatch. */
+int psx_get_in_exception(void);
+
+/* longjmp back to psx_check_interrupts, unwinding the exception handler.
+ * Called by ReturnFromException (B0:0x17 or SYSCALL(3)) when inside
+ * the exception handler to model real hardware's RFE+JR $k0 unwind. */
+void psx_exception_longjmp(void);
+
 #ifdef __cplusplus
 }
 #endif
