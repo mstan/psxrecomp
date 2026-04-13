@@ -8,6 +8,7 @@ add_executable(psx-runtime
     src/main.cpp
     src/memory.c
     src/gpu.c
+    src/gpu_sw_renderer.c
     src/dma.c
     src/timers.c
     src/interrupts.c
@@ -15,6 +16,10 @@ add_executable(psx-runtime
     src/memcard.c
     src/debug_server.c
     src/traps.c
+    src/gte.cpp
+    src/crc32.c
+    src/iso_reader.cpp
+    src/iso_reader_c.cpp
     ../generated/SCPH1001_full.c
     ../generated/SCPH1001_dispatch.c
 )

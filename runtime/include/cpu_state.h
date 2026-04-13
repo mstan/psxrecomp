@@ -23,6 +23,8 @@ typedef struct CPUState {
     uint32_t pc;        /* program counter */
     uint32_t hi, lo;    /* mult/div result registers */
     uint32_t cop0[32];  /* COP0 system control registers (SR, Cause, EPC, ...) */
+    uint32_t gte_data[32]; /* COP2 (GTE) data registers */
+    uint32_t gte_ctrl[32]; /* COP2 (GTE) control registers */
 
     /* Memory access function pointers -- wired at init to psx_read/psx_write. */
     uint32_t (*read_word)(uint32_t addr);
@@ -44,6 +46,13 @@ extern void psx_dispatch(CPUState* cpu, uint32_t target_addr);
 
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
+
+/* GTE (COP2) — defined in runtime/src/gte.cpp */
+extern void     gte_execute(CPUState* cpu, uint32_t cmd);
+extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
+extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
+extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
+extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
 
 #ifdef __cplusplus
 }
