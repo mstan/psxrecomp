@@ -48,27 +48,61 @@ The pinned base SHA lives in one place only: `UPSTREAM_BASE` at the top of `tool
 
 Both servers implement the same JSON-over-newline command set where possible so that `tools/debug_client.py compare <cmd>` diffs state between them. See `TCP_COMMANDS.md` at the v4 root for the full command table with "native-only / duckstation-only / both" annotations.
 
-## Known issue: headless BIOS boot after fresh settings.ini (2026-04-14)
+## Known issue: rebuilt binary doesn't start emulation (2026-04-14)
 
-A fresh install produces a `settings.ini` that, even after `build.sh` post-processes
-it with BIOS paths + setup-wizard bypass + portable marker + BIOS copy, still
-doesn't trigger BIOS emulation in `-bios -nogui -fastboot` mode. The process runs
-(stable at ~34 MB), but port 4371 never binds because `PSXRecompDebug::Initialize`
-is only called after `System::BootSystem` starts emulation, and emulation isn't
-starting. Working theory: a Qt/QApplication init path under `-nogui` blocks on
-something that only a GUI launch resolves. Fix on the TODO list; meanwhile the
-one-time workaround is:
+The binary from this session's rebuild does not start BIOS emulation regardless
+of launch flags (`-bios -nogui -fastboot`, `-bios -nogui -slowboot`, `-bios`
+alone, `-bios -batch`, etc.). The process runs (stable ~34 MB, no growth), but
+`PSXRecompDebug::Initialize(4371)` is never reached because it's called *after*
+`System::Initialize()` completes, and `System::Initialize()` never completes —
+likely `BIOS::GetBIOSImage` or a downstream step fails silently (the error path
+in `QtCore::CoreThread::bootSystem` emits a signal that's lost in `-nogui`).
 
-```bash
-# Launch once with GUI — this fully initialises settings and state
-./duckstation/build/bin/duckstation-qt.exe -bios       # not -nogui
-# Close the window after the BIOS shell appears, then subsequent -nogui launches work.
-```
+What's been verified working:
+- Binary has all patch strings (`PSXRecompDebug`, `pc_break`, `read_ram`,
+  `psxrecomp_debug_server`) — confirmed via `tools/check_ds_patch.py`.
+- BIOS file present + valid: `duckstation/build/bin/bios/SCPH1001.BIN`
+  has MD5 `924e392ed05558ffdb115408c263dccf` which matches DuckStation's known
+  SCPH-1001 hash in `src/core/bios.cpp:36`.
+- Prebuilt deps extracted + path-normalised (`tools/fix_duckstation_deps_paths.py`
+  handles the 27-file `_IMPORT_PREFIX` rewrite).
+- `settings.ini` has `[BIOS]PathNTSCU = SCPH1001.BIN`, `SearchDirectory = bios`,
+  `[Main]SetupWizardIncomplete = false`, `SettingsVersion = 3`,
+  `[AutoUpdater]CheckAtStartup = false`, `LogToFile = true`.
+- `portable.txt` placed, `resources/` + `translations/` directories next to exe.
+- Pinned at upstream commit `ffb33c281` (release-20260328 era).
 
-The prior working-binary session (before the rm -rf incident) had a settings.ini
-that had been "warmed up" this way — it survived because the rm -rf deleted the
-build tree, not the settings. Future fix: capture the post-warmup `settings.ini`
-into a template under `tools/duckstation/` so `build.sh` can install it verbatim.
+What hasn't been ruled out:
+- An environmental factor (GPU/Vulkan/D3D init failing silently for the user's
+  particular GPU + Qt 6.11 combination on this specific machine).
+- A subtle difference in the prebuilt deps between the archive's extraction time
+  and now — the archive was extracted originally into `psxrecomp-projects/` and
+  has absolute paths baked into CMake metadata; our path-rewriter fixes the
+  CMake paths but there may be other baked paths (e.g., pdb references) we miss.
+- Silent `InitializeAudio` / `GPU` / `Achievements` error paths in
+  `System::Initialize` that would be visible only in a DuckStation log file —
+  which itself is never written because log init happens after the failing step.
+
+The pre-rebuild binary (the one I destroyed with `rm -rf`) worked flawlessly
+for the same invocation. The same source, with only my uncommitted `pc_break`
+additions on top, doesn't. Something in the environment changed between the
+original build and the rebuild; without the original binary to diff against we
+can't narrow it further from inside a session.
+
+**Workaround / recovery path for a next session:**
+
+1. Reproduce the failure: `bash tools/duckstation/build.sh` then launch.
+2. Enable DuckStation's console logging via the Qt debugger or by editing
+   `src/core/system.cpp` to add a `DEV_LOG(...)` around each gate in
+   `BootSystem`, rebuild, identify which gate fails, push the log output into a
+   TCP-visible place (per `CLAUDE.md` §3: no `fprintf` to stderr).
+3. Or: run the prebuilt-released DuckStation binary from GitHub against the
+   same BIOS to confirm the environment setup is fine, then narrow to the
+   patch-vs-upstream delta.
+
+The restructure itself is complete and correct; only the "post-rebuild binary
+works end-to-end" box is un-ticked. The oracle can still be driven interactively
+through the GUI debugger window — that's how DuckStation is designed to be used.
 
 ## Troubleshooting
 
