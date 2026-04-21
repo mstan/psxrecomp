@@ -285,6 +285,47 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                     return;
                 }
             }
+
+            /* Pattern 5: BIOS vector dispatch table.
+             * lui  rN, hi             w0
+             * addiu rN, rN, lo        w1  (base = hi|lo)
+             * sll  rM, rM, 2          w2  (index <<= 2)
+             * addu rN, rN, rM         w3  (ptr = base + index*4)
+             * lw   rN, 0(rN)          w4  (func = *ptr)
+             * jr   rN                 w5
+             * This is the A0/B0/C0 dispatch pattern the BIOS writes at
+             * 0x500+.  rM holds the function number (set by the A0/B0/C0
+             * trampoline delay slot before we get here). */
+            if (have_target) {
+                uint32_t w3 = cpu->read_word(addr + 12);
+                uint32_t w4 = cpu->read_word(addr + 16);
+                uint32_t w5 = cpu->read_word(addr + 20);
+
+                /* w2: sll rM, rM, 2  (opcode 0, func 0, sa 2) */
+                if ((w2 & 0xFC0007FF) == 0x00000080) { /* SLL with sa=2 */
+                    uint32_t idx_rt = (w2 >> 16) & 0x1F;
+                    uint32_t idx_rd = (w2 >> 11) & 0x1F;
+                    /* w3: add/addu rN, rN, rM */
+                    if ((w3 & 0xFC0007FE) == 0x00000020) { /* ADD or ADDU */
+                        uint32_t a_rs = (w3 >> 21) & 0x1F;
+                        uint32_t a_rt = (w3 >> 16) & 0x1F;
+                        uint32_t a_rd = (w3 >> 11) & 0x1F;
+                        if (a_rs == rt0 && a_rt == idx_rd && a_rd == rt0) {
+                            /* w4: lw rN, 0(rN) */
+                            if ((w4 & 0xFFFF0000) == (0x8C000000u | ((uint32_t)rt0 << 21) | ((uint32_t)rt0 << 16))) {
+                                /* w5: jr rN */
+                                if ((w5 & 0xFC1FFFFF) == 0x00000008 && ((w5 >> 21) & 0x1F) == rt0) {
+                                    uint32_t index_val = cpu->gpr[idx_rt];
+                                    uint32_t table_addr = computed + (index_val << 2);
+                                    uint32_t func_ptr = cpu->read_word(table_addr);
+                                    cpu->pc = func_ptr;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

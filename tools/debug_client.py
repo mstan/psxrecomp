@@ -38,6 +38,16 @@ Commands (shared — identical on both servers):
     clear_input                 Remove input override
     quit                        Quit game
 
+Tier 1 write trace commands:
+    wtrace_add <lo> <hi>        Add a trace range (up to 8, hex addrs)
+    wtrace_del <slot>           Remove trace range by slot index
+    wtrace_ranges               List active trace ranges
+    wtrace [lo] [hi]            Dump write trace (optional addr filter)
+    wtrace_clear                Reset write trace ring buffer
+    wtrace_stats                Write trace statistics
+    mmio [addr]                 Dump MMIO write trace (optional addr filter)
+    mmio_clear                  Reset MMIO trace ring buffer
+
 Comparison commands (query both servers):
     compare <command> [args...] Run command on both ports, diff results
     ts_compare <start> <end>    Compare timeseries across servers
@@ -219,6 +229,35 @@ def build_cmd(args):
         return {"cmd": "bios_wait_state"}, pretty_json
     elif cmd == "memcard_log":
         return {"cmd": "memcard_log"}, pretty_json
+    # ---- Tier 1 write trace commands ----
+    elif cmd == "wtrace_add":
+        if len(args) < 3:
+            return None, lambda _: "Usage: wtrace_add <lo> <hi>"
+        return {"cmd": "wtrace_add", "lo": args[1], "hi": args[2]}, pretty_json
+    elif cmd == "wtrace_del":
+        if len(args) < 2:
+            return None, lambda _: "Usage: wtrace_del <slot>"
+        return {"cmd": "wtrace_del", "slot": int(args[1])}, pretty_json
+    elif cmd == "wtrace_ranges":
+        return {"cmd": "wtrace_ranges"}, pretty_json
+    elif cmd == "wtrace":
+        d = {"cmd": "wtrace_dump"}
+        if len(args) > 1:
+            d["addr_lo"] = args[1]
+        if len(args) > 2:
+            d["addr_hi"] = args[2]
+        return d, pretty_json
+    elif cmd == "wtrace_clear":
+        return {"cmd": "wtrace_clear"}, pretty_json
+    elif cmd == "wtrace_stats":
+        return {"cmd": "wtrace_stats"}, pretty_json
+    elif cmd == "mmio":
+        d = {"cmd": "mmio_dump"}
+        if len(args) > 1:
+            d["addr"] = args[1]
+        return d, pretty_json
+    elif cmd == "mmio_clear":
+        return {"cmd": "mmio_clear"}, pretty_json
     else:
         # Pass through as raw command
         return {"cmd": cmd}, pretty_json

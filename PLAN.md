@@ -1250,12 +1250,13 @@ F:/Projects/psxrecomp-v4/
     │   ├── gte.h
     │   ├── mips_decoder.h
     │   └── ps1_exe_parser.h
+    ├── tests/
+    │   ├── l1_decoder_test.cpp   Decoder conformance (Rabbitizer oracle)
+    │   └── l2_structural_test.cpp  Codegen pattern verification
     └── lib/
         ├── rabbitizer/  MIPS disassembler
         ├── fmt/          C++ string formatting
         └── toml11/       TOML parser
-
-(no runtime/ directory yet — built up in Phase 2)
 ```
 
 ---
@@ -1317,4 +1318,184 @@ What we want from you:
 
 ---
 
-*End of plan. Last updated 2026-04-06.*
+## Test Infrastructure
+
+Modeled after snesrecomp and gbarecomp test harnesses. Two tiers:
+
+### L1: Decoder Conformance (Rabbitizer Oracle)
+
+Tests that `MipsDecoder::decode()` produces the correct mnemonic for every
+instruction in the BIOS ROM's code regions, using Rabbitizer (already a
+project dependency) as the oracle.
+
+**Harness:** `recompiler/tests/l1_decoder_test.cpp`
+**Build target:** `l1_decoder_test`
+**Oracle:** `rabbitizer::InstructionCpu` (standard) / `rabbitizer::InstructionR3000GTE` (GTE commands)
+
+For every 4-byte word in the BIOS code regions:
+1. Decode with `MipsDecoder::decode(word, addr)`
+2. Decode with Rabbitizer (InstructionCpu for standard, InstructionR3000GTE for COP2 GTE)
+3. Compare lowercase mnemonics
+4. Bucket failures by `(oracle → ours)` pattern
+
+**Code regions tested:**
+- Boot:   0xBFC00000 – 0xBFC0DC60 (ROM 0x00000–0x0DC60)
+- Kernel: 0xBFC10000 – 0xBFC16760 (ROM 0x10000–0x16760)
+- Shell:  0xBFC18000 – 0xBFC42800 (ROM 0x18000–0x42800)
+
+**Expected known differences:**
+- Our decoder returns "GTE" for all GTE commands; Rabbitizer returns specific
+  names (RTPS, NCLIP, MVMVA, etc.) — this is a coarsening, not a bug
+- Our decoder returns "COP0CO" for unrecognized COP0 CO instructions
+- Data words in code regions may decode differently (both decoders produce
+  garbage for non-instruction data — these show up as noise in the buckets)
+
+**Run:**
+```bash
+cd /f/Projects/psxrecomp-v4
+PATH=/c/msys64/mingw64/bin:$PATH
+cd recompiler && cmake -B build && cmake --build build --target l1_decoder_test && cd ..
+./recompiler/build/l1_decoder_test bios/SCPH1001.BIN
+```
+
+### L2-structural: Codegen Pattern Verification (StrictTranslator)
+
+Tests that `StrictTranslator::translate()` produces correct C code patterns
+for each MIPS instruction form (snesrecomp-style structural matching).
+
+**Harness:** `recompiler/tests/l2_structural_test.cpp`
+**Build target:** `l2_structural_test`
+**Forms:** 42 instruction forms covering:
+- SPECIAL R-type ALU (SLL, SRL, SRA, shifts, ADDU, SUBU, AND, OR, XOR, NOR, SLT, SLTU, ADD with overflow)
+- Multiply/divide (MULTU, DIV, DIVU, MFHI, MFLO, MTHI, MTLO)
+- Immediate ALU (ADDIU, ADDI, ANDI, ORI, XORI, LUI, SLTI, SLTIU)
+- Load/store (LW, SW, LB, LBU, LH, LHU, SB, SH)
+- COP0 (MFC0, MTC0)
+- Edge cases ($zero writes discarded, NOP)
+
+Each form: decode instruction → translate → verify C code contains expected
+register references, operations, and patterns. Catches wrong register
+indices, missing operations, and translation gaps.
+
+**Known out-of-scope for strict translator:** SUB (funct 0x22), MULT (funct 0x18),
+COP2/GTE, LWC2/SWC2 — these are handled by the full_function_emitter's code path.
+
+**Run:**
+```bash
+./recompiler/build/l2_structural_test    # summary
+./recompiler/build/l2_structural_test -v # show generated C for each form
+```
+
+### L2-semantic: Full State Comparison — PLANNED
+
+Future tier: compile generated C, execute with random register states,
+compare against reference single-instruction interpreter. Modeled after
+gbarecomp's L2 with mGBA oracle. Requires `emit_one_insn` CLI and
+CMake-time code generation.
+
+---
+
+## Phase 4 Current Status (2026-04-19)
+
+Phase 4 goal: boot to BIOS shell. Sony logo renders. Shell entry stalls
+on VSync(0) because VSync counter (0x80079D9C) never increments.
+
+### Root cause chain (fully diagnosed)
+
+1. VSync counter increments in the kernel exception handler's walk of
+   DCB chain #3 (head at `0xA000E014`)
+2. Chain #3 is populated by `func_00004B90` (B_table[0x13]), called from
+   `FUN_bfc25e8c` → B0:0x13 trampoline → B-table dispatch at 0x5E0
+3. B-table dispatch at 0x5E0 is a 7-instruction pattern:
+   `lui/addiu/sll/add/lw/jr/nop` — reads B_table[$t1] and jumps to it
+4. The trampoline resolver (runtime/src/traps.c) only handled 4-instruction
+   patterns. Pattern 4 matched the first two instructions but failed on the
+   third (sll instead of jr), causing a silent dispatch miss → B0:0x13
+   was no-op'd → chain #3 never populated → VSync counter never ticked
+
+### Fix applied
+
+Added Pattern 5 to trampoline resolver (runtime/src/traps.c):
+- Matches the 7-instruction BIOS A0/B0/C0 vector dispatch pattern
+- Fixed ADD vs ADDU detection (BIOS uses ADD func=0x20, not ADDU func=0x21)
+- Runtime rebuilt with `-DCMAKE_BUILD_TYPE=Release` (was empty → `-O0`)
+
+### Current register state
+
+| Register/Address           | Value      | Meaning                                |
+|----------------------------|------------|----------------------------------------|
+| SR (COP0.12)               | 0x00000401 | IEc=1, IM[2]=1 (VBlank unmasked)      |
+| I_STAT                     | 0x00000001 | VBlank IRQ pending                     |
+| I_MASK                     | 0x0000000D | Bits 0,2,3 (VBlank, CDROM, DMA)       |
+| DCB chain head #2 (0xE00C) | 0x00006D88 | Populated (InitRCnt)                   |
+| DCB chain head #3 (0xE014) | 0x00000000 | **EMPTY — awaiting Pattern 5 verify**  |
+| VSync counter (0x80079D9C) | 0x00000000 | Never increments (empty chain #3)      |
+| Dispatch table entries     | 1045       |                                        |
+| Dispatch misses            | 0          |                                        |
+
+### Active guards/workarounds
+
+- RFE longjmp unwind for nested exception paths
+- jr $k0 permitted; IsC + ExitCriticalSection IEc mask fixed
+- Shell-copy normalize() in dispatcher: phys [0x30000..0x5AFFF] → 0x1FC18000+offset
+- Primary-copy aliases (69 entries) for [0xBFC10000..0xBFC18BEF] → [0x80000500..0x800090EF]
+- RAM-write-trace ring on configurable range
+- TCP debug server on port 4370 (native), 4371 (DuckStation)
+- VBLANK_INTERVAL = 50000 dispatches
+
+### DuckStation oracle enhancements (in working tree, not yet patched)
+
+- `system_reset` — resets console and re-arms all breakpoints
+- `mem_break` — CPU write breakpoint on a memory address
+- `mem_hit_last` / `mem_hit_clear` — query/clear last write breakpoint hit
+- Refactored breakpoint callback into shared `PcBreakCallback` + `RearmAllBreakpoints()`
+- Removed pause-on-hit (was freezing event loop and killing TCP access)
+
+### Outstanding issues (priority order)
+
+1. **Verify Pattern 5 at runtime.** Release build compiled but not yet run
+   long enough to reach the FUN_bfc25e8c call site. Poll `read_ram 0xE014`.
+2. **If chain #3 populates:** VSync counter should tick. VSync(0) stops
+   timing out. Shell progresses past logo hold.
+3. **Regenerate DuckStation oracle patch.** Changes in working tree need capture:
+   `git -C duckstation diff ffb33c281 > tools/duckstation/psxrecomp_oracle.patch`
+4. **Monitor for new dispatch misses** as shell enters rendering loop.
+
+### Build & run commands
+
+```bash
+# --- native runtime ---
+cd /f/Projects/psxrecomp-v4
+PATH=/c/msys64/mingw64/bin:$PATH
+
+# Regen after seed changes:
+./recompiler/build/psxrecomp-bios.exe bios/SCPH1001.BIN generated/ --emit-full \
+  recompiler/seeds/phase2_ghidra_seeds.json
+
+# Rebuild (Release):
+cd runtime && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && cd ..
+
+# Run (one instance at a time):
+taskkill //F //IM psx-runtime.exe 2>/dev/null
+./runtime/build/psx-runtime.exe &
+
+# --- duckstation oracle ---
+taskkill //F //IM duckstation-qt.exe 2>/dev/null
+python3 tools/duckstation/launch.py -bios
+
+# --- test infrastructure ---
+cd recompiler && cmake -B build && cmake --build build --target l1_decoder_test && cd ..
+./recompiler/build/l1_decoder_test bios/SCPH1001.BIN
+
+# Probe (ncat):
+NC='/c/Program Files (x86)/Nmap/ncat'
+(printf '{"cmd":"read_ram","addr":"0x0000E014","len":4}\n'; sleep 1) | "$NC" localhost 4370
+(printf '{"cmd":"read_ram","addr":"0x80079D9C","len":4}\n'; sleep 1) | "$NC" localhost 4370
+
+# Regenerate DS patch:
+git -C duckstation diff ffb33c281 > tools/duckstation/psxrecomp_oracle.patch
+```
+
+---
+
+*End of plan. Last updated 2026-04-19.*

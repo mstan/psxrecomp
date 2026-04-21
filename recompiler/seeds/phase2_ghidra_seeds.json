@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 824,
+  "seed_count": 827,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4127,6 +4127,21 @@
       "address": "0xBFC425BC",
       "label": "vblank_chain_handler",
       "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM — installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
+    },
+    {
+      "address": "0xBFC1E3C0",
+      "label": "sio_event_opener_epilogue",
+      "rationale": "Epilogue fragment at BFC1E3C0 (addiu sp,sp,0x18; jr ra; nop). Reached via branch from SIO state machine. Dispatch miss after fall-through fix exposed new code paths."
+    },
+    {
+      "address": "0xBFC10910",
+      "label": "kernel_exception_chain_walk_mid",
+      "rationale": "Mid-loop entry in kernel exception handler chain walker (BFC10910). Contains chain link traversal (lw s6,0(s6)), loop back to BFC108F8/BFC108E8, and k0 restore. Reached after fall-through fix."
+    },
+    {
+      "address": "0xBFC336F0",
+      "label": "gte_cop2_init",
+      "rationale": "GTE/COP2 initialization: enables COP2 in SR, sets COP2 control registers. Contains COP2 instructions (Phase 5). Reached after fall-through fix."
     }
   ],
   "excluded": [

@@ -103,3 +103,35 @@ target_link_libraries(psxrecomp-bios PRIVATE fmt rabbitizer)
 if(MINGW OR WIN32)
     target_link_options(psxrecomp-bios PRIVATE -Wl,--stack,16777216)
 endif()
+
+# L1 decoder conformance test — compares MipsDecoder against Rabbitizer
+# oracle for every instruction in SCPH1001.BIN code regions.
+add_executable(l1_decoder_test
+    tests/l1_decoder_test.cpp
+    src/mips_decoder.cpp
+    src/ps1_exe_parser.cpp
+)
+target_include_directories(l1_decoder_test PRIVATE
+    include
+    lib/rabbitizer/include
+    lib/rabbitizer/cplusplus/include
+    lib/fmt/include
+)
+target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
+
+# L2 structural codegen test — verifies StrictTranslator output patterns
+# for each MIPS instruction form.
+add_executable(l2_structural_test
+    tests/l2_structural_test.cpp
+    src/mips_decoder.cpp
+    src/ps1_exe_parser.cpp
+    src/strict_translator.cpp
+)
+target_include_directories(l2_structural_test PRIVATE
+    include
+    src
+    lib/rabbitizer/include
+    lib/rabbitizer/cplusplus/include
+    lib/fmt/include
+)
+target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)

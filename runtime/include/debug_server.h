@@ -100,6 +100,21 @@ void debug_server_shutdown(void);
 /* Check if a TCP client is connected. */
 int debug_server_is_connected(void);
 
+/* ---- Tier 1 reverse debugger: write trace ---- */
+
+/* Current dispatch target — set by psx_dispatch() before each call.
+ * Captured by the write-trace hook for function attribution. */
+extern uint32_t g_debug_current_func_addr;
+
+/* Multi-range write-trace check.  Called from memory.c write paths.
+ * Iterates up to 8 configurable address ranges; records matching
+ * writes into the 1M-entry ring buffer with function + frame attribution. */
+void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+                                    uint32_t new_val, uint8_t width);
+
+/* MMIO write trace — separate ring buffer for 0x1F801xxx writes. */
+void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);

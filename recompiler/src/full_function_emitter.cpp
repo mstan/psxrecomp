@@ -415,8 +415,20 @@ bool FullFunctionEmitter::emit_function(
         TranslateResult last_tr = StrictTranslator::translate(last_d);
 
         // If the last instruction is a delay slot with a pending branch,
-        // it already has control flow. Otherwise check if it's a terminator.
-        bool has_control_flow = last_tr.is_terminator || pending_at.count(last_addr);
+        // check whether it fully handles control flow.  Unconditional control
+        // flow (j / jr / jal / jalr) covers all paths — no fall-through needed.
+        // Conditional branches (beq / bne / blez / bgtz / bltz / bgez / etc.)
+        // only set cpu->pc for the "taken" path; the "not taken" path still
+        // falls through to the next sequential address and needs a tail call.
+        bool has_control_flow = last_tr.is_terminator;
+        if (!has_control_flow && pending_at.count(last_addr)) {
+            const PendingBranch& pb = pending_at.at(last_addr);
+            if (pb.kind == "j" || pb.kind == "jr" || pb.kind == "jal" ||
+                pb.kind == "jalr" || pb.kind == "rfe") {
+                has_control_flow = true;
+            }
+            // Conditional branches: has_control_flow stays false → emit fall-through
+        }
         if (!has_control_flow) {
             // Fallthrough tail call: set cpu->pc and return; dispatch loop re-dispatches.
             uint32_t next_addr = last_addr + 4;
@@ -450,7 +462,8 @@ void FullFunctionEmitter::emit_dispatch(
 
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
-    out += "extern void psx_check_interrupts(CPUState* cpu);\n\n";
+    out += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    out += "extern uint32_t g_debug_current_func_addr;\n\n";
 
     // Forward declarations for all emitted functions.
     for (uint32_t norm : emitted_normalized) {
@@ -496,6 +509,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        while (lo <= hi) {\n";
     out += "            int mid = (lo + hi) / 2;\n";
     out += "            if (dispatch_table[mid].addr == phys) {\n";
+    out += "                g_debug_current_func_addr = phys;\n";
     out += "                dispatch_table[mid].func(cpu);\n";
     out += "                found = 1;\n";
     out += "                break;\n";

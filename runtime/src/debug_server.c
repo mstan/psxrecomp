@@ -92,27 +92,50 @@ typedef struct {
 } Watchpoint;
 static Watchpoint s_watchpoints[MAX_WATCHPOINTS];
 
-/* ---- Write trace (ring buffer) ----
- * Records every RAM write whose physical address is in [trace_lo, trace_hi).
- * Filter variables are non-static so memory.c can inline the bounds check.
- * Disabled when trace_lo == trace_hi. */
-#define WRITE_TRACE_CAP 1024
+/* ---- Write trace (Tier 1 reverse debugger) ----
+ * Records every RAM write matching one of up to 8 configurable address ranges.
+ * 1M-entry ring buffer, heap-allocated in debug_server_init(). */
+#define WRITE_TRACE_CAP (1 << 20)  /* 1M entries = 32 MB */
 typedef struct {
-    uint64_t seq;
-    uint32_t addr;
-    uint32_t old_val;
-    uint32_t new_val;
-    uint32_t ra;
-    uint8_t  width;
+    uint64_t seq;        /* monotonic sequence number */
+    uint32_t addr;       /* physical RAM address */
+    uint32_t old_val;    /* pre-write value */
+    uint32_t new_val;    /* post-write value */
+    uint32_t ra;         /* $ra (caller return address) */
+    uint32_t func_addr;  /* dispatch target (which recompiled function) */
+    uint32_t frame;      /* VBlank frame number */
+    uint8_t  width;      /* 1, 2, or 4 */
+    uint8_t  pad[3];     /* align to 32 bytes */
 } WriteTraceEntry;
-static WriteTraceEntry s_wtrace[WRITE_TRACE_CAP];
+static WriteTraceEntry *s_wtrace = NULL;
 static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
 static uint32_t s_wtrace_head = 0;
-/* Default: trace the EvCB region from program start so we catch OpenEvent
- * writes that happen during early BIOS boot, before TCP clients can connect.
- * Can be overridden at runtime via the wtrace_range command. */
-uint32_t debug_server_wtrace_lo = 0x0000E000;  /* physical */
-uint32_t debug_server_wtrace_hi = 0x0000E1F0;  /* physical, exclusive — EvCB slots (stops before PCB@0xE1EC/TCB@0xE1F4) */
+
+/* Multi-range filter: up to 8 [lo, hi) address ranges. */
+#define WTRACE_MAX_RANGES 8
+static struct { uint32_t lo, hi; } s_wtrace_ranges[WTRACE_MAX_RANGES];
+static int s_wtrace_range_count = 0;
+
+/* Function attribution global — set by psx_dispatch() before each call. */
+uint32_t g_debug_current_func_addr = 0;
+
+/* ---- MMIO write trace (separate ring buffer) ----
+ * Records every write to 0x1F801xxx MMIO registers. Unconditional (no filtering).
+ * 64K entries, heap-allocated in debug_server_init(). */
+#define MMIO_TRACE_CAP (1 << 16)  /* 64K entries = 2 MB */
+typedef struct {
+    uint64_t seq;
+    uint32_t addr;       /* 0x1F801xxx */
+    uint32_t val;        /* value written */
+    uint32_t func_addr;  /* dispatch target */
+    uint32_t ra;         /* $ra */
+    uint32_t frame;      /* VBlank frame */
+    uint8_t  width;      /* 1, 2, or 4 */
+    uint8_t  pad[3];
+} MmioTraceEntry;
+static MmioTraceEntry *s_mmio_trace = NULL;
+static uint64_t s_mmio_trace_seq  = 0;
+static uint32_t s_mmio_trace_head = 0;
 
 /* ---- Platform helpers ---- */
 static void set_nonblocking(sock_t s)
@@ -805,32 +828,129 @@ static void handle_vram_peek(int id, const char *json)
              id, x, y, w, h, hex);
 }
 
-/* ---- Write trace: hook + handlers ---- */
+/* ---- Write trace: hook + handlers (Tier 1 reverse debugger) ---- */
 extern CPUState *debug_cpu_ptr;
 
-/* Called from memory.c write paths after the bounds check. */
-void debug_server_trace_write(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width)
+/* Record a single write into the RAM trace ring buffer. */
+static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width)
 {
+    if (!s_wtrace) return;
     uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
     WriteTraceEntry *e = &s_wtrace[s_wtrace_head];
-    e->seq     = s_wtrace_seq++;
-    e->addr    = phys;
-    e->old_val = old_val;
-    e->new_val = new_val;
-    e->ra      = ra;
-    e->width   = width;
+    e->seq       = s_wtrace_seq++;
+    e->addr      = phys;
+    e->old_val   = old_val;
+    e->new_val   = new_val;
+    e->ra        = ra;
+    e->func_addr = g_debug_current_func_addr;
+    e->frame     = (uint32_t)s_frame_count;
+    e->width     = width;
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
+}
+
+/* Multi-range check called from memory.c write paths.
+ * Iterates up to 8 ranges; records if any match. */
+void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+                                    uint32_t new_val, uint8_t width)
+{
+    if (s_wtrace_range_count == 0) return;
+    for (int i = 0; i < s_wtrace_range_count; i++) {
+        if (phys >= s_wtrace_ranges[i].lo && phys < s_wtrace_ranges[i].hi) {
+            wtrace_record(phys, old_val, new_val, width);
+            return;
+        }
+    }
+}
+
+/* MMIO write trace — called from memory.c mmio_write32/16/8. */
+void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
+{
+    if (!s_mmio_trace) return;
+    uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
+    e->seq       = s_mmio_trace_seq++;
+    e->addr      = addr;
+    e->val       = val;
+    e->func_addr = g_debug_current_func_addr;
+    e->ra        = ra;
+    e->frame     = (uint32_t)s_frame_count;
+    e->width     = width;
+    s_mmio_trace_head = (s_mmio_trace_head + 1) % MMIO_TRACE_CAP;
 }
 
 static void handle_wtrace_range(int id, const char *json)
 {
+    /* Backward compat: sets slot 0, clears all other slots. */
     char lo_str[32], hi_str[32];
     if (!json_get_str(json, "lo", lo_str, sizeof(lo_str))) { send_err(id, "missing lo"); return; }
     if (!json_get_str(json, "hi", hi_str, sizeof(hi_str))) { send_err(id, "missing hi"); return; }
-    debug_server_wtrace_lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
-    debug_server_wtrace_hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    uint32_t lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    uint32_t hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    s_wtrace_ranges[0].lo = lo;
+    s_wtrace_ranges[0].hi = hi;
+    s_wtrace_range_count = (lo != hi) ? 1 : 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
-             id, debug_server_wtrace_lo, debug_server_wtrace_hi);
+             id, lo, hi);
+}
+
+static void handle_wtrace_add(int id, const char *json)
+{
+    if (s_wtrace_range_count >= WTRACE_MAX_RANGES) {
+        send_err(id, "max ranges reached (8)"); return;
+    }
+    char lo_str[32], hi_str[32];
+    if (!json_get_str(json, "lo", lo_str, sizeof(lo_str))) { send_err(id, "missing lo"); return; }
+    if (!json_get_str(json, "hi", hi_str, sizeof(hi_str))) { send_err(id, "missing hi"); return; }
+    int slot = s_wtrace_range_count++;
+    s_wtrace_ranges[slot].lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    s_wtrace_ranges[slot].hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+             id, slot, s_wtrace_ranges[slot].lo, s_wtrace_ranges[slot].hi);
+}
+
+static void handle_wtrace_del(int id, const char *json)
+{
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0 || slot >= s_wtrace_range_count) {
+        send_err(id, "invalid slot"); return;
+    }
+    /* Compact: shift remaining slots down. */
+    for (int i = slot; i < s_wtrace_range_count - 1; i++)
+        s_wtrace_ranges[i] = s_wtrace_ranges[i + 1];
+    s_wtrace_range_count--;
+    send_ok(id);
+}
+
+static void handle_wtrace_ranges(int id, const char *json)
+{
+    (void)json;
+    const size_t BUF_SZ = 2048;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"count\":%d,\"ranges\":[", id, s_wtrace_range_count);
+    for (int i = 0; i < s_wtrace_range_count; i++) {
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+                        (i == 0) ? "" : ",",
+                        i, s_wtrace_ranges[i].lo, s_wtrace_ranges[i].hi);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_wtrace_stats(int id, const char *json)
+{
+    (void)json;
+    uint64_t oldest = (s_wtrace_seq <= WRITE_TRACE_CAP) ? 0 : s_wtrace_seq - WRITE_TRACE_CAP;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu,\"ranges\":%d}",
+             id, (unsigned long long)s_wtrace_seq, WRITE_TRACE_CAP,
+             (unsigned long long)oldest,
+             (unsigned long long)(s_wtrace_seq > 0 ? s_wtrace_seq - 1 : 0),
+             s_wtrace_range_count);
 }
 
 static void handle_wtrace_clear(int id, const char *json)
@@ -838,36 +958,106 @@ static void handle_wtrace_clear(int id, const char *json)
     (void)json;
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
-    memset(s_wtrace, 0, sizeof(s_wtrace));
+    if (s_wtrace) memset(s_wtrace, 0, (size_t)WRITE_TRACE_CAP * sizeof(WriteTraceEntry));
     send_ok(id);
 }
 
 static void handle_wtrace_dump(int id, const char *json)
 {
-    (void)json;
+    if (!s_wtrace) { send_err(id, "trace not initialized"); return; }
+
+    /* Optional post-hoc address filter. */
+    char lo_str[32], hi_str[32];
+    uint32_t filter_lo = 0, filter_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "addr_lo", lo_str, sizeof(lo_str)))
+        filter_lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", hi_str, sizeof(hi_str)))
+        filter_hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+
     uint64_t total = s_wtrace_seq;
-    uint32_t count = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
+    uint32_t avail = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
     uint32_t start = (total < WRITE_TRACE_CAP) ? 0 : s_wtrace_head;
 
-    const size_t BUF_SZ = 256 * 1024;
+    /* Dynamically size buffer: each JSON entry is ~160 bytes max.
+     * Cap output at 8192 entries to avoid multi-MB responses. */
+    const uint32_t MAX_OUT = 8192;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
+    uint32_t emitted = 0;
     pos += snprintf(buf + pos, BUF_SZ - pos,
-                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
-                    id, (unsigned long long)total, count);
-    for (uint32_t i = 0; i < count && pos < BUF_SZ - 256; i++) {
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)total, avail);
+    for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
         uint32_t idx = (start + i) % WRITE_TRACE_CAP;
         WriteTraceEntry *e = &s_wtrace[idx];
+        if (e->addr < filter_lo || e->addr >= filter_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
-                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\",\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":%u}",
-                        (i == 0) ? "" : ",",
+                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
+                        "\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"func\":\"0x%08X\","
+                        "\"frame\":%u,\"w\":%u}",
+                        (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
-                        e->addr, e->old_val, e->new_val, e->ra, (unsigned)e->width);
+                        e->addr, e->old_val, e->new_val, e->ra, e->func_addr,
+                        e->frame, (unsigned)e->width);
+        emitted++;
     }
-    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
     debug_server_send_line(buf);
     free(buf);
+}
+
+/* ---- MMIO trace handlers ---- */
+
+static void handle_mmio_dump(int id, const char *json)
+{
+    if (!s_mmio_trace) { send_err(id, "mmio trace not initialized"); return; }
+
+    /* Optional address filter. */
+    char addr_str[32];
+    uint32_t filter_addr = 0;
+    int has_filter = json_get_str(json, "addr", addr_str, sizeof(addr_str)) != NULL;
+    if (has_filter) filter_addr = hex_to_u32(addr_str);
+
+    uint64_t total = s_mmio_trace_seq;
+    uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
+    uint32_t start = (total < MMIO_TRACE_CAP) ? 0 : s_mmio_trace_head;
+
+    const uint32_t MAX_OUT = 8192;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    uint32_t emitted = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)total, avail);
+    for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
+        uint32_t idx = (start + i) % MMIO_TRACE_CAP;
+        MmioTraceEntry *e = &s_mmio_trace[idx];
+        if (has_filter && e->addr != filter_addr) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                        (emitted == 0) ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->addr, e->val, e->func_addr, e->ra,
+                        e->frame, (unsigned)e->width);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_mmio_clear(int id, const char *json)
+{
+    (void)json;
+    s_mmio_trace_seq = 0;
+    s_mmio_trace_head = 0;
+    if (s_mmio_trace) memset(s_mmio_trace, 0, (size_t)MMIO_TRACE_CAP * sizeof(MmioTraceEntry));
+    send_ok(id);
 }
 
 static void handle_quit(int id, const char *json)
@@ -897,8 +1087,14 @@ static const CmdEntry s_commands[] = {
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
     { "wtrace_range",      handle_wtrace_range },
+    { "wtrace_add",        handle_wtrace_add },
+    { "wtrace_del",        handle_wtrace_del },
+    { "wtrace_ranges",     handle_wtrace_ranges },
     { "wtrace_dump",       handle_wtrace_dump },
     { "wtrace_clear",      handle_wtrace_clear },
+    { "wtrace_stats",      handle_wtrace_stats },
+    { "mmio_dump",         handle_mmio_dump },
+    { "mmio_clear",        handle_mmio_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
     { "clear_input",       handle_clear_input },
@@ -988,6 +1184,25 @@ void debug_server_init(int port)
         s_frame_history = (PSXFrameRecord *)calloc(FRAME_HISTORY_CAP, sizeof(PSXFrameRecord));
     }
     s_history_count = 0;
+
+    /* Tier 1: heap-allocate write trace ring buffer (32 MB). */
+    if (!s_wtrace) {
+        s_wtrace = (WriteTraceEntry *)calloc(WRITE_TRACE_CAP, sizeof(WriteTraceEntry));
+    }
+    s_wtrace_seq = 0;
+    s_wtrace_head = 0;
+
+    /* Default trace range: EvCB region (same as v3 default). */
+    s_wtrace_ranges[0].lo = 0x0000E000u;
+    s_wtrace_ranges[0].hi = 0x0000E1F0u;
+    s_wtrace_range_count = 1;
+
+    /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
+    if (!s_mmio_trace) {
+        s_mmio_trace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
+    }
+    s_mmio_trace_seq = 0;
+    s_mmio_trace_head = 0;
 
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
     memset(s_snapshot_addrs, 0, sizeof(s_snapshot_addrs));

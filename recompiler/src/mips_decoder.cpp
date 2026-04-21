@@ -208,7 +208,7 @@ void MipsDecoder::set_classification_flags(DecodedInstruction& out) {
         case 0x24: // LBU
         case 0x25: // LHU
         case 0x26: // LWR
-        case 0x30: // LWC2
+        case 0x32: // LWC2
             out.is_load = true;
             break;
 
@@ -218,7 +218,7 @@ void MipsDecoder::set_classification_flags(DecodedInstruction& out) {
         case 0x2A: // SWL
         case 0x2B: // SW
         case 0x2E: // SWR
-        case 0x38: // SWC2
+        case 0x3A: // SWC2
             out.is_store = true;
             break;
 
@@ -282,8 +282,8 @@ DecodedInstruction MipsDecoder::decode(uint32_t instr, uint32_t address) {
         case 0x2A: out.mnemonic = "SWL";   out.format = InstrFormat::I; break;
         case 0x2B: out.mnemonic = "SW";    out.format = InstrFormat::I; break;
         case 0x2E: out.mnemonic = "SWR";   out.format = InstrFormat::I; break;
-        case 0x30: out.mnemonic = "LWC2";  out.format = InstrFormat::I; break;
-        case 0x38: out.mnemonic = "SWC2";  out.format = InstrFormat::I; break;
+        case 0x32: out.mnemonic = "LWC2";  out.format = InstrFormat::I; break;
+        case 0x3A: out.mnemonic = "SWC2";  out.format = InstrFormat::I; break;
         default:
             out.mnemonic = "???";
             out.format   = InstrFormat::UNKNOWN;

@@ -45,10 +45,10 @@ static const uint32_t *sr_ptr;
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
-/* Write-trace hook (implemented in debug_server.c). Disabled when lo == hi. */
-extern uint32_t debug_server_wtrace_lo;
-extern uint32_t debug_server_wtrace_hi;
-extern void debug_server_trace_write(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width);
+/* Tier 1 write-trace hooks (implemented in debug_server.c). */
+extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+                                           uint32_t new_val, uint8_t width);
+extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 
 static inline uint32_t read_ram_word(uint32_t phys) {
     return  (uint32_t)ram[phys]
@@ -158,6 +158,7 @@ static uint32_t mmio_read32(uint32_t addr) {
 }
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
+    debug_server_trace_mmio_write(addr, val, 4);
     /* Memory control: 0x1F801000..0x1F801020 */
     if (addr >= 0x1F801000u && addr <= 0x1F801020u) {
         mem_ctrl[(addr - 0x1F801000u) >> 2] = val;
@@ -229,6 +230,7 @@ static uint16_t mmio_read16(uint32_t addr) {
 }
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
+    debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         sio_write(addr, val);
@@ -264,6 +266,7 @@ static uint8_t mmio_read8(uint32_t addr) {
 }
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
+    debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         cdrom_write(addr, val);
@@ -326,9 +329,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
-        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
-            debug_server_trace_write(phys, read_ram_word(phys), val, 4);
-        }
+        debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -384,9 +385,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
-        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
-            debug_server_trace_write(phys, read_ram_half(phys), val, 2);
-        }
+        debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -434,9 +433,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
-        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
-            debug_server_trace_write(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
-        }
+        debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         ram[phys] = val;
         return;
     }
