@@ -162,6 +162,20 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         psx_exception_longjmp(); /* does not return */
     }
 
+    /* Exception handler chain-walk continuation: 0xBFC10910 (phys 0x00000E10)
+     * is the return address set by jalr $s1 in the exception handler chain
+     * walker.  In the merged exception handler function, the continuation
+     * code at BFC10910 follows the psx_dispatch call as a C fall-through.
+     * When the chain handler returns via jr $ra (compiled as C `return;`),
+     * the fall-through handles the continuation.  But if external code
+     * dispatches to BFC10910 directly (e.g., the trampoline resolver or
+     * the psx_dispatch tail-call loop picking up $ra), it's a no-op — the
+     * continuation was already handled by the merged function. */
+    if (phys == 0x00000E10u) {
+        cpu->pc = 0;
+        return;
+    }
+
     /* Reject non-word-aligned targets — corrupt function pointer. Hard fail. */
     if (addr & 3) {
         char buf[512];
@@ -313,8 +327,12 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                         if (a_rs == rt0 && a_rt == idx_rd && a_rd == rt0) {
                             /* w4: lw rN, 0(rN) */
                             if ((w4 & 0xFFFF0000) == (0x8C000000u | ((uint32_t)rt0 << 21) | ((uint32_t)rt0 << 16))) {
-                                /* w5: jr rN */
-                                if ((w5 & 0xFC1FFFFF) == 0x00000008 && ((w5 >> 21) & 0x1F) == rt0) {
+                                /* w5: jr rN — or nop then jr rN (load delay slot) */
+                                uint32_t jr_word = w5;
+                                if (w5 == 0x00000000u) {
+                                    jr_word = cpu->read_word(addr + 24);
+                                }
+                                if ((jr_word & 0xFC1FFFFF) == 0x00000008 && ((jr_word >> 21) & 0x1F) == rt0) {
                                     uint32_t index_val = cpu->gpr[idx_rt];
                                     uint32_t table_addr = computed + (index_val << 2);
                                     uint32_t func_ptr = cpu->read_word(table_addr);
@@ -339,7 +357,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             fflush(miss_log);
         }
         miss_count++;
-        if (miss_count > 200) {
+        if (miss_count > 10000) {
             fprintf(stderr, "DISPATCH MISS limit reached (%d misses). See psx_dispatch_misses.txt\n", miss_count);
             fflush(stderr);
             if (miss_log) fclose(miss_log);

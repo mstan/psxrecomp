@@ -213,6 +213,13 @@ def build_cmd(args):
         return {"cmd": "clear_input"}, pretty_json
     elif cmd == "quit":
         return {"cmd": "quit"}, pretty_json
+    elif cmd == "dispatch_check":
+        if len(args) < 2:
+            return None, lambda _: "Usage: dispatch_check <addr>"
+        return {"cmd": "dispatch_check", "addr": args[1]}, pretty_json
+    elif cmd == "dispatch_tail":
+        count = int(args[1]) if len(args) > 1 else 64
+        return {"cmd": "dispatch_tail", "count": str(count)}, pretty_json
     elif cmd == "screenshot":
         d = {"cmd": "screenshot"}
         if len(args) > 1:

@@ -52,6 +52,14 @@ static uint64_t total_checks;
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
 
+/* After the exception handler returns, suppress the next interrupt delivery
+ * to give the interrupted code at least one block of execution — matching
+ * real hardware where at least one instruction runs after RFE before the
+ * pending interrupt can re-fire.  Without this, unhandled interrupts cause
+ * a livelock: the handler runs, doesn't clear I_STAT, returns, and the
+ * very next psx_check_interrupts re-enters immediately. */
+static int post_exception_cooldown;
+
 /* setjmp target for ReturnFromException during handler dispatch. */
 static jmp_buf exception_jmpbuf;
 
@@ -61,6 +69,7 @@ void interrupts_init(void) {
     dispatch_count = 0;
     in_exception = 0;
     total_checks = 0;
+    post_exception_cooldown = 0;
 }
 
 /*
@@ -111,12 +120,19 @@ void psx_check_interrupts(CPUState* cpu) {
     if ((i_stat & i_mask) == 0) return;
     if (in_exception) return;
 
+    /* Post-exception cooldown: let at least one block execute after RFE. */
+    if (post_exception_cooldown > 0) {
+        post_exception_cooldown--;
+        return;
+    }
+
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
     uint32_t sr = cpu->cop0[COP0_SR];
     if (!(sr & 0x01)) return;    /* Interrupts globally disabled */
     if (!(sr & (1 << 10))) return; /* Hardware interrupt bit not enabled */
 
     in_exception = 1;
+    uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
 
     /* Set COP0 Cause: ExcCode=0 (interrupt), IP2 pending. */
     cpu->cop0[COP0_CAUSE] = (cpu->cop0[COP0_CAUSE] & ~0x7C) | (0 << 2);
@@ -198,4 +214,18 @@ void psx_check_interrupts(CPUState* cpu) {
     }
 
     in_exception = 0;
+
+    /* Adaptive cooldown: if the handler acknowledged the interrupt (cleared
+     * some I_STAT bits), the interrupt won't immediately re-fire and we need
+     * no cooldown.  If I_STAT is unchanged (no handler claimed the interrupt),
+     * give the main code a generous window to make progress — e.g. to let
+     * the shell finish installing handlers.  On real hardware, the CPU
+     * executes at least one instruction between exceptions; in our model
+     * each "block" is many instructions, but the handler also consumes
+     * hundreds of sub-dispatches per invocation. */
+    if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
+        post_exception_cooldown = 500;  /* unclaimed: give main code time */
+    } else {
+        post_exception_cooldown = 1;    /* claimed: minimal cooldown */
+    }
 }

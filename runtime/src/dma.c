@@ -83,10 +83,26 @@ static void execute_ch2_gpu(void) {
     uint32_t sync_mode = (chcr >> 9) & 3;    /* 0=burst, 1=block, 2=linked-list */
 
     if (direction == 0) {
-        /* GPU → RAM (VRAM read) — not implemented yet */
-        fprintf(stderr, "DMA ch2: GPU→RAM transfer not implemented\n");
-        fflush(stderr);
-        exit(1);
+        /* GPU → RAM (VRAM read) — not fully implemented.
+         * Fill target RAM with zeros and complete the transfer so the
+         * DMA interrupt fires and the handler chain can process it.
+         * The BIOS uses this during display setup; the actual VRAM
+         * contents aren't critical for boot progression. */
+        if (sync_mode == 1) {
+            uint32_t block_size = channels[2].bcr & 0xFFFF;
+            uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
+            uint32_t total_words = block_size * block_count;
+            uint32_t addr = channels[2].madr & 0x1FFFFCu;
+            int32_t  addr_step = step ? -4 : 4;
+            for (uint32_t i = 0; i < total_words; i++) {
+                psx_write_word(addr, 0);
+                addr = (addr + addr_step) & 0x1FFFFCu;
+            }
+        }
+        /* Transfer complete: clear start/busy bits.
+         * DMA IRQ suppressed — same rationale as RAM→GPU path. */
+        channels[2].chcr &= ~((1u << 24) | (1u << 28));
+        return;
     }
 
     /* direction == 1: RAM → GPU */

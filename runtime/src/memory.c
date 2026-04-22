@@ -253,6 +253,15 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
 }
 
 static uint8_t mmio_read8(uint32_t addr) {
+    /* Interrupts: 0x1F801070..0x1F801077 (I_STAT, I_MASK) */
+    if (addr >= 0x1F801070u && addr <= 0x1F801077u) {
+        uint32_t val = (addr < 0x1F801074u) ? i_stat : i_mask;
+        return (uint8_t)(val >> (8 * (addr & 3)));
+    }
+    /* SIO: 0x1F801040..0x1F80104F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
+        return (uint8_t)sio_read(addr & ~3u);
+    }
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         return (uint8_t)cdrom_read(addr);
@@ -267,6 +276,11 @@ static uint8_t mmio_read8(uint32_t addr) {
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
+    /* SIO: 0x1F801040..0x1F80105F */
+    if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
+        sio_write(addr & ~3u, (uint32_t)val);
+        return;
+    }
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         cdrom_write(addr, val);

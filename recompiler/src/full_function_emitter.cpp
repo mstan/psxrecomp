@@ -292,6 +292,10 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                 // Regular call: always go through psx_dispatch (handles tail-call loop).
                 out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                // Safety net: if continuation falls outside this function, tail-call to it.
+                if (!addr_to_raw.count(return_addr)) {
+                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
+                }
             } else if (kind == "jalr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 uint8_t rd = (pb.raw >> 11) & 0x1F;
@@ -302,6 +306,10 @@ bool FullFunctionEmitter::emit_function(
                 }
                 out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                    static_cast<int>(rs));
+                // Safety net: if continuation falls outside this function, tail-call to it.
+                if (!addr_to_raw.count(return_addr)) {
+                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
+                }
             } else if (kind == "jr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 if (rs == 31) {
@@ -463,7 +471,8 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
-    out += "extern uint32_t g_debug_current_func_addr;\n\n";
+    out += "extern uint32_t g_debug_current_func_addr;\n";
+    out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n\n";
 
     // Forward declarations for all emitted functions.
     for (uint32_t norm : emitted_normalized) {
@@ -510,6 +519,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            int mid = (lo + hi) / 2;\n";
     out += "            if (dispatch_table[mid].addr == phys) {\n";
     out += "                g_debug_current_func_addr = phys;\n";
+    out += "                debug_server_trace_dispatch(phys);\n";
     out += "                dispatch_table[mid].func(cpu);\n";
     out += "                found = 1;\n";
     out += "                break;\n";

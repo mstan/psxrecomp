@@ -119,6 +119,48 @@ static int s_wtrace_range_count = 0;
 /* Function attribution global — set by psx_dispatch() before each call. */
 uint32_t g_debug_current_func_addr = 0;
 
+/* ---- Dispatch trace ring buffer ----
+ * Records every dispatched function address for post-mortem analysis.
+ * 64K entries, stack-allocated (256 KB). */
+#define DISPATCH_TRACE_CAP (1 << 16)
+static uint32_t s_dispatch_ring[DISPATCH_TRACE_CAP];
+static uint64_t s_dispatch_seq = 0;
+
+/* Unique dispatch set — tracks every unique function address ever dispatched.
+ * Simple hash set with linear probing. */
+#define DISPATCH_UNIQUE_CAP 4096
+static uint32_t s_dispatch_unique[DISPATCH_UNIQUE_CAP];
+static int s_dispatch_unique_count = 0;
+
+static void dispatch_unique_add(uint32_t addr) {
+    uint32_t idx = (addr >> 2) % DISPATCH_UNIQUE_CAP;
+    for (int i = 0; i < DISPATCH_UNIQUE_CAP; i++) {
+        uint32_t slot = (idx + i) % DISPATCH_UNIQUE_CAP;
+        if (s_dispatch_unique[slot] == addr) return; /* already present */
+        if (s_dispatch_unique[slot] == 0) {
+            s_dispatch_unique[slot] = addr;
+            s_dispatch_unique_count++;
+            return;
+        }
+    }
+}
+
+static int dispatch_trace_contains(uint32_t target) {
+    uint32_t idx = (target >> 2) % DISPATCH_UNIQUE_CAP;
+    for (int i = 0; i < DISPATCH_UNIQUE_CAP; i++) {
+        uint32_t slot = (idx + i) % DISPATCH_UNIQUE_CAP;
+        if (s_dispatch_unique[slot] == target) return 1;
+        if (s_dispatch_unique[slot] == 0) return 0;
+    }
+    return 0;
+}
+
+void debug_server_trace_dispatch(uint32_t func_addr) {
+    s_dispatch_ring[s_dispatch_seq % DISPATCH_TRACE_CAP] = func_addr;
+    s_dispatch_seq++;
+    dispatch_unique_add(func_addr);
+}
+
 /* ---- MMIO write trace (separate ring buffer) ----
  * Records every write to 0x1F801xxx MMIO registers. Unconditional (no filtering).
  * 64K entries, heap-allocated in debug_server_init(). */
@@ -1070,6 +1112,38 @@ static void handle_quit(int id, const char *json)
 
 /* ---- Command dispatch table ---- */
 
+/* dispatch_check: check if a specific address was ever dispatched */
+static void handle_dispatch_check(int id, const char *json) {
+    char abuf[32] = {0};
+    json_get_str(json, "addr", abuf, sizeof(abuf));
+    uint32_t addr = (uint32_t)strtoul(abuf, NULL, 0);
+    int found = dispatch_trace_contains(addr);
+    debug_server_send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"found\":%s,\"total\":%llu}\n",
+        id, addr, found ? "true" : "false", (unsigned long long)s_dispatch_seq);
+}
+
+/* dispatch_tail: dump the last N dispatched function addresses */
+static void handle_dispatch_tail(int id, const char *json) {
+    int count = 64;
+    { /* try to parse count */
+        char buf[32];
+        if (json_get_str(json, "count", buf, sizeof(buf)))
+            count = atoi(buf);
+    }
+    if (count > 4096) count = 4096;
+    if ((uint64_t)count > s_dispatch_seq) count = (int)s_dispatch_seq;
+
+    debug_server_send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%d,\"addrs\":[",
+        id, (unsigned long long)s_dispatch_seq, count);
+    uint64_t start = s_dispatch_seq - count;
+    for (int i = 0; i < count; i++) {
+        uint32_t a = s_dispatch_ring[(start + i) % DISPATCH_TRACE_CAP];
+        if (i > 0) debug_server_send_fmt(",");
+        debug_server_send_fmt("\"0x%08X\"", a);
+    }
+    debug_server_send_fmt("]}\n");
+}
+
 typedef void (*CmdHandler)(int id, const char *json);
 typedef struct { const char *name; CmdHandler handler; } CmdEntry;
 
@@ -1112,6 +1186,8 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot },
     { "quit",              handle_quit },
+    { "dispatch_check",    handle_dispatch_check },
+    { "dispatch_tail",     handle_dispatch_tail },
     { NULL, NULL }
 };
 

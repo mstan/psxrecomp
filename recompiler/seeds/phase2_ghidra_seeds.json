@@ -4134,11 +4134,6 @@
       "rationale": "Epilogue fragment at BFC1E3C0 (addiu sp,sp,0x18; jr ra; nop). Reached via branch from SIO state machine. Dispatch miss after fall-through fix exposed new code paths."
     },
     {
-      "address": "0xBFC10910",
-      "label": "kernel_exception_chain_walk_mid",
-      "rationale": "Mid-loop entry in kernel exception handler chain walker (BFC10910). Contains chain link traversal (lw s6,0(s6)), loop back to BFC108F8/BFC108E8, and k0 restore. Reached after fall-through fix."
-    },
-    {
       "address": "0xBFC336F0",
       "label": "gte_cop2_init",
       "rationale": "GTE/COP2 initialization: enables COP2 in SR, sets COP2 control registers. Contains COP2 instructions (Phase 5). Reached after fall-through fix."

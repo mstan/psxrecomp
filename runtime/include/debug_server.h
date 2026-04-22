@@ -115,6 +115,9 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
 /* MMIO write trace — separate ring buffer for 0x1F801xxx writes. */
 void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 
+/* Dispatch trace — record every function dispatched. */
+void debug_server_trace_dispatch(uint32_t func_addr);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);
