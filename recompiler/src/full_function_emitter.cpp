@@ -506,6 +506,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
     out += "extern void psx_restore_state_escape(void);\n";
+    out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
     out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n\n";
 
@@ -628,7 +629,8 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
-    full_c += "extern void psx_restore_state_escape(void);\n\n";
+    full_c += "extern void psx_restore_state_escape(void);\n";
+    full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n\n";
 
     // Forward declare ALL functions so intra-file calls resolve.
     for (const auto& fn : dr.functions) {

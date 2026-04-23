@@ -1201,6 +1201,96 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             fmt::format("COP0 rs 0x{:02X} not implemented (only MFC0/MTC0/RFE in Phase 1b)", rs));
     }
 
+    // COP2 / GTE (opcode 0x12)
+    if (opcode == 0x12) {
+        const uint8_t cop_op = (d.raw >> 21) & 0x1F;
+        const uint8_t rt = (d.raw >> 16) & 0x1F;
+        const uint8_t rd = (d.raw >> 11) & 0x1F;
+
+        if (cop_op == 0x00) { // MFC2 — move from COP2 data register
+            r.supported = true;
+            r.c_code = emit_gpr_write(rt,
+                fmt::format("cpu->gte_data[{}]", static_cast<int>(rd)));
+            r.comment = fmt::format("mfc2 {}, gte_data[{}]", gpr_name(rt), rd);
+            return r;
+        }
+        if (cop_op == 0x02) { // CFC2 — move from COP2 control register
+            r.supported = true;
+            r.c_code = emit_gpr_write(rt,
+                fmt::format("cpu->gte_ctrl[{}]", static_cast<int>(rd)));
+            r.comment = fmt::format("cfc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
+            return r;
+        }
+        if (cop_op == 0x04) { // MTC2 — move to COP2 data register
+            r.supported = true;
+            r.c_code = fmt::format(
+                "cpu->gte_data[{}] = cpu->gpr[{}];",
+                static_cast<int>(rd), static_cast<int>(rt));
+            r.comment = fmt::format("mtc2 {}, gte_data[{}]", gpr_name(rt), rd);
+            return r;
+        }
+        if (cop_op == 0x06) { // CTC2 — move to COP2 control register
+            r.supported = true;
+            r.c_code = fmt::format(
+                "cpu->gte_ctrl[{}] = cpu->gpr[{}];",
+                static_cast<int>(rd), static_cast<int>(rt));
+            r.comment = fmt::format("ctc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
+            return r;
+        }
+        if (cop_op & 0x10) { // GTE command (bit 25 set)
+            uint32_t gte_cmd = d.raw & 0x1FFFFFF;
+            r.supported = true;
+            r.c_code = fmt::format(
+                "gte_execute(cpu, 0x{:07X});",
+                gte_cmd);
+            r.comment = fmt::format("gte cmd 0x{:02X}", gte_cmd & 0x3F);
+            return r;
+        }
+
+        return unsupported(d,
+            fmt::format("COP2 rs 0x{:02X} not implemented", cop_op));
+    }
+
+    // LWC2 (opcode 0x32) — load word to COP2 data register
+    if (opcode == 0x32) {
+        const uint8_t rs = (d.raw >> 21) & 0x1F;
+        const uint8_t rt = (d.raw >> 16) & 0x1F;
+        const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
+        r.supported = true;
+        if (offset == 0) {
+            r.c_code = fmt::format(
+                "cpu->gte_data[{}] = cpu->read_word(cpu->gpr[{}]);",
+                static_cast<int>(rt), static_cast<int>(rs));
+        } else {
+            r.c_code = fmt::format(
+                "cpu->gte_data[{}] = cpu->read_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})));",
+                static_cast<int>(rt), static_cast<int>(rs), static_cast<int>(offset));
+        }
+        r.comment = fmt::format("lwc2 gte[{}], {}({})",
+            rt, static_cast<int>(offset), gpr_name(rs));
+        return r;
+    }
+
+    // SWC2 (opcode 0x3A) — store word from COP2 data register
+    if (opcode == 0x3A) {
+        const uint8_t rs = (d.raw >> 21) & 0x1F;
+        const uint8_t rt = (d.raw >> 16) & 0x1F;
+        const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
+        r.supported = true;
+        if (offset == 0) {
+            r.c_code = fmt::format(
+                "cpu->write_word(cpu->gpr[{}], cpu->gte_data[{}]);",
+                static_cast<int>(rs), static_cast<int>(rt));
+        } else {
+            r.c_code = fmt::format(
+                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), cpu->gte_data[{}]);",
+                static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
+        }
+        r.comment = fmt::format("swc2 gte[{}], {}({})",
+            rt, static_cast<int>(offset), gpr_name(rs));
+        return r;
+    }
+
     return unsupported(d, fmt::format("top-level opcode 0x{:02X} not implemented in Phase 1a", opcode));
 }
 
