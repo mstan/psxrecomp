@@ -97,13 +97,8 @@ void memcard_init(const char* dir) {
                 if (n == MEMCARD_SIZE) {
                     cards[i].present = 1;
                 }
-            } else {
-                /* No card file -- create a properly formatted blank card. */
-                memcard_format(cards[i].data);
-                cards[i].present = 1;
-                cards[i].dirty = 1;
-                memcard_flush(i);
             }
+            /* No card file = no card in slot. */
         }
     }
 }

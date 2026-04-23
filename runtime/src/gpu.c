@@ -110,6 +110,13 @@ static uint32_t gpuread_latch;
 /* Vblank presentation callback */
 static gpu_vblank_cb vblank_callback;
 
+/* Shaded quad vertex capture (Phase 4.5 debug) — forward declarations
+ * so gpu_vblank_tick can reference sq_cap_armed. */
+#define SQ_CAP_MAX 32
+static GpuSqCapEntry sq_cap_buf[SQ_CAP_MAX];
+static int sq_cap_count;
+static int sq_cap_armed;
+
 /* GPUSTAT poll counter: in v4, recompiled code runs as native C without
  * per-instruction stepping. The BIOS contains tight VSYNC wait loops that
  * poll GPUSTAT bit 31 (LCF) waiting for it to toggle. LCF only changes
@@ -485,6 +492,13 @@ static void gp0_exec_shaded_tri(void) {
                              vx[2], vy[2], c[2]);
 }
 
+void gpu_arm_shaded_quad_capture(void) { sq_cap_armed = 1; sq_cap_count = 0; }
+int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out) {
+    sq_cap_armed = 0; /* disarm on read */
+    *out = sq_cap_buf;
+    return sq_cap_count;
+}
+
 /* Execute shaded quad (GP0 0x38-0x3B) */
 static void gp0_exec_shaded_quad(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
@@ -496,6 +510,14 @@ static void gp0_exec_shaded_quad(void) {
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
+    }
+    /* Capture vertex data when armed. */
+    if (sq_cap_armed && sq_cap_count < SQ_CAP_MAX) {
+        GpuSqCapEntry* e = &sq_cap_buf[sq_cap_count++];
+        for (int i = 0; i < 4; i++) {
+            e->vx[i] = vx[i]; e->vy[i] = vy[i];
+            e->color[i] = gp0_cmd_buf[i * 2] & 0xFFFFFFu;
+        }
     }
     sw_set_semi_transparency(semi_trans, (int)semi_transparency);
     sw_draw_gouraud_triangle(vx[0], vy[0], c[0],
@@ -519,7 +541,7 @@ static void setup_textured_draw(uint32_t color24, int semi_trans) {
     uint32_t r = (color24 >> 0) & 0xFF;
     uint32_t g = (color24 >> 8) & 0xFF;
     uint32_t b = (color24 >> 16) & 0xFF;
-    int raw = (r == 0x80 && g == 0x80 && b == 0x80) ? 0 : 0;
+    int raw = (r == 0x80 && g == 0x80 && b == 0x80) ? 1 : 0;
     sw_set_color_modulation((int)r, (int)g, (int)b, raw);
     sw_set_semi_transparency(semi_trans, (int)semi_transparency);
 }

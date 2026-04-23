@@ -466,12 +466,42 @@ static void handle_gpu_opcodes(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+static void handle_capture_quads(int id, const char *json)
+{
+    (void)json;
+    gpu_arm_shaded_quad_capture();
+    send_ok(id);
+}
+
+static void handle_get_quads(int id, const char *json)
+{
+    (void)json;
+    const GpuSqCapEntry *entries;
+    int count = gpu_get_shaded_quad_capture(&entries);
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"count\":%d,\"quads\":[", id, count);
+    for (int i = 0; i < count && pos < (int)sizeof(buf) - 256; i++) {
+        const GpuSqCapEntry *e = &entries[i];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"v\":[%d,%d,%d,%d,%d,%d,%d,%d],\"c\":[\"0x%06X\",\"0x%06X\",\"0x%06X\",\"0x%06X\"]}",
+            i ? "," : "",
+            e->vx[0], e->vy[0], e->vx[1], e->vy[1],
+            e->vx[2], e->vy[2], e->vx[3], e->vy[3],
+            e->color[0], e->color[1], e->color[2], e->color[3]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_fmt("%s", buf);
+}
+
+extern uint64_t gte_get_exec_count(void);
+
 static void handle_gte_state(int id, const char *json)
 {
     (void)json;
     if (!s_cpu) { send_err(id, "no cpu"); return; }
     char buf[2048];
-    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"gte_ctrl\":[", id);
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"gte_exec\":%llu,\"gte_ctrl\":[",
+                       id, (unsigned long long)gte_get_exec_count());
     for (int i = 0; i < 32; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%08X\"",
                        i ? "," : "", s_cpu->gte_ctrl[i]);
@@ -1296,6 +1326,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "gpu_opcodes",       handle_gpu_opcodes },
+    { "capture_quads",     handle_capture_quads },
+    { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
     { "quit",              handle_quit },
     { "dispatch_check",    handle_dispatch_check },

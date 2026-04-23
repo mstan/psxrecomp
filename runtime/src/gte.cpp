@@ -765,8 +765,12 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 // ---------------------------------------------------------------------------
 // gte_execute — C-linkage bridge called from generated code
 // ---------------------------------------------------------------------------
+static uint64_t s_gte_exec_count = 0;
+extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
+
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
+    s_gte_exec_count++;
 
     GTEState gte;
     // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and

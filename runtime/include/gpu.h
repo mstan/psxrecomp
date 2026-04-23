@@ -40,6 +40,14 @@ typedef struct {
 void gpu_get_draw_area(GpuDrawArea* out);
 uint16_t gpu_vram_peek(int x, int y);
 
+/* Shaded quad vertex capture (Phase 4.5 debug). */
+typedef struct {
+    int32_t vx[4], vy[4];
+    uint32_t color[4];
+} GpuSqCapEntry;
+void gpu_arm_shaded_quad_capture(void);
+int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out);
+
 /* Vblank presentation callback — called from gpu_vblank_tick(). */
 typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);
