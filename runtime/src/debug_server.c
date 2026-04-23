@@ -456,7 +456,7 @@ static void handle_sio_state(int id, const char *json)
              (uint16_t)sio_read(0x1F801044),
              (uint16_t)sio_read(0x1F80104A),
              (uint8_t)sio_read(0x1F801040),
-             0); /* TODO: expose pad_buttons from sio.c */
+             sio_get_pad_buttons());
 }
 
 static void handle_watch(int id, const char *json)
@@ -1314,7 +1314,6 @@ void debug_server_poll(void)
             sock_close(s_client);
             s_client = SOCK_INVALID;
             s_paused = 0;
-            s_input_override = -1;
             return;
         } else {
             int err = sock_error();

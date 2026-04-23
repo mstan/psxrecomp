@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 836,
+  "seed_count": 857,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4187,6 +4187,161 @@
       "address": "0xBFC4226C",
       "label": "shell_vblank_callback_loop",
       "rationale": "Mid-function entry point inside func_1FC42160. The BIOS shell jumps here directly to walk VBlank callbacks, bypassing the init-gate at the function top. Needed for VSync counter increment."
+    },
+    {
+      "address": "0xBFC1A050",
+      "label": "shell_input_handler",
+      "rationale": "Shell function called via RAM 0x80032050 after pad input detected. Dispatch miss blocked shell from processing button presses."
+    },
+    {
+      "address": "0xBFC19FD0",
+      "label": "shell_input_handler_2",
+      "rationale": "Second shell input handler at RAM 0x80031FD0. Similar to BFC1A050. Dispatch miss after adding BFC1A050."
+    },
+    {
+      "address": "0xBFC151E8",
+      "label": "kernel_56E8",
+      "rationale": "Kernel function at RAM 0x56E8. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC156A4",
+      "label": "kernel_5BA4",
+      "rationale": "Kernel function at RAM 0x5BA4. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC0BA8C",
+      "label": "bios_BA8C",
+      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC0C1DC",
+      "label": "bios_C1DC",
+      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC15268",
+      "label": "kernel_5768",
+      "rationale": "Kernel function at RAM 0x5768. Cascade from input path seeds."
+    },
+    {
+      "address": "0xBFC15724",
+      "label": "kernel_5C24",
+      "rationale": "Kernel function at RAM 0x5C24. Cascade from input path seeds."
+    },
+    {
+      "address": "0xBFC42308",
+      "label": "shell_42308",
+      "rationale": "Shell function near VSync callback area. Dispatch miss from input path."
+    },
+    {
+      "address": "0xBFC1529C",
+      "label": "kernel_579C",
+      "rationale": "Kernel function at RAM 0x579C. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15650",
+      "label": "kernel_5B50",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15894",
+      "label": "kernel_5D94",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15334",
+      "label": "kernel_5834",
+      "rationale": "Kernel function at RAM 0x5834. Cascade."
+    },
+    {
+      "address": "0xBFC15758",
+      "label": "kernel_5C58",
+      "rationale": "Kernel function at RAM 0x5C58. Cascade."
+    },
+    {
+      "address": "0xBFC15654",
+      "label": "kernel_5B54",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15370",
+      "label": "kernel_5870",
+      "rationale": "Kernel (CARD driver) function. Cascade."
+    },
+    {
+      "address": "0xBFC15848",
+      "label": "kernel_5D48",
+      "rationale": "Kernel (CARD driver) function. Cascade."
+    },
+    {
+      "address": "0xBFC15898",
+      "label": "kernel_5D98",
+      "rationale": "Kernel (CARD driver) function. Cascade."
+    },
+    {
+      "address": "0xBFC153B4",
+      "label": "kernel_58B4",
+      "rationale": "Kernel (CARD driver) function at RAM 0x58B4. Cascade."
+    },
+    {
+      "address": "0xBFC153E8",
+      "label": "kernel_58E8",
+      "rationale": "Kernel (CARD driver) function at RAM 0x58E8. Cascade."
+    },
+    {
+      "address": "0xBFC15418",
+      "label": "kernel_5918",
+      "rationale": "Kernel (CARD driver) leaf function at RAM 0x5918. Cascade."
+    },
+    {
+      "address": "0xBFC15454",
+      "label": "kernel_5954",
+      "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC15490",
+      "label": "kernel_5990",
+      "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC154CC",
+      "label": "kernel_59CC",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15508",
+      "label": "kernel_5A08",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15544",
+      "label": "kernel_5A44",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15580",
+      "label": "kernel_5A80",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC155BC",
+      "label": "kernel_5ABC",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC155F8",
+      "label": "kernel_5AF8",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15634",
+      "label": "kernel_5B34",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15500",
+      "label": "kernel_5A00",
+      "rationale": "CARD driver cascade."
     }
   ],
   "excluded": [

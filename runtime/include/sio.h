@@ -29,6 +29,9 @@ void sio_set_pad_state(uint16_t buttons);
  * connected during initial BIOS boot. */
 void sio_connect_pad(int slot);
 
+/* Return current pad button state (for debug server). */
+uint16_t sio_get_pad_buttons(void);
+
 #ifdef __cplusplus
 }
 #endif

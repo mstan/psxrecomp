@@ -160,6 +160,10 @@ void sio_set_pad_state(uint16_t buttons) {
     pad_buttons = buttons;
 }
 
+uint16_t sio_get_pad_buttons(void) {
+    return pad_buttons;
+}
+
 static void pad_process_byte(uint8_t tx_byte) {
     switch (pad_state) {
     case PAD_IDLE:

@@ -99,8 +99,13 @@ void psx_restore_state_escape(void) {
 void psx_check_interrupts(CPUState* cpu) {
     total_checks++;
 
-    /* SIO delayed IRQ delivery. */
-    sio_tick();
+    /* SIO delayed IRQ delivery removed from here.
+     * sio_tick() is now called only from SIO register accesses
+     * (sio_read/sio_write) and I_STAT reads (memory.c).  The BIOS
+     * pad detection sequence clears I_STAT bit 7 then polls I_STAT
+     * waiting for it to re-appear.  If we tick here, the IRQ fires
+     * during the delay loop BEFORE the clear, and the BIOS never
+     * sees it. */
 
     /* VBlank / timer tick — only when NOT inside the exception handler.
      *
