@@ -444,6 +444,47 @@ static void handle_irq_state(int id, const char *json)
              dma_get_dpcr(), dma_get_dicr());
 }
 
+/* GPU opcode counter — defined in gpu.c */
+extern uint32_t gpu_get_opcode_count(uint8_t op);
+
+static void handle_gpu_opcodes(int id, const char *json)
+{
+    (void)json;
+    /* Report non-zero GP0 opcode counts */
+    char buf[4096];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"opcodes\":{", id);
+    int first = 1;
+    for (int i = 0; i < 256; i++) {
+        uint32_t cnt = gpu_get_opcode_count((uint8_t)i);
+        if (cnt > 0) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%02X\":%u",
+                           first ? "" : ",", i, cnt);
+            first = 0;
+        }
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "}}");
+    send_fmt("%s", buf);
+}
+
+static void handle_gte_state(int id, const char *json)
+{
+    (void)json;
+    if (!s_cpu) { send_err(id, "no cpu"); return; }
+    char buf[2048];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"gte_ctrl\":[", id);
+    for (int i = 0; i < 32; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%08X\"",
+                       i ? "," : "", s_cpu->gte_ctrl[i]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"gte_data\":[");
+    for (int i = 0; i < 32; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%08X\"",
+                       i ? "," : "", s_cpu->gte_data[i]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_fmt("%s", buf);
+}
+
 static void handle_sio_state(int id, const char *json)
 {
     (void)json;
@@ -1254,6 +1295,8 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot },
     { "screenshot_file",   handle_screenshot_file },
+    { "gpu_opcodes",       handle_gpu_opcodes },
+    { "gte_state",         handle_gte_state },
     { "quit",              handle_quit },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },

@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 857,
+  "seed_count": 955,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -3316,7 +3316,7 @@
     {
       "address": "0xBFC4231C",
       "label": "shell_vblank_init_body",
-      "rationale": "Mid-function entry: SaveState returns v0=0 → BEQ at 0xBFC421D8 taken → callback table setup at 0xBFC4231C. Split from func_1FC42160"
+      "rationale": "Mid-function entry: SaveState returns v0=0 \u00e2\u2020\u2019 BEQ at 0xBFC421D8 taken \u00e2\u2020\u2019 callback table setup at 0xBFC4231C. Split from func_1FC42160"
     },
     {
       "address": "0xBFC42370",
@@ -4146,7 +4146,7 @@
     {
       "address": "0xBFC425BC",
       "label": "vblank_chain_handler",
-      "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM — installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
+      "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM \u00e2\u20ac\u201d installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
     },
     {
       "address": "0xBFC1E3C0",
@@ -4161,17 +4161,17 @@
     {
       "address": "0xBFC42BA0",
       "label": "shell_vblank_dispatch",
-      "rationale": "Called from chain-E004 verify (func_1FC40700) via jal 0x8005ABA0. Walks VBlank callback chain → calls VSync counter incrementer. Missing seed blocks VSync counter from incrementing."
+      "rationale": "Called from chain-E004 verify (func_1FC40700) via jal 0x8005ABA0. Walks VBlank callback chain \u00e2\u2020\u2019 calls VSync counter incrementer. Missing seed blocks VSync counter from incrementing."
     },
     {
       "address": "0xBFC38AF0",
       "label": "shell_hot_function",
-      "rationale": "Dispatch miss at 0x80050AF0 (phys 0x1FC38AF0) — 178 misses. Hot shell function during rendering loop."
+      "rationale": "Dispatch miss at 0x80050AF0 (phys 0x1FC38AF0) \u00e2\u20ac\u201d 178 misses. Hot shell function during rendering loop."
     },
     {
       "address": "0xBFC137D0",
       "label": "kernel_ram_function",
-      "rationale": "Dispatch miss at 0xBFC137D0 (phys 0x00003CD0) — 3 misses. Kernel RAM function."
+      "rationale": "Dispatch miss at 0xBFC137D0 (phys 0x00003CD0) \u00e2\u20ac\u201d 3 misses. Kernel RAM function."
     },
     {
       "address": "0xBFC42BF0",
@@ -4342,6 +4342,441 @@
       "address": "0xBFC15500",
       "label": "kernel_5A00",
       "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC33758",
+      "label": "gte_lib_BFC33758",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC337AC",
+      "label": "gte_lib_BFC337AC",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33800",
+      "label": "gte_lib_BFC33800",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3388C",
+      "label": "gte_lib_BFC3388C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33918",
+      "label": "gte_lib_BFC33918",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33978",
+      "label": "gte_lib_BFC33978",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33AB8",
+      "label": "gte_lib_BFC33AB8",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33B80",
+      "label": "gte_lib_BFC33B80",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33C04",
+      "label": "gte_lib_BFC33C04",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33C84",
+      "label": "gte_lib_BFC33C84",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33D24",
+      "label": "gte_lib_BFC33D24",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33DA4",
+      "label": "gte_lib_BFC33DA4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33E20",
+      "label": "gte_lib_BFC33E20",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33E80",
+      "label": "gte_lib_BFC33E80",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33E90",
+      "label": "gte_lib_BFC33E90",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33EA0",
+      "label": "gte_lib_BFC33EA0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33EC0",
+      "label": "gte_lib_BFC33EC0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33ECC",
+      "label": "gte_lib_BFC33ECC",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33EE0",
+      "label": "gte_lib_BFC33EE0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33EF4",
+      "label": "gte_lib_BFC33EF4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33F40",
+      "label": "gte_lib_BFC33F40",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33F54",
+      "label": "gte_lib_BFC33F54",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33F6C",
+      "label": "gte_lib_BFC33F6C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33F80",
+      "label": "gte_lib_BFC33F80",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33F94",
+      "label": "gte_lib_BFC33F94",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33FA8",
+      "label": "gte_lib_BFC33FA8",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33FF0",
+      "label": "gte_lib_BFC33FF0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33FFC",
+      "label": "gte_lib_BFC33FFC",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34008",
+      "label": "gte_lib_BFC34008",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3401C",
+      "label": "gte_lib_BFC3401C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34028",
+      "label": "gte_lib_BFC34028",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3403C",
+      "label": "gte_lib_BFC3403C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34054",
+      "label": "gte_lib_BFC34054",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34068",
+      "label": "gte_lib_BFC34068",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3407C",
+      "label": "gte_lib_BFC3407C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34088",
+      "label": "gte_lib_BFC34088",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3409C",
+      "label": "gte_lib_BFC3409C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC340CC",
+      "label": "gte_lib_BFC340CC",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC340D8",
+      "label": "gte_lib_BFC340D8",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC340E4",
+      "label": "gte_lib_BFC340E4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34104",
+      "label": "gte_lib_BFC34104",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34110",
+      "label": "gte_lib_BFC34110",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34924",
+      "label": "gte_lib_BFC34924",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34954",
+      "label": "gte_lib_BFC34954",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34980",
+      "label": "gte_lib_BFC34980",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A04",
+      "label": "gte_lib_BFC34A04",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A30",
+      "label": "gte_lib_BFC34A30",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A60",
+      "label": "gte_lib_BFC34A60",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A90",
+      "label": "gte_lib_BFC34A90",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34AA0",
+      "label": "gte_lib_BFC34AA0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34B08",
+      "label": "gte_lib_BFC34B08",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34EC0",
+      "label": "gte_lib_BFC34EC0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34EC4",
+      "label": "gte_lib_BFC34EC4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35128",
+      "label": "gte_lib_BFC35128",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3524C",
+      "label": "gte_lib_BFC3524C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35348",
+      "label": "gte_lib_BFC35348",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35470",
+      "label": "gte_lib_BFC35470",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35598",
+      "label": "gte_lib_BFC35598",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35698",
+      "label": "gte_lib_BFC35698",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC357C4",
+      "label": "gte_lib_BFC357C4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC3582C",
+      "label": "gte_lib_BFC3582C",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35890",
+      "label": "gte_lib_BFC35890",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35B88",
+      "label": "gte_lib_BFC35B88",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35BC4",
+      "label": "gte_lib_BFC35BC4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35C28",
+      "label": "gte_lib_BFC35C28",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35C60",
+      "label": "gte_lib_BFC35C60",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35CC8",
+      "label": "gte_lib_BFC35CC8",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35D10",
+      "label": "gte_lib_BFC35D10",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35D58",
+      "label": "gte_lib_BFC35D58",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35DA0",
+      "label": "gte_lib_BFC35DA0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35DD4",
+      "label": "gte_lib_BFC35DD4",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35E30",
+      "label": "gte_lib_BFC35E30",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35E64",
+      "label": "gte_lib_BFC35E64",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35E98",
+      "label": "gte_lib_BFC35E98",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35EC0",
+      "label": "gte_lib_BFC35EC0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35EEC",
+      "label": "gte_lib_BFC35EEC",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35F18",
+      "label": "gte_lib_BFC35F18",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35F38",
+      "label": "gte_lib_BFC35F38",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35F78",
+      "label": "gte_lib_BFC35F78",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35FA0",
+      "label": "gte_lib_BFC35FA0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC35FD0",
+      "label": "gte_lib_BFC35FD0",
+      "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34928",
+      "label": "gte_lib_BFC34928",
+      "rationale": "GTE library sub-entry. Cascade from batch."
+    },
+    {
+      "address": "0xBFC34A08",
+      "label": "gte_lib_BFC34A08",
+      "rationale": "GTE library sub-entry. Cascade from batch."
+    },
+    {
+      "address": "0xBFC34958",
+      "label": "gte_lib_BFC34958",
+      "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
+      "address": "0xBFC34A34",
+      "label": "gte_lib_BFC34A34",
+      "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
+      "address": "0xBFC34984",
+      "label": "gte_lib_BFC34984",
+      "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
+      "address": "0xBFC34A64",
+      "label": "gte_lib_BFC34A64",
+      "rationale": "GTE library sub-entry. Cascade."
     }
   ],
   "excluded": [

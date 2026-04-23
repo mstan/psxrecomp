@@ -440,6 +440,7 @@ static void raster_triangle(int32_t x0, int32_t y0,
 
 /* Execute mono triangle (GP0 0x20-0x23) */
 static void gp0_exec_mono_tri(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
@@ -447,11 +448,13 @@ static void gp0_exec_mono_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
 }
 
 /* Execute mono quad (GP0 0x28-0x2B) — two triangles: (0,1,2) and (2,1,3) */
 static void gp0_exec_mono_quad(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++) {
@@ -459,8 +462,9 @@ static void gp0_exec_mono_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    raster_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    sw_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
 }
 
 /* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
@@ -656,29 +660,20 @@ static void gp0_exec_shaded_textured_quad(void) {
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */
 static void gp0_exec_mono_line(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
-    /* Simple Bresenham */
-    int32_t dx = x1 - x0, dy = y1 - y0;
-    int32_t sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
-    if (dx < 0) dx = -dx;
-    if (dy < 0) dy = -dy;
-    int32_t err = dx - dy;
-    for (;;) {
-        raster_pixel(x0, y0, color);
-        if (x0 == x1 && y0 == y1) break;
-        int32_t e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 < dx)  { err += dx; y0 += sy; }
-    }
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_line(x0, y0, x1, y1, color);
 }
 
 /* Execute shaded line (GP0 0x50-0x57) — flat shaded for now */
 static void gp0_exec_shaded_line(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
@@ -686,34 +681,23 @@ static void gp0_exec_shaded_line(void) {
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
-    int32_t dx = x1 - x0, dy = y1 - y0;
-    int32_t sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
-    if (dx < 0) dx = -dx;
-    if (dy < 0) dy = -dy;
-    int32_t err = dx - dy;
-    for (;;) {
-        raster_pixel(x0, y0, color);
-        if (x0 == x1 && y0 == y1) break;
-        int32_t e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 < dx)  { err += dx; y0 += sy; }
-    }
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_line(x0, y0, x1, y1, color);
 }
 
 /* Execute mono rectangle (GP0 0x60-0x63) */
 static void gp0_exec_mono_rect(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    uint32_t w = gp0_cmd_buf[2] & 0xFFFFu;
-    uint32_t h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
-    /* Clamp to PS1 max */
+    int w = gp0_cmd_buf[2] & 0xFFFFu;
+    int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
-    for (uint32_t dy = 0; dy < h; dy++)
-        for (uint32_t dx = 0; dx < w; dx++)
-            raster_pixel(x0 + (int32_t)dx, y0 + (int32_t)dy, color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_flat_rect(x0, y0, w, h, color);
 }
 
 /* Execute textured rectangle (GP0 0x64-0x67) */
@@ -739,11 +723,13 @@ static void gp0_exec_textured_rect(void) {
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
 static void gp0_exec_mono_dot(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
     x += draw_offset_x; y += draw_offset_y;
-    raster_pixel(x, y, color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_flat_rect(x, y, 1, 1, color);
 }
 
 /* Execute 8x8 textured sprite (GP0 0x74-0x77) */
@@ -765,13 +751,13 @@ static void gp0_exec_textured_8x8(void) {
 
 /* Execute 8x8 sprite (GP0 0x70-0x73) */
 static void gp0_exec_mono_8x8(void) {
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    for (int32_t dy = 0; dy < 8; dy++)
-        for (int32_t dx = 0; dx < 8; dx++)
-            raster_pixel(x0 + dx, y0 + dy, color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_flat_rect(x0, y0, 8, 8, color);
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
@@ -1027,9 +1013,15 @@ static int gp0_command_word_count(uint8_t opcode) {
     }
 }
 
+/* Per-opcode execution counters (exposed via gpu_get_opcode_stats) */
+static uint32_t gp0_opcode_count[256];
+
+uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
+
 /* Execute a fully-collected GP0 command */
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
+    gp0_opcode_count[opcode]++;
 
     /* Categorize for diagnostics */
     if (opcode <= 0x01) gp0_nop_count++;
@@ -1118,12 +1110,39 @@ static void gp0_execute_command(void) {
         case 0x68: case 0x69: case 0x6A: case 0x6B:
             gp0_exec_mono_dot();
             break;
+        case 0x6C: case 0x6D: case 0x6E: case 0x6F: {
+            /* 1x1 textured dot: cmd, vertex, texcoord+clut (no size word) */
+            uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+            int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+            int32_t x0, y0;
+            parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+            x0 += draw_offset_x; y0 += draw_offset_y;
+            int u0 = gp0_cmd_buf[2] & 0xFF;
+            int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
+            uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+            uint16_t clut_x = (clut & 0x3F) * 16;
+            uint16_t clut_y = (clut >> 6) & 0x1FF;
+            setup_textured_draw(color24, semi_trans);
+            sw_draw_textured_rect(x0, y0, 1, 1, u0, v0, clut_x, clut_y, current_texpage());
+            break;
+        }
         case 0x70: case 0x71: case 0x72: case 0x73:
             gp0_exec_mono_8x8();
             break;
         case 0x74: case 0x75: case 0x76: case 0x77:
             gp0_exec_textured_8x8();
             break;
+        case 0x78: case 0x79: case 0x7A: case 0x7B: {
+            /* 16x16 mono sprite */
+            int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+            uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+            int32_t x0, y0;
+            parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+            x0 += draw_offset_x; y0 += draw_offset_y;
+            sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+            sw_draw_flat_rect(x0, y0, 16, 16, color);
+            break;
+        }
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
             gp0_exec_textured_16x16();
             break;
