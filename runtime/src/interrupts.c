@@ -257,6 +257,13 @@ void psx_check_interrupts(CPUState* cpu) {
     if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
         post_exception_cooldown = 500;  /* unclaimed: give main code time */
     } else {
-        post_exception_cooldown = 1;    /* claimed: minimal cooldown */
+        post_exception_cooldown = 0;    /* claimed: re-fire immediately
+                                         * Real hardware executes 1 instruction
+                                         * between exceptions. With cooldown=0,
+                                         * the next psx_check_interrupts call
+                                         * can immediately service a pending IRQ.
+                                         * This is critical for SIO card reads
+                                         * where 128 consecutive SIO IRQs must
+                                         * fire within a single blocking wait. */
     }
 }
