@@ -368,7 +368,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             fflush(miss_log);
         }
         miss_count++;
-        if (miss_count > 10000) {
+        if (miss_count > 100000) {
             fprintf(stderr, "DISPATCH MISS limit reached (%d misses). See psx_dispatch_misses.txt\n", miss_count);
             fflush(stderr);
             if (miss_log) fclose(miss_log);
