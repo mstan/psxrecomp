@@ -28,6 +28,9 @@ static uint8_t ram[RAM_SIZE];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
+/* Expose RAM pointer for oracle comparison (find_first_divergence). */
+uint8_t *memory_get_ram_ptr(void) { return ram; }
+
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
  * Includes expansion base/size, COM_DELAY, SPU_DELAY, CDROM_DELAY etc. */
 static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */

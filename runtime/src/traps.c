@@ -364,7 +364,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         static int miss_count = 0;
         if (!miss_log) miss_log = fopen("psx_dispatch_misses.txt", "w");
         if (miss_log) {
-            fprintf(miss_log, "0x%08X phys=0x%08X\n", addr, phys);
+            fprintf(miss_log, "0x%08X phys=0x%08X ra=0x%08X t9=0x%08X pc=0x%08X\n",
+                    addr, phys, cpu->gpr[31], cpu->gpr[25], cpu->pc);
             fflush(miss_log);
         }
         miss_count++;

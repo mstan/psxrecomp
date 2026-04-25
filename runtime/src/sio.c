@@ -95,6 +95,21 @@ typedef enum {
 
 static ActiveDevice active_device = DEV_NONE;
 
+/* Card probe diagnostic counters */
+static int sio_mc_probe_count = 0;  /* times 0x81 written to TX */
+static int sio_mc_ack_count = 0;    /* times card sent ACK */
+static int sio_mc_cmd_count = 0;    /* times card reached CMD state */
+static int sio_tx_writes = 0;       /* ANY write to SIO_TX_DATA */
+static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
+static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
+
+int sio_get_mc_probe_count(void) { return sio_mc_probe_count; }
+int sio_get_mc_ack_count(void) { return sio_mc_ack_count; }
+int sio_get_mc_cmd_count(void) { return sio_mc_cmd_count; }
+int sio_get_tx_writes(void) { return sio_tx_writes; }
+int sio_get_tx_gated(void) { return sio_tx_gated; }
+uint16_t sio_get_last_ctrl_on_tx(void) { return sio_last_ctrl_on_tx; }
+
 /* Delayed IRQ mechanism.
  *
  * On real PS1, each SIO byte transfer takes BAUD*8 cycles (~1088 for memcard)
@@ -223,6 +238,7 @@ static void mc_process_byte(uint8_t tx_byte) {
             mc_state = MC_CMD;
             sio_rx_data = 0xFF;
             sio_stat |= SIO_STAT_ACK;
+            sio_mc_ack_count++;
         } else {
             sio_rx_data = 0xFF;
         }
@@ -230,6 +246,7 @@ static void mc_process_byte(uint8_t tx_byte) {
 
     case MC_CMD:
         mc_cmd = tx_byte;
+        sio_mc_cmd_count++;
         if (tx_byte == 0x52 || tx_byte == 0x57 || tx_byte == 0x53) {
             mc_state = MC_ID1;
             sio_rx_data = mc_flag;
@@ -415,6 +432,7 @@ static void sio_process_byte(uint8_t tx_byte) {
             pad_process_byte(tx_byte);
         } else if (tx_byte == 0x81) {
             active_device = DEV_MEMCARD;
+            sio_mc_probe_count++;
             mc_process_byte(tx_byte);
         } else {
             sio_rx_data = 0xFF;
@@ -466,6 +484,9 @@ void sio_write(uint32_t addr, uint32_t value) {
     switch (addr) {
     case 0x1F801040: /* SIO_TX_DATA */
         sio_tx_data = (uint8_t)value;
+        sio_tx_writes++;
+        sio_last_ctrl_on_tx = sio_ctrl;
+        if (!(sio_ctrl & SIO_CTRL_TX_EN)) sio_tx_gated++;
         if (sio_ctrl & SIO_CTRL_TX_EN) {
             sio_process_byte(sio_tx_data);
             if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {

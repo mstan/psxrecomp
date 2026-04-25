@@ -583,16 +583,34 @@ static void handle_gte_state(int id, const char *json)
 static void handle_sio_state(int id, const char *json)
 {
     (void)json;
+    extern int sio_get_mc_probe_count(void);
+    extern int sio_get_mc_ack_count(void);
+    extern int sio_get_mc_cmd_count(void);
+    extern int sio_get_tx_writes(void);
+    extern int sio_get_tx_gated(void);
+    extern uint16_t sio_get_last_ctrl_on_tx(void);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"sio_stat\":\"0x%04X\","
              "\"sio_ctrl\":\"0x%04X\","
              "\"sio_rx\":\"0x%02X\","
-             "\"pad_buttons\":\"0x%04X\"}",
+             "\"pad_buttons\":\"0x%04X\","
+             "\"mc_probes\":%d,"
+             "\"mc_acks\":%d,"
+             "\"mc_cmds\":%d,"
+             "\"tx_writes\":%d,"
+             "\"tx_gated\":%d,"
+             "\"last_ctrl_on_tx\":\"0x%04X\"}",
              id,
              (uint16_t)sio_read(0x1F801044),
              (uint16_t)sio_read(0x1F80104A),
              (uint8_t)sio_read(0x1F801040),
-             sio_get_pad_buttons());
+             sio_get_pad_buttons(),
+             sio_get_mc_probe_count(),
+             sio_get_mc_ack_count(),
+             sio_get_mc_cmd_count(),
+             sio_get_tx_writes(),
+             sio_get_tx_gated(),
+             sio_get_last_ctrl_on_tx());
 }
 
 static void handle_watch(int id, const char *json)
@@ -1421,6 +1439,14 @@ static void process_command(const char *line)
             return;
         }
     }
+
+    /* Oracle commands (find_first_divergence, emu_read_ram, etc.) */
+#if defined(ENABLE_DUCKSTATION_ORACLE) || defined(ENABLE_BEETLE_PSX_ORACLE)
+    {
+        extern int psx_oracle_handle_cmd(const char *cmd, int id, const char *json);
+        if (psx_oracle_handle_cmd(cmd, id, line)) return;
+    }
+#endif
 
     send_err(id, "unknown command");
 }

@@ -13,6 +13,9 @@
 #include "spu.h"
 #include "memcard.h"
 #include "debug_server.h"
+#if defined(ENABLE_DUCKSTATION_ORACLE) || defined(ENABLE_BEETLE_PSX_ORACLE)
+#include "psx_oracle_backend.h"
+#endif
 #include <SDL.h>
 #include <cstdio>
 #include <cstring>
@@ -117,11 +120,19 @@ static void sdl_vblank_present(void) {
 
     /* Sample keyboard state and feed into SIO controller.
      * Debug server input override takes priority if active. */
+    uint16_t pad_buttons_this_frame;
     if (override >= 0) {
-        sio_set_pad_state((uint16_t)override);
+        pad_buttons_this_frame = (uint16_t)override;
     } else {
         update_pad_from_keyboard();
+        pad_buttons_this_frame = sio_get_pad_buttons();
     }
+    sio_set_pad_state(pad_buttons_this_frame);
+
+    /* Advance oracle emulator one frame with the same input. */
+#if defined(ENABLE_DUCKSTATION_ORACLE) || defined(ENABLE_BEETLE_PSX_ORACLE)
+    psx_oracle_run_frame(pad_buttons_this_frame);
+#endif
 
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
@@ -154,6 +165,8 @@ int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::fprintf(stderr, "psxrecomp-v4: main() entered\n");
+    std::fflush(stderr);
 
     const char* bios_path = "bios/SCPH1001.BIN";
     if (argc > 1) bios_path = argv[1];
@@ -215,6 +228,18 @@ int main(int argc, char** argv) {
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+
+    /* Initialize golden oracle (DuckStation) if enabled. */
+#if defined(ENABLE_DUCKSTATION_ORACLE) || defined(ENABLE_BEETLE_PSX_ORACLE)
+    {
+        int orc = psx_oracle_init(bios_path);
+        if (orc != 0) {
+            std::fprintf(stderr, "WARNING: oracle init failed (code %d) — continuing without oracle\n", orc);
+        } else {
+            std::fprintf(stdout, "psxrecomp-v4: DuckStation oracle initialized\n");
+        }
+    }
+#endif
 
     /* Initialize CPU state. */
     CPUState cpu;
