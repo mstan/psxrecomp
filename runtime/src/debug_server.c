@@ -114,7 +114,7 @@ static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
 static uint32_t s_wtrace_head = 0;
 
 /* Multi-range filter: up to 8 [lo, hi) address ranges. */
-#define WTRACE_MAX_RANGES 8
+#define WTRACE_MAX_RANGES 16
 static struct { uint32_t lo, hi; } s_wtrace_ranges[WTRACE_MAX_RANGES];
 static int s_wtrace_range_count = 0;
 
@@ -1784,7 +1784,25 @@ void debug_server_init(int port)
     s_wtrace_ranges[3].hi = 0x00066954u;
     s_wtrace_ranges[4].lo = 0x001B6810u;  /* spiral texture buffer (heap @ 0x801B6814) */
     s_wtrace_ranges[4].hi = 0x001B6830u;
-    s_wtrace_range_count = 5;
+    /* Card-chain visibility (always-on per global rule "use ring buffers, never
+     * sample"): 0x7514 is the shared chain counter, 0x7528[0..1] are the per-slot
+     * chain handler ptrs. Reading 0x7528 = 0x5688 means read-chain installed;
+     * = 0x5B64 means detection-chain installed. Catching every write to these
+     * tells us deterministically when card-read paths get armed. */
+    s_wtrace_ranges[5].lo = 0x00007514u;
+    s_wtrace_ranges[5].hi = 0x00007518u;
+    s_wtrace_ranges[6].lo = 0x00007528u;  /* 0x7528[0] (slot 0 chain handler ptr) */
+    s_wtrace_ranges[6].hi = 0x00007530u;  /* through 0x7528[1] (slot 1) */
+    /* 0x755A is the chain abort flag: D1 sets =1, outer coord clears+aborts on !=0 */
+    s_wtrace_ranges[7].lo = 0x0000755Au;
+    s_wtrace_ranges[7].hi = 0x0000755Cu;
+    /* 0x7520 is the success flag (state-3 sets, dispatcher v0=-1 cascade reads) */
+    s_wtrace_ranges[8].lo = 0x00007520u;
+    s_wtrace_ranges[8].hi = 0x00007524u;
+    /* 0x74A4 is the chain status flag */
+    s_wtrace_ranges[9].lo = 0x000074A4u;
+    s_wtrace_ranges[9].hi = 0x000074A8u;
+    s_wtrace_range_count = 10;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
