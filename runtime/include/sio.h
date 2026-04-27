@@ -33,7 +33,7 @@ void sio_connect_pad(int slot);
 uint16_t sio_get_pad_buttons(void);
 
 /* ---- SIO byte-level trace ring buffer ---- */
-#define SIO_TRACE_CAP 4096
+#define SIO_TRACE_CAP 65536
 
 typedef struct {
     uint32_t seq;           /* monotonic sequence number */
@@ -49,6 +49,7 @@ typedef struct {
     uint8_t  irq_countdown; /* sio_irq_countdown at entry */
     uint8_t  in_exception;  /* psx_get_in_exception() at time of byte */
     uint8_t  counter_7514; /* RAM[0x7514] at time of byte */
+    uint32_t cop0_sr;       /* COP0 SR at time of byte (IEc=bit0, IM2=bit10) */
 } SioTraceEntry;
 
 /* Get pointer to ring buffer and current write index.

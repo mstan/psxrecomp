@@ -4319,9 +4319,19 @@
       "rationale": "CARD driver cascade (predicted)."
     },
     {
+      "address": "0xBFC15558",
+      "label": "kernel_5A58",
+      "rationale": "CARD read chain state 12 (data-byte-store): SIO_RX -> a1[0x7F], XOR-updates checksum at 0x7560+slot*4, returns v0=0. Targeted by jump table at RAM 0x6c98 entry 12."
+    },
+    {
       "address": "0xBFC15580",
       "label": "kernel_5A80",
       "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC155B0",
+      "label": "kernel_5AB0",
+      "rationale": "CARD read chain state 13 (data-loop completion): reads byte vs checksum at 0x7560+slot*4, polls SIO_STAT for RX_RDY, reads END byte; v0=1 if 'G' else v0=-1. Targeted by jump table at RAM 0x6c98 entry 13."
     },
     {
       "address": "0xBFC155BC",

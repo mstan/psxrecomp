@@ -60,6 +60,8 @@ typedef enum {
     /* Read states */
     MC_READ_ACK1,
     MC_READ_ACK2,
+    MC_READ_MSB_ECHO,    /* rx = sector_msb (cmd ack 1 echo per no$psx) */
+    MC_READ_LSB_ECHO,    /* rx = sector_lsb (cmd ack 2 echo per no$psx) */
     MC_READ_DATA,
     MC_READ_CHK,
     MC_READ_END,
@@ -355,6 +357,12 @@ static void mc_process_byte(uint8_t tx_byte) {
             mc_state = MC_ID1;
             sio_rx_data = mc_flag;
             sio_stat |= SIO_STAT_ACK;
+            /* no$psx: FLAG byte is 0x08 only after newly-inserted/changed-battery
+             * card; cleared on first read or write. Without this clear, the BIOS
+             * sees 0x08 forever, treats every read as a fresh-card probe, and
+             * resets the chain counter (v0=-1 + 0x7520=1 path in BFC152E0).
+             * Beetle's card sim returns 0x00 in steady-state — match that. */
+            mc_flag = 0x00;
         } else {
             mc_state = MC_IDLE;
             sio_rx_data = 0xFF;
@@ -440,9 +448,23 @@ static void mc_process_byte(uint8_t tx_byte) {
         break;
 
     case MC_READ_ACK2:
+        mc_state = MC_READ_MSB_ECHO;
+        sio_rx_data = 0x5D;
+        sio_stat |= SIO_STAT_ACK;
+        break;
+
+    case MC_READ_MSB_ECHO:
+        /* Per no$psx: card echoes the requested sector address back to host
+         * as a confirm-the-address handshake, BEFORE sending the data bytes. */
+        mc_state = MC_READ_LSB_ECHO;
+        sio_rx_data = mc_sector_msb;
+        sio_stat |= SIO_STAT_ACK;
+        break;
+
+    case MC_READ_LSB_ECHO:
         mc_state = MC_READ_DATA;
         mc_data_idx = 0;
-        sio_rx_data = 0x5D;
+        sio_rx_data = mc_sector_lsb;
         sio_stat |= SIO_STAT_ACK;
         break;
 
@@ -620,6 +642,8 @@ static void sio_process_byte(uint8_t tx_byte) {
         e->dev_post      = (uint8_t)active_device;
         e->ctrl          = sio_ctrl;
         e->func_addr     = g_debug_current_func_addr;
+        { extern uint32_t memory_get_sr(void);
+          e->cop0_sr      = memory_get_sr(); }
         e->was_abort     = (sio_mc_abort_count > trace_abort_before) ? 1 : 0;
         e->irq_countdown = trace_irq_cd;
         { extern int psx_get_in_exception(void);

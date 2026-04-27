@@ -12,6 +12,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "sio.h"
+#include "memcard.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,10 +157,120 @@ static int dispatch_trace_contains(uint32_t target) {
     return 0;
 }
 
+/* ---- Chain-dispatch return-v0 ring ----
+ * Each entry pairs (just-completed dispatch target, return v0 captured from
+ * cpu->gpr[2]) with the chain counter (mem[0x7514]) and the SIO byte index.
+ * Size 4096 — only writes when prev target was a chain state (states 1..13
+ * read or 1..4 detection). Other dispatches go through trace_dispatch
+ * untouched. */
+#define CHAIN_TRACE_CAP 4096
+typedef struct {
+    uint64_t seq;
+    uint32_t prev_target;     /* phys addr of the dispatch that just returned */
+    uint32_t v0;              /* cpu->gpr[2] AT the next-dispatch trace point */
+    uint32_t counter_7514;    /* mem[0x7514] at this moment */
+    uint32_t flag_7520;       /* mem[0x7520] success flag */
+    uint32_t mc_byte_seq;     /* sio_get_seq() for cross-ref */
+} ChainTraceEntry;
+static ChainTraceEntry s_chain_trace[CHAIN_TRACE_CAP];
+static uint64_t s_chain_trace_seq = 0;
+static uint32_t s_prev_dispatch_target = 0;
+
+/* Track whether we're currently INSIDE a chain-state subtree.
+ * Set when chain state entry dispatched; cleared when chain epilogue
+ * (0x5B54 or 0x5B58) is dispatched. v0 captured at the post-epilogue
+ * dispatch is the state's final return value. */
+static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state addr */
+
+static int is_chain_state_entry(uint32_t phys) {
+    static const uint32_t entries[] = {
+        /* Read chain (table at 0x6c98) */
+        0x000056E8u, 0x00005768u, 0x0000579Cu, 0x00005834u, 0x00005870u,
+        0x000058B4u, 0x000058E8u, 0x00005918u, 0x00005954u, 0x00005990u,
+        0x00005A00u, 0x00005A58u, 0x00005AB0u,
+        /* Detection chain (table at 0x6ccc) */
+        0x00005BA4u, 0x00005C24u, 0x00005C58u, 0x00005D48u };
+    for (size_t i = 0; i < sizeof(entries)/sizeof(entries[0]); i++)
+        if (entries[i] == phys) return 1;
+    return 0;
+}
+
+/* Chain epilogue (common). All chain states fall through to bfc15654 = RAM 0x5B54.
+ * func_00005B54 is the lw $ra; jr $ra block. After it runs, the chain dispatcher
+ * cascade reads $v0. */
+static int is_chain_epilogue(uint32_t phys) {
+    return phys == 0x00005B54u || phys == 0x00005B58u;
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
+    /* Track when we ENTER a chain state subtree. */
+    if (is_chain_state_entry(func_addr)) {
+        s_chain_state_active = func_addr;
+    }
+
+    /* Capture v0 when we LEAVE a chain state subtree, identified by the dispatch
+     * that immediately follows the chain epilogue (0x5B54). The dispatch right
+     * AFTER the epilogue is the chain dispatcher's cascade input. */
+    if (s_prev_dispatch_target != 0
+        && is_chain_epilogue(s_prev_dispatch_target)
+        && s_chain_state_active != 0
+        && debug_cpu_ptr) {
+        ChainTraceEntry *e = &s_chain_trace[s_chain_trace_seq % CHAIN_TRACE_CAP];
+        e->seq = s_chain_trace_seq++;
+        e->prev_target = s_chain_state_active; /* the state, not the epilogue */
+        e->v0 = debug_cpu_ptr->gpr[2];
+        extern uint8_t psx_read_byte(uint32_t addr);
+        e->counter_7514 = (uint32_t)psx_read_byte(0x7514)
+                        | ((uint32_t)psx_read_byte(0x7515) << 8)
+                        | ((uint32_t)psx_read_byte(0x7516) << 16)
+                        | ((uint32_t)psx_read_byte(0x7517) << 24);
+        e->flag_7520    = (uint32_t)psx_read_byte(0x7520)
+                        | ((uint32_t)psx_read_byte(0x7521) << 8)
+                        | ((uint32_t)psx_read_byte(0x7522) << 16)
+                        | ((uint32_t)psx_read_byte(0x7523) << 24);
+        e->mc_byte_seq = sio_get_trace(NULL, NULL);
+        s_chain_state_active = 0;
+    }
+    s_prev_dispatch_target = func_addr;
+
     s_dispatch_ring[s_dispatch_seq % DISPATCH_TRACE_CAP] = func_addr;
     s_dispatch_seq++;
     dispatch_unique_add(func_addr);
+}
+
+static int json_get_int(const char *json, const char *key, int def);
+void debug_server_send_fmt(const char *fmt, ...);
+#define send_fmt debug_server_send_fmt
+
+static void handle_chain_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    int total = (int)(s_chain_trace_seq < CHAIN_TRACE_CAP
+                      ? s_chain_trace_seq : CHAIN_TRACE_CAP);
+    if (count > total) count = total;
+    if (count < 0) count = 0;
+
+    char buf[128 * 1024];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%d,"
+                     "\"entries\":[",
+                     id, (unsigned long long)s_chain_trace_seq, total);
+
+    int start_idx = (int)(s_chain_trace_seq - (uint64_t)count);
+    for (int i = 0; i < count; i++) {
+        int idx = (start_idx + i) % CHAIN_TRACE_CAP;
+        ChainTraceEntry *e = &s_chain_trace[idx];
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s{\"seq\":%llu,\"prev\":\"0x%08X\","
+                      "\"v0\":\"0x%08X\",\"counter\":%u,\"flag_7520\":%u,"
+                      "\"mc_seq\":%u}",
+                      i == 0 ? "" : ",",
+                      (unsigned long long)e->seq, e->prev_target,
+                      e->v0, e->counter_7514, e->flag_7520, e->mc_byte_seq);
+        if (n >= (int)sizeof(buf) - 256) break;
+    }
+    n += snprintf(buf + n, sizeof(buf) - n, "]}");
+    send_fmt("%s", buf);
 }
 
 /* ---- MMIO write trace (separate ring buffer) ----
@@ -634,6 +745,31 @@ static void handle_sio_state(int id, const char *json)
              sio_get_last_ctrl_on_tx());
 }
 
+/* ---- Memory card disk-load status (per-slot) ---- */
+static void handle_mc_status(int id, const char *json)
+{
+    (void)json;
+    const char *p0 = "", *p1 = "";
+    uint8_t m0[2] = {0,0}, m1[2] = {0,0};
+    int pres0 = 0, pres1 = 0, dirty0 = 0, dirty1 = 0;
+    memcard_debug_info(0, &p0, m0, &pres0, &dirty0);
+    memcard_debug_info(1, &p1, m1, &pres1, &dirty1);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"slot0\":{\"present\":%s,\"dirty\":%s,\"path\":\"%s\","
+             "\"magic\":\"%c%c\",\"magic_hex\":\"%02X%02X\"},"
+             "\"slot1\":{\"present\":%s,\"dirty\":%s,\"path\":\"%s\","
+             "\"magic\":\"%c%c\",\"magic_hex\":\"%02X%02X\"}}",
+             id,
+             pres0 ? "true" : "false", dirty0 ? "true" : "false", p0,
+             (m0[0] >= 0x20 && m0[0] < 0x7F) ? m0[0] : '?',
+             (m0[1] >= 0x20 && m0[1] < 0x7F) ? m0[1] : '?',
+             m0[0], m0[1],
+             pres1 ? "true" : "false", dirty1 ? "true" : "false", p1,
+             (m1[0] >= 0x20 && m1[0] < 0x7F) ? m1[0] : '?',
+             (m1[1] >= 0x20 && m1[1] < 0x7F) ? m1[1] : '?',
+             m1[0], m1[1]);
+}
+
 /* ---- I_MASK bit 7 trace (card protocol flow) ---- */
 typedef struct {
     uint32_t old_mask;
@@ -707,13 +843,14 @@ static void handle_sio_trace(int id, const char *json)
                  "\"mc_pre\":%d,\"mc_post\":%d,"
                  "\"dev_pre\":%d,\"dev_post\":%d,"
                  "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
-                 "\"abort\":%d,\"irq_cd\":%d,\"in_exc\":%d,\"ctr\":%d}",
+                 "\"abort\":%d,\"irq_cd\":%d,\"in_exc\":%d,\"ctr\":%d,"
+                 "\"sr\":\"0x%08X\"}",
                  (unsigned)e->seq, e->tx, e->rx,
                  e->mc_state_pre, e->mc_state_post,
                  e->dev_pre, e->dev_post,
                  e->ctrl, (unsigned)e->func_addr,
                  e->was_abort, e->irq_countdown, e->in_exception,
-                 e->counter_7514);
+                 e->counter_7514, (unsigned)e->cop0_sr);
     }
 
     send_fmt("]}\n");
@@ -785,6 +922,25 @@ static void handle_clear_input(int id, const char *json)
     s_input_override = -1;
     s_input_frames   = 0;
     send_ok(id);
+}
+
+/* ---- display_source: toggle SDL window between our VRAM and Beetle's framebuffer ---- */
+extern void display_source_set(int src);
+extern int  display_source_get(void);
+static void handle_display_source(int id, const char *json)
+{
+    char val[16] = {0};
+    if (!json_get_str(json, "src", val, sizeof(val))) {
+        /* No arg = report current */
+        send_fmt("{\"id\":%d,\"ok\":true,\"src\":\"%s\"}",
+                 id, display_source_get() ? "beetle" : "ours");
+        return;
+    }
+    if (strcmp(val, "beetle") == 0)        display_source_set(1);
+    else if (strcmp(val, "ours") == 0)     display_source_set(0);
+    else { send_err(id, "src must be 'ours' or 'beetle'"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"src\":\"%s\"}",
+             id, display_source_get() ? "beetle" : "ours");
 }
 
 static void handle_pause(int id, const char *json)
@@ -1486,6 +1642,8 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
     { "sio_state",         handle_sio_state },
+    { "mc_status",         handle_mc_status },
+    { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
     { "imask_trace",       handle_imask_trace },
     { "watch",             handle_watch },
@@ -1502,6 +1660,7 @@ static const CmdEntry s_commands[] = {
     { "set_input",         handle_set_input },
     { "press",             handle_press },
     { "clear_input",       handle_clear_input },
+    { "display_source",    handle_display_source },
     { "pause",             handle_pause },
     { "continue",          handle_continue },
     { "step",              handle_step },

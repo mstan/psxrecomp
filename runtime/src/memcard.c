@@ -139,3 +139,15 @@ int memcard_is_present(int card) {
     if (card < 0 || card >= MAX_CARDS) return 0;
     return cards[card].present;
 }
+
+int memcard_debug_info(int card, const char **path_out,
+                       uint8_t magic_out[2], int *present_out,
+                       int *dirty_out) {
+    if (card < 0 || card >= MAX_CARDS) return -1;
+    if (path_out)    *path_out    = cards[card].filepath;
+    if (magic_out)   { magic_out[0] = cards[card].data[0];
+                       magic_out[1] = cards[card].data[1]; }
+    if (present_out) *present_out = cards[card].present;
+    if (dirty_out)   *dirty_out   = cards[card].dirty;
+    return 0;
+}
