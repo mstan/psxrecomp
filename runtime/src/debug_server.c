@@ -1497,6 +1497,29 @@ static void handle_press(int id, const char *json)
     send_ok(id);
 }
 
+/* Reports BOTH ours' and Beetle's current pad word so the operator can
+ * empirically verify input dispatch symmetry. Note: ours' pad is what
+ * sio_set_pad_state stored last; Beetle's is whatever the last frame
+ * set s_joypad to. They should match when override is active. */
+extern uint16_t sio_get_pad_buttons(void);
+#if defined(ENABLE_BEETLE_PSX_ORACLE)
+extern uint16_t beetle_get_pad(void);
+#endif
+static void handle_pad_status(int id, const char *json)
+{
+    (void)json;
+    uint16_t ours = sio_get_pad_buttons();
+#if defined(ENABLE_BEETLE_PSX_ORACLE)
+    uint16_t beetle = beetle_get_pad();
+#else
+    uint16_t beetle = 0xFFFF;
+#endif
+    send_fmt("{\"id\":%d,\"ok\":true,\"ours\":\"0x%04X\",\"beetle\":\"0x%04X\","
+             "\"override\":%d,\"override_frames\":%d,\"match\":%s}\n",
+             id, ours, beetle, s_input_override, s_input_frames,
+             (ours == beetle) ? "true" : "false");
+}
+
 static void handle_clear_input(int id, const char *json)
 {
     (void)json;
@@ -2396,6 +2419,7 @@ static const CmdEntry s_commands[] = {
     { "mmio_clear",        handle_mmio_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
+    { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
     { "display_source",    handle_display_source },
     { "pause",             handle_pause },

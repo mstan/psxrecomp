@@ -477,6 +477,9 @@ static int beetle_sync_to_state(uint32_t addr, uint32_t val, uint16_t pad, int m
     return -1; /* timeout */
 }
 
+/* Read Beetle's current pad word (s_joypad). Used by debug pad_status. */
+extern "C" uint16_t beetle_get_pad(void) { return s_joypad; }
+
 /* Drive Beetle for `frames` frames with the given pad held down (active-low).
  * Alternates pressed/released every frame so the shell sees clean button
  * edges (matches the run_frame cadence from beetle_sync_then_press). */

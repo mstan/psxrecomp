@@ -56,6 +56,13 @@ typedef struct {
  * Returns number of entries ever written (seq of next write). */
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
 
+/* Returns 1 if a memcard protocol exchange is in progress on either
+ * slot. Callers (notably the VBlank scheduler) use this to defer
+ * interrupt delivery so the BIOS's pad polling routine — which fires
+ * from the VBlank handler — doesn't preempt an in-flight card
+ * transaction by issuing 0x01 on the SIO bus mid-read. */
+int sio_card_protocol_active(void);
+
 /* ---- Card transaction ring buffer ----
  *
  * One entry per card protocol transaction (0x81 → terminal state / abort).

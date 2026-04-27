@@ -178,6 +178,15 @@ uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
     return sio_trace_seq;
 }
 
+int sio_card_protocol_active(void) {
+    /* Active if either slot has an in-flight protocol, or the working
+     * mc_state is non-idle. */
+    if (mc_state != MC_IDLE) return 1;
+    if (mc_slots[0].state != MC_IDLE) return 1;
+    if (mc_slots[1].state != MC_IDLE) return 1;
+    return 0;
+}
+
 /* ---- Card transaction ring buffer ---- */
 static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
 static int       sio_txn_idx = 0;        /* next-write slot */
