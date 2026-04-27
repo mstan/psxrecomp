@@ -138,6 +138,73 @@ Files modified but not yet committed (from this session):
 These are all from earlier work and unrelated to today's FLAG bug fix.
 Leave them be unless a new session decides they're ready.
 
+## Update — function ENTRY/EXIT trace rings landed (commit 84180e2 + 188bdc8)
+
+Built two new always-on rings hooked off `psx_dispatch`:
+
+- **`fn_entry`** — every dispatch in CALL ORDER with target, $ra,
+  $a0..$a3, $t1 (B0/A0/C0 vector index), depth, frame
+- **`fn_exit`** — every function in FINISH ORDER with $v0, $v1, plus
+  link back to entry seq
+
+Shadow call stack (4096-frame) classifies each dispatch as:
+- RETURN — target matches an open frame's saved RA → pop + record exit
+- TAIL CALL — $ra unchanged from previous dispatch → replace top frame
+- NEW CALL — $ra changed (fresh JAL) → push new frame
+
+TCP commands:
+- `fn_filter` `{lo, hi}` — set [lo, hi) physical addr filter
+- `fn_clear` — reset both rings + shadow stack
+- `fn_stats` — totals, depth, overflows, tail-call count
+- `fn_entry_dump` `{count, seq_lo, seq_hi, addr_lo, addr_hi}`
+- `fn_exit_dump`  `{count, seq_lo, seq_hi, addr_lo, addr_hi}`
+
+### Validation revealed new info
+
+With filter `0x4000..0x6000` (BIOS card area):
+
+- During press X, captured 4 read-chain runs each going through:
+  state-1 → state-2 → ... → state-10 → 0x59D0 → state-11 → 0x5A08 → 0x5A48
+- All with `ra=0x4DDC` (chain dispatcher's jalr return)
+- The intermediate addresses 0x59D0, 0x5A08, 0x5A48 are functions
+  reached via **tail-jump from state addresses** that we didn't see
+  before. They live BETWEEN state-10/11 and AFTER state-11 in the
+  address space. Worth investigating — they may be where the chain
+  decides to abort.
+
+### Known caveat
+
+`fn_exit` records v0 at "control leaves this function" — for fall-
+through dispatches this is the moment the next function dispatches,
+not the true return-to-caller. So v0 may reflect intermediate state
+rather than intended return value. e.g. state-11 exits with v0=0xB
+because that's the COUNTER value (chain dispatcher loaded it into v0
+before jalr; state-11 didn't overwrite before falling through to
+0x5A08).
+
+Real return values still surface for functions that DO set v0 before
+returning (e.g., D-states, kernel callbacks) — those are accurate.
+
+### Workflow for the user
+
+```bash
+# 1. Set tight filter to scope of interest
+{"cmd":"fn_filter","lo":"0x00004000","hi":"0x00006000"}
+
+# 2. Clear before triggering action
+{"cmd":"fn_clear"}
+
+# 3. Trigger (press, etc)
+{"cmd":"press","buttons":49151,"frames":120}
+
+# 4. Inspect
+{"cmd":"fn_stats"}
+{"cmd":"fn_entry_dump","count":300,"addr_lo":"0x000056E0","addr_hi":"0x00005AB4"}
+{"cmd":"fn_exit_dump","count":300,"addr_lo":"0x000056E0","addr_hi":"0x00005AB4"}
+
+# Use seq_lo/seq_hi to step through specific window
+```
+
 ## Hard rules to keep
 
 - Never sample-and-hope. Use the always-on rings now extended to cover
