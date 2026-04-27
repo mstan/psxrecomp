@@ -245,6 +245,123 @@ static uint64_t     s_fn_unmatched_returns = 0;
 static uint64_t     s_fn_stack_overflows   = 0;
 static uint64_t     s_fn_tail_calls        = 0;
 
+/* ---- EvCB walk ring ----
+ *
+ * Captures the full kernel EvCB table on every entry to and exit from
+ * DeliverEvent (RAM 0x1C5C). EvCB base ptr lives at RAM 0x124, total
+ * bytes at RAM 0x120 (per disasm InitEvents at BFC04678).
+ *
+ * Per-entry tag identifies whether the snapshot was taken at DeliverEvent
+ * entry or exit; pairing them lets the operator see exactly which entries
+ * changed status (FIRED) during one DeliverEvent call.
+ *
+ * Memory: 256 snapshots × ~960B = ~240 KB. */
+#define EVCB_DELIVER_EVENT_ADDR 0x00001C5Cu  /* func_00001C5C, RAM */
+#define EVCB_RING_CAP           256
+#define EVCB_MAX_ENTRIES        32
+#define EVCB_ENTRY_SIZE         28           /* sizeof EvCB on real PSX */
+
+typedef struct {
+    uint32_t cls;
+    uint32_t status;
+    uint32_t spec;
+    uint32_t mode;
+    uint32_t fhandler;
+    uint32_t pad1;
+    uint32_t pad2;
+} EvCBRec;
+
+typedef enum { EVCB_TAG_ENTRY = 0, EVCB_TAG_EXIT = 1 } EvCBTag;
+
+typedef struct {
+    uint64_t seq;
+    uint64_t fn_entry_seq;       /* DeliverEvent fn_entry seq this snapshot is paired with */
+    uint8_t  tag;                /* EvCBTag */
+    uint8_t  pad[3];
+    uint32_t evcb_base;          /* RAM addr of EvCB table */
+    uint32_t evcb_total_bytes;
+    uint32_t entry_count;        /* number of EvCB entries actually snapshotted */
+    uint32_t a0, a1;             /* DeliverEvent args ($a0, $a1) when known */
+    uint32_t v0;                 /* return value (only valid for EXIT snapshots) */
+    uint32_t counter_7514;       /* card chain counter */
+    uint32_t flag_755A;          /* card chain abort flag */
+    uint32_t flag_75C0;          /* state-11 success marker (B0:6380) */
+    uint32_t frame;
+    EvCBRec  entries[EVCB_MAX_ENTRIES];
+} EvCBSnapshot;
+
+static EvCBSnapshot *s_evcb_ring = NULL;
+static uint64_t      s_evcb_ring_seq = 0;
+static uint64_t      s_evcb_ring_entry_count = 0; /* DeliverEvent entries seen */
+static uint64_t      s_evcb_ring_exit_count  = 0; /* DeliverEvent exits seen */
+
+/* DeliverEvent return tracking — bypasses shadow stack since the kernel
+ * uses psx_restore_state_escape() longjmp, which leaves orphaned frames.
+ * Watch for the next dispatch matching the entry's stored RA; if a new
+ * DeliverEvent entry happens first, the previous one was unwound. */
+static uint32_t s_evcb_pending_exit_ra   = 0;
+static uint64_t s_evcb_pending_entry_seq = 0;
+static int      s_evcb_pending_active    = 0;
+static uint64_t s_evcb_unwound_count     = 0; /* DeliverEvent calls that were longjmp'd over */
+
+extern uint8_t psx_read_byte(uint32_t addr);
+
+static uint32_t evcb_read_u32_ram(uint32_t ram_addr) {
+    return  (uint32_t)psx_read_byte(ram_addr)
+          | ((uint32_t)psx_read_byte(ram_addr + 1) << 8)
+          | ((uint32_t)psx_read_byte(ram_addr + 2) << 16)
+          | ((uint32_t)psx_read_byte(ram_addr + 3) << 24);
+}
+
+/* Snapshot the EvCB table into the ring. Reads kernel ptr [0x120] and
+ * size [0x124] (per nocash kernel ToT layout: 0x120=EvCB ptr, 0x124=EvCB
+ * size). Walks up to EVCB_MAX_ENTRIES entries. */
+static void evcb_snapshot_capture(EvCBTag tag, uint64_t fn_entry_seq) {
+    if (!s_evcb_ring || !debug_cpu_ptr) return;
+
+    uint32_t base_ptr   = evcb_read_u32_ram(0x00000120);
+    uint32_t total_bytes = evcb_read_u32_ram(0x00000124);
+
+    /* Convert RAM base ptr to RAM offset (kernel uses cached + uncached
+     * mirrors; mask off region bits). */
+    uint32_t base_ram = base_ptr & 0x001FFFFFu;
+
+    EvCBSnapshot *e = &s_evcb_ring[s_evcb_ring_seq % EVCB_RING_CAP];
+    e->seq              = s_evcb_ring_seq;
+    e->fn_entry_seq     = fn_entry_seq;
+    e->tag              = (uint8_t)tag;
+    e->evcb_base        = base_ptr;
+    e->evcb_total_bytes = total_bytes;
+    e->a0               = debug_cpu_ptr->gpr[4];
+    e->a1               = debug_cpu_ptr->gpr[5];
+    e->v0               = debug_cpu_ptr->gpr[2];
+    e->counter_7514     = evcb_read_u32_ram(0x00007514);
+    /* 0x755A is a single byte (chain abort flag). Read its byte directly,
+     * not the dword at 0x7558. */
+    e->flag_755A        = (uint32_t)psx_read_byte(0x0000755A);
+    e->flag_75C0        = evcb_read_u32_ram(0x000075C0);
+    e->frame            = (uint32_t)s_frame_count;
+
+    uint32_t n_entries = (total_bytes / EVCB_ENTRY_SIZE);
+    if (n_entries > EVCB_MAX_ENTRIES) n_entries = EVCB_MAX_ENTRIES;
+    e->entry_count = n_entries;
+
+    for (uint32_t i = 0; i < n_entries; i++) {
+        uint32_t off = base_ram + i * EVCB_ENTRY_SIZE;
+        if (off + EVCB_ENTRY_SIZE > 0x00200000u) break;
+        e->entries[i].cls      = evcb_read_u32_ram(off + 0);
+        e->entries[i].status   = evcb_read_u32_ram(off + 4);
+        e->entries[i].spec     = evcb_read_u32_ram(off + 8);
+        e->entries[i].mode     = evcb_read_u32_ram(off + 12);
+        e->entries[i].fhandler = evcb_read_u32_ram(off + 16);
+        e->entries[i].pad1     = evcb_read_u32_ram(off + 20);
+        e->entries[i].pad2     = evcb_read_u32_ram(off + 24);
+    }
+    s_evcb_ring_seq++;
+    if (tag == EVCB_TAG_ENTRY) s_evcb_ring_entry_count++;
+    else                       s_evcb_ring_exit_count++;
+}
+
 /* Optional [lo, hi) physical-address filter; default = trace all. */
 static uint32_t s_fn_trace_filter_lo = 0u;
 static uint32_t s_fn_trace_filter_hi = 0xFFFFFFFFu;
@@ -334,6 +451,7 @@ static void function_trace_record(uint32_t target) {
     }
 
     /* Record entry (always, when target passes filter). */
+    uint64_t this_entry_seq = (uint64_t)-1;
     if (fn_trace_in_filter(target)) {
         FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
         e->seq        = s_fn_entry_seq;
@@ -347,7 +465,36 @@ static void function_trace_record(uint32_t target) {
         e->t1         = debug_cpu_ptr->gpr[9];
         e->depth      = (uint32_t)s_fn_stack_top;
         e->frame      = (uint32_t)s_frame_count;
+        this_entry_seq = s_fn_entry_seq;
         s_fn_entry_seq++;
+
+        /* Update the just-pushed shadow frame's entry_seq so the EXIT
+         * capture in fn_record_exit can pair correctly. */
+        if (s_fn_stack_top > 0
+            && s_fn_stack[s_fn_stack_top - 1].func_addr == target) {
+            s_fn_stack[s_fn_stack_top - 1].entry_seq = this_entry_seq;
+        }
+    }
+
+    /* EvCB ring: capture on DeliverEvent entry. Track the return RA so
+     * we can record an EXIT snapshot when execution next reaches it.
+     * cur_ra has the kernel-mode bit set (0x80000000); psx_dispatch passes
+     * `target` already masked to physical (& 0x1FFFFFFF). Mask before
+     * comparing. If a new DeliverEvent entry arrives first, the previous
+     * call was longjmp'd over (psx_restore_state_escape) — count it. */
+    if (target == EVCB_DELIVER_EVENT_ADDR) {
+        if (s_evcb_pending_active) {
+            s_evcb_unwound_count++;
+        }
+        s_evcb_pending_exit_ra   = cur_ra & 0x1FFFFFFFu;
+        s_evcb_pending_entry_seq = this_entry_seq;
+        s_evcb_pending_active    = 1;
+        evcb_snapshot_capture(EVCB_TAG_ENTRY, this_entry_seq);
+    }
+    /* DeliverEvent exit: dispatch matching the stored return RA (phys). */
+    else if (s_evcb_pending_active && target == s_evcb_pending_exit_ra) {
+        evcb_snapshot_capture(EVCB_TAG_EXIT, s_evcb_pending_entry_seq);
+        s_evcb_pending_active = 0;
     }
 
     s_fn_prev_ra = cur_ra;
@@ -1029,6 +1176,265 @@ static void handle_sio_trace(int id, const char *json)
     }
 
     send_fmt("]}\n");
+}
+
+/* ---- Card transaction ring dump ----
+ *
+ * Returns the most recent N closed transactions plus the live (open) txn
+ * if there is one. Optional slot filter restricts to a single card slot.
+ * Each entry includes the full TX/RX byte stream for that transaction
+ * (truncated to SIO_TXN_MAX_BYTES per entry). */
+static const char *txn_end_reason_str(int reason) {
+    switch (reason) {
+    case SIO_TXN_END_OPEN:           return "open";
+    case SIO_TXN_END_SUCCESS:        return "success";
+    case SIO_TXN_END_ABORT_RESELECT: return "abort_reselect";
+    case SIO_TXN_END_ABORT_RESET:    return "abort_reset";
+    case SIO_TXN_END_ABORT_SLOT:     return "abort_slot";
+    case SIO_TXN_END_ABORT_BAD_CMD:  return "abort_bad_cmd";
+    case SIO_TXN_END_ABORT_OTHER:    return "abort_other";
+    default:                         return "unknown";
+    }
+}
+
+static void emit_card_txn_json(const SioTxnEntry *e, int is_live) {
+    int n_bytes = e->byte_count;
+    if (n_bytes > SIO_TXN_MAX_BYTES) n_bytes = SIO_TXN_MAX_BYTES;
+    send_fmt("{\"txn_seq\":%u,\"slot\":%u,\"cmd\":\"0x%02X\","
+             "\"sector\":\"0x%04X\",\"bytes\":%u,\"acks\":%u,"
+             "\"start_byte_seq\":%u,\"end_byte_seq\":%u,"
+             "\"start_func\":\"0x%08X\",\"end_func\":\"0x%08X\","
+             "\"end_reason\":\"%s\",\"terminal_state\":%u,\"live\":%s,\"tx\":[",
+             (unsigned)e->txn_seq, e->slot, e->cmd, e->sector,
+             (unsigned)e->byte_count, (unsigned)e->ack_count,
+             (unsigned)e->start_byte_seq, (unsigned)e->end_byte_seq,
+             (unsigned)e->start_func, (unsigned)e->end_func,
+             txn_end_reason_str(e->end_reason), e->terminal_state,
+             is_live ? "true" : "false");
+    for (int i = 0; i < n_bytes; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("\"0x%02X\"", e->tx[i]);
+    }
+    send_fmt("],\"rx\":[");
+    for (int i = 0; i < n_bytes; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("\"0x%02X\"", e->rx[i]);
+    }
+    send_fmt("]}");
+}
+
+/* ---- EvCB ring TCP cmds ----
+ *
+ * evcb_snapshot       — one-shot read of current EvCB table from RAM
+ * evcb_walk_dump      — recent always-on snapshots (paired entry + exit per
+ *                       DeliverEvent call)
+ * evcb_walk_stats     — counts + ring usage */
+static void emit_evcb_snapshot_json(const EvCBSnapshot *e) {
+    send_fmt("{\"seq\":%llu,\"fn_entry_seq\":%llu,\"tag\":\"%s\","
+             "\"evcb_base\":\"0x%08X\",\"evcb_total_bytes\":%u,"
+             "\"entry_count\":%u,\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+             "\"v0\":\"0x%08X\",\"counter_7514\":%u,\"flag_755A\":\"0x%08X\","
+             "\"flag_75C0\":\"0x%08X\",\"frame\":%u,\"entries\":[",
+             (unsigned long long)e->seq, (unsigned long long)e->fn_entry_seq,
+             e->tag == EVCB_TAG_ENTRY ? "entry" : "exit",
+             (unsigned)e->evcb_base, (unsigned)e->evcb_total_bytes,
+             (unsigned)e->entry_count, (unsigned)e->a0, (unsigned)e->a1,
+             (unsigned)e->v0, (unsigned)e->counter_7514,
+             (unsigned)e->flag_755A, (unsigned)e->flag_75C0,
+             (unsigned)e->frame);
+    for (uint32_t i = 0; i < e->entry_count; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"i\":%u,\"class\":\"0x%08X\",\"status\":\"0x%08X\","
+                 "\"spec\":\"0x%08X\",\"mode\":\"0x%08X\","
+                 "\"fhandler\":\"0x%08X\"}",
+                 i, (unsigned)e->entries[i].cls,
+                 (unsigned)e->entries[i].status,
+                 (unsigned)e->entries[i].spec,
+                 (unsigned)e->entries[i].mode,
+                 (unsigned)e->entries[i].fhandler);
+    }
+    send_fmt("]}");
+}
+
+static void handle_evcb_snapshot(int id, const char *json)
+{
+    (void)json;
+    /* Synthetic one-shot capture into a stack-local snapshot — does NOT
+     * record into the ring (so manual probes don't drown the always-on
+     * pairing). */
+    EvCBSnapshot snap;
+    memset(&snap, 0, sizeof(snap));
+    if (!debug_cpu_ptr) { send_err(id, "no cpu ptr"); return; }
+    uint32_t base_ptr    = evcb_read_u32_ram(0x00000120);
+    uint32_t total_bytes = evcb_read_u32_ram(0x00000124);
+    snap.seq             = (uint64_t)-1; /* synthetic */
+    snap.fn_entry_seq    = (uint64_t)-1;
+    snap.tag             = EVCB_TAG_ENTRY;
+    snap.evcb_base       = base_ptr;
+    snap.evcb_total_bytes = total_bytes;
+    snap.a0              = debug_cpu_ptr->gpr[4];
+    snap.a1              = debug_cpu_ptr->gpr[5];
+    snap.v0              = debug_cpu_ptr->gpr[2];
+    snap.counter_7514    = evcb_read_u32_ram(0x00007514);
+    snap.flag_755A       = (uint32_t)psx_read_byte(0x0000755A);
+    snap.flag_75C0       = evcb_read_u32_ram(0x000075C0);
+    snap.frame           = (uint32_t)s_frame_count;
+    uint32_t base_ram    = base_ptr & 0x001FFFFFu;
+    uint32_t n_entries   = (total_bytes / EVCB_ENTRY_SIZE);
+    if (n_entries > EVCB_MAX_ENTRIES) n_entries = EVCB_MAX_ENTRIES;
+    snap.entry_count     = n_entries;
+    for (uint32_t i = 0; i < n_entries; i++) {
+        uint32_t off = base_ram + i * EVCB_ENTRY_SIZE;
+        if (off + EVCB_ENTRY_SIZE > 0x00200000u) break;
+        snap.entries[i].cls      = evcb_read_u32_ram(off + 0);
+        snap.entries[i].status   = evcb_read_u32_ram(off + 4);
+        snap.entries[i].spec     = evcb_read_u32_ram(off + 8);
+        snap.entries[i].mode     = evcb_read_u32_ram(off + 12);
+        snap.entries[i].fhandler = evcb_read_u32_ram(off + 16);
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"snapshot\":", id);
+    emit_evcb_snapshot_json(&snap);
+    send_fmt("}\n");
+}
+
+static void handle_evcb_walk_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 8);
+    if (count < 1) count = 1;
+    if (count > EVCB_RING_CAP) count = EVCB_RING_CAP;
+
+    if (!s_evcb_ring) { send_err(id, "evcb ring not allocated"); return; }
+
+    int avail = (int)(s_evcb_ring_seq < (uint64_t)EVCB_RING_CAP
+                      ? s_evcb_ring_seq : EVCB_RING_CAP);
+    if (count > avail) count = avail;
+
+    uint64_t start_seq = s_evcb_ring_seq - (uint64_t)count;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"entry_count\":%llu,"
+             "\"exit_count\":%llu,\"shown\":%d,\"snapshots\":[",
+             id, (unsigned long long)s_evcb_ring_seq,
+             (unsigned long long)s_evcb_ring_entry_count,
+             (unsigned long long)s_evcb_ring_exit_count, count);
+    for (int i = 0; i < count; i++) {
+        const EvCBSnapshot *e = &s_evcb_ring[(start_seq + (uint64_t)i) % EVCB_RING_CAP];
+        if (i > 0) send_fmt(",");
+        emit_evcb_snapshot_json(e);
+    }
+    send_fmt("]}\n");
+}
+
+static void handle_evcb_walk_stats(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"entry_count\":%llu,"
+             "\"exit_count\":%llu,\"unwound_count\":%llu,"
+             "\"pending_active\":%d,\"ring_cap\":%d,\"max_entries\":%d}\n",
+             id, (unsigned long long)s_evcb_ring_seq,
+             (unsigned long long)s_evcb_ring_entry_count,
+             (unsigned long long)s_evcb_ring_exit_count,
+             (unsigned long long)s_evcb_unwound_count,
+             s_evcb_pending_active,
+             EVCB_RING_CAP, EVCB_MAX_ENTRIES);
+}
+
+/* ---- SIO IRQ ring dump ----
+ *
+ * Returns the most recent N IRQ #7 fires with timing/source/state context.
+ * Each entry shows: when it was scheduled (byte_seq) vs when it actually
+ * fired, what the chain counter was, and whether mc_state was idle or in
+ * the middle of a card protocol. */
+static const char *sio_irq_src_str(int s) {
+    switch (s) {
+    case SIO_IRQ_SRC_CARD_ACK: return "card";
+    case SIO_IRQ_SRC_PAD_ACK:  return "pad";
+    default:                   return "unknown";
+    }
+}
+
+static void handle_sio_irq_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 64);
+    int src_filter = json_get_int(json, "src", -1); /* -1=all, else SioIrqSource value */
+    if (count < 1) count = 1;
+    if (count > SIO_IRQ_RING_CAP) count = SIO_IRQ_RING_CAP;
+
+    const SioIrqEntry *buf;
+    int write_idx;
+    uint32_t total_seq = sio_get_irq_ring(&buf, &write_idx);
+
+    int avail = (int)(total_seq < (uint32_t)SIO_IRQ_RING_CAP
+                      ? total_seq : SIO_IRQ_RING_CAP);
+    if (count > avail) count = avail;
+
+    int start = (write_idx - count + SIO_IRQ_RING_CAP) % SIO_IRQ_RING_CAP;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"shown\":%d,"
+             "\"src_filter\":%d,\"entries\":[",
+             id, (unsigned)total_seq, count, src_filter);
+
+    int emitted = 0;
+    for (int i = 0; i < count; i++) {
+        const SioIrqEntry *e = &buf[(start + i) % SIO_IRQ_RING_CAP];
+        if (src_filter >= 0 && (int)e->source != src_filter) continue;
+        if (emitted > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"src\":\"%s\",\"slot\":%u,\"delay\":%u,"
+                 "\"byte_seq\":%u,\"mc_state\":%u,\"active_device\":%u,"
+                 "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
+                 "\"counter_7514\":%u,"
+                 "\"i_stat_before\":\"0x%08X\",\"i_stat_after\":\"0x%08X\"}",
+                 (unsigned)e->seq, sio_irq_src_str(e->source),
+                 e->slot, e->delay_applied,
+                 (unsigned)e->byte_seq, (unsigned)e->mc_state,
+                 (unsigned)e->active_device,
+                 (unsigned)e->ctrl, (unsigned)e->func_addr,
+                 (unsigned)e->counter_7514,
+                 (unsigned)e->i_stat_before, (unsigned)e->i_stat_after);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
+static void handle_card_txn_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 16);
+    int slot  = json_get_int(json, "slot", -1); /* -1 = all */
+    if (count < 1) count = 1;
+    if (count > SIO_TXN_CAP) count = SIO_TXN_CAP;
+
+    const SioTxnEntry *buf;
+    int write_idx, open_flag;
+    uint32_t total_seq = sio_get_card_txns(&buf, &write_idx, &open_flag);
+
+    int avail = (int)(total_seq < (uint32_t)SIO_TXN_CAP
+                      ? total_seq : SIO_TXN_CAP);
+    if (count > avail) count = avail;
+
+    int start = (write_idx - count + SIO_TXN_CAP) % SIO_TXN_CAP;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total_closed\":%u,\"open\":%s,"
+             "\"slot_filter\":%d,\"count\":%d,\"entries\":[",
+             id, (unsigned)total_seq, open_flag ? "true" : "false",
+             slot, count);
+
+    int emitted = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % SIO_TXN_CAP;
+        const SioTxnEntry *e = &buf[idx];
+        if (slot >= 0 && (int)e->slot != slot) continue;
+        if (emitted > 0) send_fmt(",");
+        emit_card_txn_json(e, 0);
+        emitted++;
+    }
+
+    /* Also append the live (open) txn if present and matches the filter. */
+    const SioTxnEntry *live = sio_get_card_txn_live();
+    if (live && (slot < 0 || (int)live->slot == slot)) {
+        if (emitted > 0) send_fmt(",");
+        emit_card_txn_json(live, 1);
+        emitted++;
+    }
+
+    send_fmt("],\"emitted\":%d}\n", emitted);
 }
 
 static void handle_watch(int id, const char *json)
@@ -1971,6 +2377,11 @@ static const CmdEntry s_commands[] = {
     { "mc_status",         handle_mc_status },
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
+    { "card_txn_dump",     handle_card_txn_dump },
+    { "sio_irq_dump",      handle_sio_irq_dump },
+    { "evcb_snapshot",     handle_evcb_snapshot },
+    { "evcb_walk_dump",    handle_evcb_walk_dump },
+    { "evcb_walk_stats",   handle_evcb_walk_stats },
     { "imask_trace",       handle_imask_trace },
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
@@ -2111,6 +2522,14 @@ void debug_server_init(int port)
     s_fn_stack_top = 0;
     s_fn_unmatched_returns = 0;
     s_fn_stack_overflows   = 0;
+
+    /* EvCB walk ring (~240 KB). */
+    if (!s_evcb_ring) s_evcb_ring = (EvCBSnapshot *)calloc(EVCB_RING_CAP, sizeof(EvCBSnapshot));
+    s_evcb_ring_seq = 0;
+    s_evcb_ring_entry_count = 0;
+    s_evcb_ring_exit_count  = 0;
+    s_evcb_pending_active   = 0;
+    s_evcb_unwound_count    = 0;
 
     /* Phase 4.5: watch EB4 area + DF8/DFC area + EvCB slot 1 status + state machine
      * + spiral texture buffer. */

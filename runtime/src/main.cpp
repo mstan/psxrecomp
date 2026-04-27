@@ -48,6 +48,20 @@ static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
 
+/* Display source toggle: 0 = our recompiled BIOS VRAM (default),
+ *                        1 = Beetle PSX libretro framebuffer (oracle).
+ * Set via CLI flag --display-beetle, or runtime via debug command
+ * `display_source` (set src="beetle"|"ours"). Allows visual confirmation
+ * that Beetle reads memory cards correctly without bringing up RetroArch. */
+static int g_display_source = 0;  /* 0 = ours, 1 = beetle */
+extern "C" void display_source_set(int src) { g_display_source = src ? 1 : 0; }
+extern "C" int  display_source_get(void)    { return g_display_source; }
+
+#if defined(ENABLE_BEETLE_PSX_ORACLE)
+extern "C" int beetle_get_framebuffer(uint32_t **out_pixels,
+                                       unsigned *out_w, unsigned *out_h);
+#endif
+
 /* Convert PS1 16-bit color (1-5-5-5) to ARGB8888 */
 static inline uint32_t psx16_to_argb(uint16_t c) {
     uint32_t r = (c & 0x1F) << 3;
@@ -116,6 +130,12 @@ static void sdl_vblank_present(void) {
             debug_server_shutdown();
             std::exit(0);
         }
+        if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F7
+            && ev.key.repeat == 0) {
+            g_display_source ^= 1;
+            std::fprintf(stderr, "psxrecomp-v4: display source = %s\n",
+                         g_display_source ? "Beetle PSX" : "ours");
+        }
     }
 
     /* Sample keyboard state and feed into SIO controller.
@@ -134,21 +154,38 @@ static void sdl_vblank_present(void) {
     psx_oracle_run_frame(pad_buttons_this_frame);
 #endif
 
-    GpuDisplayInfo di;
-    gpu_get_display_info(&di);
+    /* ---- Display source: ours OR Beetle's framebuffer ---- */
+    uint32_t w = 0, h = 0;
 
-    if (di.disabled || di.width == 0 || di.height == 0) return;
-
-    const uint16_t* vram = gpu_get_vram();
-    uint32_t w = di.width;
-    uint32_t h = di.height;
-
-    /* Blit the display area from VRAM into the staging buffer. */
-    for (uint32_t y = 0; y < h; y++) {
-        uint32_t vy = (di.display_y + y) & 511;
-        for (uint32_t x = 0; x < w; x++) {
-            uint32_t vx = (di.display_x + x) & 1023;
-            sdl_pixel_buf[y * w + x] = psx16_to_argb(vram[vy * 1024 + vx]);
+#if defined(ENABLE_BEETLE_PSX_ORACLE)
+    if (g_display_source == 1) {
+        /* Beetle PSX framebuffer (XRGB8888, native format). */
+        uint32_t *bpx = nullptr;
+        unsigned bw = 0, bh = 0;
+        if (beetle_get_framebuffer(&bpx, &bw, &bh) && bpx && bw && bh) {
+            w = bw; h = bh;
+            if (w > 640) w = 640;
+            if (h > 512) h = 512;
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++)
+                    sdl_pixel_buf[y * w + x] = bpx[y * w + x] | 0xFF000000u;
+        } else {
+            return;  /* Beetle hasn't produced a frame yet — skip present. */
+        }
+    } else
+#endif
+    {
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        if (di.disabled || di.width == 0 || di.height == 0) return;
+        const uint16_t* vram = gpu_get_vram();
+        w = di.width; h = di.height;
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t vy = (di.display_y + y) & 511;
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t vx = (di.display_x + x) & 1023;
+                sdl_pixel_buf[y * w + x] = psx16_to_argb(vram[vy * 1024 + vx]);
+            }
         }
     }
 
@@ -169,7 +206,15 @@ int main(int argc, char** argv) {
     std::fflush(stderr);
 
     const char* bios_path = "bios/SCPH1001.BIN";
-    if (argc > 1) bios_path = argv[1];
+    /* Parse positional + flags. First non-flag arg = bios_path. */
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--display-beetle") == 0) {
+            g_display_source = 1;
+            std::fprintf(stderr, "psxrecomp-v4: display source = Beetle PSX\n");
+        } else if (argv[i][0] != '-') {
+            bios_path = argv[i];
+        }
+    }
 
     std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path);
     memory_init(bios_path);

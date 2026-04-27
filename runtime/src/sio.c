@@ -178,6 +178,83 @@ uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
     return sio_trace_seq;
 }
 
+/* ---- Card transaction ring buffer ---- */
+static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
+static int       sio_txn_idx = 0;        /* next-write slot */
+static uint32_t  sio_txn_seq = 0;        /* monotonic id of next-to-close */
+static int       sio_txn_open = 0;       /* 1 when a txn is in progress */
+static SioTxnEntry sio_txn_cur;          /* in-progress txn, flushed on close */
+
+uint32_t sio_get_card_txns(const SioTxnEntry **buf_out, int *write_idx_out, int *open_out) {
+    if (buf_out) *buf_out = sio_txn_buf;
+    if (write_idx_out) *write_idx_out = sio_txn_idx;
+    if (open_out) *open_out = sio_txn_open;
+    return sio_txn_seq;
+}
+
+const SioTxnEntry *sio_get_card_txn_live(void) {
+    return sio_txn_open ? &sio_txn_cur : NULL;
+}
+
+/* Open a new txn. Caller must have ensured none is currently open. */
+static void txn_open(uint8_t slot, uint32_t start_byte_seq, uint32_t func) {
+    memset(&sio_txn_cur, 0, sizeof(sio_txn_cur));
+    sio_txn_cur.txn_seq         = sio_txn_seq;
+    sio_txn_cur.start_byte_seq  = start_byte_seq;
+    sio_txn_cur.start_func      = func;
+    sio_txn_cur.slot            = slot;
+    sio_txn_cur.sector          = 0xFFFF;
+    sio_txn_cur.terminal_state  = MC_IDLE;
+    sio_txn_cur.end_reason      = SIO_TXN_END_OPEN;
+    sio_txn_open = 1;
+}
+
+/* Append the just-processed byte to the current txn. */
+static void txn_record_byte(uint8_t tx, uint8_t rx,
+                            uint8_t cmd_after, uint16_t sector_after,
+                            int got_ack, uint32_t byte_seq) {
+    if (!sio_txn_open) return;
+    if (sio_txn_cur.byte_count < SIO_TXN_MAX_BYTES) {
+        sio_txn_cur.tx[sio_txn_cur.byte_count] = tx;
+        sio_txn_cur.rx[sio_txn_cur.byte_count] = rx;
+    }
+    sio_txn_cur.byte_count++;
+    sio_txn_cur.end_byte_seq = byte_seq;
+    if (cmd_after && !sio_txn_cur.cmd) sio_txn_cur.cmd = cmd_after;
+    if (sector_after != 0xFFFF) sio_txn_cur.sector = sector_after;
+    if (got_ack) sio_txn_cur.ack_count++;
+}
+
+/* Close the current txn into the ring. Safe to call when no txn open. */
+static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func) {
+    if (!sio_txn_open) return;
+    sio_txn_cur.end_reason     = end_reason;
+    sio_txn_cur.terminal_state = terminal_state;
+    sio_txn_cur.end_func       = func;
+    sio_txn_buf[sio_txn_idx]   = sio_txn_cur;
+    sio_txn_idx = (sio_txn_idx + 1) % SIO_TXN_CAP;
+    sio_txn_seq++;
+    sio_txn_open = 0;
+}
+
+/* ---- SIO IRQ #7 delivery ring ---- */
+static SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
+static int       sio_irq_idx = 0;
+static uint32_t  sio_irq_seq = 0;
+
+/* Pending-IRQ context — captured when the countdown is armed, used when it fires. */
+static uint8_t   sio_irq_pending_source     = SIO_IRQ_SRC_UNKNOWN;
+static uint8_t   sio_irq_pending_slot       = 0;
+static uint8_t   sio_irq_pending_delay      = 0;
+static uint8_t   sio_irq_pending_mc_state   = 0;
+static uint32_t  sio_irq_pending_byte_seq   = 0;
+
+uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out) {
+    if (buf_out) *buf_out = sio_irq_buf;
+    if (write_idx_out) *write_idx_out = sio_irq_idx;
+    return sio_irq_seq;
+}
+
 int sio_get_mc_probe_count(void) { return sio_mc_probe_count; }
 int sio_get_mc_ack_count(void) { return sio_mc_ack_count; }
 int sio_get_mc_cmd_count(void) { return sio_mc_cmd_count; }
@@ -268,6 +345,10 @@ void sio_init(void) {
     active_device = DEV_NONE;
     sio_irq_pending = 0;
     sio_irq_countdown = 0;
+    sio_txn_open = 0;
+    /* Note: sio_txn_buf, sio_txn_idx, sio_txn_seq deliberately persist
+     * across sio_init so post-reset diagnostics can still inspect prior
+     * transactions. Boot path zero-inits them via BSS. */
 }
 
 void sio_connect_pad(int slot) {
@@ -558,6 +639,15 @@ static void sio_process_byte(uint8_t tx_byte) {
     uint8_t trace_dev_pre = (uint8_t)active_device;
     uint8_t trace_irq_cd = (uint8_t)(sio_irq_countdown > 255 ? 255 : sio_irq_countdown);
     int trace_abort_before = sio_mc_abort_count;
+    int trace_ack_before   = sio_mc_ack_count;
+
+    /* ---- Card transaction tracking ----
+     * Decide whether this byte (a) closes a prior txn before processing,
+     * (b) opens a new txn before processing, (c) belongs to an existing
+     * txn, or (d) is unrelated to the card protocol. The actual record
+     * happens AFTER mc_process_byte runs so post-state is accurate. */
+    int txn_was_card_byte = 0;
+    uint8_t txn_pre_state  = (uint8_t)mc_state;
 
     if (active_device == DEV_NONE) {
         selected_slot = (sio_ctrl & SIO_CTRL_SLOT) ? 1 : 0;
@@ -581,13 +671,20 @@ static void sio_process_byte(uint8_t tx_byte) {
                 sio_mc_abort_count++;
                 sio_mc_abort_state = (int)mc_state;
                 sio_mc_abort_ctrl = sio_ctrl;
+                /* Old txn (still open) gets force-closed before the new
+                 * 0x81 starts its own. */
+                txn_close(SIO_TXN_END_ABORT_RESELECT, mc_state, g_debug_current_func_addr);
                 mc_state = MC_IDLE;
             }
             active_device = DEV_MEMCARD;
             mc_slot = selected_slot;
             sio_mc_probe_count++;
-            { extern uint32_t g_debug_current_func_addr;
-              sio_mc_last_caller = g_debug_current_func_addr; }
+            sio_mc_last_caller = g_debug_current_func_addr;
+            if (!sio_txn_open) {
+                txn_open((uint8_t)selected_slot, sio_trace_seq, g_debug_current_func_addr);
+            }
+            txn_pre_state = (uint8_t)mc_state;
+            txn_was_card_byte = 1;
             mc_process_byte(tx_byte);
         } else {
             /* Non-select byte with DEV_NONE — only resume a card protocol
@@ -597,8 +694,22 @@ static void sio_process_byte(uint8_t tx_byte) {
             mc_load_slot(selected_slot);
             if (mc_state != MC_IDLE && selected_slot == mc_slot) {
                 active_device = DEV_MEMCARD;
+                /* Continuation of an in-flight card txn across deselect/
+                 * reselect. Re-open ring entry if we don't already have
+                 * one (rare: pad polling closed it via mc_save_slot). */
+                if (!sio_txn_open) {
+                    txn_open((uint8_t)mc_slot, sio_trace_seq, g_debug_current_func_addr);
+                }
+                txn_pre_state = (uint8_t)mc_state;
+                txn_was_card_byte = 1;
                 mc_process_byte(tx_byte);
             } else {
+                if (mc_state != MC_IDLE) {
+                    /* Slot-mismatch reset: the slot's saved card state is
+                     * abandoned because the BIOS aimed at a different slot
+                     * with a non-select byte. Close the txn as ABORT_SLOT. */
+                    txn_close(SIO_TXN_END_ABORT_SLOT, mc_state, g_debug_current_func_addr);
+                }
                 mc_state = MC_IDLE;
                 sio_rx_data = 0xFF;
                 sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
@@ -613,6 +724,12 @@ static void sio_process_byte(uint8_t tx_byte) {
              * Any other byte means the BIOS moved on to a different
              * device (pad polling sends 0x01 here). */
             if (tx_byte == 0x81) {
+                /* New txn after a previous one closed naturally. */
+                if (!sio_txn_open) {
+                    txn_open((uint8_t)mc_slot, sio_trace_seq, g_debug_current_func_addr);
+                }
+                txn_pre_state = (uint8_t)mc_state;
+                txn_was_card_byte = 1;
                 mc_process_byte(tx_byte);
             } else {
                 active_device = DEV_NONE;
@@ -626,7 +743,39 @@ static void sio_process_byte(uint8_t tx_byte) {
                 }
             }
         } else {
+            txn_pre_state = (uint8_t)mc_state;
+            txn_was_card_byte = 1;
             mc_process_byte(tx_byte);
+        }
+    }
+
+    /* ---- Card transaction tracking: record + maybe-close ---- */
+    if (txn_was_card_byte && sio_txn_open) {
+        int got_ack = (sio_mc_ack_count > trace_ack_before) ? 1 : 0;
+        uint16_t sector_now = (mc_state >= MC_READ_ACK1 || mc_state == MC_WRITE_DATA
+                               || mc_state >= MC_WRITE_ACK1)
+                              ? mc_sector : 0xFFFF;
+        txn_record_byte(tx_byte, sio_rx_data, mc_cmd, sector_now,
+                        got_ack, sio_trace_seq);
+
+        /* Natural close: mc_state went IDLE this byte from non-IDLE. */
+        if (mc_state == MC_IDLE && txn_pre_state != MC_IDLE) {
+            uint8_t reason;
+            switch (txn_pre_state) {
+            case MC_READ_END:
+            case MC_WRITE_END:
+            case MC_GETID_4:
+                reason = SIO_TXN_END_SUCCESS;
+                break;
+            case MC_CMD:
+                /* Bad cmd byte: mc_process_byte resets to IDLE. */
+                reason = SIO_TXN_END_ABORT_BAD_CMD;
+                break;
+            default:
+                reason = SIO_TXN_END_ABORT_OTHER;
+                break;
+            }
+            txn_close(reason, txn_pre_state, g_debug_current_func_addr);
         }
     }
 
@@ -714,6 +863,13 @@ void sio_write(uint32_t addr, uint32_t value) {
                  * cleared through pad polling within the same ISR. */
                 sio_irq_countdown = (active_device == DEV_MEMCARD)
                     ? SIO_IRQ_DELAY_CARD : SIO_IRQ_DELAY_PAD;
+                /* Arm IRQ ring context for capture at fire time. */
+                sio_irq_pending_source   = (active_device == DEV_MEMCARD)
+                                           ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
+                sio_irq_pending_slot     = (uint8_t)selected_slot;
+                sio_irq_pending_delay    = (uint8_t)sio_irq_countdown;
+                sio_irq_pending_mc_state = (uint8_t)mc_state;
+                sio_irq_pending_byte_seq = sio_trace_seq;
             }
         }
         break;
@@ -734,6 +890,10 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_mc_abort_count++;
                 sio_mc_abort_state = (int)mc_state;
                 sio_mc_abort_ctrl = (uint16_t)value;
+            }
+            if (sio_txn_open) {
+                extern uint32_t g_debug_current_func_addr;
+                txn_close(SIO_TXN_END_ABORT_RESET, mc_state, g_debug_current_func_addr);
             }
             sio_stat = SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             sio_mode = 0;
@@ -793,7 +953,27 @@ void sio_tick(void) {
              * This unblocks the BIOS pad polling loop that spins
              * on TX_RDY before writing the next byte. */
             sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+            uint32_t i_stat_before = i_stat;
             i_stat |= (1 << IRQ_SIO0);
+
+            /* SIO IRQ ring capture. */
+            extern uint32_t g_debug_current_func_addr;
+            extern uint8_t psx_read_byte(uint32_t addr);
+            SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
+            e->seq            = sio_irq_seq;
+            e->byte_seq       = sio_irq_pending_byte_seq;
+            e->i_stat_before  = i_stat_before;
+            e->i_stat_after   = i_stat;
+            e->mc_state       = (uint32_t)sio_irq_pending_mc_state;
+            e->active_device  = (uint32_t)active_device;
+            e->ctrl           = (uint32_t)sio_ctrl;
+            e->func_addr      = g_debug_current_func_addr;
+            e->counter_7514   = (uint32_t)psx_read_byte(0x7514);
+            e->source         = sio_irq_pending_source;
+            e->slot           = sio_irq_pending_slot;
+            e->delay_applied  = sio_irq_pending_delay;
+            sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
+            sio_irq_seq++;
         }
     }
 }

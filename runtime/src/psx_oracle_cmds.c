@@ -273,6 +273,21 @@ static void h_emu_sync(int id, const char *json) {
     }
 }
 
+static void h_emu_press(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded"); return;
+    }
+    extern int beetle_press_frames(uint16_t pad, int frames);
+    int buttons = json_get_int(json, "buttons", -1);
+    int frames  = json_get_int(json, "frames", 60);
+    if (buttons < 0) { send_err(id, "missing buttons"); return; }
+    /* Convert from "0=released bit-pattern as the BIOS would see"
+     * — handle_press takes the BIOS's 16-bit pad word directly.
+     * Beetle's beetle_press_frames takes the same active-low layout. */
+    int ran = beetle_press_frames((uint16_t)buttons, frames);
+    send_fmt("{\"id\":%d,\"ok\":true,\"frames\":%d}\n", id, ran);
+}
+
 static void h_emu_sync_press(int id, const char *json) {
     if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
         send_err(id, "oracle not loaded"); return;
@@ -405,8 +420,11 @@ static void h_emu_sio_trace(int id, const char *json) {
 static int is_card_select(uint8_t tx) { return tx == 0x81; }
 static int is_pad_select(uint8_t tx)  { return tx == 0x01; }
 
-#define SIO_FFD_MAX_BYTES 16384
-#define SIO_FFD_MAX_TXNS  256
+/* Sized to hold Beetle's full SIO ring (BEETLE_SIO_TRACE_CAP). 16K was
+ * too small — only the most recent ~90 seconds, which often misses the
+ * one-shot directory-read window when comparing post-mortem. */
+#define SIO_FFD_MAX_BYTES 65536
+#define SIO_FFD_MAX_TXNS  512
 
 typedef struct {
     int start;   /* index in flat byte array */
@@ -583,6 +601,173 @@ done:;
     free(our_txns); free(bee_txns);
 }
 
+/* ---- card_txn_diff ----
+ *
+ * Like sio_first_divergence, but uses our STRUCTURED card transaction ring
+ * (one entry per 0x81-rooted protocol run) on our side. For Beetle we still
+ * have only the flat byte ring, so we split it the same way as the existing
+ * first_divergence helper. The diff aligns the K most-recent transactions
+ * (filtered to a single slot if requested), reports first byte-level
+ * divergence, and includes our side's structured metadata (cmd, sector,
+ * end_reason, terminal_state, ack_count) in the output so the operator can
+ * see WHY our side aborted.
+ */
+static void h_card_txn_diff(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded"); return;
+    }
+
+    int max_txns = json_get_int(json, "max_txns", 8);
+    if (max_txns < 1) max_txns = 1;
+    if (max_txns > SIO_FFD_MAX_TXNS) max_txns = SIO_FFD_MAX_TXNS;
+    int context = json_get_int(json, "context", 8);
+    if (context < 0) context = 0;
+    if (context > SIO_TXN_MAX_BYTES) context = SIO_TXN_MAX_BYTES;
+    int slot_filter = json_get_int(json, "slot", -1); /* -1 = any */
+
+    /* ---- Pull our structured txn ring ---- */
+    const SioTxnEntry *our_buf;
+    int our_w, our_open;
+    uint32_t our_total = sio_get_card_txns(&our_buf, &our_w, &our_open);
+    int our_avail = (int)(our_total < (uint32_t)SIO_TXN_CAP
+                          ? our_total : SIO_TXN_CAP);
+    if (our_avail < 1) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"match\":true,"
+                 "\"our_total_card_txns\":0,\"beetle_total_card_txns\":0,"
+                 "\"compared_txns\":0,\"diverge_txn\":-1,\"diverge_byte\":-1,"
+                 "\"diverge_kind\":\"no_data\"}\n", id);
+        return;
+    }
+
+    /* Walk our ring most-recent-first into a small picked array (filtered). */
+    const SioTxnEntry *our_picked[SIO_FFD_MAX_TXNS];
+    int our_picked_n = 0;
+    for (int k = 0; k < our_avail && our_picked_n < max_txns; k++) {
+        int idx = (our_w - 1 - k + SIO_TXN_CAP) % SIO_TXN_CAP;
+        const SioTxnEntry *e = &our_buf[idx];
+        if (slot_filter >= 0 && (int)e->slot != slot_filter) continue;
+        our_picked[our_picked_n++] = e;
+    }
+    if (our_picked_n < 1) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"match\":true,"
+                 "\"our_total_card_txns\":%u,\"beetle_total_card_txns\":0,"
+                 "\"compared_txns\":0,\"diverge_txn\":-1,\"diverge_byte\":-1,"
+                 "\"diverge_kind\":\"no_match_after_filter\"}\n",
+                 id, (unsigned)our_total);
+        return;
+    }
+
+    /* ---- Pull Beetle's flat byte ring and split into transactions ---- */
+    int beetle_cap = SIO_FFD_MAX_BYTES;
+    uint8_t  *bee_tx  = (uint8_t  *)malloc((size_t)beetle_cap);
+    uint8_t  *bee_rx  = (uint8_t  *)malloc((size_t)beetle_cap);
+    uint32_t *bseqs   = (uint32_t *)malloc((size_t)beetle_cap * sizeof(uint32_t));
+    uint16_t *bctrls  = (uint16_t *)malloc((size_t)beetle_cap * sizeof(uint16_t));
+    SioTxn   *bee_txns = (SioTxn   *)malloc(sizeof(SioTxn) * SIO_FFD_MAX_TXNS);
+    if (!bee_tx || !bee_rx || !bseqs || !bctrls || !bee_txns) {
+        free(bee_tx); free(bee_rx); free(bseqs); free(bctrls); free(bee_txns);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t bgot = beetle_get_sio_trace(bseqs, bee_tx, bee_rx, bctrls, beetle_cap);
+    int bee_n = (int)bgot;
+    free(bseqs); free(bctrls);
+    int bee_t = split_transactions(bee_tx, bee_n, bee_txns, SIO_FFD_MAX_TXNS);
+
+    /* Beetle has no slot metadata in the flat ring. Take the most-recent
+     * max_txns Beetle transactions verbatim and align positionally with
+     * our_picked (most-recent-first). The operator can constrain via
+     * slot filter on our side; Beetle alignment is best-effort and
+     * documented in the response. */
+    int K = max_txns;
+    if (K > our_picked_n) K = our_picked_n;
+    if (K > bee_t)        K = bee_t;
+
+    int diverge_txn  = -1;
+    int diverge_byte = -1;
+    const char *kind = "none";
+
+    for (int k = 0; k < K; k++) {
+        const SioTxnEntry *ot = our_picked[k];
+        const SioTxn *bt = &bee_txns[bee_t - 1 - k];
+        int our_n = ot->byte_count;
+        if (our_n > SIO_TXN_MAX_BYTES) our_n = SIO_TXN_MAX_BYTES;
+        int minlen = our_n < bt->len ? our_n : bt->len;
+        for (int i = 0; i < minlen; i++) {
+            uint8_t otx = ot->tx[i], orx = ot->rx[i];
+            uint8_t btx = bee_tx[bt->start + i], brx = bee_rx[bt->start + i];
+            if (otx != btx) { diverge_txn = k; diverge_byte = i; kind = "tx"; goto done; }
+            if (orx != brx) { diverge_txn = k; diverge_byte = i; kind = "rx"; goto done; }
+        }
+        if (our_n != bt->len) {
+            diverge_txn = k; diverge_byte = minlen;
+            kind = (our_n < bt->len) ? "ours_truncated" : "beetle_truncated";
+            goto done;
+        }
+    }
+done:;
+
+    int match = (diverge_txn < 0);
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"match\":%s,"
+             "\"our_total_card_txns\":%u,\"beetle_total_card_txns\":%d,"
+             "\"compared_txns\":%d,\"slot_filter\":%d,"
+             "\"diverge_txn\":%d,\"diverge_byte\":%d,\"diverge_kind\":\"%s\"",
+             id, match ? "true" : "false",
+             (unsigned)our_total, bee_t, K, slot_filter,
+             diverge_txn, diverge_byte, kind);
+
+    int show_k = diverge_txn >= 0 ? diverge_txn : (K > 0 ? 0 : -1);
+    if (show_k >= 0) {
+        const SioTxnEntry *ot = our_picked[show_k];
+        const SioTxn *bt = &bee_txns[bee_t - 1 - show_k];
+        int our_n = ot->byte_count;
+        if (our_n > SIO_TXN_MAX_BYTES) our_n = SIO_TXN_MAX_BYTES;
+
+        int center  = diverge_byte >= 0 ? diverge_byte : 0;
+        int lo      = center - context; if (lo < 0) lo = 0;
+        int our_hi  = center + context; if (our_hi > our_n)  our_hi = our_n;
+        int bee_hi  = center + context; if (bee_hi > bt->len) bee_hi = bt->len;
+
+        const char *reason_s;
+        switch (ot->end_reason) {
+        case SIO_TXN_END_OPEN:           reason_s = "open"; break;
+        case SIO_TXN_END_SUCCESS:        reason_s = "success"; break;
+        case SIO_TXN_END_ABORT_RESELECT: reason_s = "abort_reselect"; break;
+        case SIO_TXN_END_ABORT_RESET:    reason_s = "abort_reset"; break;
+        case SIO_TXN_END_ABORT_SLOT:     reason_s = "abort_slot"; break;
+        case SIO_TXN_END_ABORT_BAD_CMD:  reason_s = "abort_bad_cmd"; break;
+        case SIO_TXN_END_ABORT_OTHER:    reason_s = "abort_other"; break;
+        default:                         reason_s = "unknown"; break;
+        }
+
+        send_fmt(",\"shown_txn_k\":%d,\"our_meta\":{\"slot\":%u,\"cmd\":\"0x%02X\","
+                 "\"sector\":\"0x%04X\",\"bytes\":%u,\"acks\":%u,"
+                 "\"end_reason\":\"%s\",\"terminal_state\":%u,"
+                 "\"start_func\":\"0x%08X\",\"end_func\":\"0x%08X\"},"
+                 "\"our_len\":%d,\"beetle_len\":%d,\"ours\":[",
+                 show_k, ot->slot, ot->cmd, ot->sector,
+                 (unsigned)ot->byte_count, (unsigned)ot->ack_count,
+                 reason_s, ot->terminal_state,
+                 (unsigned)ot->start_func, (unsigned)ot->end_func,
+                 our_n, bt->len);
+        for (int i = lo; i < our_hi; i++) {
+            if (i > lo) send_fmt(",");
+            send_fmt("{\"i\":%d,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\"}",
+                     i, ot->tx[i], ot->rx[i]);
+        }
+        send_fmt("],\"beetle\":[");
+        for (int i = lo; i < bee_hi; i++) {
+            if (i > lo) send_fmt(",");
+            send_fmt("{\"i\":%d,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\"}",
+                     i, bee_tx[bt->start + i], bee_rx[bt->start + i]);
+        }
+        send_fmt("]");
+    }
+    send_fmt("}\n");
+
+    free(bee_tx); free(bee_rx); free(bee_txns);
+}
+
 /* ---- Beetle screenshot (XRGB8888 framebuffer → BMP) ---- */
 extern int beetle_get_framebuffer(uint32_t **out_pixels, unsigned *out_w, unsigned *out_h);
 
@@ -656,12 +841,14 @@ static const OracleCmd s_oracle_cmds[] = {
     { "emu_step",               h_emu_step },
     { "emu_sync",               h_emu_sync },
     { "emu_sync_press",         h_emu_sync_press },
+    { "emu_press",              h_emu_press },
     { "emu_ram_delta",          h_emu_ram_delta },
     { "find_first_divergence",  h_find_first_divergence },
     { "emu_sio_trace",          h_emu_sio_trace },
     { "emu_trace_addr",         h_emu_trace_addr },
     { "emu_screenshot",         h_emu_screenshot },
     { "sio_first_divergence",   h_sio_first_divergence },
+    { "card_txn_diff",          h_card_txn_diff },
     { NULL, NULL }
 };
 

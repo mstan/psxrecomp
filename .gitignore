@@ -24,6 +24,15 @@ psx_dispatch_misses.txt
 psx_err.txt
 psx_out.txt
 
+# Probe / scratch artifacts
+# All ad-hoc diagnostic dumps land under probes/ so the repo root stays clean.
+# Runtime data (memcards) is intentionally NOT covered: card*.mcd, dummy.*.mcr.
+probes/
+/*.json
+/*.png
+/*.bmp
+/*.txt
+
 # OS / editor junk
 .DS_Store
 Thumbs.db
