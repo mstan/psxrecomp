@@ -513,8 +513,9 @@ static void exec_one(CPUState* cpu) {
 /* ---- Interrupt injection ---- */
 
 static void interp_check_interrupts(CPUState* cpu) {
-    /* SIO tick. */
-    sio_tick();
+    /* SIO tick. cycles=0 in legacy mode (Phase 1.0a signature change;
+     * body ignores cycles, behaves identically to original). */
+    sio_tick(0);
 
     /* VBlank / timer scheduling. */
     s_vblank_count++;

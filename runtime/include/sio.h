@@ -16,9 +16,14 @@ void sio_init(void);
 uint32_t sio_read(uint32_t addr);
 void sio_write(uint32_t addr, uint32_t value);
 
-/* Advance SIO timing by one step. Called from psx_check_interrupts().
- * Fires pending IRQ7 after the transfer delay expires. */
-void sio_tick(void);
+/* Advance SIO timing.
+ *
+ * Phase 1.0a signature change. The cycles arg is reserved for a future
+ * cycle-paced model (SIO_MODEL_CYCLE_PACED=1). With the default macro
+ * setting (SIO_MODEL_CYCLE_PACED=0) the cycles arg is ignored and the
+ * body behaves identically to the prior tick-once-per-call semantics —
+ * fires pending IRQ7 after the transfer delay expires. */
+void sio_tick(int cycles);
 
 /* Update pad button state. Buttons use PS1 convention: 0=pressed, 1=released.
    Bit layout: SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT,

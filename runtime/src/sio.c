@@ -905,7 +905,7 @@ uint32_t sio_read(uint32_t addr) {
      * a tight BIOS polling loop within a single function. Advancing on
      * register access ensures the IRQ fires in time for the BIOS's
      * "clear, delay, check" card detection sequence. */
-    sio_tick();
+    sio_tick(0);
 
     switch (addr) {
     case 0x1F801040: /* SIO_RX_DATA */
@@ -1082,7 +1082,7 @@ void sio_write(uint32_t addr, uint32_t value) {
     /* Advance delayed IRQ after write processing (not before).
      * This ensures CTRL ACK writes clear the old IRQ before the
      * pending one fires. */
-    sio_tick();
+    sio_tick(0);
 }
 
 void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
@@ -1159,7 +1159,7 @@ static int sio_card_burst_drain(int max_iters) {
             reason = 2;
             break;
         }
-        sio_tick();
+        sio_tick(0);
     }
 
     if (iters == max_iters) reason = 3;
@@ -1188,7 +1188,16 @@ void sio_get_burst_stats(uint64_t out[10]) {
     out[9] = 0;
 }
 
-void sio_tick(void) {
+/* Phase 1.0a: SIO_MODEL_CYCLE_PACED defaulting to 0 keeps the legacy
+ * access-paced behavior unchanged. The cycles arg on sio_tick is
+ * reserved for a future cycle-paced model and is ignored under
+ * macro=0. */
+#ifndef SIO_MODEL_CYCLE_PACED
+#define SIO_MODEL_CYCLE_PACED 0
+#endif
+
+void sio_tick(int cycles) {
+    (void)cycles;  /* reserved for cycle-paced model (Phase 1.0c+) */
     if (sio_irq_pending && sio_irq_countdown > 0) {
         sio_irq_countdown--;
         if (sio_irq_countdown == 0) {

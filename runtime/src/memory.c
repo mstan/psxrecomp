@@ -217,7 +217,7 @@ static uint32_t mmio_read32(uint32_t addr) {
         return ram_size_reg;
     }
     /* Interrupts: 0x1F801070, 0x1F801074 */
-    if (addr == 0x1F801070u) { sio_tick(); return i_stat; }
+    if (addr == 0x1F801070u) { sio_tick(0); return i_stat; }
     if (addr == 0x1F801074u) return i_mask;
     /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
@@ -306,7 +306,7 @@ static uint16_t mmio_read16(uint32_t addr) {
         return (uint16_t)sio_read(addr);
     }
     /* Interrupts */
-    if (addr == 0x1F801070u) { sio_tick(); return (uint16_t)i_stat; }
+    if (addr == 0x1F801070u) { sio_tick(0); return (uint16_t)i_stat; }
     if (addr == 0x1F801074u) return (uint16_t)i_mask;
     /* Timers: 0x1F801100..0x1F80112F */
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
@@ -362,7 +362,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
 static uint8_t mmio_read8(uint32_t addr) {
     /* Interrupts: 0x1F801070..0x1F801077 (I_STAT, I_MASK) */
     if (addr >= 0x1F801070u && addr <= 0x1F801077u) {
-        if (addr < 0x1F801074u) sio_tick();
+        if (addr < 0x1F801074u) sio_tick(0);
         uint32_t val = (addr < 0x1F801074u) ? i_stat : i_mask;
         return (uint8_t)(val >> (8 * (addr & 3)));
     }
