@@ -27,6 +27,7 @@ set(PSX_SHARED_SOURCES
     src/iso_reader_c.cpp
     src/psx_oracle_stub.c
     src/psx_oracle_cmds.c
+    src/psx_cycles.c
 )
 
 # ---- Native target: recompiled BIOS, stub interpreter ----

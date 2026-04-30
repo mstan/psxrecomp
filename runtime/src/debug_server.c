@@ -14,6 +14,7 @@
 #include "sio.h"
 #include "memcard.h"
 #include "interrupts.h"
+#include "psx_cycles.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2501,6 +2502,7 @@ static void handle_freeze_check(int id, const char *json)
                     "\"mc_aborts\":%d,"
                     "\"mc_read_done\":%d,"
                     "\"tx_writes\":%d,"
+                    "\"psx_cycle_count\":%llu,"
                     "\"window\":%d,"
                     "\"recent_func_min\":\"0x%08X\","
                     "\"recent_func_max\":\"0x%08X\","
@@ -2531,6 +2533,7 @@ static void handle_freeze_check(int id, const char *json)
                     sio_get_mc_abort_count(),
                     sio_get_mc_read_done(),
                     sio_get_tx_writes(),
+                    (unsigned long long)psx_get_cycle_count(),
                     window,
                     (recent_total ? recent_min_func : 0),
                     recent_max_func,
