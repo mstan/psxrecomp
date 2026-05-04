@@ -3201,7 +3201,14 @@ void debug_server_init(int port)
      * error path) and which PC sets the failure flag. */
     s_wtrace_ranges[13].lo = 0x0000B9D0u;
     s_wtrace_ranges[13].hi = 0x0000B9F0u;
-    s_wtrace_range_count = 14;
+    /* Shell COPY/DELETE/LOAD_DIR sub-state at 0x80066BC0. CIRCLE→7=LOAD_DIR,
+     * CROSS→4=COPY-related, TRIANGLE→0=cleared, 6=DELETE. After clicking
+     * COPY, BIOS got stuck at BC0=4 with NO further input transitions —
+     * likely waiting for a card op completion that never fires. Track every
+     * writer to identify the BIOS function driving this sub-state. */
+    s_wtrace_ranges[14].lo = 0x00066BC0u;
+    s_wtrace_ranges[14].hi = 0x00066BD0u;
+    s_wtrace_range_count = 15;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
