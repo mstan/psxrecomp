@@ -286,6 +286,19 @@ bool FullFunctionEmitter::emit_function(
         block_cycles[leader] = count;
     }
 
+    /* Emit branch-predicate variable declarations at function entry,
+     * each initialized to 0.  Subsequent terminator-emit assigns instead of
+     * declares, so a `goto label_X` that lands on the delay slot of a
+     * preceding beq does NOT execute the dangling `if (psx_taken_X) goto Y`
+     * with an indeterminate value (would be UB per C; on MinGW the stack
+     * garbage was non-zero, causing a spurious branch — root cause of the
+     * memcard COPY confirm-modal freeze in widget 0xB → BFC21800 loop). */
+    for (const auto& [ds_addr, pb] : pending_at) {
+        if (is_branch_kind(pb.kind.c_str())) {
+            out += fmt::format("    int psx_taken_{:08X} = 0;\n", pb.terminator_addr);
+        }
+    }
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -331,7 +344,10 @@ bool FullFunctionEmitter::emit_function(
                     out += fmt::format("    {}\n", tr.pre_delay_code);
                 }
                 std::string cond = branch_condition(tr.terminator_kind, addr);
-                out += fmt::format("    int psx_taken_{:08X} = ({});\n", addr, cond);
+                /* Assignment, not declaration — variable is declared at
+                 * function entry initialized to 0 (see fix for chained
+                 * branch + delay-slot label-placement bug). */
+                out += fmt::format("    psx_taken_{:08X} = ({});\n", addr, cond);
             } else if (kind == "rfe") {
                 // RFE: emit cop0 stack pop immediately (no delay slot).
                 //
