@@ -187,6 +187,13 @@ typedef struct {
 } UnknownDispatchEntry;
 static UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
 static uint64_t s_unknown_seq = 0;
+
+/* Crash-trace accessor: returns entry at the given seq number (modulo cap).
+ * Layout matches crash_trace.c's UnknownDispatchEntry typedef. */
+UnknownDispatchEntry crash_trace_unknown_get(uint64_t seq) {
+    return s_unknown_ring[seq & (UNKNOWN_DISPATCH_CAP - 1u)];
+}
+uint64_t crash_trace_unknown_seq_get(void) { return s_unknown_seq; }
 /* Per-target hit count — bounded set, ~N unique targets typically. */
 #define UNKNOWN_UNIQUE_CAP 1024
 typedef struct { uint32_t phys; uint64_t count; } UnknownUniqueEntry;
@@ -221,6 +228,13 @@ void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
         }
     }
 }
+
+/* Crash-trace accessors (used by crash_trace.c). The unknown-ring
+ * accessor is defined later in this file, after UnknownDispatchEntry. */
+uint32_t crash_trace_dispatch_ring_get(int idx) {
+    return s_dispatch_ring[idx & (DISPATCH_TRACE_CAP - 1)];
+}
+uint64_t crash_trace_dispatch_seq_get(void) { return s_dispatch_seq; }
 
 /* Unique dispatch set — tracks every unique function address ever dispatched.
  * Simple hash set with linear probing. */

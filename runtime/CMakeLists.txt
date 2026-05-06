@@ -19,6 +19,7 @@ set(PSX_SHARED_SOURCES
     src/debug_server.c
     src/dirty_ram_interp.c
     src/traps.c
+    src/crash_trace.c
     src/gte.cpp
     src/crc32.c
     src/cdrom.c

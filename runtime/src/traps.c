@@ -16,6 +16,9 @@ void psx_exception_longjmp(void);
 static void trap_crash(const char* msg) {
     FILE* cf = fopen("psx_crash.txt", "w");
     if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }
+    /* Also dump the structured crash trace with rings + cpu state. */
+    extern void psx_crash_trace_dump(const char *reason, void *seh_info);
+    psx_crash_trace_dump("trap_crash", NULL);
 }
 
 void psx_syscall(CPUState* cpu, uint32_t code) {
@@ -367,6 +370,28 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                                                  uint32_t a1);
         psx_unknown_dispatch_record(addr, phys, cpu->gpr[31],
                                     cpu->gpr[4], cpu->gpr[5]);
+
+        /* Fail-fast mode: silent no-op masks bugs by leaving stale
+         * register state. When PSX_FAIL_FAST_UNKNOWN_DISPATCH=1, dump
+         * the crash report and exit so the first miss surfaces full
+         * context instead of accumulating 60 silent stale-v0 returns. */
+        static int s_fail_fast = -1;
+        if (s_fail_fast < 0) {
+            const char *e = getenv("PSX_FAIL_FAST_UNKNOWN_DISPATCH");
+            s_fail_fast = (e && *e == '1') ? 1 : 0;
+        }
+        if (s_fail_fast) {
+            extern void psx_crash_trace_dump(const char *reason, void *seh_info);
+            psx_crash_trace_dump("fail_fast_unknown_dispatch", NULL);
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "FAIL-FAST unknown dispatch: addr=0x%08X phys=0x%08X ra=0x%08X "
+                "a0=0x%08X a1=0x%08X — see psx_last_run_report.json\n",
+                addr, phys, cpu->gpr[31], cpu->gpr[4], cpu->gpr[5]);
+            trap_crash(msg);
+            exit(1);
+        }
+
         /* Return without executing — function is a no-op. */
         cpu->pc = 0;
     }

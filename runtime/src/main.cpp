@@ -13,6 +13,7 @@
 #include "spu.h"
 #include "memcard.h"
 #include "debug_server.h"
+#include "crash_trace.h"
 #include <SDL.h>
 #include <cstdio>
 #include <cstring>
@@ -175,6 +176,10 @@ int main(int argc, char** argv) {
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
     std::fprintf(stderr, "psxrecomp-v4: main() entered\n");
     std::fflush(stderr);
+
+    /* Install crash handlers early so they catch issues during init too.
+     * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
+    psx_crash_trace_install_handlers();
 
     const char* bios_path = "bios/SCPH1001.BIN";
     /* Parse positional. First non-flag arg = bios_path. */
