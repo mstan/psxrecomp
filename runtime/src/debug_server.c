@@ -2118,6 +2118,116 @@ static void handle_spu_status(int id, const char *json)
              info.peak);
 }
 
+/* ---- Per-voice SPU snapshot. Mirrors fields the Beetle oracle exposes
+ * via PS_SPU::GetRegister(GSREG_V0_*) so cross-process diff tooling sees
+ * the same JSON schema on both port 4370 and 4380.
+ *
+ * Single-shot emission: assemble the entire response into a heap buffer
+ * and fire one send_fmt. debug_server_send_line appends '\n' on every
+ * call, so multi-call patterns produce multi-line garbage on the wire. */
+static void handle_spu_voices(int id, const char *json)
+{
+    (void)json;
+    SpuGlobalState g;
+    spu_get_global_state(&g);
+
+    size_t cap = 8192;
+    char *out = (char *)malloc(cap);
+    if (!out) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    size_t off = 0;
+    int n = snprintf(out + off, cap - off,
+        "{\"id\":%d,\"ok\":true,"
+        "\"ctrl\":\"0x%04X\",\"main_l\":\"0x%04X\",\"main_r\":\"0x%04X\","
+        "\"kon\":\"0x%06X\",\"koff\":\"0x%06X\","
+        "\"pmon\":\"0x%06X\",\"non\":\"0x%06X\",\"eon\":\"0x%06X\","
+        "\"endx\":\"0x%06X\",\"active_mask\":\"0x%06X\","
+        "\"voices\":[",
+        id,
+        g.ctrl, g.main_vol_l, g.main_vol_r,
+        g.kon_latch, g.koff_latch,
+        g.pmon, g.non, g.eon,
+        g.endx, g.active_mask);
+    if (n > 0) off += (size_t)n;
+
+    for (int v = 0; v < 24; v++) {
+        SpuVoiceState s;
+        spu_get_voice_state(v, &s);
+        n = snprintf(out + off, cap - off,
+            "%s{\"v\":%d,\"active\":%d,"
+            "\"vol_l\":\"0x%04X\",\"vol_r\":\"0x%04X\","
+            "\"pitch\":\"0x%04X\","
+            "\"start\":\"0x%05X\",\"loop\":\"0x%05X\","
+            "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
+            "\"cur_addr\":\"0x%05X\",\"repeat_addr\":\"0x%05X\","
+            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\"}",
+            v == 0 ? "" : ",",
+            v, s.active,
+            s.vol_ctrl_l, s.vol_ctrl_r,
+            s.pitch,
+            (uint32_t)s.start_lo << 3,
+            (uint32_t)s.loop_lo  << 3,
+            s.adsr_lo, s.adsr_hi,
+            s.cur_addr, s.repeat_addr,
+            s.last_flags, s.sample_idx, s.phase);
+        if (n > 0) off += (size_t)n;
+    }
+    n = snprintf(out + off, cap - off, "]}");
+    if (n > 0) off += (size_t)n;
+    send_fmt("%s", out);
+    free(out);
+}
+
+/* ---- SPU event ring dump. Returns the most recent N events
+ * (KEYON / KEYOFF / END_STOP / END_LOOP) with frame timestamps. */
+static void handle_spu_events(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 4096) count = 4096;
+    SpuEvent *evs = (SpuEvent *)malloc((size_t)count * sizeof(SpuEvent));
+    if (!evs) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    uint32_t got = spu_event_get(evs, (uint32_t)count);
+    uint64_t total = spu_event_total();
+    static const char *kind_names[5] = { "?", "KEYON", "KEYOFF", "END_STOP", "END_LOOP" };
+
+    /* Worst case ~200 chars per event; 64 KB is plenty for 4096 events. */
+    size_t cap = 256u + (size_t)got * 256u;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(evs); send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    size_t off = 0;
+    int n = snprintf(out + off, cap - off,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+        id, (unsigned long long)total, (unsigned)got);
+    if (n > 0) off += (size_t)n;
+    for (uint32_t i = 0; i < got; i++) {
+        const SpuEvent *e = &evs[i];
+        const char *kn = (e->kind <= 4) ? kind_names[e->kind] : "?";
+        n = snprintf(out + off, cap - off,
+            "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"v\":%d,"
+            "\"pitch\":\"0x%04X\",\"addr\":\"0x%05X\","
+            "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
+            "\"vol_l\":\"0x%04X\",\"vol_r\":\"0x%04X\"}",
+            i == 0 ? "" : ",",
+            (unsigned long long)e->seq, e->frame, kn, (int)e->voice,
+            e->pitch, e->addr,
+            e->adsr_lo, e->adsr_hi,
+            e->vol_l, e->vol_r);
+        if (n > 0) off += (size_t)n;
+    }
+    n = snprintf(out + off, cap - off, "]}");
+    if (n > 0) off += (size_t)n;
+    send_fmt("%s", out);
+    free(out);
+    free(evs);
+}
+
+static void handle_spu_events_reset(int id, const char *json)
+{
+    (void)json;
+    spu_event_reset();
+    send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
 /* ---- SIO IRQ-arm audit -----------------------------------------------
  * Reports counts of TX writes that reached the IRQ-arm decision in
  * sio_write SIO_TX_DATA, partitioned by active_device. Tells us at the
@@ -3916,6 +4026,9 @@ static const CmdEntry s_commands[] = {
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
+    { "spu_voices",        handle_spu_voices },
+    { "spu_events",        handle_spu_events },
+    { "spu_events_reset",  handle_spu_events_reset },
     { "card_buffer_dump",  handle_card_buffer_dump },
     { "sio_arm_audit",     handle_sio_arm_audit },
     { "sio_burst_stats",   handle_sio_burst_stats },

@@ -20,6 +20,7 @@
 #include "mednafen/psx/psx.h"
 #include "mednafen/psx/cpu.h"
 #include "mednafen/psx/gpu.h"
+#include "mednafen/psx/spu.h"
 #include "mednafen/psx/frontio.h"
 
 namespace {
@@ -502,6 +503,145 @@ extern "C" void beetle_fntrace_reset(void) {
     memset(s_fntrace, 0, sizeof(s_fntrace));
 }
 extern "C" uint64_t beetle_fntrace_total(void) { return s_fntrace_seq; }
+
+/* ---- SPU event ring (always-on, mirrors recomp's spu_events).
+ *
+ * Beetle's spu.cpp calls psxrecomp_beetle_spu_event() at every transition
+ * we care about: KEYON, KEYOFF, END_STOP (loop-end-no-repeat), END_LOOP
+ * (loop-end-with-repeat). Each entry stamps frame + voice + envelope
+ * level + sample address, so the boot-chime timeline can be diffed
+ * directly against recomp's port-4370 spu_events output. */
+/* 1M entries × ~32 B = 32 MB. Sized for full boot-chime capture plus
+ * minutes of in-game timeline; mirrors recomp's SPU_EVENT_CAP exactly. */
+#define BEETLE_SPU_EVENT_CAP (1u << 20)
+struct BeetleSpuEvent {
+    uint64_t seq;
+    uint32_t frame;
+    uint32_t addr;
+    uint16_t env;
+    uint16_t pitch;
+    uint16_t vol_l_ctrl;
+    uint16_t vol_r_ctrl;
+    uint16_t adsr_lo;
+    uint16_t adsr_hi;
+    uint8_t  kind;     /* 1=KEYON 2=KEYOFF 3=END_STOP 4=END_LOOP */
+    uint8_t  voice;
+};
+static BeetleSpuEvent s_spu_events[BEETLE_SPU_EVENT_CAP];
+static uint32_t s_spu_event_idx = 0;
+static uint64_t s_spu_event_seq = 0;
+
+extern "C" void psxrecomp_beetle_spu_event(unsigned kind, unsigned voice,
+                                           unsigned addr, unsigned env)
+{
+    /* Snapshot the per-voice raw control registers via PS_SPU peek so the
+     * payload is structurally identical to recomp's SpuEvent. */
+    BeetleSpuEvent *e = &s_spu_events[s_spu_event_idx & (BEETLE_SPU_EVENT_CAP - 1u)];
+    e->seq    = s_spu_event_seq++;
+    e->frame  = s_frame_count;
+    e->addr   = addr;
+    e->env    = (uint16_t)env;
+    e->kind   = (uint8_t)kind;
+    e->voice  = (uint8_t)voice;
+    if (PSX_SPU && voice < 24u) {
+        char dummy[32]; const uint32_t dl = sizeof(dummy);
+        unsigned base = 0x8000u | ((unsigned)voice << 8);
+        e->pitch       = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_PITCH      & 0xFF), dummy, dl);
+        e->vol_l_ctrl  = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_CTRL_L & 0xFF), dummy, dl);
+        e->vol_r_ctrl  = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_CTRL_R & 0xFF), dummy, dl);
+        unsigned ctrl  =          PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_ADSR_CTRL  & 0xFF), dummy, dl);
+        e->adsr_lo     = (uint16_t)(ctrl & 0xFFFFu);
+        e->adsr_hi     = (uint16_t)((ctrl >> 16) & 0xFFFFu);
+    } else {
+        e->pitch = e->vol_l_ctrl = e->vol_r_ctrl = e->adsr_lo = e->adsr_hi = 0;
+    }
+    s_spu_event_idx++;
+}
+
+extern "C" uint64_t beetle_spu_event_total(void) { return s_spu_event_seq; }
+
+extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
+                                         uint32_t *out_addr, uint16_t *out_env,
+                                         uint16_t *out_pitch,
+                                         uint16_t *out_vol_l, uint16_t *out_vol_r,
+                                         uint16_t *out_adsr_lo, uint16_t *out_adsr_hi,
+                                         uint8_t *out_kind, uint8_t *out_voice,
+                                         uint32_t max_count)
+{
+    uint64_t avail = s_spu_event_seq < (uint64_t)BEETLE_SPU_EVENT_CAP
+                     ? s_spu_event_seq : (uint64_t)BEETLE_SPU_EVENT_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    uint32_t start = (s_spu_event_idx + BEETLE_SPU_EVENT_CAP - max_count) & (BEETLE_SPU_EVENT_CAP - 1u);
+    for (uint32_t i = 0; i < max_count; i++) {
+        const BeetleSpuEvent *e = &s_spu_events[(start + i) & (BEETLE_SPU_EVENT_CAP - 1u)];
+        out_seq[i]     = e->seq;
+        out_frame[i]   = e->frame;
+        out_addr[i]    = e->addr;
+        out_env[i]     = e->env;
+        out_pitch[i]   = e->pitch;
+        out_vol_l[i]   = e->vol_l_ctrl;
+        out_vol_r[i]   = e->vol_r_ctrl;
+        out_adsr_lo[i] = e->adsr_lo;
+        out_adsr_hi[i] = e->adsr_hi;
+        out_kind[i]    = e->kind;
+        out_voice[i]   = e->voice;
+    }
+    return max_count;
+}
+
+/* ---- SPU register peeks via PS_SPU::GetRegister ----
+ *
+ * Mirrors the spu_voices wire protocol psx-runtime exposes on port 4370
+ * so cross-process diff tooling sees the same JSON schema on both ports.
+ * Beetle's SPU keeps full ADSR, sweep volumes, distinct StartAddr/CurAddr/
+ * LoopAddr, and a real BlockEnd latch — so this is the oracle ground truth
+ * for "is voice v actually voicing right now and where in the sample?"
+ */
+extern "C" int beetle_spu_get_voice_state(int v,
+    uint16_t *vol_ctrl_l, uint16_t *vol_ctrl_r,
+    uint16_t *vol_l,      uint16_t *vol_r,
+    uint16_t *pitch,
+    uint32_t *start_addr, uint32_t *cur_addr, uint32_t *loop_addr,
+    uint32_t *adsr_ctrl,  uint16_t *adsr_level)
+{
+    if (v < 0 || v >= 24 || !PSX_SPU) return 0;
+    unsigned base = 0x8000u | ((unsigned)v << 8);
+    char dummy[32]; const uint32_t dl = sizeof(dummy);
+    *vol_ctrl_l = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_CTRL_L & 0xFF), dummy, dl);
+    *vol_ctrl_r = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_CTRL_R & 0xFF), dummy, dl);
+    *vol_l      = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_L      & 0xFF), dummy, dl);
+    *vol_r      = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_VOL_R      & 0xFF), dummy, dl);
+    *pitch      = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_PITCH      & 0xFF), dummy, dl);
+    *start_addr =          PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_STARTADDR   & 0xFF), dummy, dl);
+    *cur_addr   =          PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_READ_ADDR   & 0xFF), dummy, dl);
+    *loop_addr  =          PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_LOOP_ADDR   & 0xFF), dummy, dl);
+    *adsr_ctrl  =          PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_ADSR_CTRL   & 0xFF), dummy, dl);
+    *adsr_level = (uint16_t)PSX_SPU->GetRegister(base + (PS_SPU::GSREG_V0_ADSR_LEVEL & 0xFF), dummy, dl);
+    return 1;
+}
+
+extern "C" int beetle_spu_get_global_state(
+    uint16_t *spu_ctrl,
+    uint16_t *main_vol_ctrl_l, uint16_t *main_vol_ctrl_r,
+    uint16_t *main_vol_l,      uint16_t *main_vol_r,
+    uint32_t *fm_mode, uint32_t *noise_mode, uint32_t *reverb_mode,
+    uint32_t *voice_on, uint32_t *voice_off, uint32_t *block_end)
+{
+    if (!PSX_SPU) return 0;
+    char dummy[32]; const uint32_t dl = sizeof(dummy);
+    *spu_ctrl         = (uint16_t)PSX_SPU->GetRegister(PS_SPU::GSREG_SPUCONTROL,      dummy, dl);
+    *main_vol_ctrl_l  = (uint16_t)PSX_SPU->GetRegister(PS_SPU::GSREG_MAINVOL_CTRL_L,  dummy, dl);
+    *main_vol_ctrl_r  = (uint16_t)PSX_SPU->GetRegister(PS_SPU::GSREG_MAINVOL_CTRL_R,  dummy, dl);
+    *main_vol_l       = (uint16_t)PSX_SPU->GetRegister(PS_SPU::GSREG_MAINVOL_L,       dummy, dl);
+    *main_vol_r       = (uint16_t)PSX_SPU->GetRegister(PS_SPU::GSREG_MAINVOL_R,       dummy, dl);
+    *fm_mode          =          PSX_SPU->GetRegister(PS_SPU::GSREG_FM_ON,           dummy, dl);
+    *noise_mode       =          PSX_SPU->GetRegister(PS_SPU::GSREG_NOISE_ON,        dummy, dl);
+    *reverb_mode      =          PSX_SPU->GetRegister(PS_SPU::GSREG_REVERB_ON,       dummy, dl);
+    *voice_on         =          PSX_SPU->GetRegister(PS_SPU::GSREG_VOICEON,         dummy, dl);
+    *voice_off        =          PSX_SPU->GetRegister(PS_SPU::GSREG_VOICEOFF,        dummy, dl);
+    *block_end        =          PSX_SPU->GetRegister(PS_SPU::GSREG_BLOCKEND,        dummy, dl);
+    return 1;
+}
 
 extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                        uint32_t *out_caller, uint32_t *out_target,

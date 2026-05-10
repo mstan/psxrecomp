@@ -62,6 +62,30 @@ extern uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
                                    uint8_t *out_slot, uint8_t *out_size,
                                    int max_count);
 
+/* SPU event ring (always-on, mirrors recomp's spu_events). */
+extern uint64_t beetle_spu_event_total(void);
+extern uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
+                                     uint32_t *out_addr, uint16_t *out_env,
+                                     uint16_t *out_pitch,
+                                     uint16_t *out_vol_l, uint16_t *out_vol_r,
+                                     uint16_t *out_adsr_lo, uint16_t *out_adsr_hi,
+                                     uint8_t *out_kind, uint8_t *out_voice,
+                                     uint32_t max_count);
+
+/* SPU register peeks (oracle ground truth via PS_SPU::GetRegister). */
+extern int beetle_spu_get_voice_state(int v,
+    uint16_t *vol_ctrl_l, uint16_t *vol_ctrl_r,
+    uint16_t *vol_l,      uint16_t *vol_r,
+    uint16_t *pitch,
+    uint32_t *start_addr, uint32_t *cur_addr, uint32_t *loop_addr,
+    uint32_t *adsr_ctrl,  uint16_t *adsr_level);
+extern int beetle_spu_get_global_state(
+    uint16_t *spu_ctrl,
+    uint16_t *main_vol_ctrl_l, uint16_t *main_vol_ctrl_r,
+    uint16_t *main_vol_l,      uint16_t *main_vol_r,
+    uint32_t *fm_mode, uint32_t *noise_mode, uint32_t *reverb_mode,
+    uint32_t *voice_on, uint32_t *voice_off, uint32_t *block_end);
+
 /* fntrace */
 extern int      beetle_fntrace_arm(uint32_t target_pc);
 extern void     beetle_fntrace_disarm_all(void);
@@ -530,6 +554,122 @@ static void h_fntrace_dump(int id, const char *json) {
     free(a0s); free(a1s); free(frames); free(kinds);
 }
 
+/* ---- spu_voices: Beetle oracle ground truth via PS_SPU::GetRegister ----
+ *
+ * Wire-protocol mirror of psx-runtime's spu_voices (port 4370). Both
+ * backends emit a structurally-identical JSON shape so a diff tool can
+ * compare the same fields across processes. Fields:
+ *   per voice: v, active, vol_l/r (post-sweep), vol_l_ctrl/r_ctrl,
+ *              pitch, start, loop, cur_addr, adsr_ctrl, adsr_level
+ *   global:    ctrl, main_l/r, kon/koff, endx, voice_on, voice_off
+ *
+ * Beetle has no recomp-style "active" flag — we synthesize it as
+ * (adsr_level > 0), the closest oracle equivalent.
+ */
+static void h_spu_voices(int id, const char *json) {
+    (void)json;
+    uint16_t spu_ctrl = 0, mvc_l = 0, mvc_r = 0, mv_l = 0, mv_r = 0;
+    uint32_t fm = 0, nz = 0, rv = 0, von = 0, voff = 0, bend = 0;
+    if (!beetle_spu_get_global_state(&spu_ctrl, &mvc_l, &mvc_r, &mv_l, &mv_r,
+                                     &fm, &nz, &rv, &von, &voff, &bend)) {
+        send_err(id, "spu_unavailable");
+        return;
+    }
+    /* Build active mask from per-voice adsr_level > 0. */
+    uint32_t active_mask = 0;
+    struct {
+        uint16_t vc_l, vc_r, v_l, v_r, pitch, adsr_lvl;
+        uint32_t sa, ca, la, adsr_ctrl;
+    } vstate[24];
+    for (int v = 0; v < 24; v++) {
+        beetle_spu_get_voice_state(v,
+            &vstate[v].vc_l, &vstate[v].vc_r,
+            &vstate[v].v_l,  &vstate[v].v_r,
+            &vstate[v].pitch,
+            &vstate[v].sa, &vstate[v].ca, &vstate[v].la,
+            &vstate[v].adsr_ctrl, &vstate[v].adsr_lvl);
+        if (vstate[v].adsr_lvl > 0) active_mask |= (1u << v);
+    }
+
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"ctrl\":\"0x%04X\","
+             "\"main_l\":\"0x%04X\",\"main_r\":\"0x%04X\","
+             "\"main_l_ctrl\":\"0x%04X\",\"main_r_ctrl\":\"0x%04X\","
+             "\"kon\":\"0x%06X\",\"koff\":\"0x%06X\","
+             "\"endx\":\"0x%06X\",\"active_mask\":\"0x%06X\","
+             "\"fm\":\"0x%06X\",\"non\":\"0x%06X\",\"eon\":\"0x%06X\","
+             "\"voices\":[",
+             id,
+             spu_ctrl, mv_l, mv_r, mvc_l, mvc_r,
+             von & 0xFFFFFFu, voff & 0xFFFFFFu,
+             bend & 0xFFFFFFu, active_mask,
+             fm & 0xFFFFFFu, nz & 0xFFFFFFu, rv & 0xFFFFFFu);
+    for (int v = 0; v < 24; v++) {
+        if (v > 0) send_fmt(",");
+        int active = (vstate[v].adsr_lvl > 0) ? 1 : 0;
+        send_fmt("{\"v\":%d,\"active\":%d,"
+                 "\"vol_l_ctrl\":\"0x%04X\",\"vol_r_ctrl\":\"0x%04X\","
+                 "\"vol_l\":\"0x%04X\",\"vol_r\":\"0x%04X\","
+                 "\"pitch\":\"0x%04X\","
+                 "\"start\":\"0x%05X\",\"cur_addr\":\"0x%05X\",\"loop\":\"0x%05X\","
+                 "\"adsr_ctrl\":\"0x%08X\",\"adsr_level\":\"0x%04X\"}",
+                 v, active,
+                 vstate[v].vc_l, vstate[v].vc_r,
+                 vstate[v].v_l,  vstate[v].v_r,
+                 vstate[v].pitch,
+                 vstate[v].sa, vstate[v].ca, vstate[v].la,
+                 vstate[v].adsr_ctrl, vstate[v].adsr_lvl);
+    }
+    send_fmt("]}\n");
+}
+
+/* ---- spu_events: dump Beetle's SPU event ring ---- */
+static void h_spu_events(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 4096) count = 4096;
+    uint64_t *seqs   = malloc(sizeof(uint64_t)  * (size_t)count);
+    uint32_t *frames = malloc(sizeof(uint32_t)  * (size_t)count);
+    uint32_t *addrs  = malloc(sizeof(uint32_t)  * (size_t)count);
+    uint16_t *envs   = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint16_t *pits   = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint16_t *vlcs   = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint16_t *vrcs   = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint16_t *als    = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint16_t *ahs    = malloc(sizeof(uint16_t)  * (size_t)count);
+    uint8_t  *kinds  = malloc(sizeof(uint8_t)   * (size_t)count);
+    uint8_t  *vs     = malloc(sizeof(uint8_t)   * (size_t)count);
+    if (!seqs || !frames || !addrs || !envs || !pits || !vlcs || !vrcs ||
+        !als || !ahs || !kinds || !vs) {
+        free(seqs); free(frames); free(addrs); free(envs); free(pits);
+        free(vlcs); free(vrcs); free(als); free(ahs); free(kinds); free(vs);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t got = beetle_spu_event_get(seqs, frames, addrs, envs, pits,
+                                        vlcs, vrcs, als, ahs, kinds, vs,
+                                        (uint32_t)count);
+    uint64_t total = beetle_spu_event_total();
+
+    static const char *kind_names[5] = { "?", "KEYON", "KEYOFF", "END_STOP", "END_LOOP" };
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+             id, (unsigned long long)total, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        const char *kn = (kinds[i] <= 4) ? kind_names[kinds[i]] : "?";
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"v\":%d,"
+                 "\"pitch\":\"0x%04X\",\"addr\":\"0x%05X\",\"env\":\"0x%04X\","
+                 "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
+                 "\"vol_l\":\"0x%04X\",\"vol_r\":\"0x%04X\"}",
+                 (unsigned long long)seqs[i], frames[i], kn, (int)vs[i],
+                 pits[i], addrs[i], envs[i],
+                 als[i], ahs[i], vlcs[i], vrcs[i]);
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(frames); free(addrs); free(envs); free(pits);
+    free(vlcs); free(vrcs); free(als); free(ahs); free(kinds); free(vs);
+}
+
 /* ---- Command dispatch ---- */
 typedef void (*cmd_handler)(int id, const char *json);
 typedef struct { const char *name; cmd_handler handler; } CmdEntry;
@@ -556,6 +696,8 @@ static const CmdEntry CMDS[] = {
     { "fntrace_unfiltered",    h_fntrace_unfiltered },
     { "fntrace_reset",         h_fntrace_reset },
     { "fntrace_dump",          h_fntrace_dump },
+    { "spu_voices",            h_spu_voices },
+    { "spu_events",            h_spu_events },
     { NULL, NULL }
 };
 

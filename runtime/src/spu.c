@@ -25,6 +25,35 @@ static uint64_t nonzero_frames;
 static int32_t last_peak;
 static int32_t peak;
 
+/* End-block-reached latch (SPU register 0x1F801D9C/D9E on real hw).
+ * Set when a voice decodes a block whose flag byte has bit 0 (loop end).
+ * Polled by music engines to know when a one-shot voice has finished. */
+static uint32_t endx_latch;
+
+/* KEYON/KEYOFF latches: most recent values written, sticky across reads
+ * so debug snapshots always see what the BIOS last requested even if the
+ * BIOS clears them quickly. */
+static uint32_t kon_latch;
+static uint32_t koff_latch;
+
+/* External vblank counter (debug_server.c) used as event timestamp. */
+extern uint64_t s_frame_count;
+
+/* ---- Always-on event ring -------------------------------------------- */
+/* 1M entries × ~32B = 32 MB. Power of 2 so wrap is a mask. Beetle peaks at
+ * a few hundred audible-voice events per chime second; recomp at <1k total
+ * per chime. 1M gives ~minutes of headroom for game-scene capture too. */
+#define SPU_EVENT_CAP (1u << 20)
+static SpuEvent  s_events[SPU_EVENT_CAP];
+static uint32_t  s_event_idx = 0;
+static uint64_t  s_event_seq = 0;
+
+/* ADSR phases — match Beetle's order so cross-process diffs read straight. */
+#define ADSR_ATTACK   0
+#define ADSR_DECAY    1
+#define ADSR_SUSTAIN  2
+#define ADSR_RELEASE  3
+
 typedef struct {
     int active;
     uint32_t cur_addr;
@@ -35,9 +64,141 @@ typedef struct {
     int16_t hist1;
     int16_t hist2;
     uint8_t flags;
+
+    /* ADSR envelope state. Stepped once per output sample (44.1 kHz). */
+    uint16_t env_level;     /* 0..0x7FFF — applied to raw decoded sample */
+    uint32_t adsr_divider;  /* fixed-point counter; level updates on overflow */
+    uint8_t  adsr_phase;    /* ADSR_ATTACK / DECAY / SUSTAIN / RELEASE */
 } SpuVoice;
 
 static SpuVoice voices[SPU_VOICE_COUNT];
+
+static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
+    SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
+    e->seq      = s_event_seq++;
+    e->frame    = (uint32_t)s_frame_count;
+    e->kind     = kind;
+    e->voice    = (uint8_t)voice;
+    e->pitch    = spu_regs[(uint32_t)voice * 8u + 2u];
+    e->addr     = addr;
+    /* PSX voice block layout (16-bit register indices from voice base):
+     *   0=VOL_L 1=VOL_R 2=PITCH 3=START 4=ADSR_LO 5=ADSR_HI 6=CURVOL 7=LOOP */
+    e->adsr_lo  = spu_regs[(uint32_t)voice * 8u + 4u];
+    e->adsr_hi  = spu_regs[(uint32_t)voice * 8u + 5u];
+    e->vol_l    = spu_regs[(uint32_t)voice * 8u + 0u];
+    e->vol_r    = spu_regs[(uint32_t)voice * 8u + 1u];
+    s_event_idx++;
+}
+
+/* PS1 envelope rate decoder. Ported verbatim from Beetle's CalcVCDelta
+ * (beetle-psx/mednafen/psx/spu.cpp). Each call emits the per-step
+ * `increment` to add to env_level, and `divinco` added to a divider —
+ * level is updated only when divider crosses 0x8000. The combination
+ * encodes both linear and pseudo-exponential ramps at PSX-faithful
+ * rates (rates 0..127 span ~0.1 ms .. ~30+ s). */
+static void calc_vc_delta(uint8_t zs, uint8_t speed, int log_mode, int dec_mode,
+                          int inv_increment, int16_t current,
+                          int *out_increment, int *out_divinco)
+{
+    int increment = (7 - (speed & 0x3));
+    if (inv_increment) increment = ~increment;
+    int divinco = 32768;
+
+    if (speed < 0x2C)
+        increment = (unsigned)increment << ((0x2F - speed) >> 2);
+    if (speed >= 0x30)
+        divinco >>= (speed - 0x2C) >> 2;
+
+    if (log_mode) {
+        if (dec_mode) {
+            increment = (current * increment) >> 15;
+        } else if ((current & 0x7FFF) >= 0x6000) {
+            if (speed < 0x28) {
+                increment >>= 2;
+            } else if (speed >= 0x2C) {
+                divinco >>= 2;
+            } else {
+                increment >>= 1;
+                divinco   >>= 1;
+            }
+        }
+    }
+
+    if (divinco == 0 && speed < zs) divinco = 1;
+
+    *out_increment = increment;
+    *out_divinco   = divinco;
+}
+
+/* Step ADSR envelope by one output sample for voice `idx`. Mirrors
+ * Beetle's PS_SPU::RunEnvelope. */
+static void adsr_run(int idx, SpuVoice *v) {
+    uint32_t raw = (uint32_t)spu_regs[(uint32_t)idx * 8u + 4u]
+                 | ((uint32_t)spu_regs[(uint32_t)idx * 8u + 5u] << 16);
+
+    int     Sl           = (int)(raw >> 0)  & 0x0F;
+    int     Dr           = (int)(raw >> 4)  & 0x0F;
+    int     Ar           = (int)(raw >> 8)  & 0x7F;
+    int     attack_exp   = (int)((raw >> 15) & 1);
+    int     Rr           = (int)(raw >> 16) & 0x1F;
+    int     release_exp  = (int)((raw >> 21) & 1);
+    int     Sr           = (int)(raw >> 22) & 0x7F;
+    int     sustain_dec  = (int)((raw >> 30) & 1);
+    int     sustain_exp  = (int)((raw >> 31) & 1);
+    int     sustain_lvl  = (Sl + 1) << 11;
+
+    /* Attack tops out at 0x7FFF — switch to Decay (Beetle does this
+     * before the switch on Phase). */
+    if (v->adsr_phase == ADSR_ATTACK && v->env_level == 0x7FFF)
+        v->adsr_phase = ADSR_DECAY;
+
+    int increment = 0, divinco = 0;
+    int16_t uoflow_reset = 0;
+
+    switch (v->adsr_phase) {
+    case ADSR_ATTACK:
+        calc_vc_delta(0x7F, (uint8_t)Ar, attack_exp, 0, 0,
+                      (int16_t)v->env_level, &increment, &divinco);
+        uoflow_reset = 0x7FFF;
+        break;
+    case ADSR_DECAY:
+        calc_vc_delta(0x1F << 2, (uint8_t)(Dr << 2), 1, 1, 1,
+                      (int16_t)v->env_level, &increment, &divinco);
+        uoflow_reset = 0;
+        break;
+    case ADSR_SUSTAIN:
+        calc_vc_delta(0x7F, (uint8_t)Sr, sustain_exp, sustain_dec, sustain_dec,
+                      (int16_t)v->env_level, &increment, &divinco);
+        uoflow_reset = sustain_dec ? 0 : 0x7FFF;
+        break;
+    case ADSR_RELEASE:
+        calc_vc_delta(0x1F << 2, (uint8_t)(Rr << 2), release_exp, 1, 1,
+                      (int16_t)v->env_level, &increment, &divinco);
+        uoflow_reset = 0;
+        break;
+    default:
+        return;
+    }
+
+    v->adsr_divider += (uint32_t)divinco;
+    if (v->adsr_divider & 0x8000u) {
+        uint16_t prev = v->env_level;
+        v->adsr_divider = 0;
+        v->env_level = (uint16_t)((int)v->env_level + increment);
+
+        if (v->adsr_phase == ADSR_ATTACK) {
+            /* If high bit just rolled over (0→1), clamp to uoflow_reset. */
+            if (((prev ^ v->env_level) & v->env_level) & 0x8000u)
+                v->env_level = (uint16_t)uoflow_reset;
+        } else {
+            if (v->env_level & 0x8000u)
+                v->env_level = (uint16_t)uoflow_reset;
+        }
+
+        if (v->adsr_phase == ADSR_DECAY && v->env_level < (uint16_t)sustain_lvl)
+            v->adsr_phase = ADSR_SUSTAIN;
+    }
+}
 
 static inline int16_t clamp16(int32_t v) {
     if (v > 32767) return 32767;
@@ -107,6 +268,16 @@ static void decode_block(SpuVoice *v) {
     v->flags = flags;
     v->sample_idx = 0;
     v->cur_addr = (addr + 16u) & (SPU_RAM_SIZE - 1u);
+
+    /* Latch end-block-reached so the BIOS music engine sees ENDX[v] = 1
+     * when it polls 0x1F801D9C/D9E. Without this latch one-shot music
+     * engines never advance, leaving subsequent voices unkeyed. */
+    if (flags & 0x01u) {
+        int v_idx = (int)(v - voices);
+        if (v_idx >= 0 && v_idx < SPU_VOICE_COUNT) {
+            endx_latch |= (1u << v_idx);
+        }
+    }
 }
 
 static int16_t voice_next_sample(int idx) {
@@ -117,15 +288,36 @@ static int16_t voice_next_sample(int idx) {
         if (v->flags & 0x01u) {
             if (v->flags & 0x02u) {
                 v->cur_addr = v->repeat_addr & (SPU_RAM_SIZE - 1u);
+                spu_event_record(SPU_EV_END_LOOP, idx, v->repeat_addr);
             } else {
-                v->active = 0;
-                return 0;
+                /* End-without-repeat triggers Release on real hardware
+                 * (Beetle's RunDecoder calls ReleaseEnvelope here). The
+                 * voice keeps decoding past the end block — whatever
+                 * follows in SPU RAM — while env_level decays to 0.
+                 * Garbage samples are masked by the dying envelope, so
+                 * by the time anything would be audible it's silent. */
+                spu_event_record(SPU_EV_END_STOP, idx, v->cur_addr);
+                v->adsr_phase = ADSR_RELEASE;
+                v->adsr_divider = 0;
+                v->flags = 0;  /* don't re-enter this branch */
             }
         }
         decode_block(v);
     }
 
-    int16_t s = v->samples[v->sample_idx];
+    int16_t raw_s = v->samples[v->sample_idx];
+    /* Apply envelope (0..0x7FFF as a 15-bit gain). */
+    int32_t shaped = ((int32_t)raw_s * (int32_t)v->env_level) >> 15;
+    if (shaped > 32767)  shaped = 32767;
+    if (shaped < -32768) shaped = -32768;
+
+    /* Step envelope once per output sample (44.1 kHz). */
+    adsr_run(idx, v);
+    /* Deactivate once Release fully decays to silence. */
+    if (v->adsr_phase == ADSR_RELEASE && v->env_level == 0) {
+        v->active = 0;
+    }
+
     uint32_t pitch = voice_reg(idx, 2) & 0x3FFFu;
     if (pitch == 0) pitch = 0x1000u;
     v->phase += pitch;
@@ -134,7 +326,7 @@ static int16_t voice_next_sample(int idx) {
         v->sample_idx++;
         if (v->sample_idx >= SPU_BLOCK_SAMPLES) break;
     }
-    return s;
+    return (int16_t)shaped;
 }
 
 static void key_on(uint32_t mask) {
@@ -146,13 +338,29 @@ static void key_on(uint32_t mask) {
         v->cur_addr = ((uint32_t)voice_reg(i, 3) << 3) & (SPU_RAM_SIZE - 1u);
         v->repeat_addr = ((uint32_t)voice_reg(i, 7) << 3) & (SPU_RAM_SIZE - 1u);
         v->sample_idx = SPU_BLOCK_SAMPLES;
+        /* Reset ADSR — KEYON starts envelope at 0 in Attack phase
+         * (matches Beetle's PS_SPU::ResetEnvelope). */
+        v->env_level = 0;
+        v->adsr_divider = 0;
+        v->adsr_phase = ADSR_ATTACK;
         key_on_count++;
+        endx_latch &= ~(1u << i);  /* KEYON clears ENDX bit on real hw */
+        spu_event_record(SPU_EV_KEYON, i, v->cur_addr);
     }
 }
 
+/* KEYOFF triggers Release phase, NOT immediate silence. The voice
+ * keeps voicing while env_level decays from its current value to 0
+ * at the configured Release rate. This is the boot-chime fade tail —
+ * silencing immediately is what made channels appear to "cut out". */
 static void key_off(uint32_t mask) {
     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
-        if (mask & (1u << i)) voices[i].active = 0;
+        if (!(mask & (1u << i))) continue;
+        if (!voices[i].active) continue;
+        spu_event_record(SPU_EV_KEYOFF, i, voices[i].cur_addr);
+        voices[i].adsr_phase = ADSR_RELEASE;
+        voices[i].adsr_divider = 0;
+        /* env_level preserved — release decays from wherever we are now. */
     }
 }
 
@@ -160,12 +368,18 @@ void spu_init(void) {
     memset(spu_ram, 0, sizeof(spu_ram));
     memset(spu_regs, 0, sizeof(spu_regs));
     memset(voices, 0, sizeof(voices));
+    memset(s_events, 0, sizeof(s_events));
     transfer_addr = 0;
     key_on_count = 0;
     render_frames = 0;
     nonzero_frames = 0;
     last_peak = 0;
     peak = 0;
+    endx_latch = 0;
+    kon_latch = 0;
+    koff_latch = 0;
+    s_event_idx = 0;
+    s_event_seq = 0;
 }
 
 void spu_render(int16_t* out_stereo, int frames) {
@@ -230,17 +444,27 @@ uint32_t spu_read(uint32_t addr) {
             if (addr == 0x1F801DAEu) {
                 return 0x0400; /* SPUSTAT: ready */
             }
+            /* ENDX (end-block-reached latch). Real hw sets bit v when voice
+             * v decodes a block whose flag byte has bit 0; KEYON[v] clears
+             * it. Without this latch, music engines that poll ENDX to wait
+             * for a sample to finish never advance and downstream voices
+             * never get keyed on. */
             if (addr == 0x1F801D9Cu) {
-                uint32_t bits = 0;
-                for (int i = 0; i < 16; i++)
-                    if (voices[i].active) bits |= (1u << i);
-                return bits;
+                return endx_latch & 0xFFFFu;
             }
             if (addr == 0x1F801D9Eu) {
-                uint32_t bits = 0;
-                for (int i = 16; i < SPU_VOICE_COUNT; i++)
-                    if (voices[i].active) bits |= (1u << (i - 16));
-                return bits;
+                return (endx_latch >> 16) & 0xFFu;
+            }
+            /* Voice register 6 (byte offset 0x0C) is CURVOL / ADSR_LEVEL —
+             * returns the live envelope level. PSX music engines poll this
+             * to pick a "free" voice (env_level == 0). Without exposing the
+             * real envelope, the BIOS sees every voice as silent and over-
+             * recycles voices 0-3 instead of fanning across all 24. */
+            if (addr >= 0x1F801C00u && addr < 0x1F801D80u
+                && (idx & 7u) == 6u) {
+                int v = (int)(idx >> 3);
+                if (v >= 0 && v < SPU_VOICE_COUNT)
+                    return voices[v].env_level;
             }
             return spu_regs[idx];
         }
@@ -255,10 +479,22 @@ void spu_write(uint32_t addr, uint32_t value) {
         if (idx < SPU_REG_COUNT) {
             spu_regs[idx] = (uint16_t)value;
 
-            if (addr == 0x1F801D88u) key_on((uint32_t)(uint16_t)value);
-            if (addr == 0x1F801D8Au) key_on((uint32_t)(uint16_t)value << 16);
-            if (addr == 0x1F801D8Cu) key_off((uint32_t)(uint16_t)value);
-            if (addr == 0x1F801D8Eu) key_off((uint32_t)(uint16_t)value << 16);
+            if (addr == 0x1F801D88u) {
+                kon_latch = (kon_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;
+                key_on((uint32_t)(uint16_t)value);
+            }
+            if (addr == 0x1F801D8Au) {
+                kon_latch = (kon_latch & 0x0000FFFFu) | ((uint32_t)(uint16_t)value << 16);
+                key_on((uint32_t)(uint16_t)value << 16);
+            }
+            if (addr == 0x1F801D8Cu) {
+                koff_latch = (koff_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;
+                key_off((uint32_t)(uint16_t)value);
+            }
+            if (addr == 0x1F801D8Eu) {
+                koff_latch = (koff_latch & 0x0000FFFFu) | ((uint32_t)(uint16_t)value << 16);
+                key_off((uint32_t)(uint16_t)value << 16);
+            }
 
             if (addr == 0x1F801DA6u) {
                 transfer_addr = ((uint32_t)(uint16_t)value) << 3;
@@ -292,4 +528,66 @@ int spu_dma_ready(void) {
 
 const uint8_t* spu_get_ram(void) {
     return spu_ram;
+}
+
+void spu_get_voice_state(int idx, SpuVoiceState* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (idx < 0 || idx >= SPU_VOICE_COUNT) return;
+    SpuVoice *v = &voices[idx];
+    out->active      = v->active;
+    out->vol_ctrl_l  = voice_reg(idx, 0);
+    out->vol_ctrl_r  = voice_reg(idx, 1);
+    out->pitch       = voice_reg(idx, 2);
+    out->start_lo    = voice_reg(idx, 3);
+    out->adsr_lo     = voice_reg(idx, 4);
+    out->adsr_hi     = voice_reg(idx, 5);
+    out->loop_lo     = voice_reg(idx, 7);
+    out->cur_addr    = v->cur_addr;
+    out->repeat_addr = v->repeat_addr;
+    out->last_flags  = v->flags;
+    out->sample_idx  = (uint8_t)v->sample_idx;
+    out->phase       = (uint16_t)v->phase;
+}
+
+void spu_get_global_state(SpuGlobalState* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->ctrl       = spu_regs[reg_index(0x1F801DAAu)];
+    out->main_vol_l = spu_regs[reg_index(0x1F801D80u)];
+    out->main_vol_r = spu_regs[reg_index(0x1F801D82u)];
+    out->kon_latch  = kon_latch & 0xFFFFFFu;
+    out->koff_latch = koff_latch & 0xFFFFFFu;
+    out->pmon = (uint32_t)spu_regs[reg_index(0x1F801D90u)] |
+                ((uint32_t)spu_regs[reg_index(0x1F801D92u)] << 16);
+    out->non  = (uint32_t)spu_regs[reg_index(0x1F801D94u)] |
+                ((uint32_t)spu_regs[reg_index(0x1F801D96u)] << 16);
+    out->eon  = (uint32_t)spu_regs[reg_index(0x1F801D98u)] |
+                ((uint32_t)spu_regs[reg_index(0x1F801D9Au)] << 16);
+    out->endx = endx_latch & 0xFFFFFFu;
+    uint32_t am = 0;
+    for (int i = 0; i < SPU_VOICE_COUNT; i++)
+        if (voices[i].active) am |= (1u << i);
+    out->active_mask = am;
+}
+
+uint64_t spu_event_total(void) { return s_event_seq; }
+
+uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
+    if (!out || max_count == 0) return 0;
+    uint64_t avail = s_event_seq < (uint64_t)SPU_EVENT_CAP
+                     ? s_event_seq : (uint64_t)SPU_EVENT_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    /* Most recent N, oldest first. */
+    uint32_t start = (s_event_idx + SPU_EVENT_CAP - max_count) & (SPU_EVENT_CAP - 1u);
+    for (uint32_t i = 0; i < max_count; i++) {
+        out[i] = s_events[(start + i) & (SPU_EVENT_CAP - 1u)];
+    }
+    return max_count;
+}
+
+void spu_event_reset(void) {
+    s_event_idx = 0;
+    s_event_seq = 0;
+    memset(s_events, 0, sizeof(s_events));
 }
