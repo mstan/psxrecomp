@@ -16,8 +16,10 @@ void timers_init(void);
 uint32_t timers_read(uint32_t addr);
 void     timers_write(uint32_t addr, uint32_t value);
 
-/* Advance all timers by the given number of CPU cycles.
- * Called once per frame (cycles ~= 33868 for NTSC). */
+/* Advance all timers by guest CPU cycles. Used by native block-cycle builds. */
+void timers_advance(uint32_t cycles);
+
+/* Legacy coarse tick used by interpreter/oracle builds. */
 void timers_tick(int cycles);
 
 #ifdef __cplusplus

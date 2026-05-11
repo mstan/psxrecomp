@@ -1,8 +1,10 @@
 /* psx_cycles.c — PSX guest CPU cycle clock. */
 
 #include "psx_cycles.h"
+#include "cdrom.h"
 #include "sio.h"
 #include "starvation_ring.h"
+#include "timers.h"
 
 uint64_t psx_cycle_count = 0;
 
@@ -16,6 +18,8 @@ void psx_advance_cycles(uint32_t cycles) {
     if (cycles == 0) return;
     psx_cycle_count += (uint64_t)cycles;
     sio_advance(cycles);
+    cdrom_advance(cycles);
+    timers_advance(cycles);
     s_watchdog_throttle += cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;

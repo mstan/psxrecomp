@@ -46,12 +46,14 @@ typedef struct {
 } Timer;
 
 static Timer timers[3];
+static uint32_t timer_frac[3];
 
 /* I_STAT is owned by memory.c — we poke it directly via this extern. */
 extern uint32_t i_stat;
 
 void timers_init(void) {
     memset(timers, 0, sizeof(timers));
+    memset(timer_frac, 0, sizeof(timer_frac));
 }
 
 /* Determine whether this timer uses system clock ticks */
@@ -110,6 +112,65 @@ static void timer_tick_one(int t) {
     }
 }
 
+static void timer_advance_counts(int t, uint32_t ticks) {
+    Timer* tm = &timers[t];
+    while (ticks > 0) {
+        uint32_t target_dist = ((uint32_t)tm->target - (uint32_t)tm->counter) & 0xFFFFu;
+        uint32_t overflow_dist = 0x10000u - (uint32_t)tm->counter;
+        if (target_dist == 0) target_dist = 0x10000u;
+
+        uint32_t step = ticks;
+        if (step > target_dist) step = target_dist;
+        if (step > overflow_dist) step = overflow_dist;
+        if (step == 0) step = 1;
+
+        uint16_t old = tm->counter;
+        tm->counter = (uint16_t)(tm->counter + step);
+        ticks -= step;
+
+        if (step == target_dist) {
+            tm->mode |= MODE_TARGET_FLAG;
+            if (tm->mode & MODE_IRQ_TARGET)
+                timer_fire_irq(t);
+            if (tm->mode & MODE_RESET_TARGET)
+                tm->counter = 0;
+        }
+        if (old + step > 0xFFFFu || step == overflow_dist) {
+            tm->mode |= MODE_OVERFLOW_FLAG;
+            if (tm->mode & MODE_IRQ_OVERFLOW)
+                timer_fire_irq(t);
+        }
+    }
+}
+
+static void timer_advance_divided(int t, uint32_t cycles, uint32_t divisor) {
+    if (divisor == 0) divisor = 1;
+    uint32_t total = timer_frac[t] + cycles;
+    uint32_t ticks = total / divisor;
+    timer_frac[t] = total % divisor;
+    if (ticks != 0)
+        timer_advance_counts(t, ticks);
+}
+
+void timers_advance(uint32_t cycles) {
+    if (cycles == 0) return;
+
+    for (int t = 0; t < 3; t++) {
+        int src = (timers[t].mode >> 8) & 3;
+        if (t == 2 && (src == 2 || src == 3)) {
+            timer_advance_divided(t, cycles, 8);
+        } else if (timer_uses_sysclk(t)) {
+            timer_advance_counts(t, cycles);
+        } else if (t == 1) {
+            /* Timer 1 HBlank clock. NTSC has about 263 HBlanks per frame. */
+            timer_advance_divided(t, cycles, 2146);
+        } else if (t == 0) {
+            /* Timer 0 dotclock approximation; exact divider depends on GPU mode. */
+            timer_advance_divided(t, cycles, 5);
+        }
+    }
+}
+
 uint32_t timers_read(uint32_t addr) {
     int timer = (addr - TIMER_BASE) >> 4;
     int reg   = (addr - TIMER_BASE) & 0x0F;
@@ -118,6 +179,7 @@ uint32_t timers_read(uint32_t addr) {
 
     switch (reg) {
         case 0x00: {
+#ifndef PSX_ENABLE_BLOCK_CYCLES
             /* Advance counter by a small amount to simulate continuous
              * counting between bulk timers_tick calls. */
             int inc = 8;
@@ -132,6 +194,7 @@ uint32_t timers_read(uint32_t addr) {
                 if (timers[timer].mode & MODE_RESET_TARGET)
                     timers[timer].counter = 0;
             }
+#endif
             return timers[timer].counter;
         }
         case 0x04: {
@@ -160,6 +223,7 @@ void timers_write(uint32_t addr, uint32_t value) {
             timers[timer].mode = (value & 0x03FF) | MODE_IRQ_REQUEST;
             timers[timer].counter = 0;
             timers[timer].irq_line = 0;
+            timer_frac[timer] = 0;
             break;
         case 0x08:
             timers[timer].target = value & 0xFFFF;
