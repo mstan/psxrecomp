@@ -11,7 +11,10 @@
 
 #include "dma.h"
 #include "cdrom.h"
+#include "dirty_ram_interp.h"
 #include "gpu.h"
+#include "mdec.h"
+#include "spu.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,7 +75,68 @@ static int channel_enabled(int ch) {
     return (dpcr >> (ch * 4 + 3)) & 1;
 }
 
+static uint32_t transfer_word_count(int ch) {
+    uint32_t chcr = channels[ch].chcr;
+    uint32_t sync_mode = (chcr >> 9) & 3;
+    uint32_t block_size = channels[ch].bcr & 0xFFFFu;
+    uint32_t block_count = (channels[ch].bcr >> 16) & 0xFFFFu;
+
+    if (sync_mode == 1) {
+        if (block_size == 0) block_size = 0x10000u;
+        if (block_count == 0) block_count = 1u;
+        return block_size * block_count;
+    }
+
+    if (block_size == 0) block_size = 0x10000u;
+    return block_size;
+}
+
+static void complete_transfer(int ch) {
+    channels[ch].chcr &= ~((1u << 24) | (1u << 28));
+    dicr |= (1u << (24 + ch));
+    update_master_irq();
+    i_stat |= (1u << 3);
+}
+
 /* ---- Transfer execution ---- */
+
+static void execute_ch0_mdec_in(void) {
+    uint32_t chcr = channels[0].chcr;
+    uint32_t direction = chcr & 1;           /* 1=from RAM to MDEC */
+    uint32_t step = (chcr >> 1) & 1;
+    uint32_t total_words = transfer_word_count(0);
+    uint32_t addr = channels[0].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+
+    if (direction != 0) {
+        for (uint32_t i = 0; i < total_words; i++) {
+            mdec_dma_write_word(psx_read_word(addr));
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+        channels[0].madr = addr;
+    }
+
+    complete_transfer(0);
+}
+
+static void execute_ch1_mdec_out(void) {
+    uint32_t chcr = channels[1].chcr;
+    uint32_t direction = chcr & 1;           /* 0=from MDEC to RAM */
+    uint32_t step = (chcr >> 1) & 1;
+    uint32_t total_words = transfer_word_count(1);
+    uint32_t addr = channels[1].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+
+    if (direction == 0) {
+        for (uint32_t i = 0; i < total_words; i++) {
+            psx_write_word(addr, mdec_dma_read_word());
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+        channels[1].madr = addr;
+    }
+
+    complete_transfer(1);
+}
 
 static void execute_ch2_gpu(void) {
     uint32_t chcr = channels[2].chcr;
@@ -199,6 +263,7 @@ static void execute_ch3_cdrom(void) {
     for (uint32_t i = 0; i < total_words; i++) {
         uint32_t word = cdrom_dma_read();
         psx_write_word(addr, word);
+        dirty_ram_mark_executable_range(addr, 4);
         addr = (addr + addr_step) & 0x1FFFFCu;
     }
 
@@ -207,6 +272,30 @@ static void execute_ch3_cdrom(void) {
     dicr |= (1u << (24 + 3));
     update_master_irq();
     i_stat |= (1u << 3);
+}
+
+static void execute_ch4_spu(void) {
+    uint32_t chcr = channels[4].chcr;
+    uint32_t direction = chcr & 1;           /* 1=from RAM to SPU, 0=SPU to RAM */
+    uint32_t step = (chcr >> 1) & 1;
+    uint32_t total_words = transfer_word_count(4);
+    uint32_t addr = channels[4].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+
+    if (direction != 0) {
+        for (uint32_t i = 0; i < total_words; i++) {
+            spu_dma_write(psx_read_word(addr));
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    } else {
+        for (uint32_t i = 0; i < total_words; i++) {
+            psx_write_word(addr, 0);
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    }
+
+    channels[4].madr = addr;
+    complete_transfer(4);
 }
 
 static void execute_ch6_otc(void) {
@@ -246,11 +335,20 @@ static void try_execute(int ch) {
     if (!channel_enabled(ch)) return;
 
     switch (ch) {
+        case 0:
+            execute_ch0_mdec_in();
+            break;
+        case 1:
+            execute_ch1_mdec_out();
+            break;
         case 2:
             execute_ch2_gpu();
             break;
         case 3:
             execute_ch3_cdrom();
+            break;
+        case 4:
+            execute_ch4_spu();
             break;
         case 6:
             execute_ch6_otc();

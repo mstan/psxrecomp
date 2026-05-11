@@ -50,6 +50,9 @@ extern "C" void memory_set_sr_ptr(const uint32_t *p);
 /* dma.c */
 extern "C" void dma_init(void);
 
+/* mdec.c */
+extern "C" void mdec_init(void);
+
 /* timers.c */
 extern "C" void timers_init(void);
 
@@ -376,6 +379,7 @@ int main(int argc, char** argv) {
     memory_init(bios_path_str.c_str());
     gpu_init();
     dma_init();
+    mdec_init();
     timers_init();
     interrupts_init();
     sio_init();

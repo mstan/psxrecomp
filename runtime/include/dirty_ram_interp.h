@@ -33,12 +33,19 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
 uint32_t dirty_ram_get_bitmap(void);
+uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
+uint32_t dirty_ram_get_bitmap_word_count(void);
+void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 
 /* Counters for visibility / TCP debug.  Increment in interpreter; expose
  * via debug_server.c if helpful. */
 extern uint64_t g_dirty_ram_blocks_run;     /* basic blocks interpreted */
 extern uint64_t g_dirty_ram_insns_run;      /* instructions interpreted */
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
+extern uint64_t g_dirty_ram_unsupported_midblock;
+extern uint32_t g_dirty_ram_last_unsupported_pc;
+extern uint32_t g_dirty_ram_last_unsupported_insn;
+extern const char *g_dirty_ram_last_unsupported_reason;
 
 /* Per-entry-PC counters.  Aggregate counters above hide which install
  * stubs actually fire — a single noisy spurious-dispatch site can mask

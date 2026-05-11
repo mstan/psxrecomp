@@ -72,6 +72,10 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 
+#ifdef PSX_HAS_GAME_DISPATCH
+extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
+#endif
+
 /* Forward decls from memory.c — used to read instruction bytes. */
 extern uint8_t *memory_get_ram_ptr(void);
 
@@ -216,6 +220,20 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->pc = target;
             return 1;
         }
+        case 0x10: /* MFHI */
+            cpu->gpr[rd] = cpu->hi;
+            cpu->gpr[0] = 0;
+            return 0;
+        case 0x11: /* MTHI */
+            cpu->hi = cpu->gpr[rs];
+            return 0;
+        case 0x12: /* MFLO */
+            cpu->gpr[rd] = cpu->lo;
+            cpu->gpr[0] = 0;
+            return 0;
+        case 0x13: /* MTLO */
+            cpu->lo = cpu->gpr[rs];
+            return 0;
         case 0x21: /* ADDU rd, rs, rt */
             cpu->gpr[rd] = cpu->gpr[rs] + cpu->gpr[rt];
             cpu->gpr[0] = 0;
@@ -337,6 +355,24 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[rt] = imm << 16;
         cpu->gpr[0] = 0;
         return 0;
+    case 0x10: { /* COP0 */
+        uint32_t cop_op = rs;
+        if (cop_op == 0x00) { /* MFC0 */
+            cpu->gpr[rt] = cpu->cop0[rd];
+            cpu->gpr[0] = 0;
+            return 0;
+        }
+        if (cop_op == 0x04) { /* MTC0 */
+            cpu->cop0[rd] = cpu->gpr[rt];
+            return 0;
+        }
+        if (cop_op == 0x10 && fnt == 0x10) { /* RFE */
+            uint32_t sr = cpu->cop0[12];
+            cpu->cop0[12] = (sr & 0xFFFFFFF0u) | ((sr >> 2) & 0x0Fu);
+            return 0;
+        }
+        return abort_unsupported(pc, insn, "COP0 op");
+    }
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
@@ -396,10 +432,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
-    if (addr == 0x80000048u && psx_get_in_exception()) {
+    if (addr == 0x80000048u) {
         cpu->pc = 0;
-        psx_exception_longjmp(); /* does not return */
+        if (psx_get_in_exception()) {
+            psx_exception_longjmp(); /* does not return */
+        }
+        return 1;
     }
+
+#ifdef PSX_HAS_GAME_DISPATCH
+    if (psx_dispatch_game_compiled(cpu, addr)) return 1;
+#endif
 
     if (!dirty_ram_is_dirty(phys)) return 0;
 

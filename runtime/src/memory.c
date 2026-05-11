@@ -12,6 +12,7 @@
 #include "cdrom.h"
 #include "dma.h"
 #include "gpu.h"
+#include "mdec.h"
 #include "sio.h"
 #include "spu.h"
 #include "timers.h"
@@ -39,10 +40,10 @@ uint8_t *memory_get_ram_ptr(void) { return ram; }
  * which RAM pages have been written-to since boot and route any psx_dispatch
  * landing in such a page through a small MIPS interpreter (dirty_ram_interp.c).
  *
- * Granularity: 4 KB pages.  We only track the kernel-code region (RAM 0..0xFFFF
- * = 16 pages = 16 bits).  Game RAM and dynamic data RAM are not tracked because
- * dispatch never lands there in normal operation, and because tracking writes
- * to all of RAM would mark "everything dirty" within seconds.
+ * Granularity: 4 KB pages.  Ordinary CPU writes only mark the kernel-code
+ * region (RAM 0..0xFFFF) where BIOS install stubs live.  CD-ROM DMA can also
+ * mark arbitrary RAM ranges as executable candidates, which covers game
+ * overlays loaded from disc without treating every data write as code.
  *
  * Future option (Option B, see docs/dynamic_handler_install.md): when a page
  * goes dirty, JIT-compile its bytes via StrictTranslator instead of running
@@ -52,24 +53,51 @@ uint8_t *memory_get_ram_ptr(void) { return ram; }
  * Windows MinGW + dlopen friction.  Revisit only if install stubs become a
  * measurable hot path; today they're cold-path glue (~4k instructions per
  * directory-load is sub-microsecond to interpret). */
-#define DIRTY_RAM_TRACK_BYTES   0x10000u    /* track only kernel area RAM 0..0xFFFF */
+#define DIRTY_RAM_KERNEL_TRACK_BYTES 0x10000u
 #define DIRTY_RAM_PAGE_SHIFT    12          /* 4 KB pages */
-#define DIRTY_RAM_PAGE_COUNT    (DIRTY_RAM_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT)
-static uint32_t dirty_ram_bitmap;  /* one bit per page; up to 32 pages supported */
+#define DIRTY_RAM_PAGE_COUNT    (RAM_SIZE >> DIRTY_RAM_PAGE_SHIFT)
+#define DIRTY_RAM_BITMAP_WORDS  ((DIRTY_RAM_PAGE_COUNT + 31u) / 32u)
+static uint32_t dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
 
-static inline void dirty_ram_mark(uint32_t phys) {
-    if (phys >= DIRTY_RAM_TRACK_BYTES) return;
+static inline void dirty_ram_mark_page(uint32_t phys) {
+    if (phys >= RAM_SIZE) return;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
-    dirty_ram_bitmap |= (1u << page);
+    dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
+}
+
+static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
+    if (phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
+    dirty_ram_mark_page(phys);
+}
+
+void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
+    if (len == 0 || phys >= RAM_SIZE) return;
+    uint32_t end = phys + len - 1u;
+    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
+
+    uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page = end >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; page++) {
+        dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
+    }
 }
 
 int dirty_ram_is_dirty(uint32_t phys) {
-    if (phys >= DIRTY_RAM_TRACK_BYTES) return 0;
+    if (phys >= RAM_SIZE) return 0;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
-    return (dirty_ram_bitmap >> page) & 1u;
+    return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
 
-uint32_t dirty_ram_get_bitmap(void) { return dirty_ram_bitmap; }
+uint32_t dirty_ram_get_bitmap(void) { return dirty_ram_bitmap[0]; }
+
+uint32_t dirty_ram_get_bitmap_word(uint32_t word_index) {
+    if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
+    return dirty_ram_bitmap[word_index];
+}
+
+uint32_t dirty_ram_get_bitmap_word_count(void) {
+    return DIRTY_RAM_BITMAP_WORDS;
+}
 
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
  * Includes expansion base/size, COM_DELAY, SPU_DELAY, CDROM_DELAY etc. */
@@ -238,7 +266,7 @@ static uint32_t mmio_read32(uint32_t addr) {
     if (addr == 0x1F801810u) return gpu_read_gpuread();
     if (addr == 0x1F801814u) return gpu_read_gpustat();
     /* MDEC: 0x1F801820, 0x1F801824 */
-    if (addr == 0x1F801820u || addr == 0x1F801824u) return 0;
+    if (addr == 0x1F801820u || addr == 0x1F801824u) return mdec_read(addr);
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         return spu_read(addr);
@@ -290,7 +318,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     if (addr == 0x1F801810u) { gpu_write_gp0(val); return; }
     if (addr == 0x1F801814u) { gpu_write_gp1(val); return; }
     /* MDEC: 0x1F801820, 0x1F801824 */
-    if (addr == 0x1F801820u || addr == 0x1F801824u) return;
+    if (addr == 0x1F801820u || addr == 0x1F801824u) { mdec_write(addr, val); return; }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         spu_write(addr, val);
@@ -318,6 +346,11 @@ static uint16_t mmio_read16(uint32_t addr) {
     /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         uint32_t val = dma_read(addr & ~3u);
+        return (addr & 2) ? (uint16_t)(val >> 16) : (uint16_t)val;
+    }
+    /* MDEC: 0x1F801820..0x1F801827 */
+    if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
+        uint32_t val = mdec_read(addr & ~3u);
         return (addr & 2) ? (uint16_t)(val >> 16) : (uint16_t)val;
     }
     /* SPU: 0x1F801C00..0x1F801FFF */
@@ -354,6 +387,17 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
         dma_write(aligned, cur);
         return;
     }
+    /* MDEC: 0x1F801820..0x1F801827 */
+    if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = mdec_read(aligned);
+        if (addr & 2)
+            cur = (cur & 0x0000FFFFu) | ((uint32_t)val << 16);
+        else
+            cur = (cur & 0xFFFF0000u) | (uint32_t)val;
+        mdec_write(aligned, cur);
+        return;
+    }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         spu_write(addr, val);
@@ -379,6 +423,11 @@ static uint8_t mmio_read8(uint32_t addr) {
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         uint32_t aligned = addr & ~3u;
         uint32_t val = dma_read(aligned);
+        return (uint8_t)(val >> (8 * (addr & 3)));
+    }
+    /* MDEC: 0x1F801820..0x1F801827 */
+    if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
+        uint32_t val = mdec_read(addr & ~3u);
         return (uint8_t)(val >> (8 * (addr & 3)));
     }
     /* CDROM: 0x1F801800..0x1F801803 */
@@ -408,6 +457,15 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
         uint32_t shift = 8 * (addr & 3);
         cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
         dma_write(aligned, cur);
+        return;
+    }
+    /* MDEC: 0x1F801820..0x1F801827 */
+    if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = mdec_read(aligned);
+        uint32_t shift = 8 * (addr & 3);
+        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+        mdec_write(aligned, cur);
         return;
     }
     /* CDROM: 0x1F801800..0x1F801803 */
@@ -474,7 +532,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         card_data_writes_check(phys, val, 4);
-        dirty_ram_mark(phys);
+        dirty_ram_mark_kernel_write(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -485,6 +543,12 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        debug_server_trace_write_check(phys,
+            (uint32_t)scratchpad[off]
+          | ((uint32_t)scratchpad[off + 1] << 8)
+          | ((uint32_t)scratchpad[off + 2] << 16)
+          | ((uint32_t)scratchpad[off + 3] << 24),
+            val, 4);
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         scratchpad[off + 2] = (uint8_t)(val >> 16);
@@ -532,7 +596,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
         card_data_writes_check(phys, (uint32_t)val, 2);
-        dirty_ram_mark(phys);
+        dirty_ram_mark_kernel_write(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -540,6 +604,9 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        debug_server_trace_write_check(phys,
+            (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
+            (uint32_t)val, 2);
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         return;
@@ -582,12 +649,14 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         card_data_writes_check(phys, (uint32_t)val, 1);
-        dirty_ram_mark(phys);
+        dirty_ram_mark_kernel_write(phys);
         ram[phys] = val;
         return;
     }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+        debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
+                                       (uint32_t)val, 1);
         scratchpad[phys - 0x1F800000u] = val;
         return;
     }
