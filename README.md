@@ -177,13 +177,6 @@ truth for PS1 code.
 
 ---
 
-## Acknowledgments
-
-- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** — Inspired by this N64 static recompilation project. PSXRecomp's architecture is directly modeled on N64Recomp's approach. We also use [rabbitizer](https://github.com/Decompollaborate/rabbitizer), the MIPS disassembly library from the N64 decomp community.
-- **[PS1Recomp](https://github.com/nihirunoherr/PS1Recomp)** — A PS1 recompiler tool by Wiseguy, referenced during development.
-
----
-
 ## License
 
 PSXRecomp is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for
