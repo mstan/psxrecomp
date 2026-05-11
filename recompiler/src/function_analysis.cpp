@@ -69,6 +69,27 @@ bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
     return false;
 }
 
+static bool is_sw_reg_base(uint32_t instr, uint32_t base_reg, uint32_t value_reg) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    uint32_t rt = (instr >> 16) & 0x1F;
+    return opcode == 0x2B && rs == base_reg && rt == value_reg;
+}
+
+static bool is_lui(uint32_t instr, uint32_t& rt_out) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    if (opcode != 0x0F) return false;
+    rt_out = (instr >> 16) & 0x1F;
+    return true;
+}
+
+static bool is_lw_same_reg_base(uint32_t instr, uint32_t reg) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    uint32_t rt = (instr >> 16) & 0x1F;
+    return opcode == 0x23 && rs == reg && rt == reg;
+}
+
 uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
     // Scan backward from jr $ra to find function start
     // Heuristic: Look for prologue or function alignment (16-byte boundary after prev function)
@@ -104,6 +125,17 @@ uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
                 auto prev_opt = exe_.read_word(search_addr - 4);
                 if (prev_opt.has_value() && is_branch_or_jump(*prev_opt)) {
                     continue;  // delay slot, not a real prologue — keep scanning
+                }
+            }
+            if (search_addr >= exe_.header.load_address + 8) {
+                auto prev2_opt = exe_.read_word(search_addr - 8);
+                auto prev1_opt = exe_.read_word(search_addr - 4);
+                if (prev2_opt.has_value() && prev1_opt.has_value()) {
+                    uint32_t lui_rt = 0;
+                    if (is_lui(*prev2_opt, lui_rt) &&
+                        is_lw_same_reg_base(*prev1_opt, lui_rt)) {
+                        return search_addr - 8;
+                    }
                 }
             }
             return search_addr;
@@ -186,6 +218,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.jr_ra_count = 0;
     result.prologue_count = 0;
     result.call_discovered_count = 0;
+    result.state_continuation_count = 0;
 
     fmt::print("\n=== Function Boundary Detection ===\n\n");
 
@@ -264,6 +297,40 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.call_discovered_count = static_cast<int>(function_starts.size() - jr_ra_discovered);
     fmt::print("✓ Identified {} unique functions ({} call-discovered)\n\n",
                function_starts.size(), result.call_discovered_count);
+
+    // Pass 2.6: discover continuations saved by setjmp/SaveState-style helpers.
+    //
+    // Some games save the caller's $ra into an application context object and
+    // later restore it from an exception/VSync callback. The restored PC is the
+    // instruction after the original JAL delay slot, not a normal prologue, so
+    // it must be available as a split dispatch entry.
+    fmt::print("Finding SaveState-style continuation entries...\n");
+    int state_continuations = 0;
+    for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
+        auto word_opt = exe_.read_word(addr);
+        if (!word_opt.has_value()) break;
+        uint32_t instr = *word_opt;
+        uint32_t opcode = (instr >> 26) & 0x3F;
+        if (opcode != 3) continue;  // JAL
+
+        uint32_t target = ((instr & 0x03FFFFFFu) << 2) | 0x80000000u;
+        uint32_t cont = addr + 8;
+        if (target < exe_start || target >= exe_end || (target & 3) != 0) continue;
+        if (cont < exe_start || cont >= exe_end || (cont & 3) != 0) continue;
+
+        auto target_first = exe_.read_word(target);
+        if (!target_first.has_value()) continue;
+
+        // sw $ra, imm($a0) at callee entry is the narrow signature for these
+        // context-save helpers. It avoids splitting ordinary calls.
+        if (is_sw_reg_base(*target_first, 4, 31)) {
+            bool inserted = function_starts.insert(cont).second;
+            if (inserted) state_continuations++;
+        }
+    }
+    result.state_continuation_count = state_continuations;
+    fmt::print("Identified {} SaveState continuation entries\n\n",
+               result.state_continuation_count);
 
     // Pass 2.7: Add forced entry points
     // These are function starts that do not have a standard prologue (e.g. the

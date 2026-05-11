@@ -53,16 +53,31 @@ target_include_directories(rabbitizer PRIVATE
 )
 
 # PSXRecomp — MIPS→C recompiler tool
-add_executable(PSXRecomp
+set(PSXRECOMP_GAME_SOURCES
     src/ps1_exe_parser.cpp
     src/mips_decoder.cpp
-    src/basic_block.cpp
     src/control_flow.cpp
     src/function_analysis.cpp
     src/code_generator.cpp
     src/annotations.cpp
     src/main_psx.cpp
 )
+
+add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
+target_include_directories(psxrecomp-game PRIVATE
+    include
+    lib/rabbitizer/include
+    lib/rabbitizer/cplusplus/include
+    lib/fmt/include
+    lib/toml11
+    lib/ELFIO
+)
+target_link_libraries(psxrecomp-game PRIVATE fmt rabbitizer)
+if(MINGW OR WIN32)
+    target_link_options(psxrecomp-game PRIVATE -Wl,--stack,16777216)
+endif()
+
+add_executable(PSXRecomp ${PSXRECOMP_GAME_SOURCES})
 target_include_directories(PSXRecomp PRIVATE
     include
     lib/rabbitizer/include

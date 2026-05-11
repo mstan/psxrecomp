@@ -24,6 +24,7 @@ struct FunctionAnalysisResult {
     int jr_ra_count;
     int prologue_count;
     int call_discovered_count = 0; // Functions found via JAL call-target following
+    int state_continuation_count = 0; // Split entries after calls to SaveState-style helpers
 };
 
 class FunctionAnalyzer {

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <set>
 
 #include "ps1_exe_parser.h"
 #include "gte.h"
@@ -19,17 +20,26 @@ int main(int argc, char** argv) {
     fmt::print("============================================\n\n");
 
     if (argc < 2) {
-        fmt::print("Usage: {} <PS1-EXE file> [--extra-funcs <file>]\n", argv[0]);
-        fmt::print("Example: {} SLUS_006.30\n", argv[0]);
-        fmt::print("         {} SLUS_006.30 --extra-funcs discovered_functions.log\n\n", argv[0]);
+        fmt::print("Usage: {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
         return 0;
     }
 
     std::filesystem::path exe_path = argv[1];
     const char* extra_funcs_path = nullptr;
+    bool inspect_mode = false;
+    std::filesystem::path out_dir = "generated";
     for (int i = 2; i < argc; i++) {
-        if (std::string(argv[i]) == "--extra-funcs" && i + 1 < argc) {
+        std::string arg = argv[i];
+        if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
             extra_funcs_path = argv[++i];
+        } else if (arg == "--out-dir" && i + 1 < argc) {
+            out_dir = argv[++i];
+        } else if (arg == "--strict") {
+            /* The PS-X EXE path is fail-loud by default; accepted for parity
+             * with psxrecomp-bios and project scripts. */
+        } else if (arg == "--inspect") {
+            inspect_mode = true;
         }
     }
 
@@ -62,6 +72,7 @@ int main(int argc, char** argv) {
                    exe->header.initial_pc);
     }
 
+    if (inspect_mode) {
     // Disassemble first 20 instructions from entry point
     fmt::print("Disassembly at Entry Point (0x{:08X}):\n", exe->header.initial_pc);
     fmt::print("---------------------------------------\n");
@@ -147,11 +158,13 @@ int main(int argc, char** argv) {
     }
 
     fmt::print("\n");
+    }
 
     // Function boundary detection
     fmt::print("Performing function analysis...\n");
 
     PSXRecomp::FunctionAnalyzer analyzer(*exe);
+    analyzer.add_forced_entry(exe->header.initial_pc);
 
     // Forced entry points: functions called from the dispatch table but not
     // automatically detected by the heuristic-based function analysis.
@@ -337,15 +350,30 @@ int main(int argc, char** argv) {
     // Use argv[2] as output path if provided, otherwise derive from input filename
     // Use filename() not stem() because ".36" in SCUS_942.36 is part of the serial, not an extension
     std::string exe_stem = exe_path.filename().string();
-    std::string output_filename;
-    if (argc >= 3) {
-        output_filename = argv[2];
-    } else {
-        output_filename = "generated/" + exe_stem + "_full.c";
-    }
-    fmt::print("Generating complete C file: {}\n", output_filename);
+    std::filesystem::create_directories(out_dir);
+    std::filesystem::path output_filename = out_dir / (exe_stem + "_full.c");
+    fmt::print("Generating complete C file: {}\n", output_filename.string());
 
     std::string full_c_code = codegen.generate_file(analysis_result.functions, all_cfgs);
+    std::set<uint32_t> dispatch_addrs;
+    {
+        const std::string marker = "void func_";
+        size_t pos = 0;
+        while ((pos = full_c_code.find(marker, pos)) != std::string::npos) {
+            size_t hex_pos = pos + marker.size();
+            if (hex_pos + 8 <= full_c_code.size() &&
+                full_c_code.compare(hex_pos + 8, 14, "(CPUState* cpu") == 0) {
+                std::string hex = full_c_code.substr(hex_pos, 8);
+                dispatch_addrs.insert((uint32_t)std::strtoul(hex.c_str(), nullptr, 16));
+            }
+            pos = hex_pos + 8;
+        }
+    }
+    if (dispatch_addrs.empty()) {
+        for (const auto& func : analysis_result.functions) {
+            dispatch_addrs.insert(func.start_addr);
+        }
+    }
 
     std::ofstream out_file(output_filename);
     if (out_file.is_open()) {
@@ -353,7 +381,7 @@ int main(int argc, char** argv) {
         out_file.close();
         fmt::print("✓ Saved {} lines to {}\n\n",
                   std::count(full_c_code.begin(), full_c_code.end(), '\n'),
-                  output_filename);
+                  output_filename.string());
     } else {
         fmt::print(stderr, "⚠ Failed to write output file\n\n");
     }
@@ -362,8 +390,8 @@ int main(int argc, char** argv) {
     // This maps PS1 addresses to compiled C functions so call_by_address() can
     // dispatch dynamic jalr/jr calls to the right compiled function.
     {
-        std::string dispatch_filename = "generated/" + exe_stem + "_dispatch.c";
-        fmt::print("Generating dispatch table: {}\n", dispatch_filename);
+        std::filesystem::path dispatch_filename = out_dir / (exe_stem + "_dispatch.c");
+        fmt::print("Generating dispatch table: {}\n", dispatch_filename.string());
 
         std::ostringstream ds;
         ds << "/* Generated by PSXRecomp - dynamic dispatch table */\n";
@@ -371,18 +399,18 @@ int main(int argc, char** argv) {
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
-        for (const auto& func : analysis_result.functions) {
-            ds << fmt::format("extern void func_{:08X}(CPUState* cpu);\n", func.start_addr);
+        for (uint32_t addr : dispatch_addrs) {
+            ds << fmt::format("extern void func_{:08X}(CPUState* cpu);\n", addr);
         }
         ds << "\n";
 
         // Dispatch function
-        ds << "/* Maps PS1 address to compiled function. Returns 1 if dispatched, 0 if unknown. */\n";
-        ds << "int psx_dispatch_compiled(CPUState* cpu, uint32_t addr) {\n";
+        ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
+        ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    switch (addr) {\n";
-        for (const auto& func : analysis_result.functions) {
+        for (uint32_t addr : dispatch_addrs) {
             ds << fmt::format("        case 0x{:08X}u: func_{:08X}(cpu); return 1;\n",
-                              func.start_addr, func.start_addr);
+                              addr, addr);
         }
         ds << "        default: return 0;\n";
         ds << "    }\n";
@@ -393,7 +421,7 @@ int main(int argc, char** argv) {
             dispatch_file << ds.str();
             dispatch_file.close();
             fmt::print("✓ Dispatch table written ({} entries)\n\n",
-                       analysis_result.functions.size());
+                       dispatch_addrs.size());
         } else {
             fmt::print(stderr, "⚠ Failed to write dispatch file\n\n");
         }

@@ -357,8 +357,13 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
 
     // Simplified single-pass analysis: scan instructions to find block boundaries
     // without building full CFG. This avoids the crash in build_basic_blocks.
-    std::set<uint32_t> boundaries;
-    boundaries.insert(func.start_addr);
+    std::vector<uint32_t> boundary_vec;
+    boundary_vec.push_back(func.start_addr);
+    auto add_boundary = [&](uint32_t target) {
+        if (target >= func.start_addr && target < func.end_addr) {
+            boundary_vec.push_back(target);
+        }
+    };
 
     // Scan instructions for branches/jumps to find block starts
     for (uint32_t addr = func.start_addr; addr < func.end_addr; addr += 4) {
@@ -370,19 +375,19 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
             ControlFlowInstr cf = analyze_instruction(addr, instr);
 
             if (cf.target != 0 && cf.target >= func.start_addr && cf.target < func.end_addr) {
-                boundaries.insert(cf.target);
+                add_boundary(cf.target);
             }
 
             // After delay slot is a new block
             uint32_t after_delay = addr + 8;
             if (after_delay < func.end_addr) {
-                boundaries.insert(after_delay);
+                add_boundary(after_delay);
             }
         }
     }
-
     // Build blocks from boundaries
-    std::vector<uint32_t> boundary_vec(boundaries.begin(), boundaries.end());
+    std::sort(boundary_vec.begin(), boundary_vec.end());
+    boundary_vec.erase(std::unique(boundary_vec.begin(), boundary_vec.end()), boundary_vec.end());
 
     for (size_t i = 0; i < boundary_vec.size(); i++) {
         BasicBlock block;
@@ -423,7 +428,9 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
 
         // Add successors — only targets within this function's block set
         auto in_func = [&](uint32_t addr) {
-            return addr >= func.start_addr && addr < func.end_addr && boundaries.count(addr);
+            return addr >= func.start_addr &&
+                   addr < func.end_addr &&
+                   std::binary_search(boundary_vec.begin(), boundary_vec.end(), addr);
         };
         if (block.exit_instr.type == ControlFlowType::Branch) {
             if (block.exit_instr.target != 0 && in_func(block.exit_instr.target))
@@ -443,9 +450,8 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
             if (in_func(next)) block.successors.push_back(next);
         }
 
-        cfg.blocks[block.start_addr] = std::move(block);
+        cfg.blocks[block.start_addr] = block;
     }
-
     // Detect back-edges (loops)
     for (const auto& [addr, block] : cfg.blocks) {
         for (uint32_t succ : block.successors) {

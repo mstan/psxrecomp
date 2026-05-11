@@ -32,16 +32,8 @@ CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& conf
     : exe_(exe), config_(config) {}
 
 std::string CodeGenerator::reg_name(int reg_num) {
-    // MIPS register names
-    static const char* reg_names[32] = {
-        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
-        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"
-    };
-
     if (reg_num >= 0 && reg_num < 32) {
-        return std::string("cpu->") + reg_names[reg_num];
+        return fmt::format("cpu->gpr[{}]", reg_num);
     }
     return fmt::format("cpu->gpr[{}]", reg_num);
 }
@@ -319,11 +311,11 @@ std::string CodeGenerator::translate_lwl(uint32_t instr) {
     // LWL: Load Word Left - loads bytes into the most-significant portion of rt
     // addr = rs + offset; byte_pos = addr & 3
     // Result merges high bytes from aligned word with low bytes from current rt value
-    // Generate a helper call: cpu->rt = cpu->lwl(addr, cpu->rt)
+    // Generate a helper call: cpu->rt = psx_lwl(cpu, addr, cpu->rt)
     if (offset == 0) {
-        return fmt::format("{} = cpu->lwl({}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
+        return fmt::format("{} = psx_lwl(cpu, {}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("{} = cpu->lwl({} + {}, {});",
+        return fmt::format("{} = psx_lwl(cpu, {} + {}, {});",
                           reg_name(rt), reg_name(rs), (int32_t)offset, reg_name(rt));
     }
 }
@@ -340,11 +332,11 @@ std::string CodeGenerator::translate_lwr(uint32_t instr) {
     // LWR: Load Word Right - loads bytes into the least-significant portion of rt
     // addr = rs + offset; byte_pos = addr & 3
     // Result merges low bytes from aligned word with high bytes from current rt value
-    // Generate a helper call: cpu->rt = cpu->lwr(addr, cpu->rt)
+    // Generate a helper call: cpu->rt = psx_lwr(cpu, addr, cpu->rt)
     if (offset == 0) {
-        return fmt::format("{} = cpu->lwr({}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
+        return fmt::format("{} = psx_lwr(cpu, {}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("{} = cpu->lwr({} + {}, {});",
+        return fmt::format("{} = psx_lwr(cpu, {} + {}, {});",
                           reg_name(rt), reg_name(rs), (int32_t)offset, reg_name(rt));
     }
 }
@@ -355,11 +347,11 @@ std::string CodeGenerator::translate_swl(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     // SWL: Store Word Left - stores rt into memory using addr, MSB side
-    // Generate a helper call: cpu->swl(addr, cpu->rt)
+    // Generate a helper call: psx_swl(cpu, addr, cpu->rt)
     if (offset == 0) {
-        return fmt::format("cpu->swl({}, {});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_swl(cpu, {}, {});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->swl({} + {}, {});",
+        return fmt::format("psx_swl(cpu, {} + {}, {});",
                           reg_name(rs), (int32_t)offset, reg_name(rt));
     }
 }
@@ -370,11 +362,11 @@ std::string CodeGenerator::translate_swr(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     // SWR: Store Word Right - stores rt into memory using addr, LSB side
-    // Generate a helper call: cpu->swr(addr, cpu->rt)
+    // Generate a helper call: psx_swr(cpu, addr, cpu->rt)
     if (offset == 0) {
-        return fmt::format("cpu->swr({}, {});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_swr(cpu, {}, {});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->swr({} + {}, {});",
+        return fmt::format("psx_swr(cpu, {} + {}, {});",
                           reg_name(rs), (int32_t)offset, reg_name(rt));
     }
 }
@@ -832,6 +824,13 @@ std::string CodeGenerator::translate_basic_block(
 
     // Block label
     ss << fmt::format("block_{:08X}:\n", block.start_addr);
+    if (block.instruction_count > 0) {
+        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
+                                            static_cast<uint32_t>(block.instruction_count));
+        ss << "#endif\n";
+    }
+    ss << config_.indent << "psx_check_interrupts(cpu);\n";
 
     // Translate each instruction in the block
     uint32_t addr = block.start_addr;
@@ -934,7 +933,7 @@ std::string CodeGenerator::translate_basic_block(
                             if (regimm_op == 0x10 || regimm_op == 0x11) {
                                 // bltzal or bgezal: link register always set
                                 ss << config_.indent
-                                   << fmt::format("cpu->ra = 0x{:08X};  /* branch-and-link return addr */\n", addr + 8);
+                                   << fmt::format("cpu->gpr[31] = 0x{:08X};  /* branch-and-link return addr */\n", addr + 8);
                             }
                         }
                     }
@@ -1166,7 +1165,7 @@ std::string CodeGenerator::translate_basic_block(
                     }
                 } else if (block.exit_instr.type == ControlFlowType::JumpLink) {
                     // Function call (jal)
-                    ss << config_.indent << "cpu->ra = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
+                    ss << config_.indent << "cpu->gpr[31] = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
                     uint32_t target = block.exit_instr.target;
                     if (known_functions_.count(target) > 0) {
                         ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
@@ -1244,12 +1243,6 @@ GeneratedFunction CodeGenerator::generate_function(
 
     std::stringstream body_ss;
     body_ss << "{\n";
-
-    // Override preamble: allows external code to intercept this function
-    // without patching the generated file. psx_override_dispatch() is
-    // implemented in tomba_runtime.c and checks the registered override table.
-    body_ss << fmt::format("    if (psx_override_dispatch(cpu, 0x{:08X}u)) return;\n",
-                           func.start_addr);
 
     // Add function comment
     if (config_.emit_comments) {
@@ -1383,13 +1376,12 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
 
     for (const Function& func : functions) {
         if (func.is_data_section) {
-            // Emit a stub for data sections - do not decode instructions
             GeneratedFunction stub;
             stub.function_name = func.name;
             stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
             stub.body = fmt::format(
-                "{{\n    if (psx_override_dispatch(cpu, 0x{:08X}u)) return;\n    /* data section 0x{:08X}: {} bytes - not executable code */\n}}\n",
-                func.start_addr, func.start_addr, func.size);
+                "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
+                func.start_addr, func.start_addr & 0x1FFFFFFFu);
             stub.full_code = stub.signature + "\n" + stub.body;
             stub.line_count = 4;
             results.push_back(stub);
@@ -1431,8 +1423,7 @@ std::string CodeGenerator::generate_file(
     ss << "/* Generated by PSXRecomp - PlayStation 1 Static Recompiler */\n\n";
 
     // Include the generic PSX runtime header.
-    // This provides: CPUState typedef, gte_execute, call_by_address,
-    // psx_syscall, psx_override_dispatch, and all other runtime API.
+    // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
