@@ -30,6 +30,7 @@ typedef struct CDROMDebugState {
     uint8_t stat_reg;
     uint8_t irq_enable;
     uint8_t irq_flag;
+    uint8_t mode_reg;
     uint8_t seek_min;
     uint8_t seek_sec;
     uint8_t seek_sect;
@@ -40,10 +41,13 @@ typedef struct CDROMDebugState {
     int response_count;
     int sector_read_pos;
     int sector_available;
+    int sector_size;
     int reading;
     int read_min;
     int read_sec;
     int read_sect;
+    uint8_t read_cmd;
+    int read_delay;
     int pending_pending;
     int pending_delay;
     int pending_phase;
@@ -68,12 +72,15 @@ typedef struct CDROMTraceEntry {
     uint8_t response_read;
     uint8_t response_count;
     uint8_t sector_available;
+    uint8_t mode_reg;
     uint8_t pending_cmd;
     uint8_t pending_pending;
     uint8_t reading;
-    uint8_t pad;
+    uint8_t read_cmd;
     int sector_read_pos;
+    int sector_size;
     int pending_delay;
+    int read_delay;
 } CDROMTraceEntry;
 
 #define CDROM_TRACE_CAP (1 << 16)

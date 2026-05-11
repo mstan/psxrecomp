@@ -13,6 +13,9 @@ ghidra/
 
 # Build artifacts
 recompiler/build/
+recompiler/build-asan/
+recompiler/build-asan2/
+recompiler/build-checked/
 runtime/build/
 runtime/build-msvc/
 test_msvc/
@@ -52,3 +55,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Python caches
+__pycache__/

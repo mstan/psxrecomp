@@ -25,10 +25,10 @@
 
 #include "dirty_ram_interp.h"
 #include "cpu_state.h"
+#include "debug_server.h"
 #include "interrupts.h"
 
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -98,6 +98,50 @@ static inline uint32_t fetch_word(uint32_t phys) {
          | ((uint32_t)ram[phys + 1] <<  8)
          | ((uint32_t)ram[phys + 2] << 16)
          | ((uint32_t)ram[phys + 3] << 24);
+}
+
+static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
+    uint32_t word = cpu->read_word(addr & ~3u);
+    switch (addr & 3u) {
+        case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);
+        case 1: return (rt_value & 0x0000FFFFu) | (word << 16);
+        case 2: return (rt_value & 0x000000FFu) | (word << 8);
+        default: return word;
+    }
+}
+
+static inline uint32_t interp_lwr(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
+    uint32_t word = cpu->read_word(addr & ~3u);
+    switch (addr & 3u) {
+        case 0: return word;
+        case 1: return (rt_value & 0xFF000000u) | (word >> 8);
+        case 2: return (rt_value & 0xFFFF0000u) | (word >> 16);
+        default: return (rt_value & 0xFFFFFF00u) | (word >> 24);
+    }
+}
+
+static inline void interp_swl(CPUState *cpu, uint32_t addr, uint32_t value) {
+    uint32_t aligned = addr & ~3u;
+    uint32_t word = cpu->read_word(aligned);
+    switch (addr & 3u) {
+        case 0: word = (word & 0xFFFFFF00u) | (value >> 24); break;
+        case 1: word = (word & 0xFFFF0000u) | (value >> 16); break;
+        case 2: word = (word & 0xFF000000u) | (value >> 8); break;
+        default: word = value; break;
+    }
+    cpu->write_word(aligned, word);
+}
+
+static inline void interp_swr(CPUState *cpu, uint32_t addr, uint32_t value) {
+    uint32_t aligned = addr & ~3u;
+    uint32_t word = cpu->read_word(aligned);
+    switch (addr & 3u) {
+        case 0: word = value; break;
+        case 1: word = (word & 0x000000FFu) | (value << 8); break;
+        case 2: word = (word & 0x0000FFFFu) | (value << 16); break;
+        default: word = (word & 0x00FFFFFFu) | (value << 24); break;
+    }
+    cpu->write_word(aligned, word);
 }
 
 /* Soft-fail thread-local flag.  When the interpreter encounters an opcode
@@ -214,12 +258,30 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         }
         case 0x09: { /* JALR rd, rs */
             uint32_t target = cpu->gpr[rs];
-            cpu->gpr[rd ? rd : 31] = pc + 8;
+            uint32_t return_pc = pc + 8;
+            cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
+#ifdef PSX_HAS_GAME_DISPATCH
+            cpu->pc = 0;
+            if (psx_dispatch_game_compiled(cpu, target)) {
+                if (cpu->pc != 0) return 1;
+                *next_pc_out = return_pc;
+                return 0;
+            }
+#endif
             cpu->pc = target;
             return 1;
         }
+        case 0x0C: /* SYSCALL */
+            cpu->pc = pc;
+            psx_syscall(cpu, (insn >> 6) & 0xFFFFFu);
+            return (cpu->pc != 0);
+        case 0x0D: /* BREAK */
+            psx_break(cpu, (insn >> 6) & 0xFFFFFu, pc);
+            return 1;
+        case 0x0F: /* SYNC */
+            return 0;
         case 0x10: /* MFHI */
             cpu->gpr[rd] = cpu->hi;
             cpu->gpr[0] = 0;
@@ -234,10 +296,48 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x13: /* MTLO */
             cpu->lo = cpu->gpr[rs];
             return 0;
+        case 0x18: { /* MULT */
+            int64_t r = (int64_t)(int32_t)cpu->gpr[rs] * (int64_t)(int32_t)cpu->gpr[rt];
+            cpu->lo = (uint32_t)r;
+            cpu->hi = (uint32_t)((uint64_t)r >> 32);
+            return 0;
+        }
+        case 0x19: { /* MULTU */
+            uint64_t r = (uint64_t)cpu->gpr[rs] * (uint64_t)cpu->gpr[rt];
+            cpu->lo = (uint32_t)r;
+            cpu->hi = (uint32_t)(r >> 32);
+            return 0;
+        }
+        case 0x1A: { /* DIV */
+            int32_t a = (int32_t)cpu->gpr[rs];
+            int32_t b = (int32_t)cpu->gpr[rt];
+            if (b == 0) {
+                cpu->lo = (a < 0) ? 1u : 0xFFFFFFFFu;
+                cpu->hi = (uint32_t)a;
+            } else if ((uint32_t)a == 0x80000000u && b == -1) {
+                cpu->lo = 0x80000000u;
+                cpu->hi = 0;
+            } else {
+                cpu->lo = (uint32_t)(a / b);
+                cpu->hi = (uint32_t)(a % b);
+            }
+            return 0;
+        }
+        case 0x1B: /* DIVU */
+            if (cpu->gpr[rt] == 0) {
+                cpu->lo = 0xFFFFFFFFu;
+                cpu->hi = cpu->gpr[rs];
+            } else {
+                cpu->lo = cpu->gpr[rs] / cpu->gpr[rt];
+                cpu->hi = cpu->gpr[rs] % cpu->gpr[rt];
+            }
+            return 0;
+        case 0x20: /* ADD - overflow traps are delegated if they occur. */
         case 0x21: /* ADDU rd, rs, rt */
             cpu->gpr[rd] = cpu->gpr[rs] + cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
+        case 0x22: /* SUB - overflow traps are delegated if they occur. */
         case 0x23: /* SUBU */
             cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
             cpu->gpr[0] = 0;
@@ -279,8 +379,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x03: { /* JAL target */
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
-        cpu->gpr[31] = pc + 8;
+        uint32_t return_pc = pc + 8;
+        cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
+#ifdef PSX_HAS_GAME_DISPATCH
+        cpu->pc = 0;
+        if (psx_dispatch_game_compiled(cpu, target)) {
+            if (cpu->pc != 0) return 1;
+            *next_pc_out = return_pc;
+            return 0;
+        }
+#endif
         cpu->pc = target;
         return 1;
     }
@@ -373,6 +482,32 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         }
         return abort_unsupported(pc, insn, "COP0 op");
     }
+    case 0x12: { /* COP2 / GTE */
+        uint32_t cop_op = rs;
+        if (cop_op == 0x00) { /* MFC2 */
+            cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
+            cpu->gpr[0] = 0;
+            return 0;
+        }
+        if (cop_op == 0x02) { /* CFC2 */
+            cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
+            cpu->gpr[0] = 0;
+            return 0;
+        }
+        if (cop_op == 0x04) { /* MTC2 */
+            gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]);
+            return 0;
+        }
+        if (cop_op == 0x06) { /* CTC2 */
+            gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]);
+            return 0;
+        }
+        if (cop_op & 0x10) {
+            gte_execute(cpu, insn & 0x1FFFFFFu);
+            return 0;
+        }
+        return abort_unsupported(pc, insn, "COP2 op");
+    }
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
@@ -382,6 +517,12 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x21: { /* LH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)cpu->read_half(addr);
+        cpu->gpr[0] = 0;
+        return 0;
+    }
+    case 0x22: { /* LWL */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = interp_lwl(cpu, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -403,6 +544,12 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     }
+    case 0x26: { /* LWR */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = interp_lwr(cpu, addr, cpu->gpr[rt]);
+        cpu->gpr[0] = 0;
+        return 0;
+    }
     case 0x28: { /* SB */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->write_byte(addr, (uint8_t)cpu->gpr[rt]);
@@ -413,9 +560,29 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->write_half(addr, (uint16_t)cpu->gpr[rt]);
         return 0;
     }
+    case 0x2A: { /* SWL */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        interp_swl(cpu, addr, cpu->gpr[rt]);
+        return 0;
+    }
     case 0x2B: { /* SW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->write_word(addr, cpu->gpr[rt]);
+        return 0;
+    }
+    case 0x2E: { /* SWR */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        interp_swr(cpu, addr, cpu->gpr[rt]);
+        return 0;
+    }
+    case 0x32: { /* LWC2 */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr));
+        return 0;
+    }
+    case 0x3A: { /* SWC2 */
+        uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt));
         return 0;
     }
     default:
@@ -448,6 +615,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
+    int allow_local_dirty_flow = (phys >= 0x00098000u);
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -465,15 +633,23 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
         e->ra     = cpu->gpr[31];
         e->a0     = cpu->gpr[4];
         e->a1     = cpu->gpr[5];
+        e->a2     = cpu->gpr[6];
+        e->a3     = cpu->gpr[7];
+        e->sp     = cpu->gpr[29];
         e->frame  = (uint32_t)s_frame_count;
     }
 
-    /* Run instructions until a control-transfer terminates the block.
-     * Cap iterations as a safety net — install stubs are tiny. */
-    enum { MAX_INSNS_PER_BLOCK = 256 };
+    if (debug_server_dirty_break_maybe_pause(addr, cpu)) {
+        debug_server_wait_if_paused();
+    }
+
+    /* Run dirty code locally until it returns to compiled/non-dirty code.
+     * Runtime-loaded overlays are larger than BIOS install stubs, so stopping
+     * at every local branch burns the dispatch loop. */
+    enum { MAX_INSNS_PER_DISPATCH = 1000000 };
     uint32_t pc = addr;
     int insns_executed = 0;
-    for (int i = 0; i < MAX_INSNS_PER_BLOCK; i++) {
+    for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
         int transferred = exec_one(cpu, pc, &next_pc);
         if (g_unsupported_seen) {
@@ -505,8 +681,18 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
         g_dirty_ram_insns_run++;
         insns_executed++;
         if (transferred) {
-            /* Control transfer completed; first successful block run. */
-            if (insns_executed == 1) g_dirty_ram_blocks_run++;
+            uint32_t target = cpu->pc;
+            if (allow_local_dirty_flow &&
+                target != 0 && dirty_ram_is_dirty(target & 0x1FFFFFFFu)) {
+                pc = target;
+                if ((insns_executed & 0xFFF) == 0) {
+                    debug_server_poll();
+                    debug_server_wait_if_paused();
+                    psx_check_interrupts(cpu);
+                }
+                continue;
+            }
+            g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
             return 1;
         }
@@ -521,11 +707,10 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
             return 1;
         }
     }
-    fprintf(stderr,
-            "[dirty_ram_interp] FATAL: basic block at PC=0x%08X exceeded "
-            "%d instructions without a control-transfer terminator.\n",
-            addr, MAX_INSNS_PER_BLOCK);
-    fflush(stderr);
+    g_dirty_ram_aborts++;
+    g_dirty_ram_last_unsupported_pc = pc;
+    g_dirty_ram_last_unsupported_insn = fetch_word(pc & 0x1FFFFFFFu);
+    g_dirty_ram_last_unsupported_reason = "instruction guard";
     abort();
     return 0;
 }

@@ -43,6 +43,7 @@ extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);
 
 /* Dispatch — defined in generated/SCPH1001_dispatch.c */
 extern void psx_dispatch(CPUState* cpu, uint32_t target_addr);
+extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t return_addr);
 
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);

@@ -4,11 +4,38 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern uint64_t s_frame_count;
+
 enum {
     MDEC_CMD_NOP = 0,
     MDEC_CMD_DECODE = 1,
     MDEC_CMD_SET_QUANT = 2,
     MDEC_CMD_SET_SCALE = 3
+};
+
+enum {
+    MDEC_EVT_RESET = 1,
+    MDEC_EVT_CTRL_WRITE,
+    MDEC_EVT_CMD_BEGIN,
+    MDEC_EVT_CMD_DONE,
+    MDEC_EVT_DECODE_DONE,
+    MDEC_EVT_DMA_IN_START,
+    MDEC_EVT_DMA_IN_END,
+    MDEC_EVT_DMA_OUT_START,
+    MDEC_EVT_DMA_OUT_END,
+    MDEC_EVT_OUTPUT_DRAINED,
+    MDEC_EVT_READ_UNDERFLOW
+};
+
+enum {
+    MDEC_STOP_NONE = 0,
+    MDEC_STOP_INPUT_END = 1,
+    MDEC_STOP_CR = 2,
+    MDEC_STOP_CB = 3,
+    MDEC_STOP_Y0 = 4,
+    MDEC_STOP_Y1 = 5,
+    MDEC_STOP_Y2 = 6,
+    MDEC_STOP_Y3 = 7
 };
 
 static const uint8_t zigzag_to_linear[64] = {
@@ -46,9 +73,42 @@ typedef struct MDECState {
     uint8_t input_full;
     uint8_t enable_dma_in;
     uint8_t enable_dma_out;
+
+    uint32_t last_status;
+    uint32_t decode_macroblocks;
+    uint32_t decode_blocks;
+    uint32_t decode_stop_reason;
+    uint32_t decode_input_pos;
+    uint32_t decode_input_end;
+    uint32_t dma_in_words;
+    uint32_t dma_out_words;
+    uint32_t dma_read_underflows;
 } MDECState;
 
 static MDECState mdec;
+
+#define MDEC_TRACE_CAP 4096u
+static MDECDebugEvent mdec_trace[MDEC_TRACE_CAP];
+static uint64_t mdec_trace_seq;
+static uint32_t mdec_trace_head;
+
+static void trace_event(uint32_t kind, uint32_t value) {
+    MDECDebugEvent *e = &mdec_trace[mdec_trace_head];
+    e->seq = mdec_trace_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->kind = kind;
+    e->value = value;
+    e->command = mdec.command;
+    e->input_count = mdec.input_count;
+    e->expected_halfwords = mdec.expected_halfwords;
+    e->output_size = mdec.output_size;
+    e->output_pos = mdec.output_pos;
+    e->macroblocks = mdec.decode_macroblocks;
+    e->blocks = mdec.decode_blocks;
+    e->stop_reason = mdec.decode_stop_reason;
+    e->underruns = mdec.dma_read_underflows;
+    mdec_trace_head = (mdec_trace_head + 1u) % MDEC_TRACE_CAP;
+}
 
 static int16_t sign_extend_10(uint16_t value) {
     return (int16_t)((int16_t)(value << 6) >> 6);
@@ -102,6 +162,7 @@ static void finish_command(void) {
     mdec.input_count = 0;
     mdec.busy = 0;
     mdec.input_full = 1;
+    trace_event(MDEC_EVT_CMD_DONE, mdec.command);
 }
 
 static void idct_block(int16_t *block) {
@@ -130,6 +191,7 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
                             uint32_t *pos, uint32_t end) {
     memset(block, 0, 64 * sizeof(int16_t));
     if (*pos >= end) return 0;
+    mdec.decode_blocks++;
 
     uint16_t word = mdec.input[(*pos)++];
     while (word == 0xFE00u && *pos < end) {
@@ -212,12 +274,23 @@ static void execute_decode(void) {
     uint32_t pos = 0;
     uint32_t end = mdec.input_count;
     clear_output();
+    mdec.decode_macroblocks = 0;
+    mdec.decode_blocks = 0;
+    mdec.decode_stop_reason = MDEC_STOP_NONE;
+    mdec.decode_input_pos = 0;
+    mdec.decode_input_end = end;
+    mdec.dma_out_words = 0;
+    mdec.dma_read_underflows = 0;
 
     if (mdec.output_depth < 2) {
         int16_t yblk[64];
         while (pos < end && decode_rle_block(yblk, mdec.y_quant, &pos, end)) {
             append_luma_block(yblk);
+            mdec.decode_macroblocks++;
         }
+        mdec.decode_stop_reason = (pos >= end) ? MDEC_STOP_INPUT_END : MDEC_STOP_Y0;
+        mdec.decode_input_pos = pos;
+        trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
         return;
     }
 
@@ -225,14 +298,20 @@ static void execute_decode(void) {
         int16_t crblk[64];
         int16_t cbblk[64];
         int16_t yblk[4][64];
-        if (!decode_rle_block(crblk, mdec.uv_quant, &pos, end)) break;
-        if (!decode_rle_block(cbblk, mdec.uv_quant, &pos, end)) break;
-        if (!decode_rle_block(yblk[0], mdec.y_quant, &pos, end)) break;
-        if (!decode_rle_block(yblk[1], mdec.y_quant, &pos, end)) break;
-        if (!decode_rle_block(yblk[2], mdec.y_quant, &pos, end)) break;
-        if (!decode_rle_block(yblk[3], mdec.y_quant, &pos, end)) break;
+        if (!decode_rle_block(crblk, mdec.uv_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_CR; break; }
+        if (!decode_rle_block(cbblk, mdec.uv_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_CB; break; }
+        if (!decode_rle_block(yblk[0], mdec.y_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_Y0; break; }
+        if (!decode_rle_block(yblk[1], mdec.y_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_Y1; break; }
+        if (!decode_rle_block(yblk[2], mdec.y_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_Y2; break; }
+        if (!decode_rle_block(yblk[3], mdec.y_quant, &pos, end)) { mdec.decode_stop_reason = MDEC_STOP_Y3; break; }
         append_color_macroblock(crblk, cbblk, yblk);
+        mdec.decode_macroblocks++;
     }
+    if (pos >= end && mdec.decode_stop_reason == MDEC_STOP_NONE) {
+        mdec.decode_stop_reason = MDEC_STOP_INPUT_END;
+    }
+    mdec.decode_input_pos = pos;
+    trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
 }
 
 static void execute_command(void) {
@@ -286,6 +365,8 @@ static void begin_command(uint32_t value) {
 
     if (mdec.expected_halfwords == 0 || !ensure_input_capacity(mdec.expected_halfwords)) {
         finish_command();
+    } else {
+        trace_event(MDEC_EVT_CMD_BEGIN, value);
     }
 }
 
@@ -306,6 +387,9 @@ static void write_data(uint32_t value) {
 
 void mdec_init(void) {
     memset(&mdec, 0, sizeof(mdec));
+    memset(mdec_trace, 0, sizeof(mdec_trace));
+    mdec_trace_seq = 0;
+    mdec_trace_head = 0;
     for (int i = 0; i < 64; i++) {
         mdec.y_quant[i] = 1;
         mdec.uv_quant[i] = 1;
@@ -335,6 +419,7 @@ uint32_t mdec_read(uint32_t addr) {
     if (mdec.busy) status |= 1u << 29;
     if (mdec.input_full) status |= 1u << 30;
     if (mdec.output_pos >= mdec.output_size) status |= 1u << 31;
+    mdec.last_status = status;
     return status;
 }
 
@@ -355,9 +440,11 @@ void mdec_write(uint32_t addr, uint32_t value) {
             mdec.y_quant[i] = 1;
             mdec.uv_quant[i] = 1;
         }
+        trace_event(MDEC_EVT_RESET, value);
     }
     mdec.enable_dma_in = (uint8_t)((value >> 30) & 1u);
     mdec.enable_dma_out = (uint8_t)((value >> 29) & 1u);
+    trace_event(MDEC_EVT_CTRL_WRITE, value);
 }
 
 void mdec_dma_write_word(uint32_t value) {
@@ -366,12 +453,21 @@ void mdec_dma_write_word(uint32_t value) {
 
 uint32_t mdec_dma_read_word(void) {
     uint32_t value = 0;
+    uint32_t start_pos = mdec.output_pos;
     for (uint32_t i = 0; i < 4u; i++) {
         if (mdec.output_pos < mdec.output_size) {
             value |= (uint32_t)mdec.output[mdec.output_pos++] << (i * 8u);
         }
     }
+    mdec.dma_out_words++;
+    if (start_pos >= mdec.output_size) {
+        mdec.dma_read_underflows++;
+        if (mdec.dma_read_underflows == 1u) {
+            trace_event(MDEC_EVT_READ_UNDERFLOW, mdec.dma_out_words);
+        }
+    }
     if (mdec.output_pos >= mdec.output_size) {
+        trace_event(MDEC_EVT_OUTPUT_DRAINED, mdec.output_size);
         clear_output();
     }
     return value;
@@ -383,4 +479,73 @@ int mdec_dma_write_ready(void) {
 
 int mdec_dma_read_ready(void) {
     return mdec.output_pos < mdec.output_size;
+}
+
+void mdec_debug_get_state(MDECDebugState *out) {
+    if (!out) return;
+    out->command = mdec.command;
+    out->expected_halfwords = mdec.expected_halfwords;
+    out->input_count = mdec.input_count;
+    out->output_size = mdec.output_size;
+    out->output_pos = mdec.output_pos;
+    out->output_depth = mdec.output_depth;
+    out->output_signed = mdec.output_signed;
+    out->output_bit15 = mdec.output_bit15;
+    out->busy = mdec.busy;
+    out->input_full = mdec.input_full;
+    out->enable_dma_in = mdec.enable_dma_in;
+    out->enable_dma_out = mdec.enable_dma_out;
+    out->last_status = mdec.last_status;
+    out->decode_macroblocks = mdec.decode_macroblocks;
+    out->decode_blocks = mdec.decode_blocks;
+    out->decode_stop_reason = mdec.decode_stop_reason;
+    out->decode_input_pos = mdec.decode_input_pos;
+    out->decode_input_end = mdec.decode_input_end;
+    out->dma_in_words = mdec.dma_in_words;
+    out->dma_out_words = mdec.dma_out_words;
+    out->dma_read_underflows = mdec.dma_read_underflows;
+}
+
+uint64_t mdec_debug_get_event_total(void) {
+    return mdec_trace_seq;
+}
+
+uint32_t mdec_debug_copy_events(uint64_t seq_lo, uint64_t seq_hi,
+                                MDECDebugEvent *out, uint32_t max_count) {
+    if (!out || max_count == 0) return 0;
+    uint64_t oldest = (mdec_trace_seq > MDEC_TRACE_CAP) ? mdec_trace_seq - MDEC_TRACE_CAP : 0;
+    if (seq_lo < oldest) seq_lo = oldest;
+    if (seq_hi > mdec_trace_seq) seq_hi = mdec_trace_seq;
+    uint32_t n = 0;
+    for (uint64_t seq = seq_lo; seq < seq_hi && n < max_count; seq++) {
+        out[n++] = mdec_trace[seq % MDEC_TRACE_CAP];
+    }
+    return n;
+}
+
+void mdec_debug_clear(void) {
+    memset(mdec_trace, 0, sizeof(mdec_trace));
+    mdec_trace_seq = 0;
+    mdec_trace_head = 0;
+}
+
+void mdec_debug_dma_in_start(uint32_t addr, uint32_t words) {
+    (void)addr;
+    trace_event(MDEC_EVT_DMA_IN_START, words);
+}
+
+void mdec_debug_dma_in_end(uint32_t addr, uint32_t words) {
+    (void)addr;
+    mdec.dma_in_words += words;
+    trace_event(MDEC_EVT_DMA_IN_END, words);
+}
+
+void mdec_debug_dma_out_start(uint32_t addr, uint32_t words) {
+    (void)addr;
+    trace_event(MDEC_EVT_DMA_OUT_START, words);
+}
+
+void mdec_debug_dma_out_end(uint32_t addr, uint32_t words) {
+    (void)addr;
+    trace_event(MDEC_EVT_DMA_OUT_END, words);
 }

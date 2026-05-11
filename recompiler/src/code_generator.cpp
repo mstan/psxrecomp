@@ -1223,10 +1223,20 @@ std::string CodeGenerator::translate_basic_block(
         addr += 4;
     }
 
-    // If no explicit control flow, fall through to next block
+    // If no explicit control flow, fall through to the next block. When a
+    // mid-function seed split placed the next instruction in a different C
+    // function, tail-call that split piece so the physical fall-through is
+    // preserved.
     if (block.exit_instr.type == ControlFlowType::None && !block.successors.empty()) {
         ss << config_.indent << fmt::format("/* fall through to block_{:08X} */\n",
                                            block.successors[0]);
+    } else if (block.exit_instr.type == ControlFlowType::None) {
+        uint32_t next_addr = block.end_addr + 4;
+        if (known_functions_.count(next_addr) > 0) {
+            ss << config_.indent
+               << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
+                              next_addr);
+        }
     }
 
     return ss.str();
@@ -1243,6 +1253,9 @@ GeneratedFunction CodeGenerator::generate_function(
 
     std::stringstream body_ss;
     body_ss << "{\n";
+    body_ss << config_.indent
+            << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
+                          func.start_addr);
 
     // Add function comment
     if (config_.emit_comments) {
@@ -1425,6 +1438,7 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
+    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

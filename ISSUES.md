@@ -363,3 +363,38 @@ all other commands stall (including `ping`).
 loop before any string formatting; cap `seq_hi - seq_lo` to a
 sensible default (e.g. 2M) when the caller doesn't pass an explicit
 window.
+
+---
+
+## Issue #3 — BIOS "PlayStation" disc-detected screen is missing the PS logo glyph
+
+**Status:** open
+**Date opened:** 2026-05-11
+**Phase:** 4 (BIOS shell render)
+
+### Symptom
+
+After the Sony logo, the BIOS shows the second boot screen (the
+"PlayStation" disc-detected screen rendered when a disc is present).
+On this screen the top region — which on real hardware shows the
+stylized PS logo bitmap — is blank. The text below it ("PlayStation",
+license string, etc.) renders correctly.
+
+Cosmetic only; boot continues, the disc loads, and Tomba's FMVs start.
+Logged here so we don't lose track of it once the FMV cluster is fixed.
+
+### Likely areas
+
+- GPU VRAM upload for the logo bitmap (CopyRectangle / CPU->VRAM
+  transfer) may be dropping a region. The other tiles on the same
+  screen render, so it isn't a wholesale VRAM/clut wipe.
+- Or the logo is sourced from a CD raw-sector / sector-header data
+  path that the current `cdrom.c` whole-sector mode doesn't expose
+  the way the BIOS expects.
+
+### Concrete next step
+
+Take a Beetle screenshot of the same boot screen as oracle, diff the
+VRAM region the logo lives in (Beetle vs recomp at the same frame),
+and walk back from the missing pixels via `wtrace` on the source
+RAM/VRAM coordinates.

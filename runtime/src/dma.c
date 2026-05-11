@@ -26,6 +26,9 @@ extern void     psx_write_word(uint32_t addr, uint32_t val);
 
 /* Interrupt status — defined in memory.c */
 extern uint32_t i_stat;
+extern uint32_t g_debug_current_func_addr;
+extern uint32_t g_debug_last_store_pc;
+extern uint64_t s_frame_count;
 
 /* ---- Per-channel registers ---- */
 
@@ -42,9 +45,33 @@ static DMAChannel channels[7];
 static uint32_t dpcr;  /* 0x1F8010F0: DMA control (enable bits) */
 static uint32_t dicr;  /* 0x1F8010F4: DMA interrupt control */
 
-/* ---- Helpers ---- */
+#define DICR_WRITE_MASK 0x00FF803Fu
+#define DICR_RESET_MASK 0x7F000000u
 
-static uint32_t prev_master_flag;  /* for edge detection */
+static DMATraceEntry dma_trace[DMA_TRACE_CAP];
+static uint64_t dma_trace_seq;
+
+static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
+                      uint32_t dicr_before, uint32_t i_stat_before) {
+    DMATraceEntry *e = &dma_trace[dma_trace_seq % DMA_TRACE_CAP];
+    e->seq = dma_trace_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->kind = kind;
+    e->channel = (uint32_t)ch;
+    e->total_words = total_words;
+    e->madr = (ch >= 0 && ch < 7) ? channels[ch].madr : 0;
+    e->bcr = (ch >= 0 && ch < 7) ? channels[ch].bcr : 0;
+    e->chcr = (ch >= 0 && ch < 7) ? channels[ch].chcr : 0;
+    e->dpcr = dpcr;
+    e->dicr_before = dicr_before;
+    e->dicr_after = dicr;
+    e->i_stat_before = i_stat_before;
+    e->i_stat_after = i_stat;
+    e->func = g_debug_current_func_addr;
+    e->pc = g_debug_last_store_pc;
+}
+
+/* ---- Helpers ---- */
 
 static void update_master_irq(void) {
     /* DICR bit 31 (master IRQ flag) is read-only, calculated as:
@@ -59,20 +86,19 @@ static void update_master_irq(void) {
     uint32_t master_flag = force_irq | (master_enable & ((enable_bits & flag_bits) != 0));
 
     dicr = (dicr & 0x7FFFFFFFu) | (master_flag << 31);
-
-    /* I_STAT bit 3 is set by direct assertion in transfer completion
-     * code (not through edge detection here).  The BIOS shell handler
-     * only acknowledges ch3 in DICR, leaving ch2/ch6 flags high — so
-     * edge detection on master_flag would fire once and then be stuck.
-     * Direct assertion + handler AND-acknowledge gives exactly one IRQ
-     * per DMA completion, matching real hardware behavior. */
-    prev_master_flag = master_flag;
+    if (master_flag) {
+        i_stat |= (1u << 3);
+    }
 }
 
 static int channel_enabled(int ch) {
     /* DPCR: each channel has 4 bits, bit 3 of each group is enable.
      * Ch0 = bits 0-3, Ch1 = bits 4-7, etc. Enable = bit (ch*4 + 3). */
     return (dpcr >> (ch * 4 + 3)) & 1;
+}
+
+static int channel_irq_enabled(int ch) {
+    return ((dicr >> (16 + ch)) & 1u) && ((dicr >> 23) & 1u);
 }
 
 static uint32_t transfer_word_count(int ch) {
@@ -92,10 +118,14 @@ static uint32_t transfer_word_count(int ch) {
 }
 
 static void complete_transfer(int ch) {
+    uint32_t dicr_before = dicr;
+    uint32_t i_stat_before = i_stat;
     channels[ch].chcr &= ~((1u << 24) | (1u << 28));
-    dicr |= (1u << (24 + ch));
-    update_master_irq();
-    i_stat |= (1u << 3);
+    if (channel_irq_enabled(ch)) {
+        dicr |= (1u << (24 + ch));
+        update_master_irq();
+    }
+    trace_dma('C', ch, 0, dicr_before, i_stat_before);
 }
 
 /* ---- Transfer execution ---- */
@@ -109,10 +139,12 @@ static void execute_ch0_mdec_in(void) {
     int32_t addr_step = step ? -4 : 4;
 
     if (direction != 0) {
+        mdec_debug_dma_in_start(addr, total_words);
         for (uint32_t i = 0; i < total_words; i++) {
             mdec_dma_write_word(psx_read_word(addr));
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
+        mdec_debug_dma_in_end(addr, total_words);
         channels[0].madr = addr;
     }
 
@@ -128,10 +160,12 @@ static void execute_ch1_mdec_out(void) {
     int32_t addr_step = step ? -4 : 4;
 
     if (direction == 0) {
+        mdec_debug_dma_out_start(addr, total_words);
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, mdec_dma_read_word());
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
+        mdec_debug_dma_out_end(addr, total_words);
         channels[1].madr = addr;
     }
 
@@ -159,11 +193,7 @@ static void execute_ch2_gpu(void) {
                 addr = (addr + addr_step) & 0x1FFFFCu;
             }
         }
-        /* Transfer complete: clear start/busy bits, post IRQ directly. */
-        channels[2].chcr &= ~((1u << 24) | (1u << 28));
-        dicr |= (1u << (24 + 2));
-        update_master_irq();
-        i_stat |= (1u << 3);
+        complete_transfer(2);
         return;
     }
 
@@ -228,11 +258,7 @@ static void execute_ch2_gpu(void) {
         channels[2].madr = addr;
     }
 
-    /* Transfer complete: clear start/busy/trigger bits, post IRQ directly. */
-    channels[2].chcr &= ~((1u << 24) | (1u << 28));
-    dicr |= (1u << (24 + 2));
-    update_master_irq();
-    i_stat |= (1u << 3);
+    complete_transfer(2);
 }
 
 static void execute_ch3_cdrom(void) {
@@ -268,10 +294,7 @@ static void execute_ch3_cdrom(void) {
     }
 
     channels[3].madr = addr;
-    channels[3].chcr &= ~((1u << 24) | (1u << 28));
-    dicr |= (1u << (24 + 3));
-    update_master_irq();
-    i_stat |= (1u << 3);
+    complete_transfer(3);
 }
 
 static void execute_ch4_spu(void) {
@@ -320,11 +343,7 @@ static void execute_ch6_otc(void) {
         addr = (addr - 4) & 0x1FFFFCu;
     }
 
-    /* Transfer complete, post IRQ directly. */
-    channels[6].chcr &= ~((1u << 24) | (1u << 28));
-    dicr |= (1u << (24 + 6));
-    update_master_irq();
-    i_stat |= (1u << 3);
+    complete_transfer(6);
 }
 
 static void try_execute(int ch) {
@@ -333,6 +352,8 @@ static void try_execute(int ch) {
     /* Transfer starts when bit 24 (start/busy) is set AND channel is enabled in DPCR */
     if (!((chcr >> 24) & 1)) return;
     if (!channel_enabled(ch)) return;
+
+    trace_dma('S', ch, transfer_word_count(ch), dicr, i_stat);
 
     switch (ch) {
         case 0:
@@ -370,7 +391,7 @@ void dma_init(void) {
     memset(channels, 0, sizeof(channels));
     dpcr = 0x07654321u; /* default: priorities set, no channels enabled */
     dicr = 0;
-    prev_master_flag = 0;
+    dma_debug_clear_trace();
 }
 
 uint32_t dma_read(uint32_t addr) {
@@ -404,22 +425,25 @@ bad:
     return 0;
 }
 
-void dma_write(uint32_t addr, uint32_t val) {
+void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
     /* DPCR */
     if (addr == 0x1F8010F0u) {
-        dpcr = val;
+        dpcr = (dpcr & ~mask) | (val & mask);
         return;
     }
-    /* DICR: bits 24-30 are write-1-to-acknowledge (clear), rest are writable */
+    /* DICR: selected low/control bits are writable; bits 24-30 are write-1-to-acknowledge. */
     if (addr == 0x1F8010F4u) {
-        /* Bits 0-14: unused / force-IRQ bits — writable */
-        /* Bit 15: force IRQ — writable */
-        /* Bits 16-23: enable flags — writable */
-        /* Bits 24-30: IRQ flags — write 1 to CLEAR */
-        /* Bit 31: master flag — read-only (computed) */
-        uint32_t ack_bits = val & 0x7F000000u;  /* bits to clear */
-        uint32_t write_bits = val & 0x00FFFFFFu; /* bits to set */
-        dicr = (write_bits) | (dicr & 0x7F000000u & ~ack_bits);
+        /* Bits 0-5: unknown/unused but writable */
+        /* Bits 6-14: unused/read-only */
+        /* Bit 15: bus-error flag */
+        /* Bits 16-22: per-channel IRQ enable */
+        /* Bit 23: master IRQ enable */
+        /* Bits 24-30: IRQ flags, write 1 to clear */
+        /* Bit 31: master flag, read-only (computed) */
+        uint32_t write_mask = DICR_WRITE_MASK & mask;
+        uint32_t reset_mask = DICR_RESET_MASK & mask;
+        dicr = (dicr & ~write_mask) | (val & write_mask);
+        dicr &= ~(val & reset_mask);
         update_master_irq();
         return;
     }
@@ -433,15 +457,15 @@ void dma_write(uint32_t addr, uint32_t val) {
         if (ch > 6) goto bad;
         switch (reg) {
             case 0x00:
-                channels[ch].madr = val;
+                channels[ch].madr = (channels[ch].madr & ~mask) | (val & mask);
                 return;
             case 0x04:
-                channels[ch].bcr = val;
+                channels[ch].bcr = (channels[ch].bcr & ~mask) | (val & mask);
                 return;
             case 0x08:
-                channels[ch].chcr = val;
-                /* Writing CHCR with start bit set triggers transfer */
-                if ((val >> 24) & 1) {
+                channels[ch].chcr = (channels[ch].chcr & ~mask) | (val & mask);
+                /* Writing CHCR's start bit set triggers transfer. */
+                if ((mask & (1u << 24)) && ((channels[ch].chcr >> 24) & 1)) {
                     try_execute(ch);
                 }
                 return;
@@ -454,4 +478,18 @@ bad:
     fprintf(stderr, "DMA write to unknown address 0x%08X = 0x%08X\n", addr, val);
     fflush(stderr);
     exit(1);
+}
+
+void dma_write(uint32_t addr, uint32_t val) {
+    dma_write_masked(addr, val, 0xFFFFFFFFu);
+}
+
+uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries) {
+    if (out_entries) *out_entries = dma_trace;
+    return dma_trace_seq;
+}
+
+void dma_debug_clear_trace(void) {
+    memset(dma_trace, 0, sizeof(dma_trace));
+    dma_trace_seq = 0;
 }

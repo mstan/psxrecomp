@@ -1,5 +1,6 @@
 #include "function_analysis.h"
 #include <algorithm>
+#include <map>
 #include <set>
 #include <fmt/format.h>
 
@@ -261,10 +262,15 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     fmt::print("Analyzing function boundaries...\n");
 
     std::set<uint32_t> function_starts; // Use set to avoid duplicates
+    std::map<uint32_t, uint32_t> function_last_return;
 
     for (uint32_t return_addr : return_addresses) {
         uint32_t func_start = find_function_start(return_addr);
         function_starts.insert(func_start);
+        auto it = function_last_return.find(func_start);
+        if (it == function_last_return.end() || return_addr > it->second) {
+            function_last_return[func_start] = return_addr;
+        }
     }
 
     size_t jr_ra_discovered = function_starts.size();
@@ -362,6 +368,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             func.end_addr = starts_vec[i + 1];
         } else {
             func.end_addr = end_addr;
+        }
+        auto ret_it = function_last_return.find(func.start_addr);
+        if (ret_it != function_last_return.end()) {
+            uint32_t return_end = ret_it->second + 8u;  /* include jr delay slot */
+            if (return_end > func.start_addr && return_end < func.end_addr) {
+                func.end_addr = return_end;
+            }
         }
 
         func.size = func.end_addr - func.start_addr;

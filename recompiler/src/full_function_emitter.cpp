@@ -972,7 +972,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n\n";
-    out += "void psx_dispatch(CPUState* cpu, uint32_t addr) {\n";
+    out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
     out += "     * without growing the native stack. Interrupts are only checked when\n";
@@ -1021,8 +1021,22 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
+    out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";
+    out += "            cpu->pc = 0;\n";
+    out += "            --g_psx_dispatch_depth;\n";
+    out += "            if (outermost) {\n";
+    out += "                psx_check_interrupts(cpu);\n";
+    out += "            }\n";
+    out += "            return;\n";
+    out += "        }\n";
     out += "        addr = cpu->pc;  /* tail call: re-dispatch */\n";
     out += "    }\n";
+    out += "}\n\n";
+    out += "void psx_dispatch(CPUState* cpu, uint32_t addr) {\n";
+    out += "    psx_dispatch_impl(cpu, addr, 0);\n";
+    out += "}\n\n";
+    out += "void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr) {\n";
+    out += "    psx_dispatch_impl(cpu, addr, return_addr);\n";
     out += "}\n";
 }
 

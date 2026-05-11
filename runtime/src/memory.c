@@ -379,12 +379,9 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
     /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         uint32_t aligned = addr & ~3u;
-        uint32_t cur = dma_read(aligned);
-        if (addr & 2)
-            cur = (cur & 0x0000FFFFu) | ((uint32_t)val << 16);
-        else
-            cur = (cur & 0xFFFF0000u) | (uint32_t)val;
-        dma_write(aligned, cur);
+        uint32_t shift = (addr & 2) ? 16u : 0u;
+        uint32_t mask = 0xFFFFu << shift;
+        dma_write_masked(aligned, (uint32_t)val << shift, mask);
         return;
     }
     /* MDEC: 0x1F801820..0x1F801827 */
@@ -453,10 +450,9 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
      * byte of the 32-bit register.  Needed for DICR byte-level access. */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         uint32_t aligned = addr & ~3u;
-        uint32_t cur = dma_read(aligned);
         uint32_t shift = 8 * (addr & 3);
-        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
-        dma_write(aligned, cur);
+        uint32_t mask = 0xFFu << shift;
+        dma_write_masked(aligned, (uint32_t)val << shift, mask);
         return;
     }
     /* MDEC: 0x1F801820..0x1F801827 */

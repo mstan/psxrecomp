@@ -15,6 +15,7 @@
 #include "sio.h"
 #include "memcard.h"
 #include "spu.h"
+#include "mdec.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "card_read_summary.h"
@@ -85,6 +86,20 @@ static volatile int s_paused     = 0;
 static int          s_step_count = 0;
 static uint32_t     s_run_to     = 0;
 
+/* ---- Dirty-RAM one-shot break ---- */
+static volatile int s_dirty_break_active = 0;
+static uint32_t s_dirty_break_lo = 0;
+static uint32_t s_dirty_break_hi = 0;
+static uint32_t s_dirty_break_target = 0;
+static uint32_t s_dirty_break_ra = 0;
+static uint32_t s_dirty_break_a0 = 0;
+static uint32_t s_dirty_break_a1 = 0;
+static uint32_t s_dirty_break_a2 = 0;
+static uint32_t s_dirty_break_a3 = 0;
+static uint32_t s_dirty_break_sp = 0;
+static uint32_t s_dirty_break_frame = 0;
+static uint64_t s_dirty_break_hits = 0;
+
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
@@ -107,9 +122,9 @@ typedef struct {
 static Watchpoint s_watchpoints[MAX_WATCHPOINTS];
 
 /* ---- Write trace (Tier 1 reverse debugger) ----
- * Records every RAM write matching one of up to 8 configurable address ranges.
+ * Records every RAM write matching one of the configurable address ranges.
  * 1M-entry ring buffer, heap-allocated in debug_server_init(). */
-#define WRITE_TRACE_CAP (1 << 20)  /* 1M entries = 32 MB */
+#define WRITE_TRACE_CAP (1 << 22)
 typedef struct {
     uint64_t seq;        /* monotonic sequence number */
     uint32_t addr;       /* physical RAM address */
@@ -118,6 +133,16 @@ typedef struct {
     uint32_t ra;         /* $ra (caller return address) */
     uint32_t func_addr;  /* dispatch target (which recompiled function) */
     uint32_t pc;         /* g_debug_last_store_pc — exact PC of the SW/SH/SB */
+    uint32_t cpu_pc;     /* CPUState::pc at the moment of the write */
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t t0;
+    uint32_t t1;
     uint32_t frame;      /* VBlank frame number */
     uint8_t  width;      /* 1, 2, or 4 */
     uint8_t  pad[3];     /* align to 8 bytes */
@@ -227,6 +252,45 @@ typedef struct {
 static RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
 static uint64_t s_restore_trace_seq = 0;
 
+#define THREAD_TRACE_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t kind;
+    uint32_t current_tcb;
+    uint32_t target_tcb;
+    uint32_t current_state;
+    uint32_t target_state;
+    uint32_t current_tcb_ptr;
+    uint32_t target_pc;
+    uint32_t func;
+    uint32_t last_store_pc;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t s3;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t saved_a0;
+    uint32_t saved_a1;
+    uint32_t saved_a2;
+    uint32_t saved_a3;
+    uint32_t saved_s3;
+    uint32_t saved_sp;
+    uint32_t saved_ra;
+    uint32_t saved_pc;
+    uint32_t saved_sr;
+    uint32_t istat;
+    uint32_t imask;
+    uint32_t frame;
+    uint8_t  in_exception;
+    uint8_t  pad[3];
+} ThreadTraceEntry;
+static ThreadTraceEntry s_thread_trace[THREAD_TRACE_CAP];
+static uint64_t s_thread_trace_seq = 0;
+
 #define PROBE_TRACE_CAP (1 << 16)
 typedef struct {
     uint64_t seq;
@@ -307,6 +371,57 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     e->imask         = i_mask;
     e->frame         = (uint32_t)s_frame_count;
     e->in_exception  = (uint8_t)psx_get_in_exception();
+}
+
+static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
+{
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys > 0x001FFFFCu) return 0;
+    return cpu ? cpu->read_word(addr) : 0;
+}
+
+void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
+                                   uint32_t current_tcb,
+                                   uint32_t target_tcb,
+                                   uint32_t target_pc)
+{
+    if (!cpu) return;
+    ThreadTraceEntry *e =
+        &s_thread_trace[s_thread_trace_seq % THREAD_TRACE_CAP];
+    uint32_t tcb_ptr_addr = trace_read_word(cpu, 0x00000108u);
+    uint32_t save = target_tcb + 8u;
+    e->seq             = s_thread_trace_seq++;
+    e->kind            = kind;
+    e->current_tcb     = current_tcb;
+    e->target_tcb      = target_tcb;
+    e->current_state   = current_tcb ? trace_read_word(cpu, current_tcb) : 0;
+    e->target_state    = target_tcb ? trace_read_word(cpu, target_tcb) : 0;
+    e->current_tcb_ptr = tcb_ptr_addr ? trace_read_word(cpu, tcb_ptr_addr) : 0;
+    e->target_pc       = target_pc;
+    e->func            = g_debug_current_func_addr;
+    e->last_store_pc   = g_debug_last_store_pc;
+    e->ra              = cpu->gpr[31];
+    e->sp              = cpu->gpr[29];
+    e->a0              = cpu->gpr[4];
+    e->a1              = cpu->gpr[5];
+    e->a2              = cpu->gpr[6];
+    e->a3              = cpu->gpr[7];
+    e->s3              = cpu->gpr[19];
+    e->sr              = cpu->cop0[12];
+    e->epc             = cpu->cop0[14];
+    e->saved_a0        = target_tcb ? trace_read_word(cpu, save + 16u) : 0;
+    e->saved_a1        = target_tcb ? trace_read_word(cpu, save + 20u) : 0;
+    e->saved_a2        = target_tcb ? trace_read_word(cpu, save + 24u) : 0;
+    e->saved_a3        = target_tcb ? trace_read_word(cpu, save + 28u) : 0;
+    e->saved_s3        = target_tcb ? trace_read_word(cpu, save + 76u) : 0;
+    e->saved_sp        = target_tcb ? trace_read_word(cpu, save + 116u) : 0;
+    e->saved_ra        = target_tcb ? trace_read_word(cpu, save + 124u) : 0;
+    e->saved_pc        = target_tcb ? trace_read_word(cpu, save + 128u) : 0;
+    e->saved_sr        = target_tcb ? trace_read_word(cpu, save + 140u) : 0;
+    e->istat           = i_stat;
+    e->imask           = i_mask;
+    e->frame           = (uint32_t)s_frame_count;
+    e->in_exception    = (uint8_t)psx_get_in_exception();
 }
 
 static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
@@ -1046,10 +1161,12 @@ static void handle_dirty_block_log(int id, const char *json)
         pos += snprintf(out + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"target\":\"0x%08X\","
                         "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"sp\":\"0x%08X\","
                         "\"frame\":%u}",
                         emitted == 0 ? "" : ",",
                         (unsigned long long)e->seq,
-                        e->target, e->ra, e->a0, e->a1, e->frame);
+                        e->target, e->ra, e->a0, e->a1, e->a2, e->a3,
+                        e->sp, e->frame);
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
@@ -1478,6 +1595,29 @@ static void emit_restore_entry(const RestoreTraceEntry *e, int first)
              e->frame, (unsigned)e->in_exception);
 }
 
+static size_t append_restore_entry(char *buf, size_t pos, size_t cap,
+                                   const RestoreTraceEntry *e, int first)
+{
+    if (pos >= cap) return pos;
+    pos += snprintf(buf + pos, cap - pos,
+                    "%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\",\"jmp\":%u,"
+                    "\"target\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+                    "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+                    "\"byte_seq\":%u,\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                    "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
+                    "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                    "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\",\"sr\":\"0x%08X\","
+                    "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+                    "\"frame\":%u,\"in_exc\":%u}",
+                    first ? "" : ",",
+                    (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
+                    e->jmp_val, e->target_pc, e->cpu_pc, e->func, e->last_store_pc,
+                    e->byte_seq, e->ra, e->sp, e->v0, e->v1, e->a0, e->a1, e->a2,
+                    e->a3, e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+                    e->frame, (unsigned)e->in_exception);
+    return pos;
+}
+
 static void handle_restore_trace(int id, const char *json)
 {
     int count = json_get_int(json, "count", 200);
@@ -1489,15 +1629,23 @@ static void handle_restore_trace(int id, const char *json)
     if ((uint64_t)count > avail) count = (int)avail;
     uint64_t start = total - (uint64_t)count;
 
-    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
-             "\"entries\":[",
-             id, (unsigned long long)total, (unsigned long long)avail);
+    const size_t BUF_SZ = 256u + (size_t)count * 512u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail);
     for (int i = 0; i < count; i++) {
         uint64_t s = start + (uint64_t)i;
         const RestoreTraceEntry *e = &s_restore_trace[s % RESTORE_TRACE_CAP];
-        emit_restore_entry(e, i == 0);
+        if (pos > BUF_SZ - 512) break;
+        pos = append_restore_entry(buf, pos, BUF_SZ, e, i == 0);
     }
-    send_fmt("]}\n");
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_restore_trace_window(int id, const char *json)
@@ -1515,18 +1663,26 @@ static void handle_restore_trace_window(int id, const char *json)
     uint64_t avail = (total < RESTORE_TRACE_CAP) ? total : RESTORE_TRACE_CAP;
     uint64_t start_seq = total - avail;
 
-    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
-             "\"byte_seq\":%d,\"entries\":[",
-             id, (unsigned long long)total, (unsigned long long)avail, seq);
+    const size_t BUF_SZ = 4 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"byte_seq\":%d,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail, seq);
     int emitted = 0;
     for (uint64_t i = 0; i < avail; i++) {
         uint64_t s = start_seq + i;
         const RestoreTraceEntry *e = &s_restore_trace[s % RESTORE_TRACE_CAP];
         if (e->byte_seq < lo || e->byte_seq > hi) continue;
-        emit_restore_entry(e, emitted == 0);
+        if (pos > BUF_SZ - 512) break;
+        pos = append_restore_entry(buf, pos, BUF_SZ, e, emitted == 0);
         emitted++;
     }
-    send_fmt("],\"emitted\":%d}\n", emitted);
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_restore_trace_clear(int id, const char *json)
@@ -1534,6 +1690,95 @@ static void handle_restore_trace_clear(int id, const char *json)
     (void)json;
     memset(s_restore_trace, 0, sizeof(s_restore_trace));
     s_restore_trace_seq = 0;
+    send_ok(id);
+}
+
+static const char *thread_kind_name(uint32_t kind)
+{
+    switch (kind) {
+        case 1: return "save";
+        case 2: return "restore";
+        case 3: return "change_enter";
+        case 4: return "invalid";
+        case 5: return "same";
+        case 6: return "closed_current";
+        case 7: return "target_missing";
+        case 8: return "switch_to";
+        case 9: return "switch_back";
+        case 10: return "fiber_entry";
+        case 11: return "fiber_done";
+        case 12: return "fiber_return_restore";
+        default: return "unknown";
+    }
+}
+
+static size_t append_thread_entry(char *buf, size_t pos, size_t cap,
+                                  const ThreadTraceEntry *e, int first)
+{
+    if (pos >= cap) return pos;
+    pos += snprintf(buf + pos, cap - pos,
+                    "%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\","
+                    "\"current_tcb\":\"0x%08X\",\"target_tcb\":\"0x%08X\","
+                    "\"current_state\":\"0x%08X\",\"target_state\":\"0x%08X\","
+                    "\"current_ptr\":\"0x%08X\",\"target_pc\":\"0x%08X\","
+                    "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+                    "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                    "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                    "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                    "\"s3\":\"0x%08X\",\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+                    "\"saved_a0\":\"0x%08X\",\"saved_a1\":\"0x%08X\","
+                    "\"saved_a2\":\"0x%08X\",\"saved_a3\":\"0x%08X\","
+                    "\"saved_s3\":\"0x%08X\",\"saved_sp\":\"0x%08X\","
+                    "\"saved_ra\":\"0x%08X\",\"saved_pc\":\"0x%08X\","
+                    "\"saved_sr\":\"0x%08X\",\"istat\":\"0x%08X\","
+                    "\"imask\":\"0x%08X\",\"frame\":%u,\"in_exc\":%u}",
+                    first ? "" : ",",
+                    (unsigned long long)e->seq, e->kind, thread_kind_name(e->kind),
+                    e->current_tcb, e->target_tcb, e->current_state, e->target_state,
+                    e->current_tcb_ptr, e->target_pc, e->func, e->last_store_pc,
+                    e->ra, e->sp, e->a0, e->a1, e->a2, e->a3, e->s3,
+                    e->sr, e->epc, e->saved_a0, e->saved_a1, e->saved_a2,
+                    e->saved_a3, e->saved_s3, e->saved_sp, e->saved_ra,
+                    e->saved_pc, e->saved_sr, e->istat, e->imask, e->frame,
+                    (unsigned)e->in_exception);
+    return pos;
+}
+
+static void handle_thread_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count < 0) count = 0;
+    if (count > (int)THREAD_TRACE_CAP) count = THREAD_TRACE_CAP;
+
+    uint64_t total = s_thread_trace_seq;
+    uint64_t avail = (total < THREAD_TRACE_CAP) ? total : THREAD_TRACE_CAP;
+    if ((uint64_t)count > avail) count = (int)avail;
+    uint64_t start = total - (uint64_t)count;
+
+    const size_t BUF_SZ = 256u + (size_t)count * 768u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail);
+    for (int i = 0; i < count; i++) {
+        uint64_t s = start + (uint64_t)i;
+        const ThreadTraceEntry *e = &s_thread_trace[s % THREAD_TRACE_CAP];
+        if (pos > BUF_SZ - 768) break;
+        pos = append_thread_entry(buf, pos, BUF_SZ, e, i == 0);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_thread_trace_clear(int id, const char *json)
+{
+    (void)json;
+    memset(s_thread_trace, 0, sizeof(s_thread_trace));
+    s_thread_trace_seq = 0;
     send_ok(id);
 }
 
@@ -1588,7 +1833,7 @@ static void handle_probe_clear(int id, const char *json)
 
 /* ---- MMIO write trace (separate ring buffer) ----
  * Records every write to 0x1F801xxx MMIO registers. Unconditional (no filtering).
- * 1<<22 entries x 32 bytes = 128 MiB, heap-allocated in debug_server_init().
+ * 1<<22 entries, heap-allocated in debug_server_init().
  * Kept in step with the SIO PC trace so generic MMIO history has enough
  * retention for post-failure queries. */
 #define MMIO_TRACE_CAP (1 << 22)
@@ -1597,7 +1842,18 @@ typedef struct {
     uint32_t addr;       /* 0x1F801xxx */
     uint32_t val;        /* value written */
     uint32_t func_addr;  /* dispatch target */
+    uint32_t pc;         /* g_debug_last_store_pc */
+    uint32_t cpu_pc;     /* live CPUState.pc, useful across nonlocal returns */
     uint32_t ra;         /* $ra */
+    uint32_t sp;         /* $sp */
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t istat;
+    uint32_t imask;
     uint32_t frame;      /* VBlank frame */
     uint8_t  width;      /* 1, 2, or 4 */
     uint8_t  pad[3];
@@ -1707,6 +1963,25 @@ void debug_server_send_fmt(const char *fmt, ...)
 
 #define send_line  debug_server_send_line
 #define send_fmt   debug_server_send_fmt
+
+int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
+{
+    if (!s_dirty_break_active) return 0;
+    if (target < s_dirty_break_lo || target >= s_dirty_break_hi) return 0;
+
+    s_dirty_break_active = 0;
+    s_dirty_break_hits++;
+    s_dirty_break_target = target;
+    s_dirty_break_ra = cpu ? cpu->gpr[31] : 0;
+    s_dirty_break_a0 = cpu ? cpu->gpr[4] : 0;
+    s_dirty_break_a1 = cpu ? cpu->gpr[5] : 0;
+    s_dirty_break_a2 = cpu ? cpu->gpr[6] : 0;
+    s_dirty_break_a3 = cpu ? cpu->gpr[7] : 0;
+    s_dirty_break_sp = cpu ? cpu->gpr[29] : 0;
+    s_dirty_break_frame = (uint32_t)s_frame_count;
+    s_paused = 1;
+    return 1;
+}
 
 static void send_ok(int id)
 {
@@ -1894,6 +2169,7 @@ static const char *cdrom_trace_kind_name(uint8_t kind)
     case 'F': return "fire_irq";
     case 'f': return "irq_masked";
     case 'S': return "sector";
+    case 'O': return "overwrite";
     case 'R': return "read";
     case 'W': return "write";
     case 'D': return "dma";
@@ -1910,17 +2186,21 @@ static void handle_cdrom_state(int id, const char *json)
              "\"seq\":%llu,\"has_disc\":%d,"
              "\"index\":%u,\"stat\":\"0x%02X\","
              "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+             "\"mode\":\"0x%02X\","
              "\"param_count\":%d,\"response_read\":%d,\"response_count\":%d,"
-             "\"sector_available\":%d,\"sector_read_pos\":%d,"
+             "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
+             "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
              "\"i_stat\":\"0x%08X\"}",
              id, (unsigned long long)s.seq, s.has_disc,
              s.index_reg, s.stat_reg, s.irq_enable, s.irq_flag,
+             s.mode_reg,
              s.param_count, s.response_read, s.response_count,
-             s.sector_available, s.sector_read_pos,
+             s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,
+             s.read_cmd, s.read_delay,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
              s.pending_phase, s.i_stat);
@@ -1963,19 +2243,84 @@ static void handle_cdrom_trace_dump(int id, const char *json)
                         "\"pc\":\"0x%08X\",\"frame\":%u,\"i_stat\":\"0x%08X\","
                         "\"index\":%u,\"stat\":\"0x%02X\","
                         "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+                        "\"mode\":\"0x%02X\","
                         "\"param\":%u,\"resp_read\":%u,\"resp_count\":%u,"
-                        "\"sector_avail\":%u,\"sector_pos\":%d,"
+                        "\"sector_avail\":%u,\"sector_pos\":%d,\"sector_size\":%d,"
                         "\"pending_cmd\":\"0x%02X\",\"pending\":%u,"
-                        "\"pending_delay\":%d,\"reading\":%u}",
+                        "\"pending_delay\":%d,\"reading\":%u,"
+                        "\"read_cmd\":\"0x%02X\",\"read_delay\":%d}",
                         emitted ? "," : "",
                         (unsigned long long)e->seq, cdrom_trace_kind_name(e->kind),
                         e->addr, e->val, (unsigned)e->width,
                         e->func, e->pc, e->frame, e->i_stat,
                         e->index_reg, e->stat_reg, e->irq_enable, e->irq_flag,
+                        e->mode_reg,
                         e->param_count, e->response_read, e->response_count,
-                        e->sector_available, e->sector_read_pos,
+                        e->sector_available, e->sector_read_pos, e->sector_size,
                         e->pending_cmd, e->pending_pending,
-                        e->pending_delay, e->reading);
+                        e->pending_delay, e->reading,
+                        e->read_cmd, e->read_delay);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static const char *dma_trace_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case 'S': return "start";
+    case 'C': return "complete";
+    default: return "unknown";
+    }
+}
+
+static void handle_dma_trace_clear(int id, const char *json)
+{
+    (void)json;
+    dma_debug_clear_trace();
+    send_ok(id);
+}
+
+static void handle_dma_trace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > DMA_TRACE_CAP) count = DMA_TRACE_CAP;
+
+    const DMATraceEntry *entries = NULL;
+    uint64_t total = dma_debug_get_trace(&entries);
+    uint64_t oldest = (total > DMA_TRACE_CAP) ? total - DMA_TRACE_CAP : 0;
+    uint64_t start = (total > (uint64_t)count) ? total - (uint64_t)count : 0;
+    if (start < oldest) start = oldest;
+
+    size_t bufsz = 256u + (size_t)count * 512u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+    for (uint64_t seq = start; seq < total && pos < bufsz - 512; seq++) {
+        const DMATraceEntry *e = &entries[seq % DMA_TRACE_CAP];
+        if (e->seq != seq) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"ch\":%u,"
+                        "\"words\":%u,\"madr\":\"0x%08X\",\"bcr\":\"0x%08X\","
+                        "\"chcr\":\"0x%08X\",\"dpcr\":\"0x%08X\","
+                        "\"dicr_before\":\"0x%08X\",\"dicr_after\":\"0x%08X\","
+                        "\"i_stat_before\":\"0x%08X\",\"i_stat_after\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"pc\":\"0x%08X\"}",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq, e->frame,
+                        dma_trace_kind_name(e->kind), e->channel,
+                        e->total_words, e->madr, e->bcr, e->chcr, e->dpcr,
+                        e->dicr_before, e->dicr_after,
+                        e->i_stat_before, e->i_stat_after,
+                        e->func, e->pc);
         emitted++;
     }
     pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
@@ -3144,6 +3489,67 @@ static void handle_run_to_frame(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"running_to\":%d}", id, target);
 }
 
+static void handle_dirty_break_range(int id, const char *json)
+{
+    char buf[32];
+    if (!json_get_str(json, "lo", buf, sizeof(buf))) {
+        send_err(id, "missing lo");
+        return;
+    }
+    uint32_t lo = hex_to_u32(buf);
+    if (!json_get_str(json, "hi", buf, sizeof(buf))) {
+        send_err(id, "missing hi");
+        return;
+    }
+    uint32_t hi = hex_to_u32(buf);
+    if (hi <= lo) {
+        send_err(id, "invalid range");
+        return;
+    }
+
+    s_dirty_break_lo = lo;
+    s_dirty_break_hi = hi;
+    s_dirty_break_target = 0;
+    s_dirty_break_ra = 0;
+    s_dirty_break_a0 = 0;
+    s_dirty_break_a1 = 0;
+    s_dirty_break_a2 = 0;
+    s_dirty_break_a3 = 0;
+    s_dirty_break_sp = 0;
+    s_dirty_break_frame = 0;
+    s_dirty_break_active = 1;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":true,"
+             "\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+             id, s_dirty_break_lo, s_dirty_break_hi);
+}
+
+static void handle_dirty_break_clear(int id, const char *json)
+{
+    (void)json;
+    s_dirty_break_active = 0;
+    send_ok(id);
+}
+
+static void handle_dirty_break_state(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":%s,"
+             "\"lo\":\"0x%08X\",\"hi\":\"0x%08X\",\"hits\":%llu,"
+             "\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+             "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+             "\"sp\":\"0x%08X\",\"frame\":%u,\"paused\":%s}",
+             id, s_dirty_break_active ? "true" : "false",
+             s_dirty_break_lo, s_dirty_break_hi,
+             (unsigned long long)s_dirty_break_hits,
+             s_dirty_break_target, s_dirty_break_ra,
+             s_dirty_break_a0, s_dirty_break_a1,
+             s_dirty_break_a2, s_dirty_break_a3,
+             s_dirty_break_sp, s_dirty_break_frame,
+             s_paused ? "true" : "false");
+}
+
 /* ---- Ring buffer queries ---- */
 
 static void handle_history(int id, const char *json)
@@ -3534,6 +3940,16 @@ static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uin
     e->ra        = ra;
     e->func_addr = g_debug_current_func_addr;
     e->pc        = g_debug_last_store_pc;
+    e->cpu_pc    = debug_cpu_ptr ? debug_cpu_ptr->pc      : 0;
+    e->sp        = debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0;
+    e->v0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[2]  : 0;
+    e->v1        = debug_cpu_ptr ? debug_cpu_ptr->gpr[3]  : 0;
+    e->a0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[4]  : 0;
+    e->a1        = debug_cpu_ptr ? debug_cpu_ptr->gpr[5]  : 0;
+    e->a2        = debug_cpu_ptr ? debug_cpu_ptr->gpr[6]  : 0;
+    e->a3        = debug_cpu_ptr ? debug_cpu_ptr->gpr[7]  : 0;
+    e->t0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[8]  : 0;
+    e->t1        = debug_cpu_ptr ? debug_cpu_ptr->gpr[9]  : 0;
     e->frame     = (uint32_t)s_frame_count;
     e->width     = width;
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
@@ -3557,13 +3973,23 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
 void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
 {
     if (!s_mmio_trace) return;
-    uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;
     e->addr      = addr;
     e->val       = val;
     e->func_addr = g_debug_current_func_addr;
-    e->ra        = ra;
+    e->pc        = g_debug_last_store_pc;
+    e->cpu_pc    = debug_cpu_ptr ? debug_cpu_ptr->pc      : 0;
+    e->ra        = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->sp        = debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0;
+    e->a0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[4]  : 0;
+    e->a1        = debug_cpu_ptr ? debug_cpu_ptr->gpr[5]  : 0;
+    e->a2        = debug_cpu_ptr ? debug_cpu_ptr->gpr[6]  : 0;
+    e->a3        = debug_cpu_ptr ? debug_cpu_ptr->gpr[7]  : 0;
+    e->sr        = debug_cpu_ptr ? debug_cpu_ptr->cop0[12] : 0;
+    e->epc       = debug_cpu_ptr ? debug_cpu_ptr->cop0[14] : 0;
+    e->istat     = i_stat;
+    e->imask     = i_mask;
     e->frame     = (uint32_t)s_frame_count;
     e->width     = width;
     s_mmio_trace_head = (s_mmio_trace_head + 1) % MMIO_TRACE_CAP;
@@ -3849,10 +4275,11 @@ static void handle_wtrace_dump(int id, const char *json)
     int max_out = json_get_int(json, "count", 65536);
     if (max_out < 1) max_out = 1;
     if (max_out > WRITE_TRACE_CAP) max_out = WRITE_TRACE_CAP;
+    int newest_first = json_get_int(json, "newest", 0) != 0;
 
     const uint32_t MAX_OUT = (uint32_t)max_out;
-    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 256u;
-    if (BUF_SZ > (size_t)64 * 1024 * 1024) BUF_SZ = (size_t)64 * 1024 * 1024;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -3861,17 +4288,30 @@ static void handle_wtrace_dump(int id, const char *json)
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
                     id, (unsigned long long)total, avail);
     for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
-        uint32_t idx = (start + i) % WRITE_TRACE_CAP;
+        uint32_t idx;
+        if (newest_first) {
+            uint32_t newest = (s_wtrace_head + WRITE_TRACE_CAP - 1u) % WRITE_TRACE_CAP;
+            idx = (newest + WRITE_TRACE_CAP - (i % WRITE_TRACE_CAP)) % WRITE_TRACE_CAP;
+        } else {
+            idx = (start + i) % WRITE_TRACE_CAP;
+        }
         WriteTraceEntry *e = &s_wtrace[idx];
         if (e->addr < filter_lo || e->addr >= filter_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
                         "\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"func\":\"0x%08X\","
-                        "\"pc\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                        "\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+                        "\"frame\":%u,\"w\":%u}",
                         (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
                         e->addr, e->old_val, e->new_val, e->ra, e->func_addr,
-                        e->pc, e->frame, (unsigned)e->width);
+                        e->pc, e->cpu_pc, e->sp,
+                        e->v0, e->v1, e->a0, e->a1, e->a2, e->a3, e->t0, e->t1,
+                        e->frame, (unsigned)e->width);
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
@@ -3895,9 +4335,14 @@ static void handle_mmio_dump(int id, const char *json)
     uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
     uint32_t start = (total < MMIO_TRACE_CAP) ? 0 : s_mmio_trace_head;
 
-    /* 1 GB response buffer; emit up to MAX_OUT (effectively whole ring). */
-    const uint32_t MAX_OUT = MMIO_TRACE_CAP;
-    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
+    int max_out = json_get_int(json, "count", 65536);
+    if (max_out < 1) max_out = 1;
+    if (max_out > (int)MMIO_TRACE_CAP) max_out = (int)MMIO_TRACE_CAP;
+    int newest_first = json_get_int(json, "newest", 0) != 0;
+
+    const uint32_t MAX_OUT = (uint32_t)max_out;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -3906,15 +4351,29 @@ static void handle_mmio_dump(int id, const char *json)
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
                     id, (unsigned long long)total, avail);
     for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
-        uint32_t idx = (start + i) % MMIO_TRACE_CAP;
+        uint32_t idx;
+        if (newest_first) {
+            uint32_t newest = (s_mmio_trace_head + MMIO_TRACE_CAP - 1u) % MMIO_TRACE_CAP;
+            idx = (newest + MMIO_TRACE_CAP - (i % MMIO_TRACE_CAP)) % MMIO_TRACE_CAP;
+        } else {
+            idx = (start + i) % MMIO_TRACE_CAP;
+        }
         MmioTraceEntry *e = &s_mmio_trace[idx];
         if (has_filter && e->addr != filter_addr) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
-                        "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                        "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+                        "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+                        "\"frame\":%u,\"w\":%u}",
                         (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
-                        e->addr, e->val, e->func_addr, e->ra,
+                        e->addr, e->val, e->func_addr, e->pc, e->cpu_pc,
+                        e->ra, e->sp, e->a0, e->a1, e->a2, e->a3,
+                        e->sr, e->epc, e->istat, e->imask,
                         e->frame, (unsigned)e->width);
         emitted++;
     }
@@ -3929,6 +4388,105 @@ static void handle_mmio_clear(int id, const char *json)
     s_mmio_trace_seq = 0;
     s_mmio_trace_head = 0;
     if (s_mmio_trace) memset(s_mmio_trace, 0, (size_t)MMIO_TRACE_CAP * sizeof(MmioTraceEntry));
+    send_ok(id);
+}
+
+static const char *mdec_event_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case 1: return "reset";
+    case 2: return "ctrl_write";
+    case 3: return "cmd_begin";
+    case 4: return "cmd_done";
+    case 5: return "decode_done";
+    case 6: return "dma_in_start";
+    case 7: return "dma_in_end";
+    case 8: return "dma_out_start";
+    case 9: return "dma_out_end";
+    case 10: return "output_drained";
+    case 11: return "read_underflow";
+    default: return "unknown";
+    }
+}
+
+static void handle_mdec_state(int id, const char *json)
+{
+    (void)json;
+    MDECDebugState s;
+    mdec_debug_get_state(&s);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"command\":\"0x%08X\",\"expected_halfwords\":%u,"
+             "\"input_count\":%u,\"output_size\":%u,\"output_pos\":%u,"
+             "\"output_depth\":%u,\"output_signed\":%u,\"output_bit15\":%u,"
+             "\"busy\":%u,\"input_full\":%u,\"enable_dma_in\":%u,\"enable_dma_out\":%u,"
+             "\"last_status\":\"0x%08X\","
+             "\"decode_macroblocks\":%u,\"decode_blocks\":%u,"
+             "\"decode_stop_reason\":%u,\"decode_input_pos\":%u,\"decode_input_end\":%u,"
+             "\"dma_in_words\":%u,\"dma_out_words\":%u,\"dma_read_underflows\":%u,"
+             "\"trace_total\":%llu}",
+             id, s.command, s.expected_halfwords, s.input_count,
+             s.output_size, s.output_pos, s.output_depth, s.output_signed,
+             s.output_bit15, s.busy, s.input_full, s.enable_dma_in,
+             s.enable_dma_out, s.last_status, s.decode_macroblocks,
+             s.decode_blocks, s.decode_stop_reason, s.decode_input_pos,
+             s.decode_input_end, s.dma_in_words, s.dma_out_words,
+             s.dma_read_underflows,
+             (unsigned long long)mdec_debug_get_event_total());
+}
+
+static void handle_mdec_trace(int id, const char *json)
+{
+    uint64_t total = mdec_debug_get_event_total();
+    uint64_t oldest = (total > 4096ull) ? total - 4096ull : 0;
+    uint64_t seq_hi = total;
+    uint64_t seq_lo = (total > 256ull) ? total - 256ull : oldest;
+    char buf32[32];
+    if (json_get_str(json, "seq_lo", buf32, sizeof(buf32))) seq_lo = strtoull(buf32, NULL, 0);
+    if (json_get_str(json, "seq_hi", buf32, sizeof(buf32))) seq_hi = strtoull(buf32, NULL, 0);
+    if (seq_lo < oldest) seq_lo = oldest;
+    if (seq_hi > total) seq_hi = total;
+
+    int max_out = json_get_int(json, "count", 256);
+    if (max_out < 1) max_out = 1;
+    if (max_out > 4096) max_out = 4096;
+
+    MDECDebugEvent *events = (MDECDebugEvent *)malloc((size_t)max_out * sizeof(MDECDebugEvent));
+    if (!events) { send_err(id, "oom"); return; }
+    uint32_t n = mdec_debug_copy_events(seq_lo, seq_hi, events, (uint32_t)max_out);
+
+    size_t buf_sz = 256u + (size_t)n * 384u;
+    char *out = (char *)malloc(buf_sz);
+    if (!out) { free(events); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, buf_sz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,"
+                    "\"seq_lo\":%llu,\"seq_hi\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest,
+                    (unsigned long long)seq_lo, (unsigned long long)seq_hi);
+    for (uint32_t i = 0; i < n && pos < buf_sz - 384u; i++) {
+        const MDECDebugEvent *e = &events[i];
+        pos += snprintf(out + pos, buf_sz - pos,
+                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"value\":\"0x%08X\","
+                        "\"command\":\"0x%08X\",\"input_count\":%u,\"expected_halfwords\":%u,"
+                        "\"output_size\":%u,\"output_pos\":%u,\"macroblocks\":%u,"
+                        "\"blocks\":%u,\"stop_reason\":%u,\"underruns\":%u}",
+                        i ? "," : "",
+                        (unsigned long long)e->seq, e->frame,
+                        mdec_event_kind_name(e->kind), e->value, e->command,
+                        e->input_count, e->expected_halfwords,
+                        e->output_size, e->output_pos, e->macroblocks,
+                        e->blocks, e->stop_reason, e->underruns);
+    }
+    pos += snprintf(out + pos, buf_sz - pos, "],\"emitted\":%u}", n);
+    debug_server_send_line(out);
+    free(out);
+    free(events);
+}
+
+static void handle_mdec_trace_clear(int id, const char *json)
+{
+    (void)json;
+    mdec_debug_clear();
     send_ok(id);
 }
 
@@ -4049,8 +4607,8 @@ static void fn_dump_parse(const char *json, uint64_t total,
     *out_max     = 4 * 1024 * 1024;
     if (json_get_str(json, "seq_lo", buf, sizeof(buf))) *out_seq_lo = strtoull(buf, NULL, 0);
     if (json_get_str(json, "seq_hi", buf, sizeof(buf))) *out_seq_hi = strtoull(buf, NULL, 0);
-    if (json_get_str(json, "addr_lo", buf, sizeof(buf))) *out_addr_lo = hex_to_u32(buf) & 0x1FFFFFFFu;
-    if (json_get_str(json, "addr_hi", buf, sizeof(buf))) *out_addr_hi = hex_to_u32(buf) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_lo", buf, sizeof(buf))) *out_addr_lo = hex_to_u32(buf);
+    if (json_get_str(json, "addr_hi", buf, sizeof(buf))) *out_addr_hi = hex_to_u32(buf);
     *out_max = json_get_int(json, "count", *out_max);
     if (*out_max < 1) *out_max = 1;
 }
@@ -4067,9 +4625,8 @@ static void handle_fn_entry_dump(int id, const char *json) {
     if (seq_lo < oldest) seq_lo = oldest;
     if (seq_hi > s_fn_entry_seq) seq_hi = s_fn_entry_seq;
 
-    /* 1 GB response buffer.  Each entry serializes to ~256 bytes JSON, so we
-     * can emit up to ~4M entries per dump.  No artificial truncation. */
-    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
+    size_t BUF_SZ = 256u + (size_t)max_count * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -4112,7 +4669,8 @@ static void handle_fn_exit_dump(int id, const char *json) {
     if (seq_lo < oldest) seq_lo = oldest;
     if (seq_hi > s_fn_exit_seq) seq_hi = s_fn_exit_seq;
 
-    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
+    size_t BUF_SZ = 256u + (size_t)max_count * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -4157,6 +4715,8 @@ static const CmdEntry s_commands[] = {
     { "cdrom_state",       handle_cdrom_state },
     { "cdrom_trace_dump",  handle_cdrom_trace_dump },
     { "cdrom_trace_clear", handle_cdrom_trace_clear },
+    { "dma_trace_dump",    handle_dma_trace_dump },
+    { "dma_trace_clear",   handle_dma_trace_clear },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
@@ -4178,6 +4738,8 @@ static const CmdEntry s_commands[] = {
     { "restore_trace",     handle_restore_trace },
     { "restore_trace_window", handle_restore_trace_window },
     { "restore_trace_clear", handle_restore_trace_clear },
+    { "thread_trace",      handle_thread_trace },
+    { "thread_trace_clear", handle_thread_trace_clear },
     { "probe_trace",       handle_probe_trace },
     { "probe_clear",       handle_probe_clear },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
@@ -4212,6 +4774,9 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
+    { "mdec_state",        handle_mdec_state },
+    { "mdec_trace",        handle_mdec_trace },
+    { "mdec_trace_clear",  handle_mdec_trace_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
@@ -4220,6 +4785,9 @@ static const CmdEntry s_commands[] = {
     { "continue",          handle_continue },
     { "step",              handle_step },
     { "run_to_frame",      handle_run_to_frame },
+    { "dirty_break_range", handle_dirty_break_range },
+    { "dirty_break_clear", handle_dirty_break_clear },
+    { "dirty_break_state", handle_dirty_break_state },
     { "history",           handle_history },
     { "get_frame",         handle_get_frame },
     { "frame_range",       handle_frame_range },
@@ -4406,6 +4974,36 @@ void debug_server_init(int port)
     s_wtrace_ranges[14].lo = 0x00066BC0u;
     s_wtrace_ranges[14].hi = 0x00066BD0u;
     s_wtrace_range_count = 15;
+
+#if DEFAULT_DEBUG_PORT == 4470
+    /* Tomba STR/FMVs: movie state, CD sector descriptor ring, and CD globals.
+     * These are passive traces for the game runtime only. */
+    s_wtrace_ranges[15].lo = 0x000D7188u;
+    s_wtrace_ranges[15].hi = 0x000D7588u;
+    s_wtrace_ranges[16].lo = 0x0009B010u;
+    s_wtrace_ranges[16].hi = 0x0009B050u;
+    s_wtrace_ranges[17].lo = 0x000A15C8u;
+    s_wtrace_ranges[17].hi = 0x000A3270u;
+    /* Tomba task scheduler descriptors and scratchpad state. The current
+     * black-screen blocker is a missing resume after the loader task closes,
+     * so keep the task table and scheduler scratch bytes in the reverse trace
+     * from process start. */
+    s_wtrace_ranges[18].lo = 0x001FD800u;
+    s_wtrace_ranges[18].hi = 0x001FD950u;
+    s_wtrace_ranges[19].lo = 0x1F8001CCu;
+    s_wtrace_ranges[19].hi = 0x1F800200u;
+    s_wtrace_ranges[20].lo = 0x1F800150u;
+    s_wtrace_ranges[20].hi = 0x1F800180u;
+    /* Runtime-loaded Tomba overlay text/data and the high-stack descriptors
+     * used by its primitive-list builders. This catches loader writes and any
+     * later self-modification before the frame-2500 overlay loop floods the
+     * trace. */
+    s_wtrace_ranges[21].lo = 0x000E0000u;
+    s_wtrace_ranges[21].hi = 0x000F0000u;
+    s_wtrace_ranges[22].lo = 0x001FE000u;
+    s_wtrace_ranges[22].hi = 0x001FE400u;
+    s_wtrace_range_count = 23;
+#endif
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {

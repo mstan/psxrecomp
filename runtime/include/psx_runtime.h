@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 static inline void call_by_address(CPUState* cpu, uint32_t addr) {
-    psx_dispatch(cpu, addr);
+    psx_dispatch_call(cpu, addr, cpu->gpr[31]);
 }
 
 #ifdef __cplusplus

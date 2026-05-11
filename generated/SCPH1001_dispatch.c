@@ -8845,7 +8845,7 @@ extern void fntrace_record(CPUState* cpu, uint32_t target);
 
 int g_psx_dispatch_depth = 0;
 
-void psx_dispatch(CPUState* cpu, uint32_t addr) {
+static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     /* Tail-call trampoline: functions signal tail calls by setting
      * cpu->pc to the target and returning. We loop here to re-dispatch
      * without growing the native stack. Interrupts are only checked when
@@ -8894,6 +8894,22 @@ void psx_dispatch(CPUState* cpu, uint32_t addr) {
             }
             return;
         }
+        if (stop_addr != 0 && cpu->pc == stop_addr) {
+            cpu->pc = 0;
+            --g_psx_dispatch_depth;
+            if (outermost) {
+                psx_check_interrupts(cpu);
+            }
+            return;
+        }
         addr = cpu->pc;  /* tail call: re-dispatch */
     }
+}
+
+void psx_dispatch(CPUState* cpu, uint32_t addr) {
+    psx_dispatch_impl(cpu, addr, 0);
+}
+
+void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr) {
+    psx_dispatch_impl(cpu, addr, return_addr);
 }

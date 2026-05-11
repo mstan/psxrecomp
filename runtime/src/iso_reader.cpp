@@ -157,6 +157,34 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
     }
 }
 
+bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
+    if (!is_open_ || !buffer) {
+        return false;
+    }
+
+    file_.clear();
+    file_.seekg(0, std::ios::end);
+    std::streampos file_size = file_.tellg();
+    file_.clear();
+
+    if (file_size <= 0 || (file_size % RAW_SECTOR_SIZE) != 0) {
+        return false;
+    }
+
+    std::streampos offset = static_cast<std::streampos>(lba) * RAW_SECTOR_SIZE;
+    file_.seekg(offset, std::ios::beg);
+    if (!file_.good()) {
+        file_.clear();
+        return false;
+    }
+
+    file_.read(reinterpret_cast<char*>(buffer), RAW_SECTOR_SIZE);
+    std::streamsize bytes_read = file_.gcount();
+    bool success = (bytes_read == RAW_SECTOR_SIZE);
+    file_.clear();
+    return success;
+}
+
 bool ISOReader::IsOpen() const {
     return is_open_;
 }

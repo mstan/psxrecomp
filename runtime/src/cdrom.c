@@ -17,6 +17,7 @@
 /* C wrappers for the C++ ISOReader (defined in iso_reader_c.cpp) */
 extern void* iso_open(const char* path);
 extern int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
+extern int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern void iso_close(void* handle);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
@@ -42,11 +43,16 @@ static uint8_t response_fifo[RESPONSE_FIFO_SIZE];
 static int response_read;
 static int response_count;
 
-/* Data buffer. PSY-Q's whole-sector mode reads the 12-byte sector
- * header separately, then the 2048-byte user payload. */
+/* Data buffer. Whole-sector mode transfers 0x924 bytes starting after
+ * the 12 sync bytes: header, subheader, and sector payload. */
 #define SECTOR_SIZE 2048
-#define SECTOR_HEADER_SIZE 12
-#define SECTOR_BUFFER_SIZE (SECTOR_HEADER_SIZE + SECTOR_SIZE)
+#define RAW_SECTOR_SIZE 2352
+#define RAW_USER_DATA_OFFSET 24
+#define WHOLE_SECTOR_OFFSET 12
+#define WHOLE_SECTOR_SIZE (RAW_SECTOR_SIZE - WHOLE_SECTOR_OFFSET)
+#define FALLBACK_SECTOR_HEADER_SIZE 12
+#define FALLBACK_WHOLE_SECTOR_SIZE (FALLBACK_SECTOR_HEADER_SIZE + SECTOR_SIZE)
+#define SECTOR_BUFFER_SIZE WHOLE_SECTOR_SIZE
 static uint8_t sector_buffer[SECTOR_BUFFER_SIZE];
 static int sector_read_pos;
 static int sector_available;
@@ -59,6 +65,8 @@ static uint8_t seek_min, seek_sec, seek_sect;
 static int reading;
 static int read_min, read_sec, read_sect;
 static uint8_t mode_reg;
+static uint8_t read_cmd;
+static int read_delay;
 
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
@@ -96,15 +104,19 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->stat_reg = stat_reg;
     e->irq_enable = irq_enable;
     e->irq_flag = irq_flag;
+    e->mode_reg = mode_reg;
     e->param_count = (uint8_t)param_count;
     e->response_read = (uint8_t)response_read;
     e->response_count = (uint8_t)response_count;
     e->sector_available = (uint8_t)sector_available;
     e->sector_read_pos = sector_read_pos;
+    e->sector_size = sector_size;
     e->pending_cmd = pending.cmd;
     e->pending_pending = (uint8_t)pending.pending;
     e->pending_delay = pending.delay;
     e->reading = (uint8_t)reading;
+    e->read_cmd = read_cmd;
+    e->read_delay = read_delay;
 }
 
 static int has_disc(void) {
@@ -169,9 +181,14 @@ static uint8_t bin_to_bcd(int val) {
 static void read_sector_at(int min, int sec, int sect) {
     int lba = msf_to_lba(min, sec, sect);
     uint8_t user_data[SECTOR_SIZE];
+    uint8_t raw_data[RAW_SECTOR_SIZE];
+    int have_raw = 0;
 
     if (iso_handle) {
-        if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {
+        have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
+        if (have_raw) {
+            memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
+        } else if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {
             memset(user_data, 0, sizeof(user_data));
         }
     } else {
@@ -180,12 +197,17 @@ static void read_sector_at(int min, int sec, int sect) {
 
     memset(sector_buffer, 0, sizeof(sector_buffer));
     if (mode_reg & 0x20) {
-        sector_buffer[0] = bin_to_bcd(min);
-        sector_buffer[1] = bin_to_bcd(sec);
-        sector_buffer[2] = bin_to_bcd(sect);
-        sector_buffer[3] = 0x02; /* Mode 2 sector. */
-        memcpy(sector_buffer + SECTOR_HEADER_SIZE, user_data, SECTOR_SIZE);
-        sector_size = SECTOR_HEADER_SIZE + SECTOR_SIZE;
+        if (have_raw) {
+            memcpy(sector_buffer, raw_data + WHOLE_SECTOR_OFFSET, WHOLE_SECTOR_SIZE);
+            sector_size = WHOLE_SECTOR_SIZE;
+        } else {
+            sector_buffer[0] = bin_to_bcd(min);
+            sector_buffer[1] = bin_to_bcd(sec);
+            sector_buffer[2] = bin_to_bcd(sect);
+            sector_buffer[3] = 0x02; /* Mode 2 sector. */
+            memcpy(sector_buffer + FALLBACK_SECTOR_HEADER_SIZE, user_data, SECTOR_SIZE);
+            sector_size = FALLBACK_WHOLE_SECTOR_SIZE;
+        }
     } else {
         memcpy(sector_buffer, user_data, SECTOR_SIZE);
         sector_size = SECTOR_SIZE;
@@ -200,6 +222,38 @@ static void advance_msf(int* m, int* s, int* f) {
     (*f)++;
     if (*f >= 75) { *f = 0; (*s)++; }
     if (*s >= 60) { *s = 0; (*m)++; }
+}
+
+static void clear_sector_buffer(void) {
+    sector_read_pos = 0;
+    sector_size = 0;
+    sector_available = 0;
+}
+
+static void start_read_stream(uint8_t cmd) {
+    clear_sector_buffer();
+    read_min = seek_min;
+    read_sec = seek_sec;
+    read_sect = seek_sect;
+    read_cmd = cmd;
+    read_delay = sector_delay_cycles();
+    reading = 1;
+    stat_reg |= CDSTAT_READ;
+}
+
+static void stop_read_stream(void) {
+    reading = 0;
+    read_cmd = 0;
+    read_delay = 0;
+}
+
+static void deliver_read_sector(void) {
+    read_sector_at(read_min, read_sec, read_sect);
+    advance_msf(&read_min, &read_sec, &read_sect);
+    response_clear();
+    response_push(stat_reg);
+    set_irq(CDIRQ_DATA_READY);
+    fire_cdrom_irq();
 }
 
 static void exec_command(uint8_t cmd) {
@@ -233,21 +287,13 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
-        read_min = seek_min;
-        read_sec = seek_sec;
-        read_sect = seek_sect;
-        reading = 1;
-        stat_reg |= CDSTAT_READ;
+        start_read_stream(cmd);
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
-        pending.cmd = 0x06;
-        pending.pending = 1;
-        pending.delay = sector_delay_cycles();
-        pending.phase = 1;
         break;
 
     case 0x09: /* Pause */
-        reading = 0;
+        stop_read_stream();
         stat_reg &= ~CDSTAT_READ;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -258,7 +304,7 @@ static void exec_command(uint8_t cmd) {
         break;
 
     case 0x0A: /* Init */
-        reading = 0;
+        stop_read_stream();
         stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -314,17 +360,9 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
-        read_min = seek_min;
-        read_sec = seek_sec;
-        read_sect = seek_sect;
-        reading = 1;
-        stat_reg |= CDSTAT_READ;
+        start_read_stream(cmd);
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
-        pending.cmd = 0x1B;
-        pending.pending = 1;
-        pending.delay = sector_delay_cycles();
-        pending.phase = 1;
         break;
 
     case 0x1E: /* ReadTOC */
@@ -435,6 +473,26 @@ static void process_pending(uint32_t cycles) {
     }
 }
 
+static void process_read_stream(uint32_t cycles) {
+    if (!reading) return;
+
+    if (cycles > 0) {
+        read_delay -= (int)cycles;
+    }
+
+    if (sector_available && irq_flag != 0) {
+        return;
+    }
+
+    if (read_delay <= 0) {
+        if (sector_available) {
+            trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
+        }
+        deliver_read_sector();
+        read_delay += sector_delay_cycles();
+    }
+}
+
 void cdrom_init(const char* cue_path) {
     memset(param_fifo, 0, sizeof(param_fifo));
     memset(response_fifo, 0, sizeof(response_fifo));
@@ -449,7 +507,7 @@ void cdrom_init(const char* cue_path) {
     sector_read_pos = 0;
     sector_size = 0;
     sector_available = 0;
-    reading = 0;
+    stop_read_stream();
     mode_reg = 0;
     pending.pending = 0;
     seek_min = seek_sec = seek_sect = 0;
@@ -550,13 +608,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 
 void cdrom_advance(uint32_t cycles) {
     process_pending(cycles);
-
-    if (reading && !sector_available && !pending.pending) {
-        pending.cmd = 0x06;
-        pending.pending = 1;
-        pending.delay = sector_delay_cycles();
-        pending.phase = 1;
-    }
+    process_read_stream(cycles);
 }
 
 void cdrom_tick(void) {
@@ -577,7 +629,7 @@ uint32_t cdrom_dma_read(void) {
 }
 
 int cdrom_dma_ready(void) {
-    return sector_available && (sector_read_pos < SECTOR_SIZE);
+    return sector_available && (sector_read_pos < sector_size);
 }
 
 void cdrom_debug_snapshot(CDROMDebugState* out) {
@@ -588,6 +640,7 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->stat_reg = stat_reg;
     out->irq_enable = irq_enable;
     out->irq_flag = irq_flag;
+    out->mode_reg = mode_reg;
     out->seek_min = seek_min;
     out->seek_sec = seek_sec;
     out->seek_sect = seek_sect;
@@ -598,10 +651,13 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->response_count = response_count;
     out->sector_read_pos = sector_read_pos;
     out->sector_available = sector_available;
+    out->sector_size = sector_size;
     out->reading = reading;
     out->read_min = read_min;
     out->read_sec = read_sec;
     out->read_sect = read_sect;
+    out->read_cmd = read_cmd;
+    out->read_delay = read_delay;
     out->pending_pending = pending.pending;
     out->pending_delay = pending.delay;
     out->pending_phase = pending.phase;

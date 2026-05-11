@@ -5,6 +5,7 @@
  */
 
 #include "cpu_state.h"
+#include "debug_server.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,7 @@ static void psx_save_context_to_tcb(CPUState* cpu, uint32_t tcb, uint32_t resume
     cpu->write_word(save + 136u, cpu->lo);
     cpu->write_word(save + 140u, (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2));
     cpu->write_word(save + 144u, cpu->cop0[13]);
+    debug_server_log_thread_event(1, cpu, tcb, tcb, resume_pc);
 }
 
 static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
@@ -85,6 +87,7 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
     }
     cpu->cop0[13] = cpu->read_word(save + 144u);
     cpu->gpr[26] = cpu->read_word(save + 128u);
+    debug_server_log_thread_event(2, cpu, psx_current_tcb_ptr(cpu), tcb, cpu->gpr[26]);
     return cpu->gpr[26];
 }
 
@@ -165,12 +168,14 @@ static VOID CALLBACK psx_thread_fiber_entry(LPVOID param)
     HostThreadFiber* slot = (HostThreadFiber*)param;
     CPUState* cpu = slot->cpu;
 
+    debug_server_log_thread_event(10, cpu, psx_current_tcb_ptr(cpu), slot->tcb, 0);
     psx_set_current_tcb(cpu, slot->tcb);
     uint32_t target_pc = psx_restore_context_from_tcb(cpu, slot->tcb);
     if (target_pc != 0) {
         psx_dispatch(cpu, target_pc);
     }
 
+    debug_server_log_thread_event(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc);
     slot->closed = 1;
     if (psx_tcb_state(cpu, slot->tcb) == 0x4000u) {
         cpu->write_word(slot->tcb, 0x1000u);
@@ -181,6 +186,7 @@ static VOID CALLBACK psx_thread_fiber_entry(LPVOID param)
             psx_set_current_tcb(cpu, slot->return_tcb);
             (void)psx_restore_context_from_tcb(cpu, slot->return_tcb);
         }
+        debug_server_log_thread_event(12, cpu, slot->tcb, slot->return_tcb, 0);
         SwitchToFiber(slot->return_fiber);
     }
 
@@ -223,10 +229,13 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
 static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 {
     uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    debug_server_log_thread_event(3, cpu, current_tcb, target_tcb, 0);
     if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
+        debug_server_log_thread_event(4, cpu, current_tcb, target_tcb, 0);
         return 0;
     }
     if (current_tcb == target_tcb) {
+        debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
         cpu->pc = 0;
         return 1;
     }
@@ -236,10 +245,12 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
         psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
     } else {
         current->closed = 1;
+        debug_server_log_thread_event(6, cpu, current_tcb, target_tcb, 0);
     }
 
     HostThreadFiber* target = psx_get_or_create_host_thread(cpu, target_tcb);
     if (!target) {
+        debug_server_log_thread_event(7, cpu, current_tcb, target_tcb, 0);
         return 0;
     }
 
@@ -248,8 +259,10 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 
     psx_set_current_tcb(cpu, target_tcb);
     (void)psx_restore_context_from_tcb(cpu, target_tcb);
+    debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
     SwitchToFiber(target->fiber);
 
+    debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
     cpu->pc = 0;
     return 1;
 }

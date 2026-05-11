@@ -132,6 +132,9 @@ void psx_restore_state_escape(void) {
 
 void psx_check_interrupts(CPUState* cpu) {
     total_checks++;
+    if ((total_checks & 0x3FFFu) == 0) {
+        debug_server_poll();
+    }
 
     /* SIO delayed IRQ delivery removed from here.
      * sio_tick() is now called only from SIO register accesses

@@ -143,6 +143,18 @@ void debug_server_log_probe(uint32_t pc, CPUState *cpu);
  * control-flow events that can skip normal function epilogues. */
 void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val);
 
+/* BIOS ChangeThread / TCB context tracer. Records runtime thread switches
+ * and the saved register block belonging to the selected TCB. */
+void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
+                                   uint32_t current_tcb,
+                                   uint32_t target_tcb,
+                                   uint32_t target_pc);
+
+/* Dirty-RAM dispatch break.  Used by the dynamic-code interpreter to pause
+ * immediately when dispatch enters a configured address range, before a hot
+ * loop can overwrite the trace rings. */
+int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);

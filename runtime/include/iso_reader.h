@@ -70,6 +70,14 @@ public:
     bool ReadSector(uint32_t lba, uint8_t* buffer);
 
     /**
+     * Read a raw 2352-byte sector from a BIN image.
+     * @param lba Logical Block Address (sector number)
+     * @param buffer Buffer to read into (must be at least 2352 bytes)
+     * @return true if the image stores raw sectors and read succeeded
+     */
+    bool ReadRawSector(uint32_t lba, uint8_t* buffer);
+
+    /**
      * Check if a file is currently open
      * @return true if file is open
      */
