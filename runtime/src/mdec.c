@@ -165,144 +165,26 @@ static void finish_command(void) {
     trace_event(MDEC_EVT_CMD_DONE, mdec.command);
 }
 
-/* ============================================================================
- * Fast IDCT — butterfly decomposition, ported from FFmpeg
- * libavcodec/simple_idct_template.c (BIT_DEPTH=8, LGPL-2.1+).
- *
- * Constants W1..W7 = cos(k*pi/16)*sqrt(2)*2^14 + 0.5; W4 ≈ cos(pi/4)*sqrt(2)*2^14.
- * Replaces the prior O(N^3) reference IDCT (~1024 mul/block) with a butterfly
- * implementation (~64 mul/block). Produces int16_t output to match the
- * existing mdec.c convention so to_output_u8 / append_color_macroblock /
- * append_luma_block continue to work unchanged.
- *
- * The PSX MDEC ignores the GP0 IDCT-scale matrix; the prior code used
- * mdec.scale as the cosine matrix. With FFmpeg's IDCT we compute cosines
- * from the W1..W7 constants directly and no longer depend on mdec.scale
- * — that matches real-hardware behavior more closely.
- * ========================================================================== */
-#define MDEC_IDCT_W1 22725u
-#define MDEC_IDCT_W2 21407u
-#define MDEC_IDCT_W3 19266u
-#define MDEC_IDCT_W4 16383u
-#define MDEC_IDCT_W5 12873u
-#define MDEC_IDCT_W6  8867u
-#define MDEC_IDCT_W7  4520u
-#define MDEC_IDCT_ROW_SHIFT 11
-#define MDEC_IDCT_COL_SHIFT 20
-#define MDEC_IDCT_DC_SHIFT   3
-
-static void idct_row_cond_dc(int16_t *row) {
-    if (!(row[1] | row[2] | row[3] | row[4] | row[5] | row[6] | row[7])) {
-        int16_t dc = (int16_t)(row[0] << MDEC_IDCT_DC_SHIFT);
-        row[0] = row[1] = row[2] = row[3] =
-        row[4] = row[5] = row[6] = row[7] = dc;
-        return;
-    }
-
-    uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
-
-    a0 = (uint32_t)(MDEC_IDCT_W4 * row[0]) + (1u << (MDEC_IDCT_ROW_SHIFT - 1));
-    a1 = a0; a2 = a0; a3 = a0;
-
-    a0 += (uint32_t)( MDEC_IDCT_W2 * row[2]);
-    a1 += (uint32_t)( MDEC_IDCT_W6 * row[2]);
-    a2 += (uint32_t)(-MDEC_IDCT_W6 * row[2]);
-    a3 += (uint32_t)(-MDEC_IDCT_W2 * row[2]);
-
-    b0 = (uint32_t)(MDEC_IDCT_W1 * row[1]);
-    b1 = (uint32_t)(MDEC_IDCT_W3 * row[1]);
-    b2 = (uint32_t)(MDEC_IDCT_W5 * row[1]);
-    b3 = (uint32_t)(MDEC_IDCT_W7 * row[1]);
-
-    b0 += (uint32_t)( MDEC_IDCT_W3 * row[3]);
-    b1 += (uint32_t)(-MDEC_IDCT_W7 * row[3]);
-    b2 += (uint32_t)(-MDEC_IDCT_W1 * row[3]);
-    b3 += (uint32_t)(-MDEC_IDCT_W5 * row[3]);
-
-    if (row[4] | row[5] | row[6] | row[7]) {
-        a0 += (uint32_t)( MDEC_IDCT_W4 * row[4]) + (uint32_t)( MDEC_IDCT_W6 * row[6]);
-        a1 += (uint32_t)(-MDEC_IDCT_W4 * row[4]) + (uint32_t)(-MDEC_IDCT_W2 * row[6]);
-        a2 += (uint32_t)(-MDEC_IDCT_W4 * row[4]) + (uint32_t)( MDEC_IDCT_W2 * row[6]);
-        a3 += (uint32_t)( MDEC_IDCT_W4 * row[4]) + (uint32_t)(-MDEC_IDCT_W6 * row[6]);
-
-        b0 += (uint32_t)( MDEC_IDCT_W5 * row[5]) + (uint32_t)( MDEC_IDCT_W7 * row[7]);
-        b1 += (uint32_t)(-MDEC_IDCT_W1 * row[5]) + (uint32_t)(-MDEC_IDCT_W5 * row[7]);
-        b2 += (uint32_t)( MDEC_IDCT_W7 * row[5]) + (uint32_t)( MDEC_IDCT_W3 * row[7]);
-        b3 += (uint32_t)( MDEC_IDCT_W3 * row[5]) + (uint32_t)(-MDEC_IDCT_W1 * row[7]);
-    }
-
-    row[0] = (int16_t)((int)(a0 + b0) >> MDEC_IDCT_ROW_SHIFT);
-    row[7] = (int16_t)((int)(a0 - b0) >> MDEC_IDCT_ROW_SHIFT);
-    row[1] = (int16_t)((int)(a1 + b1) >> MDEC_IDCT_ROW_SHIFT);
-    row[6] = (int16_t)((int)(a1 - b1) >> MDEC_IDCT_ROW_SHIFT);
-    row[2] = (int16_t)((int)(a2 + b2) >> MDEC_IDCT_ROW_SHIFT);
-    row[5] = (int16_t)((int)(a2 - b2) >> MDEC_IDCT_ROW_SHIFT);
-    row[3] = (int16_t)((int)(a3 + b3) >> MDEC_IDCT_ROW_SHIFT);
-    row[4] = (int16_t)((int)(a3 - b3) >> MDEC_IDCT_ROW_SHIFT);
-}
-
-/* Column pass — operates on the 8 entries col[0], col[8], col[16], … col[56].
- * Writes int16_t back into the same column so the block is transformed
- * in-place. */
-static void idct_col_int16(int16_t *col) {
-    uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
-
-    a0 = (uint32_t)(MDEC_IDCT_W4 * col[0]) + (1u << (MDEC_IDCT_COL_SHIFT - 1));
-    a1 = a0; a2 = a0; a3 = a0;
-
-    a0 += (uint32_t)( MDEC_IDCT_W2 * col[16]);
-    a1 += (uint32_t)( MDEC_IDCT_W6 * col[16]);
-    a2 += (uint32_t)(-MDEC_IDCT_W6 * col[16]);
-    a3 += (uint32_t)(-MDEC_IDCT_W2 * col[16]);
-
-    b0 = (uint32_t)(MDEC_IDCT_W1 * col[8]);
-    b1 = (uint32_t)(MDEC_IDCT_W3 * col[8]);
-    b2 = (uint32_t)(MDEC_IDCT_W5 * col[8]);
-    b3 = (uint32_t)(MDEC_IDCT_W7 * col[8]);
-
-    b0 += (uint32_t)( MDEC_IDCT_W3 * col[24]);
-    b1 += (uint32_t)(-MDEC_IDCT_W7 * col[24]);
-    b2 += (uint32_t)(-MDEC_IDCT_W1 * col[24]);
-    b3 += (uint32_t)(-MDEC_IDCT_W5 * col[24]);
-
-    if (col[32]) {
-        a0 += (uint32_t)( MDEC_IDCT_W4 * col[32]);
-        a1 += (uint32_t)(-MDEC_IDCT_W4 * col[32]);
-        a2 += (uint32_t)(-MDEC_IDCT_W4 * col[32]);
-        a3 += (uint32_t)( MDEC_IDCT_W4 * col[32]);
-    }
-    if (col[40]) {
-        b0 += (uint32_t)( MDEC_IDCT_W5 * col[40]);
-        b1 += (uint32_t)(-MDEC_IDCT_W1 * col[40]);
-        b2 += (uint32_t)( MDEC_IDCT_W7 * col[40]);
-        b3 += (uint32_t)( MDEC_IDCT_W3 * col[40]);
-    }
-    if (col[48]) {
-        a0 += (uint32_t)( MDEC_IDCT_W6 * col[48]);
-        a1 += (uint32_t)(-MDEC_IDCT_W2 * col[48]);
-        a2 += (uint32_t)( MDEC_IDCT_W2 * col[48]);
-        a3 += (uint32_t)(-MDEC_IDCT_W6 * col[48]);
-    }
-    if (col[56]) {
-        b0 += (uint32_t)( MDEC_IDCT_W7 * col[56]);
-        b1 += (uint32_t)(-MDEC_IDCT_W5 * col[56]);
-        b2 += (uint32_t)( MDEC_IDCT_W3 * col[56]);
-        b3 += (uint32_t)(-MDEC_IDCT_W1 * col[56]);
-    }
-
-    col[0]  = (int16_t)((int)(a0 + b0) >> MDEC_IDCT_COL_SHIFT);
-    col[8]  = (int16_t)((int)(a1 + b1) >> MDEC_IDCT_COL_SHIFT);
-    col[16] = (int16_t)((int)(a2 + b2) >> MDEC_IDCT_COL_SHIFT);
-    col[24] = (int16_t)((int)(a3 + b3) >> MDEC_IDCT_COL_SHIFT);
-    col[32] = (int16_t)((int)(a3 - b3) >> MDEC_IDCT_COL_SHIFT);
-    col[40] = (int16_t)((int)(a2 - b2) >> MDEC_IDCT_COL_SHIFT);
-    col[48] = (int16_t)((int)(a1 - b1) >> MDEC_IDCT_COL_SHIFT);
-    col[56] = (int16_t)((int)(a0 - b0) >> MDEC_IDCT_COL_SHIFT);
-}
-
 static void idct_block(int16_t *block) {
-    for (int i = 0; i < 8; i++) idct_row_cond_dc(block + i * 8);
-    for (int i = 0; i < 8; i++) idct_col_int16(block + i);
+    int16_t tmp[64];
+    int16_t *src = block;
+    int16_t *dst = tmp;
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                int sum = 0;
+                for (int z = 0; z < 8; z++) {
+                    sum += (int)src[y + z * 8] * ((int)mdec.scale[x + z * 8] / 8);
+                }
+                dst[x + y * 8] = (int16_t)((sum + 0xFFF) / 0x2000);
+            }
+        }
+
+        int16_t *swap = src;
+        src = dst;
+        dst = swap;
+    }
 }
 
 static int decode_rle_block(int16_t *block, const uint8_t *quant,
