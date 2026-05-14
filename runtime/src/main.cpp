@@ -14,6 +14,7 @@
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
+#include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include <SDL.h>
 #include <cstdio>
@@ -205,6 +206,7 @@ static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();
     debug_server_poll();
@@ -213,6 +215,13 @@ static void sdl_vblank_present(void) {
 
     /* Check debug server input override. */
     int override = debug_server_get_input_override();
+#else
+    /* Production: skip debug server. Still need to advance frame counter
+     * locally so anything else that reads it continues to work. */
+    extern uint64_t s_frame_count;
+    s_frame_count++;
+    int override = -1;
+#endif
 
     /* Pump SDL events to prevent window freeze. */
     SDL_Event ev;
@@ -388,7 +397,12 @@ int main(int argc, char** argv) {
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
+#ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
+    freeze_heartbeat_start("psx-runtime");
+#else
+    (void)debug_port;
+#endif
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");

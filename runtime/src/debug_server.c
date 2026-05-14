@@ -335,6 +335,10 @@ static uint64_t s_probe_trace_seq = 0;
 
 void debug_server_log_probe(uint32_t pc, CPUState *cpu)
 {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)pc; (void)cpu;
+    return;
+#else
     if (!cpu) return;
     ProbeTraceEntry *e = &s_probe_trace[s_probe_trace_seq % PROBE_TRACE_CAP];
     e->seq          = s_probe_trace_seq++;
@@ -356,10 +360,15 @@ void debug_server_log_probe(uint32_t pc, CPUState *cpu)
     e->imask        = i_mask;
     e->frame        = (uint32_t)s_frame_count;
     e->in_exception = (uint8_t)psx_get_in_exception();
+#endif /* PSX_NO_DEBUG_TOOLS */
 }
 
 void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val)
 {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)kind; (void)target_pc; (void)jmp_val;
+    return;
+#endif
     RestoreTraceEntry *e =
         &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
     CPUState *cpu = s_cpu;
@@ -414,6 +423,10 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t target_tcb,
                                    uint32_t target_pc)
 {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)kind; (void)cpu; (void)current_tcb; (void)target_tcb; (void)target_pc;
+    return;
+#endif
     if (!cpu) return;
     ThreadTraceEntry *e =
         &s_thread_trace[s_thread_trace_seq % THREAD_TRACE_CAP];
@@ -492,6 +505,10 @@ static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
 }
 
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)addr; (void)value; (void)width;
+    return;
+#endif
     SioPcTraceEntry *e = &s_sio_pc_trace[s_sio_pc_trace_seq % SIO_PC_TRACE_CAP];
     uint32_t byte_seq = sio_get_seq();
     e->seq      = s_sio_pc_trace_seq++;
@@ -1089,6 +1106,13 @@ static int is_chain_epilogue(uint32_t phys) {
  * stack is owned by function_trace_record and is only meaningful for
  * indirect dispatches; direct calls return through the native C stack. */
 void debug_server_log_call_entry(uint32_t func_addr) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    /* Hottest call site in the binary — called at the top of every
+     * recompiled function. Early-return makes it a 1-instruction
+     * function-call cost; the compiler will likely PLT it through. */
+    (void)func_addr;
+    return;
+#endif
     if (!debug_cpu_ptr) return;
     card_mgr_trace_record(func_addr, 0);
     if (!s_fn_entry) return;
@@ -1109,6 +1133,10 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 }
 
 void debug_server_trace_dispatch(uint32_t func_addr) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)func_addr;
+    return;
+#endif
     card_mgr_trace_record(func_addr, 1);
 
     /* Function entry/exit rings (always-on, hooked here so every dispatch
@@ -4345,6 +4373,10 @@ static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uin
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                     uint32_t new_val, uint8_t width)
 {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)phys; (void)old_val; (void)new_val; (void)width;
+    return;
+#endif
     if (s_wtrace_range_count == 0) return;
     for (int i = 0; i < s_wtrace_range_count; i++) {
         if (phys >= s_wtrace_ranges[i].lo && phys < s_wtrace_ranges[i].hi) {
@@ -4357,6 +4389,10 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
 /* MMIO write trace — called from memory.c mmio_write32/16/8. */
 void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
 {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)addr; (void)val; (void)width;
+    return;
+#endif
     if (!s_mmio_trace) return;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;

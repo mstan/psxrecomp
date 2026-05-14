@@ -8,6 +8,14 @@ if(NOT DEFINED PSXRECOMP_V4_ROOT)
     get_filename_component(PSXRECOMP_V4_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+# Production build flag: -DPSX_DEBUG_TOOLS=OFF disables the TCP debug
+# server, the freeze heartbeat thread, and the hot-path log functions
+# (call_entry / sio_write / probe / restore_event / thread_event) that
+# the recompiled C invokes on every block. Use to test whether the
+# debug infrastructure itself contributes to freezes, or to ship a
+# lean production binary. Visible to all targets including psx-beetle.
+option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
+
 if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     if(MSVC)
         file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_V4_ROOT}/../sdl2-msvc/SDL2-*")
@@ -48,6 +56,7 @@ set(PSXRECOMP_V4_RUNTIME_SOURCES
     ${PSXRECOMP_V4_ROOT}/runtime/src/fntrace.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/traps.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/crash_trace.c
+    ${PSXRECOMP_V4_ROOT}/runtime/src/freeze_heartbeat.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/gte.cpp
     ${PSXRECOMP_V4_ROOT}/runtime/src/crc32.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/cdrom.c
@@ -147,6 +156,12 @@ function(psxrecomp_v4_add_runtime_target target)
     endif()
     if(has_game_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_GAME_DISPATCH=1)
+    endif()
+
+    # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's
+    # also visible to psx-beetle / non-runtime-helper targets.
+    if(NOT PSX_DEBUG_TOOLS)
+        target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
     endif()
 
     if(WIN32 OR MINGW)

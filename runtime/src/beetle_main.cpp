@@ -109,10 +109,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 #ifdef DEFAULT_DEBUG_PORT
     beetle_debug_server_init(DEFAULT_DEBUG_PORT);
 #else
     beetle_debug_server_init(4380);
+#endif
 #endif
 
     static uint32_t pixels[640 * 512];
@@ -121,7 +123,9 @@ int main(int argc, char** argv) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
+#ifndef PSX_NO_DEBUG_TOOLS
                 beetle_debug_server_shutdown();
+#endif
                 beetle_shutdown();
                 SDL_DestroyTexture(tex);
                 SDL_DestroyRenderer(ren);
@@ -131,9 +135,12 @@ int main(int argc, char** argv) {
             }
         }
 
+#ifndef PSX_NO_DEBUG_TOOLS
         beetle_debug_server_poll();
-
         int override = beetle_debug_server_get_input_override();
+#else
+        int override = -1;
+#endif
         uint16_t pad = (override >= 0) ? (uint16_t)override : pad_from_keyboard();
 
         beetle_run_frame(pad);

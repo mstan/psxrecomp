@@ -91,6 +91,9 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         PSX_BEETLE_BUILD=1
         DEFAULT_DEBUG_PORT=4380
     )
+    if(NOT PSX_DEBUG_TOOLS)
+        target_compile_definitions(psx-beetle PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
 
     target_link_libraries(psx-beetle PRIVATE
         "${BEETLE_LIB}"
