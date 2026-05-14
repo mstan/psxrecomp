@@ -89,8 +89,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
-    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    /* Software renderer only — see main.cpp note. GPU-driver-side hangs in
+     * SDL_RenderPresent reproducibly wedge the SDL main thread mid-frame. */
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!ren) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;

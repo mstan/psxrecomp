@@ -421,11 +421,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
-    if (!sdl_renderer) {
-        /* Fall back to software renderer. */
-        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_SOFTWARE);
-    }
+    /* Software renderer only: the accelerated path lets SDL_RenderPresent
+     * block inside the GPU driver, which has reproducibly hung the main
+     * thread mid-frame after extended uptime (TombaRecomp/ISSUES.md #6).
+     * Software costs a few % more CPU but cannot stall in the GPU stack. */
+    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_SOFTWARE);
     if (!sdl_renderer) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;
