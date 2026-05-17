@@ -2060,6 +2060,59 @@ static size_t append_thread_entry(char *buf, size_t pos, size_t cap,
     return pos;
 }
 
+/* Thread context save/restore ring — declared in traps.c. */
+typedef struct ThreadCtxRingEntry {
+    uint32_t seq;
+    uint32_t frame;
+    uint8_t  op;
+    uint8_t  pad0[3];
+    uint32_t tcb;
+    uint32_t resume_pc;
+    uint32_t gpr_29;
+    uint32_t gpr_31;
+    uint32_t cop0_sr;
+    uint32_t cop0_epc;
+} ThreadCtxRingEntry;
+#define THREAD_CTX_RING_CAP_DS 256u
+extern ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP_DS];
+extern uint64_t           g_thread_ctx_ring_seq;
+
+static void handle_thread_ctx_ring(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 64);
+    if (count < 0) count = 0;
+    if (count > (int)THREAD_CTX_RING_CAP_DS) count = THREAD_CTX_RING_CAP_DS;
+
+    uint64_t total = g_thread_ctx_ring_seq;
+    uint64_t avail = (total < THREAD_CTX_RING_CAP_DS) ? total : THREAD_CTX_RING_CAP_DS;
+    if ((uint64_t)count > avail) count = (int)avail;
+    uint64_t start = total - (uint64_t)count;
+
+    const size_t BUF_SZ = 256u + (size_t)count * 240u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail);
+    int emitted = 0;
+    for (uint64_t s = start; s < total && emitted < count; s++) {
+        const ThreadCtxRingEntry *e = &g_thread_ctx_ring[s & (THREAD_CTX_RING_CAP_DS - 1u)];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%u,\"frame\":%u,\"op\":\"%s\",\"tcb\":\"0x%08X\","
+                        "\"resume_pc\":\"0x%08X\",\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                        "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\"}",
+                        emitted == 0 ? "" : ",",
+                        e->seq, e->frame,
+                        e->op == 0 ? "save" : "restore",
+                        e->tcb, e->resume_pc, e->gpr_29, e->gpr_31, e->cop0_sr, e->cop0_epc);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_thread_trace(int id, const char *json)
 {
     int count = json_get_int(json, "count", 200);
@@ -5683,6 +5736,7 @@ static const CmdEntry s_commands[] = {
     { "restore_trace_clear", handle_restore_trace_clear },
     { "thread_trace",      handle_thread_trace },
     { "thread_trace_clear", handle_thread_trace_clear },
+    { "thread_ctx_ring",   handle_thread_ctx_ring },
     { "probe_trace",       handle_probe_trace },
     { "probe_clear",       handle_probe_clear },
     { "dirty_ram_stats",   handle_dirty_ram_stats },

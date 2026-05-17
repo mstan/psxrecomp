@@ -1301,12 +1301,14 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         r.supported = true;
         if (offset == 0) {
             r.c_code = fmt::format(
+                "g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word(cpu->gpr[{}], cpu->gte_data[{}]);",
-                static_cast<int>(rs), static_cast<int>(rt));
+                d.address, static_cast<int>(rs), static_cast<int>(rt));
         } else {
             r.c_code = fmt::format(
+                "g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), cpu->gte_data[{}]);",
-                static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
+                d.address, static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
         }
         r.comment = fmt::format("swc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));

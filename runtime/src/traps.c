@@ -56,6 +56,48 @@ static void psx_set_current_tcb(CPUState* cpu, uint32_t tcb)
     if (tcbh) cpu->write_word(tcbh, tcb);
 }
 
+/* Save/restore PC ring — diagnoses thread-resume drift.
+ *
+ * Each thread switch logs the (op, tcb, pc, sp, ra) tuple at save and
+ * restore. Read back via debug_server "thread_ctx_ring" to see whether
+ * a thread's saved resume_pc matches the one we later restore. If a
+ * save/restore pair for the same TCB shows different resume_pc with no
+ * intervening progress, the recompiled code never advanced and we have
+ * a thread-state corruption signal. */
+typedef struct ThreadCtxRingEntry {
+    uint32_t seq;
+    uint32_t frame;
+    uint8_t  op;       /* 0=save 1=restore */
+    uint8_t  pad0[3];
+    uint32_t tcb;
+    uint32_t resume_pc;/* save: passed-in resume_pc; restore: read from TCB+128 */
+    uint32_t gpr_29;   /* sp */
+    uint32_t gpr_31;   /* ra */
+    uint32_t cop0_sr;
+    uint32_t cop0_epc;
+} ThreadCtxRingEntry;
+#define THREAD_CTX_RING_CAP 256u
+ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
+uint64_t g_thread_ctx_ring_seq = 0;
+
+extern uint64_t s_frame_count;
+
+static void thread_ctx_ring_log(CPUState* cpu, uint32_t tcb,
+                                uint32_t resume_pc, uint8_t op)
+{
+    ThreadCtxRingEntry* e = &g_thread_ctx_ring[g_thread_ctx_ring_seq & (THREAD_CTX_RING_CAP - 1u)];
+    e->seq        = (uint32_t)g_thread_ctx_ring_seq;
+    e->frame      = (uint32_t)s_frame_count;
+    e->op         = op;
+    e->tcb        = tcb;
+    e->resume_pc  = resume_pc;
+    e->gpr_29     = cpu->gpr[29];
+    e->gpr_31     = cpu->gpr[31];
+    e->cop0_sr    = cpu->cop0[12];
+    e->cop0_epc   = cpu->cop0[14];
+    g_thread_ctx_ring_seq++;
+}
+
 static void psx_save_context_to_tcb(CPUState* cpu, uint32_t tcb, uint32_t resume_pc)
 {
     uint32_t save = tcb + 8u;
@@ -69,6 +111,7 @@ static void psx_save_context_to_tcb(CPUState* cpu, uint32_t tcb, uint32_t resume
     cpu->write_word(save + 136u, cpu->lo);
     cpu->write_word(save + 140u, (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2));
     cpu->write_word(save + 144u, cpu->cop0[13]);
+    thread_ctx_ring_log(cpu, tcb, resume_pc, 0);
     debug_server_log_thread_event(1, cpu, tcb, tcb, resume_pc);
 }
 
@@ -87,6 +130,7 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
     }
     cpu->cop0[13] = cpu->read_word(save + 144u);
     cpu->gpr[26] = cpu->read_word(save + 128u);
+    thread_ctx_ring_log(cpu, tcb, cpu->gpr[26], 1);
     debug_server_log_thread_event(2, cpu, psx_current_tcb_ptr(cpu), tcb, cpu->gpr[26]);
     return cpu->gpr[26];
 }

@@ -22,6 +22,16 @@
 #include "mednafen/psx/gpu.h"
 #include "mednafen/psx/spu.h"
 #include "mednafen/psx/frontio.h"
+#include "mednafen/psx/irq.h"
+#include "beetle_history.h"
+
+/* GPU global lives in PS_GPU's translation unit; psx.h doesn't extern it.
+ * Declared here for the per-frame display-state snapshot. NOTE: GPU is
+ * a struct VALUE in gpu.cpp (`PS_GPU GPU;`), not a pointer, despite the
+ * `extern PS_GPU *GPU;` declaration in beetle-psx/mednafen/psx/debug.cpp.
+ * That debug.cpp declaration is buggy and would crash if its file were
+ * actually compiled — we get the value-type declaration right here. */
+extern PS_GPU GPU;
 
 namespace {
 
@@ -46,13 +56,60 @@ static void sio_trace_callback(uint8_t tx, uint8_t rx, uint16_t ctrl) {
     s_sio_trace_idx = (s_sio_trace_idx + 1) % BEETLE_SIO_TRACE_CAP;
 }
 
-/* ---- wtrace ring (filtered by armed physical-RAM ranges) ---- */
+/* ---- wtrace_all ring (ALWAYS-ON; no filter; captures every write) ----
+ * Per global rule "ring buffers always-on": every write hits this ring
+ * unconditionally so probes connected late can still query the last ~1s
+ * of activity without needing to have armed a range pre-event.
+ *
+ * Sizing trade-off: 256K * 32B = 8 MB.  At ~250k writes/s idle / ~2M
+ * writes/s under heavy emulation, retention window is ~1s under load
+ * and ~1s idle.  If the user needs longer retention of specific cells
+ * they should arm the focused wtrace ring (large capacity, narrow
+ * filter, longer wrap).  The two rings are complementary, NOT
+ * redundant — focused gives rich register window + long retention for
+ * armed cells; all gives lean coverage of EVERY write for last second. */
+#define BEETLE_WTRACE_ALL_CAP 262144
+struct BeetleWtraceAllEntry {
+    uint64_t seq;
+    uint32_t addr;
+    uint32_t new_val;
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t frame;
+    uint8_t  w;
+    uint8_t  pad[3];
+};
+static BeetleWtraceAllEntry s_wtrace_all[BEETLE_WTRACE_ALL_CAP];
+static uint32_t s_wtrace_all_idx = 0;
+static uint64_t s_wtrace_all_seq = 0;
+
+/* ---- wtrace ring (filtered by armed physical-RAM ranges) ----
+ * Parity contract with runtime's WriteTraceEntry: same field names and
+ * widths on the wire, captured by reading PSX_CPU GPRs at callback time.
+ *
+ * Gaps relative to runtime (documented, never zero-faked):
+ *   - old_val: callback fires AFTER the write so the pre-write value is
+ *     already gone. Field omitted from beetle output. Wire it later by
+ *     extending psxrecomp_wtrace_cb_t to receive the old value.
+ *   - func_addr: beetle has no per-function dispatch gate; field omitted.
+ *   - cpu_pc vs pc: identical on beetle (single in-order interpreter), so
+ *     cpu_pc is reported equal to pc rather than duplicated. */
 #define BEETLE_WTRACE_CAP        65536
 #define BEETLE_WTRACE_MAX_RANGES 16
 struct BeetleWtraceEntry {
     uint64_t seq;
-    uint32_t addr, value, pc, ra, frame;
-    uint8_t  slot_idx, size, pad[2];
+    uint32_t addr;
+    uint32_t value;     /* "new" on the wire */
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0, v1;
+    uint32_t a0, a1, a2, a3;
+    uint32_t t0, t1;
+    uint32_t frame;
+    uint8_t  slot_idx;  /* beetle-only: current memcard slot byte */
+    uint8_t  size;      /* "w" on the wire */
+    uint8_t  pad[2];
 };
 static BeetleWtraceEntry s_wtrace[BEETLE_WTRACE_CAP];
 static uint32_t s_wtrace_idx = 0;
@@ -63,6 +120,21 @@ static int s_wtrace_range_count = 0;
 static void wtrace_callback(uint32_t addr, uint32_t value,
                             uint32_t pc, uint32_t ra, uint8_t size)
 {
+    /* ALWAYS-ON catch-all ring: lean fields, no filter, fires before the
+     * focused-range filter so a connected probe can read recent writes
+     * regardless of what's armed. */
+    {
+        BeetleWtraceAllEntry *a = &s_wtrace_all[s_wtrace_all_idx];
+        a->seq     = s_wtrace_all_seq++;
+        a->addr    = addr;
+        a->new_val = value;
+        a->pc      = pc;
+        a->ra      = ra;
+        a->frame   = s_frame_count;
+        a->w       = size;
+        s_wtrace_all_idx = (s_wtrace_all_idx + 1) % BEETLE_WTRACE_ALL_CAP;
+    }
+
     if (s_wtrace_range_count == 0) return;
     uint32_t phys = addr & 0x1FFFFFFFu;
     int hit = 0;
@@ -86,6 +158,25 @@ static void wtrace_callback(uint32_t addr, uint32_t value,
     e->frame    = s_frame_count;
     e->slot_idx = slot;
     e->size     = size;
+
+    /* Rich register window — read live from PSX_CPU. Parity with runtime's
+     * WriteTraceEntry. Only paid on filter hits so volume stays bounded. */
+    if (PSX_CPU) {
+        char dummy[8] = {0};
+        e->sp = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 29, dummy, sizeof(dummy));
+        e->v0 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  2, dummy, sizeof(dummy));
+        e->v1 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  3, dummy, sizeof(dummy));
+        e->a0 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  4, dummy, sizeof(dummy));
+        e->a1 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  5, dummy, sizeof(dummy));
+        e->a2 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  6, dummy, sizeof(dummy));
+        e->a3 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  7, dummy, sizeof(dummy));
+        e->t0 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  8, dummy, sizeof(dummy));
+        e->t1 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR +  9, dummy, sizeof(dummy));
+    } else {
+        e->sp = e->v0 = e->v1 = 0;
+        e->a0 = e->a1 = e->a2 = e->a3 = 0;
+        e->t0 = e->t1 = 0;
+    }
     s_wtrace_idx = (s_wtrace_idx + 1) % BEETLE_WTRACE_CAP;
 }
 
@@ -251,6 +342,10 @@ extern "C" int beetle_init(const char *bios_path) {
 extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_path) {
     if (s_loaded) return 0;
 
+    /* Allocate the per-frame history ring once. Mirrors runtime's
+     * frame_history allocation in debug_server_init(). */
+    beetle_history_init();
+
     /* Set system directory to the directory containing the BIOS. */
     strncpy(s_system_dir, bios_path, sizeof(s_system_dir) - 1);
     char *last_sep = strrchr(s_system_dir, '/');
@@ -351,6 +446,7 @@ extern "C" void beetle_run_frame(uint16_t pad1_buttons) {
     s_joypad = pad1_buttons;
     s_frame_count++;
     retro_run();
+    beetle_history_record_frame();
 }
 
 extern "C" int beetle_get_framebuffer(uint32_t **out_pixels,
@@ -461,7 +557,17 @@ extern "C" int beetle_wtrace_arm(uint32_t lo, uint32_t hi) {
     return slot;
 }
 extern "C" void beetle_wtrace_disarm_all(void) { s_wtrace_range_count = 0; }
+extern "C" int  beetle_wtrace_disarm(int slot) {
+    if (slot < 0 || slot >= s_wtrace_range_count) return -1;
+    /* Compact remaining slots down — matches runtime's wtrace_del semantics. */
+    for (int i = slot; i < s_wtrace_range_count - 1; i++)
+        s_wtrace_ranges[i] = s_wtrace_ranges[i + 1];
+    s_wtrace_range_count--;
+    return 0;
+}
 extern "C" int  beetle_wtrace_range_count(void)  { return s_wtrace_range_count; }
+extern "C" int  beetle_wtrace_max_ranges(void)   { return BEETLE_WTRACE_MAX_RANGES; }
+extern "C" int  beetle_wtrace_capacity(void)     { return BEETLE_WTRACE_CAP; }
 extern "C" int  beetle_wtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi) {
     if (slot < 0 || slot >= s_wtrace_range_count) return -1;
     *out_lo = s_wtrace_ranges[slot].lo;
@@ -474,11 +580,49 @@ extern "C" void beetle_wtrace_reset(void) {
 }
 extern "C" uint64_t beetle_wtrace_total(void) { return s_wtrace_seq; }
 
-extern "C" uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
-                                      uint32_t *out_value, uint32_t *out_pc,
-                                      uint32_t *out_ra, uint32_t *out_frame,
-                                      uint8_t *out_slot, uint8_t *out_size,
-                                      int max_count)
+/* ---- wtrace_all (always-on, no-filter) accessors ---- */
+extern "C" uint64_t beetle_wtrace_all_total(void) { return s_wtrace_all_seq; }
+extern "C" int      beetle_wtrace_all_capacity(void) { return BEETLE_WTRACE_ALL_CAP; }
+extern "C" void     beetle_wtrace_all_reset(void) {
+    s_wtrace_all_idx = 0; s_wtrace_all_seq = 0;
+    memset(s_wtrace_all, 0, sizeof(s_wtrace_all));
+}
+extern "C" uint32_t beetle_wtrace_all_get(uint64_t *out_seq, uint32_t *out_addr,
+                                          uint32_t *out_new, uint32_t *out_pc,
+                                          uint32_t *out_ra, uint32_t *out_frame,
+                                          uint8_t *out_w, int max_count)
+{
+    int avail = (int)(s_wtrace_all_seq < (uint64_t)BEETLE_WTRACE_ALL_CAP
+                      ? s_wtrace_all_seq : BEETLE_WTRACE_ALL_CAP);
+    int count = max_count < avail ? max_count : avail;
+    int start = ((int)s_wtrace_all_idx - count + BEETLE_WTRACE_ALL_CAP) % BEETLE_WTRACE_ALL_CAP;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % BEETLE_WTRACE_ALL_CAP;
+        const BeetleWtraceAllEntry *e = &s_wtrace_all[idx];
+        out_seq[i]   = e->seq;
+        out_addr[i]  = e->addr;
+        out_new[i]   = e->new_val;
+        out_pc[i]    = e->pc;
+        out_ra[i]    = e->ra;
+        out_frame[i] = e->frame;
+        out_w[i]     = e->w;
+    }
+    return (uint32_t)count;
+}
+
+/* Rich-window accessor. Out-params mirror the runtime's WriteTraceEntry
+ * fields, with the documented gaps (old_val, func_addr) absent. */
+extern "C" uint32_t beetle_wtrace_get_rich(uint64_t *out_seq, uint32_t *out_addr,
+                                           uint32_t *out_value, uint32_t *out_pc,
+                                           uint32_t *out_ra,
+                                           uint32_t *out_sp,
+                                           uint32_t *out_v0, uint32_t *out_v1,
+                                           uint32_t *out_a0, uint32_t *out_a1,
+                                           uint32_t *out_a2, uint32_t *out_a3,
+                                           uint32_t *out_t0, uint32_t *out_t1,
+                                           uint32_t *out_frame,
+                                           uint8_t *out_slot, uint8_t *out_size,
+                                           int max_count)
 {
     int avail = (int)(s_wtrace_seq < (uint64_t)BEETLE_WTRACE_CAP
                       ? s_wtrace_seq : BEETLE_WTRACE_CAP);
@@ -492,12 +636,18 @@ extern "C" uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
         out_value[i] = e->value;
         out_pc[i]    = e->pc;
         out_ra[i]    = e->ra;
+        out_sp[i]    = e->sp;
+        out_v0[i]    = e->v0;  out_v1[i] = e->v1;
+        out_a0[i]    = e->a0;  out_a1[i] = e->a1;
+        out_a2[i]    = e->a2;  out_a3[i] = e->a3;
+        out_t0[i]    = e->t0;  out_t1[i] = e->t1;
         out_frame[i] = e->frame;
         out_slot[i]  = e->slot_idx;
         out_size[i]  = e->size;
     }
     return (uint32_t)count;
 }
+
 
 /* ---- fntrace accessors ---- */
 extern "C" int beetle_fntrace_arm(uint32_t target_pc) {
@@ -684,4 +834,151 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
         out_kind[i]   = e->kind;
     }
     return (uint32_t)count;
+}
+
+/* ====================================================================== */
+/* ====================  PER-FRAME HISTORY RING  ======================== */
+/* ====================================================================== */
+/* Mirrors runtime/src/debug_server.c's s_frame_history. Same capacity,
+ * same recording cadence (post-frame), same snapshot model
+ * (4 configurable regions × 128 bytes per frame).
+ *
+ * Why duplicate the runtime's mechanism instead of sharing code: psx-beetle
+ * has no recompiler CPUState; it reads MIPS state via PSX_CPU::GetRegister
+ * and RAM via the MainRAM byte array. The runtime's recorder reads s_cpu
+ * (recomp CPUState) and psx_read_byte. Different sources, same wire shape. */
+
+static BeetleFrameRecord *s_beetle_history = nullptr;
+static uint64_t           s_beetle_history_count = 0;
+static uint32_t           s_beetle_snap_addrs[BEETLE_RAM_SNAPSHOT_REGIONS];
+static int                s_beetle_snap_active[BEETLE_RAM_SNAPSHOT_REGIONS];
+
+extern "C" void beetle_history_init(void) {
+    if (s_beetle_history) return;
+    s_beetle_history = (BeetleFrameRecord *)std::calloc(
+        BEETLE_FRAME_HISTORY_CAP, sizeof(BeetleFrameRecord));
+    s_beetle_history_count = 0;
+    std::memset(s_beetle_snap_addrs,  0, sizeof(s_beetle_snap_addrs));
+    std::memset(s_beetle_snap_active, 0, sizeof(s_beetle_snap_active));
+    if (!s_beetle_history) {
+        std::fprintf(stderr,
+            "[psx-beetle] WARNING: failed to allocate %u-frame history ring\n",
+            (unsigned)BEETLE_FRAME_HISTORY_CAP);
+    }
+}
+
+extern "C" void beetle_history_record_frame(void) {
+    if (!s_beetle_history || !PSX_CPU) return;
+
+    uint32_t idx = (uint32_t)(s_frame_count % BEETLE_FRAME_HISTORY_CAP);
+    BeetleFrameRecord *r = &s_beetle_history[idx];
+
+    r->frame_number = s_frame_count;
+    r->verify_pass  = -1;     /* no cross-check verify mode on beetle */
+    r->diff_count   = 0;
+
+    /* MIPS CPU state via PS_CPU::GetRegister. The `special` buffer is
+     * unused by the GPR/HI/LO/COP0-SR/CAUSE/EPC paths in cpu.cpp, but
+     * we pass a real backing array so future register kinds that DO
+     * print into it can't smash the stack. */
+    char dummy[64] = {0};
+    for (int i = 0; i < 32; i++) {
+        r->gpr[i] = PSX_CPU->GetRegister(
+            (unsigned)(PS_CPU::GSREG_GPR + i), dummy, sizeof(dummy));
+    }
+    r->hi = PSX_CPU->GetRegister(PS_CPU::GSREG_HI, dummy, sizeof(dummy));
+    r->lo = PSX_CPU->GetRegister(PS_CPU::GSREG_LO, dummy, sizeof(dummy));
+    r->cop0_sr    = PSX_CPU->GetRegister(PS_CPU::GSREG_SR,    dummy, sizeof(dummy));
+    r->cop0_cause = PSX_CPU->GetRegister(PS_CPU::GSREG_CAUSE, dummy, sizeof(dummy));
+    r->cop0_epc   = PSX_CPU->GetRegister(PS_CPU::GSREG_EPC,   dummy, sizeof(dummy));
+
+    /* Interrupt controller. */
+    r->i_stat = IRQ_GetRegister(IRQ_GSREG_STATUS, dummy, sizeof(dummy));
+    r->i_mask = IRQ_GetRegister(IRQ_GSREG_MASK,   dummy, sizeof(dummy));
+
+    /* GPU display state.  PS_GPU's fields are public.  We snapshot the
+     * raw register-level XStart/YStart for origin; framebuffer width/height
+     * already mirrored by on_video_refresh into s_fb_*. */
+    r->display_area_x   = (uint16_t)GPU.DisplayFB_XStart;
+    r->display_area_y   = (uint16_t)GPU.DisplayFB_YStart;
+    r->display_w        = (uint16_t)s_fb_width;
+    r->display_h        = (uint16_t)s_fb_height;
+    r->display_disabled = GPU.DisplayOff ? 1 : 0;
+
+    /* SIO / pad.  pad_buttons follows runtime convention (active-low
+     * 16-bit mask).  sio_stat/sio_ctrl left zero; beetle's libretro
+     * surface doesn't expose them and inventing values would obscure
+     * real divergences in the time-series. */
+    r->pad_buttons = s_joypad;
+    r->sio_stat = 0;
+    r->sio_ctrl = 0;
+
+    /* Timing: beetle has no dispatch table to count gates.  Leave zero
+     * dispatch_count; total_dispatches = frame# so the field is
+     * monotonic and frame_timeseries can still graph it. */
+    r->dispatch_count   = 0;
+    r->total_dispatches = s_frame_count;
+
+    /* Per-frame configurable RAM snapshot regions. */
+    for (int i = 0; i < BEETLE_RAM_SNAPSHOT_REGIONS; i++) {
+        r->snapshot_addr[i] = s_beetle_snap_addrs[i];
+        if (s_beetle_snap_active[i] && s_beetle_snap_addrs[i] != 0 && MainRAM) {
+            uint32_t base = s_beetle_snap_addrs[i] & 0x1FFFFFu;
+            for (int j = 0; j < BEETLE_RAM_SNAPSHOT_SIZE; j++) {
+                uint32_t off = (base + (uint32_t)j) & 0x1FFFFFu;
+                r->snapshot_data[i][j] = MainRAM->data8[off];
+            }
+        } else {
+            std::memset(r->snapshot_data[i], 0, BEETLE_RAM_SNAPSHOT_SIZE);
+        }
+    }
+
+    s_beetle_history_count = (uint64_t)s_frame_count + 1;
+}
+
+extern "C" void beetle_history_get_bounds(uint64_t *out_count,
+                                          uint64_t *out_oldest,
+                                          uint64_t *out_newest)
+{
+    uint64_t cnt = s_beetle_history_count;
+    uint64_t oldest = (cnt > BEETLE_FRAME_HISTORY_CAP)
+                     ? cnt - BEETLE_FRAME_HISTORY_CAP : 0;
+    uint64_t newest = (cnt > 0) ? cnt - 1 : 0;
+    if (out_count)  *out_count  = cnt;
+    if (out_oldest) *out_oldest = oldest;
+    if (out_newest) *out_newest = newest;
+}
+
+extern "C" const BeetleFrameRecord *beetle_history_get_frame(uint32_t frame) {
+    if (!s_beetle_history) return nullptr;
+    uint64_t cnt = s_beetle_history_count;
+    uint64_t oldest = (cnt > BEETLE_FRAME_HISTORY_CAP)
+                     ? cnt - BEETLE_FRAME_HISTORY_CAP : 0;
+    if ((uint64_t)frame < oldest || (uint64_t)frame >= cnt) return nullptr;
+
+    uint32_t idx = frame % BEETLE_FRAME_HISTORY_CAP;
+    const BeetleFrameRecord *r = &s_beetle_history[idx];
+    if (r->frame_number != frame) return nullptr;  /* slot reused since */
+    return r;
+}
+
+extern "C" int beetle_history_first_failure(uint32_t *out_frame, int *out_diff_count) {
+    /* No verify-mode on beetle yet; mirrors runtime's "no failures" path. */
+    if (out_frame)      *out_frame      = (uint32_t)-1;
+    if (out_diff_count) *out_diff_count = 0;
+    return 0;
+}
+
+extern "C" int beetle_history_set_snapshot(int slot, uint32_t addr) {
+    if (slot < 0 || slot >= BEETLE_RAM_SNAPSHOT_REGIONS) return 0;
+    s_beetle_snap_addrs[slot]  = addr;
+    s_beetle_snap_active[slot] = (addr != 0) ? 1 : 0;
+    return 1;
+}
+
+extern "C" int beetle_history_get_snapshot(int slot, uint32_t *out_addr, int *out_active) {
+    if (slot < 0 || slot >= BEETLE_RAM_SNAPSHOT_REGIONS) return 0;
+    if (out_addr)   *out_addr   = s_beetle_snap_addrs[slot];
+    if (out_active) *out_active = s_beetle_snap_active[slot];
+    return 1;
 }

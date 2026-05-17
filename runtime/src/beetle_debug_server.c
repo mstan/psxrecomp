@@ -55,16 +55,34 @@ extern void     beetle_reset_sio_trace(void);
 
 /* wtrace */
 extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
+extern int      beetle_wtrace_disarm(int slot);
 extern void     beetle_wtrace_disarm_all(void);
 extern int      beetle_wtrace_range_count(void);
+extern int      beetle_wtrace_max_ranges(void);
+extern int      beetle_wtrace_capacity(void);
 extern int      beetle_wtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi);
 extern void     beetle_wtrace_reset(void);
 extern uint64_t beetle_wtrace_total(void);
-extern uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
-                                   uint32_t *out_value, uint32_t *out_pc,
-                                   uint32_t *out_ra, uint32_t *out_frame,
-                                   uint8_t *out_slot, uint8_t *out_size,
-                                   int max_count);
+extern uint32_t beetle_wtrace_get_rich(uint64_t *out_seq, uint32_t *out_addr,
+                                        uint32_t *out_value, uint32_t *out_pc,
+                                        uint32_t *out_ra,
+                                        uint32_t *out_sp,
+                                        uint32_t *out_v0, uint32_t *out_v1,
+                                        uint32_t *out_a0, uint32_t *out_a1,
+                                        uint32_t *out_a2, uint32_t *out_a3,
+                                        uint32_t *out_t0, uint32_t *out_t1,
+                                        uint32_t *out_frame,
+                                        uint8_t *out_slot, uint8_t *out_size,
+                                        int max_count);
+
+/* wtrace_all (always-on, no-filter, lean fields) */
+extern uint64_t beetle_wtrace_all_total(void);
+extern int      beetle_wtrace_all_capacity(void);
+extern void     beetle_wtrace_all_reset(void);
+extern uint32_t beetle_wtrace_all_get(uint64_t *out_seq, uint32_t *out_addr,
+                                       uint32_t *out_new, uint32_t *out_pc,
+                                       uint32_t *out_ra, uint32_t *out_frame,
+                                       uint8_t *out_w, int max_count);
 
 /* SPU event ring (always-on, mirrors recomp's spu_events). */
 extern uint64_t beetle_spu_event_total(void);
@@ -89,6 +107,16 @@ extern int beetle_spu_get_global_state(
     uint16_t *main_vol_l,      uint16_t *main_vol_r,
     uint32_t *fm_mode, uint32_t *noise_mode, uint32_t *reverb_mode,
     uint32_t *voice_on, uint32_t *voice_off, uint32_t *block_end);
+
+/* Per-frame history ring (parity with runtime's frame_history). */
+#include "beetle_history.h"
+extern void beetle_history_get_bounds(uint64_t *out_count,
+                                       uint64_t *out_oldest,
+                                       uint64_t *out_newest);
+extern const BeetleFrameRecord *beetle_history_get_frame(uint32_t frame);
+extern int  beetle_history_first_failure(uint32_t *out_frame, int *out_diff_count);
+extern int  beetle_history_set_snapshot(int slot, uint32_t addr);
+extern int  beetle_history_get_snapshot(int slot, uint32_t *out_addr, int *out_active);
 
 /* fntrace */
 extern int      beetle_fntrace_arm(uint32_t target_pc);
@@ -407,8 +435,12 @@ static void h_wtrace_arm(int id, const char *json) {
         !json_get_str(json, "hi", hi_s, sizeof(hi_s))) {
         send_err(id, "need lo,hi"); return;
     }
-    uint32_t lo = hex_to_u32(lo_s);
-    uint32_t hi = hex_to_u32(hi_s);
+    /* Mask kseg so the wire response matches runtime's handle_wtrace_add:
+     * stored physical address, NOT the as-typed virtual.  Tools that diff
+     * "lo" across backends would otherwise see 0x8009... vs 0x0009... and
+     * spuriously flag a mismatch. */
+    uint32_t lo = hex_to_u32(lo_s) & 0x1FFFFFFFu;
+    uint32_t hi = hex_to_u32(hi_s) & 0x1FFFFFFFu;
     int slot = beetle_wtrace_arm(lo, hi);
     if (slot < 0) {
         send_err(id, slot == -1 ? "ranges full" : "lo>=hi"); return;
@@ -417,12 +449,37 @@ static void h_wtrace_arm(int id, const char *json) {
              id, slot, lo, hi);
 }
 
+/* Per-slot disarm (parity with runtime wtrace_del). slot=N required. */
 static void h_wtrace_disarm(int id, const char *json) {
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0) { send_err(id, "missing slot"); return; }
+    if (beetle_wtrace_disarm(slot) != 0) {
+        send_err(id, "invalid slot"); return;
+    }
+    send_ok(id);
+}
+
+/* Disarm all armed ranges. */
+static void h_wtrace_disarm_all(int id, const char *json) {
     (void)json; beetle_wtrace_disarm_all(); send_ok(id);
 }
 
 static void h_wtrace_reset(int id, const char *json) {
     (void)json; beetle_wtrace_reset(); send_ok(id);
+}
+
+/* Ring stats — parity with runtime's wtrace_stats. */
+static void h_wtrace_stats(int id, const char *json) {
+    (void)json;
+    uint64_t total = beetle_wtrace_total();
+    int cap = beetle_wtrace_capacity();
+    uint64_t oldest = (total <= (uint64_t)cap) ? 0 : total - (uint64_t)cap;
+    uint64_t newest = (total > 0) ? total - 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu,\"ranges\":%d}\n",
+             id, (unsigned long long)total, cap,
+             (unsigned long long)oldest, (unsigned long long)newest,
+             beetle_wtrace_range_count());
 }
 
 static void h_wtrace_ranges(int id, const char *json) {
@@ -438,43 +495,92 @@ static void h_wtrace_ranges(int id, const char *json) {
     send_fmt("]}\n");
 }
 
-static void h_wtrace(int id, const char *json) {
+/* wtrace_dump — rich-window entries, FIELD NAMES MUST MATCH runtime
+ * (handle_wtrace_dump in debug_server.c) so cross-backend tools read
+ * `entry["new"]`, `entry["pc"]`, `entry["w"]` etc. without per-backend
+ * branches. Documented gaps vs runtime: no `old` (callback fires post-
+ * write), no `func` (no per-function dispatch gate on beetle). `cpu_pc`
+ * is the same as `pc` on beetle, emitted equal for parity. */
+static void h_wtrace_dump(int id, const char *json) {
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
     if (count > 65536) count = 65536;
 
-    uint64_t *seqs   = (uint64_t*)malloc(count * sizeof(uint64_t));
-    uint32_t *addrs  = (uint32_t*)malloc(count * sizeof(uint32_t));
-    uint32_t *vals   = (uint32_t*)malloc(count * sizeof(uint32_t));
-    uint32_t *pcs    = (uint32_t*)malloc(count * sizeof(uint32_t));
-    uint32_t *ras    = (uint32_t*)malloc(count * sizeof(uint32_t));
-    uint32_t *frames = (uint32_t*)malloc(count * sizeof(uint32_t));
-    uint8_t  *slots  = (uint8_t*) malloc(count);
-    uint8_t  *sizes  = (uint8_t*) malloc(count);
-    if (!seqs || !addrs || !vals || !pcs || !ras || !frames || !slots || !sizes) {
-        free(seqs); free(addrs); free(vals); free(pcs); free(ras);
-        free(frames); free(slots); free(sizes);
+    /* Optional post-hoc address filter — parity with runtime. */
+    char lo_s[32] = {0}, hi_s[32] = {0};
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu;
+    if (json_get_str(json, "addr_lo", lo_s, sizeof(lo_s)))
+        flo = hex_to_u32(lo_s) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", hi_s, sizeof(hi_s)))
+        fhi = hex_to_u32(hi_s) & 0x1FFFFFFFu;
+
+    uint64_t *seqs   = (uint64_t*)malloc((size_t)count * sizeof(uint64_t));
+    uint32_t *addrs  = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *vals   = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *pcs    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *ras    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *sps    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *v0s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *v1s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *a0s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *a1s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *a2s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *a3s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *t0s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *t1s    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *frames = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint8_t  *slots  = (uint8_t*) malloc((size_t)count);
+    uint8_t  *sizes  = (uint8_t*) malloc((size_t)count);
+    if (!seqs || !addrs || !vals || !pcs || !ras || !sps ||
+        !v0s || !v1s || !a0s || !a1s || !a2s || !a3s || !t0s || !t1s ||
+        !frames || !slots || !sizes) {
+        free(seqs); free(addrs); free(vals); free(pcs); free(ras); free(sps);
+        free(v0s); free(v1s); free(a0s); free(a1s); free(a2s); free(a3s);
+        free(t0s); free(t1s); free(frames); free(slots); free(sizes);
         send_err(id, "alloc"); return;
     }
 
-    uint32_t got   = beetle_wtrace_get(seqs, addrs, vals, pcs, ras,
-                                        frames, slots, sizes, count);
+    uint32_t got = beetle_wtrace_get_rich(seqs, addrs, vals, pcs, ras, sps,
+                                          v0s, v1s, a0s, a1s, a2s, a3s,
+                                          t0s, t1s, frames, slots, sizes,
+                                          count);
     uint64_t total = beetle_wtrace_total();
+    int cap = beetle_wtrace_capacity();
+    uint32_t avail = (total < (uint64_t)cap) ? (uint32_t)total : (uint32_t)cap;
 
-    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
-             id, (unsigned long long)total, (unsigned)got);
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+             id, (unsigned long long)total, avail);
+    uint32_t emitted = 0;
     for (uint32_t i = 0; i < got; i++) {
-        if (i > 0) send_fmt(",");
-        send_fmt("{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
-                 "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\","
-                 "\"frame\":%u,\"slot\":%u,\"size\":%u}",
-                 (unsigned long long)seqs[i], addrs[i], vals[i],
-                 pcs[i], ras[i], frames[i], slots[i], sizes[i]);
+        uint32_t phys = addrs[i] & 0x1FFFFFFFu;
+        if (phys < flo || phys >= fhi) continue;
+        if (emitted > 0) send_fmt(",");
+        /* Field names match runtime's handle_wtrace_dump exactly: addr,
+         * new, ra, pc, cpu_pc, sp, v0/v1/a0..a3/t0/t1, frame, w.
+         * Beetle-only extras: slot. Runtime-only fields (old, func) are
+         * absent — tools must use .get(). */
+        send_fmt("{\"seq\":%llu,\"addr\":\"0x%08X\","
+                 "\"new\":\"0x%08X\",\"ra\":\"0x%08X\","
+                 "\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"sp\":\"0x%08X\","
+                 "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                 "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                 "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                 "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+                 "\"frame\":%u,\"w\":%u,\"slot\":%u}",
+                 (unsigned long long)seqs[i], addrs[i],
+                 vals[i], ras[i],
+                 pcs[i], pcs[i], sps[i],
+                 v0s[i], v1s[i],
+                 a0s[i], a1s[i], a2s[i], a3s[i],
+                 t0s[i], t1s[i],
+                 frames[i], (unsigned)sizes[i], (unsigned)slots[i]);
+        emitted++;
     }
-    send_fmt("]}\n");
+    send_fmt("],\"emitted\":%u}\n", emitted);
 
-    free(seqs); free(addrs); free(vals); free(pcs); free(ras);
-    free(frames); free(slots); free(sizes);
+    free(seqs); free(addrs); free(vals); free(pcs); free(ras); free(sps);
+    free(v0s); free(v1s); free(a0s); free(a1s); free(a2s); free(a3s);
+    free(t0s); free(t1s); free(frames); free(slots); free(sizes);
 }
 
 /* ---- fntrace ---- */
@@ -674,6 +780,273 @@ static void h_spu_events(int id, const char *json) {
     free(vlcs); free(vrcs); free(als); free(ahs); free(kinds); free(vs);
 }
 
+/* ---- wtrace_all (always-on, no-filter, lean fields) ----
+ * Mirrors runtime's wtrace_all surface so probes that haven't pre-armed
+ * a range can still see the last ~1 second of writes the moment they
+ * connect. Lean fields only (no register window) to keep capacity
+ * affordable. */
+
+static void h_wtrace_all_stats(int id, const char *json) {
+    (void)json;
+    uint64_t total = beetle_wtrace_all_total();
+    int cap = beetle_wtrace_all_capacity();
+    uint64_t oldest = (total <= (uint64_t)cap) ? 0 : total - (uint64_t)cap;
+    uint64_t newest = (total > 0) ? total - 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu}\n",
+             id, (unsigned long long)total, cap,
+             (unsigned long long)oldest, (unsigned long long)newest);
+}
+
+static void h_wtrace_all_reset(int id, const char *json) {
+    (void)json; beetle_wtrace_all_reset(); send_ok(id);
+}
+
+static void h_wtrace_all_dump(int id, const char *json) {
+    int count = json_get_int(json, "count", 1024);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;
+
+    char lo_s[32] = {0}, hi_s[32] = {0};
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu;
+    if (json_get_str(json, "addr_lo", lo_s, sizeof(lo_s)))
+        flo = hex_to_u32(lo_s) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", hi_s, sizeof(hi_s)))
+        fhi = hex_to_u32(hi_s) & 0x1FFFFFFFu;
+
+    uint64_t *seqs   = (uint64_t*)malloc((size_t)count * sizeof(uint64_t));
+    uint32_t *addrs  = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *news   = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *pcs    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *ras    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *frames = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint8_t  *ws     = (uint8_t*) malloc((size_t)count);
+    if (!seqs || !addrs || !news || !pcs || !ras || !frames || !ws) {
+        free(seqs); free(addrs); free(news); free(pcs);
+        free(ras); free(frames); free(ws);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t got = beetle_wtrace_all_get(seqs, addrs, news, pcs, ras,
+                                          frames, ws, count);
+    uint64_t total = beetle_wtrace_all_total();
+    int cap = beetle_wtrace_all_capacity();
+    uint32_t avail = (total < (uint64_t)cap) ? (uint32_t)total : (uint32_t)cap;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+             id, (unsigned long long)total, avail);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        uint32_t phys = addrs[i] & 0x1FFFFFFFu;
+        if (phys < flo || phys >= fhi) continue;
+        if (emitted > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"addr\":\"0x%08X\",\"new\":\"0x%08X\","
+                 "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\","
+                 "\"frame\":%u,\"w\":%u}",
+                 (unsigned long long)seqs[i], addrs[i], news[i],
+                 pcs[i], ras[i], frames[i], (unsigned)ws[i]);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%u}\n", emitted);
+
+    free(seqs); free(addrs); free(news); free(pcs);
+    free(ras); free(frames); free(ws);
+}
+
+/* ---- Per-frame history ring (wire-format identical to runtime) ---- */
+
+static void h_history(int id, const char *json) {
+    (void)json;
+    uint64_t cnt = 0, oldest = 0, newest = 0;
+    beetle_history_get_bounds(&cnt, &oldest, &newest);
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%llu,\"oldest\":%llu,\"newest\":%llu}\n",
+             id,
+             (unsigned long long)cnt,
+             (unsigned long long)oldest,
+             (unsigned long long)newest);
+}
+
+static void h_get_frame(int id, const char *json) {
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    const BeetleFrameRecord *r = beetle_history_get_frame((uint32_t)f);
+    if (!r) { send_err(id, "frame not in buffer"); return; }
+
+    static char buf[8192];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,"
+        "\"frame\":%u,\"verify_pass\":%d,\"diff_count\":%d,"
+        "\"cop0_sr\":\"0x%08X\",\"cop0_cause\":\"0x%08X\",\"cop0_epc\":\"0x%08X\","
+        "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+        "\"display\":{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"disabled\":%d},"
+        "\"pad_buttons\":\"0x%04X\","
+        "\"sio_stat\":\"0x%04X\",\"sio_ctrl\":\"0x%04X\","
+        "\"dispatch_count\":%u,"
+        "\"total_dispatches\":%llu,"
+        "\"last_func\":\"%s\","
+        "\"gpr\":[",
+        id, r->frame_number, r->verify_pass, r->diff_count,
+        r->cop0_sr, r->cop0_cause, r->cop0_epc,
+        r->i_stat, r->i_mask,
+        r->display_area_x, r->display_area_y, r->display_w, r->display_h,
+        r->display_disabled,
+        r->pad_buttons,
+        r->sio_stat, r->sio_ctrl,
+        r->dispatch_count,
+        (unsigned long long)r->total_dispatches,
+        "(beetle)");
+    for (int i = 0; i < 32; i++) {
+        if (i) buf[pos++] = ',';
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\"0x%08X\"", r->gpr[i]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+    send_raw(buf, pos);
+}
+
+static void h_frame_range(int id, const char *json) {
+    int start = json_get_int(json, "start", -1);
+    int end   = json_get_int(json, "end",   -1);
+    if (start < 0 || end < 0) { send_err(id, "missing start/end"); return; }
+    if (end - start + 1 > 200) { send_err(id, "max 200 frames per request"); return; }
+
+    static char buf[200 * 256 + 256];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"frames\":[", id);
+    int first = 1;
+    for (int f = start; f <= end; f++) {
+        if (!first) buf[pos++] = ',';
+        first = 0;
+        const BeetleFrameRecord *r = beetle_history_get_frame((uint32_t)f);
+        if (!r) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "{\"frame\":%d,\"available\":false}", f);
+            continue;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"frame\":%u,\"verify\":%d,"
+            "\"sr\":\"0x%08X\",\"i_stat\":\"0x%08X\","
+            "\"pad\":\"0x%04X\"}",
+            r->frame_number, r->verify_pass,
+            r->cop0_sr, r->i_stat,
+            r->pad_buttons);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+    send_raw(buf, pos);
+}
+
+static void h_frame_timeseries(int id, const char *json) {
+    int start = json_get_int(json, "start", -1);
+    int end   = json_get_int(json, "end",   -1);
+    if (start < 0 || end < 0) { send_err(id, "missing start/end"); return; }
+    if (end - start + 1 > 200) { send_err(id, "max 200 frames per request"); return; }
+
+    static char buf[200 * 320 + 256];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"ts\":[", id);
+    int first = 1;
+    for (int f = start; f <= end; f++) {
+        if (!first) buf[pos++] = ',';
+        first = 0;
+        const BeetleFrameRecord *r = beetle_history_get_frame((uint32_t)f);
+        if (!r) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "null");
+            continue;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"f\":%u,\"v\":%d,"
+            "\"sr\":\"0x%08X\",\"ist\":\"0x%08X\",\"imk\":\"0x%08X\","
+            "\"pad\":\"0x%04X\",\"dc\":%u}",
+            r->frame_number, r->verify_pass,
+            r->cop0_sr, r->i_stat, r->i_mask,
+            r->pad_buttons, r->dispatch_count);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+    send_raw(buf, pos);
+}
+
+static void h_first_failure(int id, const char *json) {
+    (void)json;
+    uint32_t frame = 0; int diff = 0;
+    int found = beetle_history_first_failure(&frame, &diff);
+    if (found) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%u,\"diff_count\":%d}\n",
+                 id, frame, diff);
+    } else {
+        send_fmt("{\"id\":%d,\"ok\":true,\"frame\":-1,\"message\":\"no failures found\"}\n",
+                 id);
+    }
+}
+
+static void h_read_frame_ram(int id, const char *json) {
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char addr_s[32] = {0};
+    if (!json_get_str(json, "addr", addr_s, sizeof(addr_s))) {
+        send_err(id, "missing addr"); return;
+    }
+    uint32_t addr = hex_to_u32(addr_s);
+    int len = json_get_int(json, "len", 1);
+    if (len < 1)   len = 1;
+    if (len > 128) len = 128;
+
+    const BeetleFrameRecord *r = beetle_history_get_frame((uint32_t)f);
+    if (!r) { send_err(id, "frame not in buffer"); return; }
+
+    /* Search the 4 snapshot regions for a span that covers [addr, addr+len). */
+    char hex[257];
+    int found = 0;
+    for (int i = 0; i < BEETLE_RAM_SNAPSHOT_REGIONS; i++) {
+        uint32_t saddr = r->snapshot_addr[i];
+        if (saddr == 0) continue;
+        if (addr >= saddr &&
+            (uint64_t)addr + (uint64_t)len <= (uint64_t)saddr + BEETLE_RAM_SNAPSHOT_SIZE) {
+            uint32_t off = addr - saddr;
+            for (int j = 0; j < len; j++) {
+                snprintf(hex + j * 2, 3, "%02x", r->snapshot_data[i][off + j]);
+            }
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        send_err(id, "address not in any snapshot region for this frame");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"%s\"}\n",
+             id, f, addr, len, hex);
+}
+
+static void h_set_snapshot(int id, const char *json) {
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0 || slot >= BEETLE_RAM_SNAPSHOT_REGIONS) {
+        send_err(id, "invalid slot (0-3)"); return;
+    }
+    char addr_s[32] = {0};
+    if (!json_get_str(json, "addr", addr_s, sizeof(addr_s))) {
+        send_err(id, "missing addr"); return;
+    }
+    uint32_t addr = hex_to_u32(addr_s);
+    if (!beetle_history_set_snapshot(slot, addr)) {
+        send_err(id, "set_snapshot failed"); return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"addr\":\"0x%08X\"}\n",
+             id, slot, addr);
+}
+
+static void h_get_snapshots(int id, const char *json) {
+    (void)json;
+    uint32_t a[BEETLE_RAM_SNAPSHOT_REGIONS] = {0};
+    int act[BEETLE_RAM_SNAPSHOT_REGIONS] = {0};
+    for (int i = 0; i < BEETLE_RAM_SNAPSHOT_REGIONS; i++) {
+        beetle_history_get_snapshot(i, &a[i], &act[i]);
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"snapshots\":["
+             "{\"slot\":0,\"addr\":\"0x%08X\",\"active\":%d},"
+             "{\"slot\":1,\"addr\":\"0x%08X\",\"active\":%d},"
+             "{\"slot\":2,\"addr\":\"0x%08X\",\"active\":%d},"
+             "{\"slot\":3,\"addr\":\"0x%08X\",\"active\":%d}]}\n",
+             id,
+             a[0], act[0], a[1], act[1],
+             a[2], act[2], a[3], act[3]);
+}
+
 /* ---- Command dispatch ---- */
 typedef void (*cmd_handler)(int id, const char *json);
 typedef struct { const char *name; cmd_handler handler; } CmdEntry;
@@ -689,11 +1062,18 @@ static const CmdEntry CMDS[] = {
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
     { "sio_write_window",      h_sio_write_window },
+    /* wtrace — normalized verb set (parity contract with psx-runtime). */
     { "wtrace_arm",            h_wtrace_arm },
-    { "wtrace_disarm",         h_wtrace_disarm },
+    { "wtrace_disarm",         h_wtrace_disarm },       /* per-slot */
+    { "wtrace_disarm_all",     h_wtrace_disarm_all },
     { "wtrace_reset",          h_wtrace_reset },
     { "wtrace_ranges",         h_wtrace_ranges },
-    { "wtrace",                h_wtrace },
+    { "wtrace_dump",           h_wtrace_dump },
+    { "wtrace_stats",          h_wtrace_stats },
+    /* Always-on catch-all wtrace (parity with psx-runtime). */
+    { "wtrace_all_dump",       h_wtrace_all_dump },
+    { "wtrace_all_stats",      h_wtrace_all_stats },
+    { "wtrace_all_reset",      h_wtrace_all_reset },
     { "fntrace_arm",           h_fntrace_arm },
     { "fntrace_disarm",        h_fntrace_disarm },
     { "fntrace_arms",          h_fntrace_arms },
@@ -702,6 +1082,15 @@ static const CmdEntry CMDS[] = {
     { "fntrace_dump",          h_fntrace_dump },
     { "spu_voices",            h_spu_voices },
     { "spu_events",            h_spu_events },
+    /* Per-frame history ring (parity with psx-runtime). */
+    { "history",               h_history },
+    { "get_frame",             h_get_frame },
+    { "frame_range",           h_frame_range },
+    { "frame_timeseries",      h_frame_timeseries },
+    { "first_failure",         h_first_failure },
+    { "read_frame_ram",        h_read_frame_ram },
+    { "set_snapshot",          h_set_snapshot },
+    { "get_snapshots",         h_get_snapshots },
     { NULL, NULL }
 };
 
