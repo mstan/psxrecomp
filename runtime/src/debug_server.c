@@ -9,7 +9,9 @@
  */
 /* Expose POSIX clock_gettime()/CLOCK_MONOTONIC (used by monotonic_ms) on
  * glibc — must precede any system header. Harmless on Windows/macOS. */
-#ifndef _POSIX_C_SOURCE
+#ifdef __APPLE__
+#  define _DARWIN_C_SOURCE 1   /* full BSD+POSIX namespace: clock_gettime AND INADDR_LOOPBACK/timeval */
+#elif !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include <time.h>
