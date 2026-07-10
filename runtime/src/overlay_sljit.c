@@ -163,6 +163,7 @@ static uint32_t s_gpr_lru;
 static int      s_frag_ws_cull;
 extern int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* gpu.c — shared widen */
 extern int psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* gpu.c — signed right edge */
+extern int32_t psx_ws_player_x_bound(int32_t vanilla);    /* gpu.c — gameplay X clamp */
 extern int psx_ws_cull_bltz(uint32_t v);                  /* gpu.c — signed left edge */
 extern int psx_ws_is_cull_w_imm(uint32_t imm);            /* gpu.c — per-game W-imm set */
 extern int psx_ws_auto_cull_on(void);                     /* gpu.c — per-game opt-in gate */
@@ -371,6 +372,17 @@ void overlay_sljit_init_helpers(CPUState *cpu) {
     cpu->sljit_helpers[SLJIT_HLP_CALL]         = (void *)psx_sljit_call;
     cpu->sljit_helpers[SLJIT_HLP_WS_CULL_SLTI] = (void *)psx_ws_cull_slti;
     cpu->sljit_helpers[SLJIT_HLP_WS_CULL_BLTZ] = (void *)psx_ws_cull_bltz;
+    cpu->sljit_helpers[SLJIT_HLP_WS_PLAYER_X_BOUND] = (void *)psx_ws_player_x_bound;
+}
+
+static void emit_ws_player_x_bound(struct sljit_compiler *C, uint32_t rt, int32_t vanilla) {
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)vanilla);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU),
+                   (sljit_sw)(offsetof(CPUState, sljit_helpers)
+                              + (size_t)SLJIT_HLP_WS_PLAYER_X_BOUND * sizeof(void *)));
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(32, 32), SLJIT_R2, 0);
+    sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
+    gpr_unpin();
 }
 
 /* Emit `rt = <cull helper>(gpr[rs], imm)` for a flagged auto_screen_x cull
@@ -401,7 +413,7 @@ enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
  * is `jr $ra` (the only terminator this slice supports — caller then emits the
  * delay slot + the shard return), or EMIT_ABORT for anything outside the slice
  * (any other control transfer, or an unsupported opcode). */
-static int emit_one(struct sljit_compiler *C, uint32_t insn, int bd_kind, int bd_cols) {
+static int emit_one(struct sljit_compiler *C, uint32_t pc, uint32_t insn, int bd_kind, int bd_cols) {
     uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
     uint32_t rd = f_rd(insn), sh = f_sh(insn), fn = f_fn(insn);
     uint32_t imm = f_imm(insn);
@@ -615,7 +627,10 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn, int bd_kind, int bd
         return EMIT_OK;
     }
     case 0x0F: /* LUI rt = imm << 16 */
-        sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_IMM, (sljit_sw)(imm << 16));
+        if (psx_ws_is_signed_x_bound_site(pc, insn))
+            emit_ws_player_x_bound(C, rt, (int32_t)(imm << 16));
+        else
+            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_IMM, (sljit_sw)(imm << 16));
         return EMIT_OK;
     case 0x20: emit_load(C, offsetof(CPUState, read_byte), SLJIT_MOV_S8,  rt, rs, simm); return EMIT_OK; /* LB */
     case 0x21: emit_load(C, offsetof(CPUState, read_half), SLJIT_MOV_S16, rt, rs, simm); return EMIT_OK; /* LH */
@@ -996,7 +1011,7 @@ void overlay_sljit_try_compile(uint32_t entry,
                 pending = PEND_CALL;
                 continue;
             }
-            if (emit_one(C, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
+            if (emit_one(C, entry + i * 4u, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
         } else {
             /* This instruction is the delay slot of the pending control insn;
              * it must be a plain, supported, non-control op (the constraint the
@@ -1006,7 +1021,7 @@ void overlay_sljit_try_compile(uint32_t entry,
              * the pending transfer. */
             int32_t dummy = 0;
             if (classify_control(insn, i * 4u, entry_phys, &dummy) != CTRL_NONE) { aborted = 1; break; }
-            if (emit_one(C, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
+            if (emit_one(C, entry + i * 4u, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
             gpr_flush(C);
             if (pending == PEND_RET) {
                 if (g_psx_cps_mode) {

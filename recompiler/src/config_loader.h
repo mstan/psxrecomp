@@ -45,6 +45,11 @@ struct RecompilerPatch {
     std::string note;
 };
 
+struct WidescreenSignedBoundSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded LUI instruction
+};
+
 // Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
 // "digital" (case-insensitive) and returns `fallback` for anything else.
 int         pad_mode_from_string(const std::string& s, int fallback);
@@ -569,6 +574,11 @@ struct GameConfig {
     // canonical VRAM. Required when edge-crossing polygon interpolation is
     // transformed in the mirror.
     bool ws_nw_full_mirror = false;
+
+    // [[widescreen.signed_x_bound]] guarded LUI sites whose signed Q16
+    // constants scale with the active native-wide field and remain identity in
+    // 4:3/menus/FMV. Shared by static codegen, overlay JIT, and interpreter.
+    std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a

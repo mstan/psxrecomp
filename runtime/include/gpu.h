@@ -145,6 +145,12 @@ void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
                                     const uint32_t *slti, int nslti);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
+/* Scale a signed Q16 horizontal gameplay limit into the active native-wide
+ * game field. Identity at 4:3 / menus / FMV. */
+int32_t psx_ws_player_x_bound(int32_t vanilla);
+void gpu_ws_set_signed_x_bound_sites(const uint32_t *addresses,
+                                     const uint32_t *expected, int count);
+int psx_ws_is_signed_x_bound_site(uint32_t pc, uint32_t instr);
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
  * the gcc emit, the sljit JIT, and the interpreter all route a flagged

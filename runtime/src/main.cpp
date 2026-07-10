@@ -329,6 +329,7 @@ static bool          g_ws_hud_sprt = false;
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
 extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
+extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -2652,6 +2653,17 @@ int main(int argc, char** argv) {
             gpu_ws_set_nw_textured_edges(gc.ws_nw_textured_edges ? 1 : 0,
                                          gc.ws_nw_textured_edge_scale);
             gl_renderer_set_wide_fast(gc.ws_nw_full_mirror ? 0 : 1);
+            {
+                std::vector<uint32_t> addresses, expected;
+                addresses.reserve(gc.ws_signed_x_bound_sites.size());
+                expected.reserve(gc.ws_signed_x_bound_sites.size());
+                for (const auto& site : gc.ws_signed_x_bound_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                }
+                gpu_ws_set_signed_x_bound_sites(addresses.data(), expected.data(),
+                                                (int)addresses.size());
+            }
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);

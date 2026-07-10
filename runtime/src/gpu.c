@@ -346,6 +346,35 @@ int psx_ws_x_margin(void) {
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
 
+int32_t psx_ws_player_x_bound(int32_t vanilla)
+{
+    const int margin = psx_ws_x_margin();
+    if (margin <= 0) return vanilla;
+    return (int32_t)(((int64_t)vanilla * (320 + 2 * margin)) / 320);
+}
+
+#define WS_SIGNED_BOUND_MAX 64
+static uint32_t ws_signed_bound_addr[WS_SIGNED_BOUND_MAX];
+static uint32_t ws_signed_bound_expected[WS_SIGNED_BOUND_MAX];
+static int ws_signed_bound_count = 0;
+void gpu_ws_set_signed_x_bound_sites(const uint32_t *addresses,
+                                     const uint32_t *expected, int count) {
+    if (count < 0) count = 0;
+    if (count > WS_SIGNED_BOUND_MAX) count = WS_SIGNED_BOUND_MAX;
+    ws_signed_bound_count = count;
+    for (int i = 0; i < count; i++) {
+        ws_signed_bound_addr[i] = addresses[i] & 0x1FFFFFFFu;
+        ws_signed_bound_expected[i] = expected[i];
+    }
+}
+int psx_ws_is_signed_x_bound_site(uint32_t pc, uint32_t instr) {
+    const uint32_t phys = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < ws_signed_bound_count; i++)
+        if (ws_signed_bound_addr[i] == phys && ws_signed_bound_expected[i] == instr)
+            return 1;
+    return 0;
+}
+
 /* ---- Capcom 2D background tile-loop widen ([widescreen.bg2d]) --------------
  * Mega Man X5/X6 use a pure-2D sprite engine that renders only a 4:3 (320px) field
  * of view — there is no overscan to "reveal." Its per-layer background renderer

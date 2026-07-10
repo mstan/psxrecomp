@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
     std::vector<PSXRecompV4::RecompilerPatch> instruction_patches;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
                           ws_bg2d_startx_site = 0,
@@ -168,6 +169,7 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_cap_site)     ws_bg2d_cap_site     = cfg.ws_bg2d_cap_site;
         if (cfg.ws_bg2d_init_func)    ws_bg2d_init_func    = cfg.ws_bg2d_init_func;
         instruction_patches = cfg.recompiler_patches;
+        ws_signed_x_bound_sites = cfg.ws_signed_x_bound_sites;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -242,6 +244,9 @@ int main(int argc, char** argv) {
         instruction_patches.insert(instruction_patches.end(),
                                    wscfg.recompiler_patches.begin(),
                                    wscfg.recompiler_patches.end());
+        ws_signed_x_bound_sites.insert(ws_signed_x_bound_sites.end(),
+                                       wscfg.ws_signed_x_bound_sites.begin(),
+                                       wscfg.ws_signed_x_bound_sites.end());
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
@@ -782,6 +787,7 @@ int main(int argc, char** argv) {
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.overlay_mode = overlay_mode;
     codegen_config.instruction_patches = instruction_patches;
+    codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;

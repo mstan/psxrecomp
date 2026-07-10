@@ -1572,7 +1572,10 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     case 0x0F: /* LUI rt, imm */
-        cpu->gpr[rt] = imm << 16;
+        if (psx_ws_is_signed_x_bound_site(pc, insn))
+            cpu->gpr[rt] = (uint32_t)psx_ws_player_x_bound((int32_t)(imm << 16));
+        else
+            cpu->gpr[rt] = imm << 16;
         cpu->gpr[0] = 0;
         return 0;
     case 0x10: { /* COP0 */

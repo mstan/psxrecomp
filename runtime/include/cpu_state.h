@@ -33,6 +33,7 @@ enum {
     SLJIT_HLP_CALL,       /* psx_sljit_call    — jal/jalr call contract       */
     SLJIT_HLP_WS_CULL_SLTI, /* psx_ws_cull_slti — signed funnel right edge (appended) */
     SLJIT_HLP_WS_CULL_BLTZ, /* psx_ws_cull_bltz — signed funnel left edge (appended) */
+    SLJIT_HLP_WS_PLAYER_X_BOUND, /* typed native-wide signed gameplay bound */
     SLJIT_HLP_COUNT
 };
 

@@ -30,6 +30,8 @@ Commands (shared — identical on both servers):
     run_to <frame>              Run to specific frame, then pause
     history                     Ring buffer stats
     get_frame <n>               Get full frame record from ring buffer
+    frame_read <frame> <addr> [len]
+                                Read a configured RAM snapshot from a frame
     range <start> <end>         Frame range query (max 200)
     ts <start> <end>            Frame timeseries — compact (max 200)
     set_snapshot <slot> <addr>  Configure RAM snapshot region (slot 0-3)
@@ -211,7 +213,7 @@ def build_cmd(args):
     elif cmd == "write":
         if len(args) < 3:
             return None, lambda _: "Usage: write <addr> <hex>"
-        return {"cmd": "write_ram", "addr": args[1], "hex": args[2]}, pretty_json
+        return {"cmd": "write_ram", "addr": args[1], "val": args[2]}, pretty_json
     elif cmd == "scratch":
         addr = args[1] if len(args) > 1 else "0x1F800000"
         length = int(args[2]) if len(args) > 2 else 16
@@ -245,6 +247,11 @@ def build_cmd(args):
         if len(args) < 2:
             return None, lambda _: "Usage: get_frame <n>"
         return {"cmd": "get_frame", "frame": int(args[1])}, pretty_json
+    elif cmd == "frame_read":
+        if len(args) < 3:
+            return None, lambda _: "Usage: frame_read <frame> <addr> [len]"
+        return {"cmd": "read_frame_ram", "frame": int(args[1]),
+                "addr": args[2], "len": int(args[3]) if len(args) > 3 else 16}, pretty_json
     elif cmd == "range":
         if len(args) < 3:
             return None, lambda _: "Usage: range <start> <end>"
@@ -283,6 +290,11 @@ def build_cmd(args):
         return d, pretty_json
     elif cmd == "clear_input":
         return {"cmd": "clear_input"}, pretty_json
+    elif cmd == "turbo_loads":
+        d = {"cmd": "turbo_loads"}
+        if len(args) > 1:
+            d["n"] = int(args[1])
+        return d, pretty_json
     elif cmd == "ws_margin":
         if len(args) < 2:
             return None, lambda _: "Usage: ws_margin <value|-1>"
@@ -339,11 +351,34 @@ def build_cmd(args):
             d["addr_lo"] = args[1]
         if len(args) > 2:
             d["addr_hi"] = args[2]
+        if len(args) > 3:
+            d["count"] = int(args[3])
+        if len(args) > 4:
+            d["newest"] = 1 if args[4].lower() in ("1", "on", "true", "newest") else 0
+        if len(args) > 5:
+            d["frame_lo"] = str(int(args[5], 0))
+        if len(args) > 6:
+            d["frame_hi"] = str(int(args[6], 0))
         return d, pretty_json
     elif cmd == "wtrace_clear":
         return {"cmd": "wtrace_clear"}, pretty_json
     elif cmd == "wtrace_stats":
         return {"cmd": "wtrace_stats"}, pretty_json
+    elif cmd == "wtrace_all":
+        d = {"cmd": "wtrace_all_dump"}
+        if len(args) > 1:
+            d["addr_lo"] = args[1]
+        if len(args) > 2:
+            d["addr_hi"] = args[2]
+        if len(args) > 3:
+            d["count"] = int(args[3])
+        if len(args) > 4:
+            d["newest"] = 1 if args[4].lower() in ("1", "on", "true", "newest") else 0
+        return d, pretty_json
+    elif cmd == "wtrace_all_reset":
+        return {"cmd": "wtrace_all_reset"}, pretty_json
+    elif cmd == "wtrace_all_stats":
+        return {"cmd": "wtrace_all_stats"}, pretty_json
     elif cmd == "mmio":
         d = {"cmd": "mmio_dump"}
         if len(args) > 1:

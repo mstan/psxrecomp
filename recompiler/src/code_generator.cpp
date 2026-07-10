@@ -774,6 +774,21 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
 
     std::string code;
 
+    for (const auto& site : config_.ws_signed_x_bound_sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: signed_x_bound expected 0x{:08X} at 0x{:08X}, found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        const int32_t vanilla = (int32_t)((instr & 0xFFFFu) << 16);
+        return fmt::format("{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
+                           "  /* typed native-wide signed X bound */{}",
+                           reg_name(get_rt(instr)), (uint32_t)vanilla, comment);
+    }
+
     // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
     // auto_backdrop). At a detected window's START/END finalize, route the value
     // through psx_ws_backdrop_value(orig, is_end): identity at 4:3, but in
@@ -2662,6 +2677,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
+    ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";

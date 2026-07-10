@@ -89,6 +89,7 @@ extern uint32_t i_mask;
 /* Memory access (from memory.c) */
 extern uint32_t psx_read_word(uint32_t addr);
 extern void     psx_write_word(uint32_t addr, uint32_t val);
+extern void     psx_write_half(uint32_t addr, uint16_t val);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern void     psx_write_byte(uint32_t addr, uint8_t val);
 
@@ -12794,11 +12795,15 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    /* Return the armed input for this poll before consuming its frame budget.
+     * The previous order cleared a one-frame `press` before returning it, so
+     * the documented frames=1 pulse was silently dropped. */
+    int cur = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0)
             s_input_override = -1;
     }
-    return s_input_override;
+    return cur;
 }
 
 int debug_server_get_axis_override(unsigned char st[4])
