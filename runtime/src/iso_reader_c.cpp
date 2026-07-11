@@ -48,6 +48,11 @@ uint32_t iso_track_start_lba(void* handle, int track) {
     return static_cast<PS1::ISOReader*>(handle)->TrackStartLBA(track);
 }
 
+uint32_t iso_track_pregap_lba(void* handle, int track) {
+    auto* reader = static_cast<PS1::ISOReader*>(handle);
+    return reader ? reader->TrackPregapLBA(track) : 0;
+}
+
 int iso_track_is_audio(void* handle, int track) {
     if (!handle) return 0;
     return static_cast<PS1::ISOReader*>(handle)->TrackIsAudio(track) ? 1 : 0;

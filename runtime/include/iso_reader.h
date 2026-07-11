@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <fstream>
+#include <memory>
 #include <vector>
 
 /**
@@ -47,6 +48,7 @@ struct CDTrack {
     int      number;     // 1-based track number
     bool     is_audio;   // true = CD-DA audio (Red Book); false = data
     uint32_t start_lba;  // .bin-relative start LBA (cue INDEX 01; track 1 = 0)
+    uint32_t pregap_lba = 0; // cue INDEX 00, or INDEX 01 when no pregap exists
 };
 
 class ISOReader {
@@ -119,6 +121,7 @@ public:
      */
     int      TrackCount() const;
     uint32_t TrackStartLBA(int track) const;
+    uint32_t TrackPregapLBA(int track) const;
     bool     TrackIsAudio(int track) const;
 
     /**
@@ -159,6 +162,17 @@ public:
     size_t GetFileSize(const std::string& path);
 
 private:
+    struct ImageFile {
+        std::string path;
+        std::ifstream stream;
+        uint32_t base_lba = 0;
+        uint32_t sector_count = 0;
+        uint32_t sector_size = 0;
+        uint32_t data_offset = 0;
+    };
+
+    ImageFile* FindImageFile(uint32_t lba);
+
     /**
      * Parse the Primary Volume Descriptor (sector 16)
      * Extracts volume ID and root directory information
@@ -187,11 +201,11 @@ private:
      */
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
 
-    std::ifstream file_;
     bool is_open_;
     std::string volume_id_;
     std::string bin_path_;
     RootDirectoryInfo root_dir_;
+    std::vector<std::unique_ptr<ImageFile>> files_;
     std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
 };
 
