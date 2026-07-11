@@ -750,6 +750,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     for (const auto& patch : config_.instruction_patches) {
         if (patch.address != addr) continue;
         if (instr != patch.expected) {
+            // Captured overlays reuse virtual addresses for unrelated scene
+            // variants. Apply a patch only to the variant carrying its guarded
+            // opcode; main-EXE mismatches remain fatal revision drift.
+            if (config_.overlay_mode) continue;
             fmt::print(stderr,
                        "ERROR: recompiler patch '{}' expected 0x{:08X} at "
                        "0x{:08X}, found 0x{:08X}. Wrong revision or stale patch.\n",

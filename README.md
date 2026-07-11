@@ -34,6 +34,10 @@ runs — static / native-overlay / interpreter), then
 [`docs/BUILDING.md`](docs/BUILDING.md), and
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+Adding widescreen, 60 FPS, camera, physics, or other title-specific changes?
+Use the typed config features and guarded instruction replacements described in
+[`docs/GAME_TWEAKS.md`](docs/GAME_TWEAKS.md) instead of forking psxrecomp.
+
 ## Philosophy — toward 100% static recompilation
 
 The goal is simple and absolute: **a PS1 game should run as native code, not be

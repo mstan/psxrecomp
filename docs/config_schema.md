@@ -102,7 +102,9 @@ stripped (`Path.stem` is NOT used because it mishandles `SCUS_942.36`).
 
 Each `[[recompiler.patch]]` performs one exact MIPS word replacement before
 translation. All fields except `note` are required. Duplicate addresses are
-rejected, and generation aborts if the executable word differs from `expected`.
+rejected. Main-EXE generation aborts if the executable word differs from
+`expected`; overlay generation skips nonmatching variants at the same virtual
+address and applies the patch only to the variant whose word matches.
 Use these for small, understood timing/bounds/logic changes; prefer typed
 features such as `[widescreen]` for reusable runtime behavior.
 
