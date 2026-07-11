@@ -952,16 +952,80 @@ int main(int argc, char** argv) {
                       return a.addr < b.addr;
                   });
 
+        // Record the exact instruction ranges owned by each compiled function.
+        // Games commonly keep mutable data next to code, so validating an
+        // arbitrary byte window around an entry can mistake a data write for
+        // self-modifying code and unnecessarily route the whole page through
+        // the interpreter.  These ranges let the runtime compare only bytes the
+        // generated function can actually execute.
+        struct CodeRangeRecord {
+            uint32_t lo;
+            uint32_t len;
+        };
+        std::vector<CodeRangeRecord> code_ranges;
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> owner_code_ranges;
+        for (uint32_t owner : dispatch_addrs) {
+            auto cfg_it = all_cfgs.find(owner);
+            if (cfg_it == all_cfgs.end()) continue;
+
+            std::vector<std::pair<uint32_t, uint32_t>> intervals;
+            for (const auto& [block_addr, block] : cfg_it->second.blocks) {
+                (void)block_addr;
+                uint32_t lo = block.start_addr;
+                uint32_t hi = block.end_addr + 4u;
+                if (hi > lo) intervals.emplace_back(lo, hi);
+            }
+            if (intervals.empty()) continue;
+
+            std::sort(intervals.begin(), intervals.end());
+            std::vector<std::pair<uint32_t, uint32_t>> merged;
+            for (const auto& interval : intervals) {
+                if (!merged.empty() && interval.first <= merged.back().second) {
+                    if (interval.second > merged.back().second)
+                        merged.back().second = interval.second;
+                } else {
+                    merged.push_back(interval);
+                }
+            }
+
+            uint32_t first = static_cast<uint32_t>(code_ranges.size());
+            for (const auto& interval : merged) {
+                code_ranges.push_back({interval.first & 0x1FFFFFFFu,
+                                       interval.second - interval.first});
+            }
+            owner_code_ranges[owner] = {
+                first, static_cast<uint32_t>(code_ranges.size()) - first};
+        }
+
+        ds << "extern int dirty_ram_text_range_native_ok(uint32_t phys_lo, uint32_t len);\n\n";
+        ds << "typedef struct { uint32_t lo; uint32_t len; } PsxGameCodeRange;\n";
+        ds << "static const PsxGameCodeRange k_psx_game_code_ranges[] = {\n";
+        for (const auto& range : code_ranges) {
+            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u}},\n",
+                              range.lo, range.len);
+        }
+        ds << "};\n\n";
+
         ds << "typedef void (*PsxGameDispatchFn)(CPUState* cpu);\n";
         ds << "typedef struct {\n";
         ds << "    uint32_t addr;\n";
         ds << "    uint32_t resume_pc;\n";
+        ds << "    uint32_t range_first;\n";
+        ds << "    uint32_t range_count;\n";
         ds << "    PsxGameDispatchFn fn;\n";
         ds << "} PsxGameDispatchEntry;\n\n";
         ds << "static const PsxGameDispatchEntry k_psx_game_dispatch[] = {\n";
         for (const auto& rec : records) {
-            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, func_{:08X}}},\n",
-                              rec.addr, rec.resume, rec.owner);
+            uint32_t range_first = 0;
+            uint32_t range_count = 0;
+            auto range_it = owner_code_ranges.find(rec.owner);
+            if (range_it != owner_code_ranges.end()) {
+                range_first = range_it->second.first;
+                range_count = range_it->second.second;
+            }
+            ds << fmt::format(
+                "    {{0x{:08X}u, 0x{:08X}u, {}u, {}u, func_{:08X}}},\n",
+                rec.addr, rec.resume, range_first, range_count, rec.owner);
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
@@ -977,10 +1041,21 @@ int main(int argc, char** argv) {
         ds << "    return 0;\n";
         ds << "}\n\n";
 
+        ds << "static int psx_game_entry_code_native_ok(const PsxGameDispatchEntry* entry) {\n";
+        ds << "    if (entry->range_count == 0)\n";
+        ds << "        return dirty_ram_text_range_native_ok(entry->addr & 0x1FFFFFFFu, 4u);\n";
+        ds << "    for (uint32_t i = 0; i < entry->range_count; ++i) {\n";
+        ds << "        const PsxGameCodeRange* range = &k_psx_game_code_ranges[entry->range_first + i];\n";
+        ds << "        if (!dirty_ram_text_range_native_ok(range->lo, range->len)) return 0;\n";
+        ds << "    }\n";
+        ds << "    return 1;\n";
+        ds << "}\n\n";
+
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry) return 0;\n";
+        ds << "    if (!psx_game_entry_code_native_ok(entry)) return 0;\n";
         ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
         if (codegen.cps_enabled())
             ds << "    cpu->pc = entry->resume_pc;\n";

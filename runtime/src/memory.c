@@ -107,6 +107,16 @@ static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
 
 int dirty_ram_is_dirty(uint32_t phys);
 
+/* Registered boot-EXE reference image and its modification state.  Declared
+ * before dirty_ram_clear_image_baseline because that handoff clears the writes
+ * performed by the BIOS loader itself. */
+static uint8_t *text_ref_image = NULL;
+static uint32_t text_ref_lo = 0, text_ref_hi = 0;
+static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint64_t g_text_native_blocked = 0;
+static uint32_t g_text_diverged_pages = 0;
+
 /* Establish the clean compiled-image baseline for the game-EXE text region.
  * Called ONCE when the game entry is first reached (fntrace game-start): by then
  * the BIOS has fully loaded the boot EXE into [0x10000, FLOOR) — which IS the
@@ -125,8 +135,14 @@ void dirty_ram_clear_image_baseline(void) {
     if (floor > RAM_SIZE) floor = RAM_SIZE;
     uint32_t first_page = DIRTY_RAM_KERNEL_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
-    for (uint32_t page = first_page; page <= last_page; page++)
+    for (uint32_t page = first_page; page <= last_page; page++) {
         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+        /* The guarded writes that loaded the original EXE are also baseline,
+         * not runtime modifications.  Forget them here so pristine code does
+         * not pay a byte-compare on every dispatch. */
+        text_modified_bitmap[page >> 5] &= ~(1u << (page & 31u));
+        text_diverged_bitmap[page >> 5] &= ~(1u << (page & 31u));
+    }
 }
 
 /* Text-image divergence guard.
@@ -146,13 +162,6 @@ void dirty_ram_clear_image_baseline(void) {
  * never frees it). Intentional data patches by the translation layer are blessed
  * into it via dirty_ram_text_bless so they are not mistaken for self-modifying
  * code — see dirty_ram_text_native_ok / dirty_ram_text_bless. */
-static uint8_t *text_ref_image = NULL;
-static uint32_t text_ref_lo = 0, text_ref_hi = 0;
-static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
-static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
-static uint64_t g_text_native_blocked = 0;
-static uint32_t g_text_diverged_pages = 0;
-
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
@@ -211,6 +220,38 @@ int dirty_ram_text_native_ok(uint32_t phys) {
     g_text_diverged_pages++;
     g_text_native_blocked++;
     return 0;
+}
+
+/* Validate an exact generated-code interval against the original EXE image.
+ * Unlike dirty_ram_text_native_ok(), this deliberately ignores mutable bytes
+ * elsewhere on the same page.  The generated game dispatcher calls it for all
+ * CFG instruction ranges owned by a function before entering native code. */
+int dirty_ram_text_range_native_ok(uint32_t phys_lo, uint32_t len) {
+    if (len == 0) return 1;
+    if (!text_ref_image || phys_lo < text_ref_lo ||
+        phys_lo >= text_ref_hi || len > text_ref_hi - phys_lo)
+        return 0;
+
+    uint32_t phys_hi = phys_lo + len;
+    uint32_t first_page = phys_lo >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page = (phys_hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; ++page) {
+        uint32_t bit = 1u << (page & 31u);
+        if (!(text_modified_bitmap[page >> 5] & bit) &&
+            !dirty_ram_is_dirty(page << DIRTY_RAM_PAGE_SHIFT))
+            continue;
+
+        uint32_t lo = phys_lo;
+        uint32_t page_lo = page << DIRTY_RAM_PAGE_SHIFT;
+        uint32_t page_hi = page_lo + (1u << DIRTY_RAM_PAGE_SHIFT);
+        if (lo < page_lo) lo = page_lo;
+        uint32_t hi = phys_hi < page_hi ? phys_hi : page_hi;
+        if (memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) != 0) {
+            g_text_native_blocked++;
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Bless an INTENTIONAL data patch into the reference image so the text-divergence
