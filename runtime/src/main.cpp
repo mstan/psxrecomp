@@ -1277,6 +1277,25 @@ static std::string default_input_ini_text(void) {
         "select = back\n";
 }
 
+static void load_keyboard_config(const char* argv0) {
+#if defined(PSX_WEB)
+    /* The browser shell owns this stable MEMFS path so it can install a
+     * localStorage-backed map before callMain and update it between visits. */
+    psx_keybinds_init("/keybinds.ini");
+#else
+    psx_keybinds_init(argv0);
+#endif
+}
+
+#if defined(PSX_WEB)
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_keybind(uint32_t button,
+                                                          uint32_t scancode) {
+    if (button >= (uint32_t)PSX_KB_COUNT || scancode >= (uint32_t)SDL_NUM_SCANCODES)
+        return;
+    psx_keybinds_set_button(1, (int)button, (SDL_Scancode)scancode);
+}
+#endif
+
 static void load_input_config(const char* argv0) {
     set_default_controller_mapping();
 
@@ -1286,6 +1305,7 @@ static void load_input_config(const char* argv0) {
     if (!fs::exists(config_path, ec)) {
         std::ofstream out(config_path, std::ios::binary);
         if (out) out << default_input_ini_text();
+        load_keyboard_config(argv0);
         return;
     }
 
@@ -1335,7 +1355,7 @@ static void load_input_config(const char* argv0) {
      * from input.ini's gamepad map. Loads the user's map (or writes defaults on
      * first run). The launcher may have just edited+saved this file; we re-read
      * it here so the runtime always reflects the current bindings. */
-    psx_keybinds_init(argv0);
+    load_keyboard_config(argv0);
 }
 
 static void close_player(PlayerInput& p) {
