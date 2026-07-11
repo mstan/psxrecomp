@@ -435,6 +435,15 @@ int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
     if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
+    /* A dispatch above the statically compiled EXE is itself evidence that the
+     * guest installed executable code there. Some games (Mega Man Legends)
+     * read an overlay into a staging buffer with CD DMA, then copy it to its
+     * final address with ordinary CPU stores. Those stores deliberately do not
+     * dirty arbitrary RAM pages, so the final overlay would otherwise miss the
+     * dynamic interpreter and fail as an unknown dispatch. There is no static
+     * code above g_overlay_region_floor to preserve; invalid/data entrypoints
+     * still fail closed when the interpreter rejects their first instruction. */
+    if (phys >= g_overlay_region_floor) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }

@@ -261,8 +261,26 @@ def build_cmd(args):
         return {"cmd": "get_snapshots"}, pretty_json
     elif cmd == "input":
         if len(args) < 2:
-            return None, lambda _: "Usage: input <buttons_hex>"
-        return {"cmd": "set_input", "buttons": args[1]}, pretty_json
+            return None, lambda _: "Usage: input <buttons_hex> [lx=N ly=N rx=N ry=N]"
+        d = {"cmd": "set_input", "buttons": args[1]}
+        for item in args[2:]:
+            key, sep, value = item.partition("=")
+            if not sep or key not in ("lx", "ly", "rx", "ry"):
+                return None, lambda _, item=item: f"Invalid analog axis '{item}'"
+            d[key] = int(value, 0)
+        return d, pretty_json
+    elif cmd == "press":
+        if len(args) < 2:
+            return None, lambda _: "Usage: press <buttons_hex> [frames] [lx=N ly=N rx=N ry=N]"
+        d = {"cmd": "press", "buttons": int(args[1], 0),
+             "frames": int(args[2]) if len(args) > 2 and "=" not in args[2] else 1}
+        axis_start = 3 if len(args) > 2 and "=" not in args[2] else 2
+        for item in args[axis_start:]:
+            key, sep, value = item.partition("=")
+            if not sep or key not in ("lx", "ly", "rx", "ry"):
+                return None, lambda _, item=item: f"Invalid analog axis '{item}'"
+            d[key] = int(value, 0)
+        return d, pretty_json
     elif cmd == "clear_input":
         return {"cmd": "clear_input"}, pretty_json
     elif cmd == "ws_margin":

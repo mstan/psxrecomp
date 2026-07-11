@@ -675,6 +675,16 @@ int sio_get_pad_analog(int slot) {
     return (slot >= 0 && slot <= 1) ? pad_analog[slot] : 0;
 }
 
+void sio_get_pad_sticks(int slot, uint8_t out[4]) {
+    if (!out) return;
+    if (slot < 0 || slot > 1) {
+        out[0] = out[1] = out[2] = out[3] = 0x80;
+        return;
+    }
+    out[0] = pad_stick[slot][0]; out[1] = pad_stick[slot][1];
+    out[2] = pad_stick[slot][2]; out[3] = pad_stick[slot][3];
+}
+
 /* ── LEGACY pad-config compatibility (Tomba "Hybrid" controller) ─────────────
  *
  * Why this exists, and why it is explicitly LEGACY:

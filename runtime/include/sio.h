@@ -109,6 +109,7 @@ uint8_t  sio_peek_rx_data(void);
 /* Debug accessors: is a pad connected on the slot, and is it in analog mode. */
 int sio_get_pad_connected(int slot);
 int sio_get_pad_analog(int slot);
+void sio_get_pad_sticks(int slot, uint8_t out[4]);
 
 /* ---- SIO byte-level trace ring buffer ----
  * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
