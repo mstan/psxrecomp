@@ -747,6 +747,18 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
 }
 
 std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
+    for (const auto& patch : config_.instruction_patches) {
+        if (patch.address != addr) continue;
+        if (instr != patch.expected) {
+            fmt::print(stderr,
+                       "ERROR: recompiler patch '{}' expected 0x{:08X} at "
+                       "0x{:08X}, found 0x{:08X}. Wrong revision or stale patch.\n",
+                       patch.id, patch.expected, addr, instr);
+            std::exit(1);
+        }
+        instr = patch.replacement;
+        break;
+    }
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t funct = instr & 0x3F;
 

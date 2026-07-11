@@ -37,6 +37,14 @@ namespace PSXRecompV4 {
 //   digital — always present a digital pad (id 0x41); sticks disabled.
 enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
+struct RecompilerPatch {
+    std::string id;
+    uint32_t address = 0;
+    uint32_t expected = 0;
+    uint32_t replacement = 0;
+    std::string note;
+};
+
 // Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
 // "digital" (case-insensitive) and returns `fallback` for anything else.
 int         pad_mode_from_string(const std::string& s, int fallback);
@@ -607,6 +615,10 @@ struct GameConfig {
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
     uint32_t ws_bg2d_packet_cap       = 1000;
+
+    // Declarative, revision-guarded replacements for title-specific timing,
+    // bounds, and logic changes. A mismatch is a codegen error, never a guess.
+    std::vector<RecompilerPatch> recompiler_patches;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

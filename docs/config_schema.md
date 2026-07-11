@@ -86,12 +86,25 @@ bios_thunks = "seeds/tomba_bios_thunks.txt"                # game-only
 out_dir     = "generated"                                  # both
 strict      = true                                         # both — currently always true
 out_stem    = "SCPH1001"                                   # optional; overrides the auto-derived stem
+
+[[recompiler.patch]]
+id          = "gameplay-60fps-divisor"
+address     = "0x80012340"
+expected    = "0x24020002"
+replacement = "0x24020001"
+note        = "Run the gameplay update every vblank"
 ```
 
 Output filenames: `<out_dir>/<out_stem>_full.c` and
 `<out_dir>/<out_stem>_dispatch.c`. If `out_stem` is omitted, it's derived
 from the `rom`/`exe` file basename with the trailing `.BIN` or `.EXE`
 stripped (`Path.stem` is NOT used because it mishandles `SCUS_942.36`).
+
+Each `[[recompiler.patch]]` performs one exact MIPS word replacement before
+translation. All fields except `note` are required. Duplicate addresses are
+rejected, and generation aborts if the executable word differs from `expected`.
+Use these for small, understood timing/bounds/logic changes; prefer typed
+features such as `[widescreen]` for reusable runtime behavior.
 
 ## Runtime block
 

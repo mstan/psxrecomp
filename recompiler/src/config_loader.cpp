@@ -4,6 +4,7 @@
 
 #include <cctype>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -697,6 +698,29 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         out_stem = derive_out_stem(fs::path(exe_field).filename().string());
     }
 
+    std::vector<RecompilerPatch> recompiler_patches;
+    if (recomp.contains("patch")) {
+        const auto& patches = toml::find<toml::array>(recomp, "patch");
+        std::set<uint32_t> seen_addresses;
+        for (const auto& item : patches) {
+            RecompilerPatch patch;
+            patch.id = toml::find<std::string>(item, "id");
+            patch.address = parse_hex(toml::find<std::string>(item, "address"),
+                                      "recompiler.patch.address");
+            patch.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                       "recompiler.patch.expected");
+            patch.replacement = parse_hex(toml::find<std::string>(item, "replacement"),
+                                          "recompiler.patch.replacement");
+            if (item.contains("note")) patch.note = toml::find<std::string>(item, "note");
+            if (patch.id.empty()) throw std::runtime_error("recompiler.patch.id must not be empty");
+            if (!seen_addresses.insert(patch.address).second)
+                throw std::runtime_error(fmt::format(
+                    "{}: duplicate [[recompiler.patch]] address 0x{:08X}",
+                    config_path.string(), patch.address));
+            recompiler_patches.push_back(std::move(patch));
+        }
+    }
+
     // Optional [widescreen] block — per-game hooks for the widescreen hack.
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t ws_sprite_anchor_addr = 0;
@@ -973,6 +997,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
+        /*recompiler_patches*/    recompiler_patches,
     };
 }
 
