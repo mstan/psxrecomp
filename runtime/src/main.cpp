@@ -46,6 +46,7 @@
 #include "debug_server.h"
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
+#include "starvation_ring.h"
 #include "config_loader.h"
 #include "game_options.h"
 #include "crc32.h"
@@ -70,6 +71,7 @@
 #define SDL_UnlockAudioDevice psx_web_audio_unlock
 #endif
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -308,6 +310,9 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * it trims the display-side scanout latency the CPU-side ring can't see. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
+#if defined(PSX_WEB)
+static std::atomic<int> g_web_paused{0};
+#endif
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -1294,6 +1299,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_keybind(uint32_t button,
         return;
     psx_keybinds_set_button(1, (int)button, (SDL_Scancode)scancode);
 }
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_paused(int paused) {
+    g_web_paused.store(paused ? 1 : 0, std::memory_order_release);
+}
 #endif
 
 static void load_input_config(const char* argv0) {
@@ -1933,6 +1942,17 @@ static PresRingEntry* present_ring_commit(uint8_t path, uint16_t disp_w,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+#if defined(PSX_WEB)
+    /* Freeze guest progress at a clean vblank boundary. The browser main
+     * thread can still clear the shared atomic through psx_web_set_paused.
+     * Keep the diagnostic watchdog fresh while intentionally stopped, then
+     * refresh it once more before guest execution resumes. */
+    while (g_web_paused.load(std::memory_order_acquire)) {
+        starvation_watchdog_heartbeat();
+        SDL_Delay(16);
+    }
+    starvation_watchdog_heartbeat();
+#endif
 #ifndef PSX_NO_DEBUG_TOOLS
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();
