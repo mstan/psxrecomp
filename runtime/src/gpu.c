@@ -1184,6 +1184,12 @@ static int ws_tagged_anchor(int32_t *out_ax) {
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
 static int ws_nw_phase_backdrop = 0;
 void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
+static int ws_nw_textured_edges = 0;
+int g_ws_tex_edge_pct = 0;
+void gpu_ws_set_nw_textured_edges(int on, int scale_pct) {
+    ws_nw_textured_edges = on ? 1 : 0;
+    g_ws_tex_edge_pct = scale_pct;
+}
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -1269,6 +1275,11 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_textured_edges) {
+        uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+        if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
+            return 2; /* GL gate: expand only vertices beyond canonical edges */
+    }
     if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both

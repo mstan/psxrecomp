@@ -643,7 +643,12 @@ static const char *GEO_VS =
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "noperspective out vec4 v_col;\n"
     "void main(){ v_col = a_col;\n"
-    "  float xb = (a_pos.x - u_xcenter)*u_xscale + u_xcenter;\n"
+    "  float xb = a_pos.x;\n"
+    "  if (u_xscale < 0.0) {\n"
+    "    float s = -u_xscale; float h = u_xhalf / s;\n"
+    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
+    "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
+    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
     "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
@@ -685,7 +690,12 @@ static const char *TEX_VS =
     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
-    "  float xb = (a_pos.x - u_xcenter)*u_xscale + u_xcenter;\n"
+    "  float xb = a_pos.x;\n"
+    "  if (u_xscale < 0.0) {\n"
+    "    float s = -u_xscale; float h = u_xhalf / s;\n"
+    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
+    "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
+    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
     "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
@@ -1180,12 +1190,18 @@ static int mirror_geo_center_only(const int *xs, int n) {
 /* Set / clear the 2D-backdrop x-stretch for a wide-mirror draw, per the current
  * gate (s_bd_gate, set by the caller from bd_prim_gate / the batch gate). */
 static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
+    extern int g_ws_tex_edge_pct;
     float scale = 1.0f, center = 0.0f;
     if (s_bd_gate && g_ws_bd_stretch_on && g_wide_w > 0) {
         int native_w = g_wide_w - 2 * g_wide_off;
         if (native_w > 0) {
             scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
                                              : (float)g_wide_w / (float)native_w;
+            if (s_bd_gate == 2) {
+                scale = g_ws_tex_edge_pct > 0
+                      ? (float)g_ws_tex_edge_pct / 100.0f : scale;
+                scale = -scale; /* shader: expand only beyond canonical edges */
+            }
             center = (float)g_wide_cur_base + (float)native_w / 2.0f;
         }
     }

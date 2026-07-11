@@ -559,6 +559,17 @@ struct GameConfig {
     // off by default because draw ordering is title-specific.
     bool ws_nw_phase_backdrop = false;
 
+    // Expand only textured polygon vertices that already lie beyond the
+    // canonical 4:3 boundary. Useful for finite arena/background meshes while
+    // leaving actors, HUD, sprites, and centre geometry untouched.
+    bool ws_nw_textured_edges = false;
+    int  ws_nw_textured_edge_scale = 0; // percent; 0 = aspect-derived
+
+    // Render the complete wide mirror instead of splicing its centre from
+    // canonical VRAM. Required when edge-crossing polygon interpolation is
+    // transformed in the mirror.
+    bool ws_nw_full_mirror = false;
+
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
     // title's widescreen is unported/unvalidated (e.g. MMX4 at bring-up):

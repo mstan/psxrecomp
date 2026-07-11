@@ -735,6 +735,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
+    bool ws_nw_textured_edges = false;
+    int ws_nw_textured_edge_scale = 0;
+    bool ws_nw_full_mirror = false;
     bool ws_offered = true;
     bool ws_ultrawide_offered = false;
     if (cfg.contains("widescreen")) {
@@ -791,6 +794,18 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
         if (ws.contains("nw_phase_backdrop"))
             ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
+        if (ws.contains("nw_textured_edges"))
+            ws_nw_textured_edges = toml::find<bool>(ws, "nw_textured_edges");
+        if (ws.contains("nw_textured_edge_scale")) {
+            ws_nw_textured_edge_scale = toml::find<int>(ws, "nw_textured_edge_scale");
+            if (ws_nw_textured_edge_scale != 0 &&
+                (ws_nw_textured_edge_scale < 100 || ws_nw_textured_edge_scale > 400))
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_textured_edge_scale must be 0 or in [100, 400]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_full_mirror"))
+            ws_nw_full_mirror = toml::find<bool>(ws, "nw_full_mirror");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
         if (ws.contains("offer_ultrawide"))
@@ -979,6 +994,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
+        /*ws_nw_textured_edges*/ ws_nw_textured_edges,
+        /*ws_nw_textured_edge_scale*/ ws_nw_textured_edge_scale,
+        /*ws_nw_full_mirror*/ ws_nw_full_mirror,
         /*ws_offered*/            ws_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,

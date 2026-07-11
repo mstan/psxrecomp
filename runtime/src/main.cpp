@@ -328,6 +328,7 @@ static bool          g_ws_hud_sprt = false;
 /* Runtime-only transition cleanup; kept out of gpu.h because generated game
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
+extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -2648,6 +2649,9 @@ int main(int argc, char** argv) {
             /* [widescreen] nw_phase_backdrop — stretch only the textured
              * backdrop phase emitted before shaded 3D foreground geometry. */
             gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
+            gpu_ws_set_nw_textured_edges(gc.ws_nw_textured_edges ? 1 : 0,
+                                         gc.ws_nw_textured_edge_scale);
+            gl_renderer_set_wide_fast(gc.ws_nw_full_mirror ? 0 : 1);
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
