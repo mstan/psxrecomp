@@ -45,7 +45,11 @@ extern uint64_t s_frame_count;
 /* 1M entries × ~32B = 32 MB. Power of 2 so wrap is a mask. Beetle peaks at
  * a few hundred audible-voice events per chime second; recomp at <1k total
  * per chime. 1M gives ~minutes of headroom for game-scene capture too. */
+#ifdef PSX_WEB
+#define SPU_EVENT_CAP (1u << 14)
+#else
 #define SPU_EVENT_CAP (1u << 20)
+#endif
 static SpuEvent  s_events[SPU_EVENT_CAP];
 static uint32_t  s_event_idx = 0;
 static uint64_t  s_event_seq = 0;
@@ -68,6 +72,7 @@ static uint64_t cd_underflow_frames;
 
 typedef struct {
     int active;
+    uint32_t start_addr;
     uint32_t cur_addr;
     uint32_t repeat_addr;
     int16_t samples[SPU_BLOCK_SAMPLES];
@@ -84,6 +89,27 @@ typedef struct {
 } SpuVoice;
 
 static SpuVoice voices[SPU_VOICE_COUNT];
+
+#ifdef PEPSIMAN_SFX_RETRIGGER_GUARD
+/* Pepsiman currently completes two update loops in some VBlank intervals
+ * because the host GPU has no command-duration model. Its low-voice SFX
+ * allocator consequently submits repeating effects twice as often as
+ * hardware. A strict sample cooldown fixed footsteps but swallowed the second
+ * and third cans in a legitimate pickup burst; a per-voice cooldown then
+ * failed because the allocator rotates footsteps across voices. Track the
+ * effect address across voices, allow the first three distinct activations in
+ * a burst, then enforce the measured 12-VBlank hardware cadence. Same-frame
+ * voices are always allowed because they are layers of one effect. */
+typedef struct {
+    uint32_t last_seen_frame;
+    uint32_t last_played_frame;
+    uint8_t  burst_plays;
+} SfxRetriggerState;
+#define SFX_RETRIGGER_FRAMES 12u
+#define SFX_BURST_RESET_FRAMES 30u
+#define SFX_BURST_FREE_PLAYS 3u
+static SfxRetriggerState sfx_retrigger[SPU_RAM_SIZE / 16];
+#endif
 
 static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
@@ -413,16 +439,18 @@ static int16_t voice_next_sample(int idx) {
                 v->cur_addr = v->repeat_addr & (SPU_RAM_SIZE - 1u);
                 spu_event_record(SPU_EV_END_LOOP, idx, v->repeat_addr);
             } else {
-                /* End-without-repeat triggers Release on real hardware
-                 * (Beetle's RunDecoder calls ReleaseEnvelope here). The
-                 * voice keeps decoding past the end block — whatever
-                 * follows in SPU RAM — while env_level decays to 0.
-                 * Garbage samples are masked by the dying envelope, so
-                 * by the time anything would be audible it's silent. */
+                /* End-without-repeat is a hard-silent one-shot boundary on
+                 * the PS1 SPU.  The decoder returns to LoopAddr, enters
+                 * Release, and clears the envelope immediately.  Continuing
+                 * forward with a gradual release is audibly wrong when the
+                 * following block carries END+REPEAT: short effects such as
+                 * Pepsiman's footsteps then loop many times in a frame. */
                 spu_event_record(SPU_EV_END_STOP, idx, v->cur_addr);
+                v->cur_addr = v->repeat_addr & (SPU_RAM_SIZE - 1u);
                 v->adsr_phase = ADSR_RELEASE;
                 v->adsr_divider = 0;
-                v->flags = 0;  /* don't re-enter this branch */
+                v->env_level = 0;
+                v->flags = 0;
             }
         }
         decode_block(v);
@@ -478,9 +506,35 @@ static void key_on(uint32_t mask) {
     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
         if (!(mask & (1u << i))) continue;
         SpuVoice *v = &voices[i];
+        uint32_t start_addr = ((uint32_t)voice_reg(i, 3) << 3) &
+                              (SPU_RAM_SIZE - 1u);
+#ifdef PEPSIMAN_SFX_RETRIGGER_GUARD
+        if (i < 8) {
+            uint32_t now = (uint32_t)s_frame_count;
+            SfxRetriggerState *state = &sfx_retrigger[start_addr >> 4];
+            int duplicate = 0;
+            if (state->last_seen_frame == 0xFFFFFFFFu ||
+                (uint32_t)(now - state->last_seen_frame) >=
+                    SFX_BURST_RESET_FRAMES) {
+                state->burst_plays = 1;
+            } else if (now != state->last_seen_frame) {
+                if (state->burst_plays < SFX_BURST_FREE_PLAYS) {
+                    state->burst_plays++;
+                } else if (state->last_played_frame != 0xFFFFFFFFu &&
+                           (uint32_t)(now - state->last_played_frame) <
+                               SFX_RETRIGGER_FRAMES) {
+                    duplicate = 1;
+                }
+            }
+            state->last_seen_frame = now;
+            if (duplicate) continue;
+            state->last_played_frame = now;
+        }
+#endif
         memset(v, 0, sizeof(*v));
         v->active = 1;
-        v->cur_addr = ((uint32_t)voice_reg(i, 3) << 3) & (SPU_RAM_SIZE - 1u);
+        v->start_addr = start_addr;
+        v->cur_addr = start_addr;
         v->repeat_addr = ((uint32_t)voice_reg(i, 7) << 3) & (SPU_RAM_SIZE - 1u);
         v->sample_idx = SPU_BLOCK_SAMPLES;
         /* Reset ADSR — KEYON starts envelope at 0 in Attack phase
@@ -513,6 +567,9 @@ void spu_init(void) {
     memset(spu_ram, 0, sizeof(spu_ram));
     memset(spu_regs, 0, sizeof(spu_regs));
     memset(voices, 0, sizeof(voices));
+#ifdef PEPSIMAN_SFX_RETRIGGER_GUARD
+    memset(sfx_retrigger, 0xFF, sizeof(sfx_retrigger));
+#endif
     memset(s_events, 0, sizeof(s_events));
     transfer_addr = 0;
     key_on_count = 0;
