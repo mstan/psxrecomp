@@ -286,3 +286,38 @@ All Tomba2, GL 16:9, worktree `_wt-tomba2-ipr` / `Tomba2Recomp` build-t2.
   phase_profile is a ring read and returns instantly.
 - CAUTION: any pace numbers taken in diff mode before ISSUES.md #9's redesign
   lands are garbage (the wedged shadow silently disabled all native dispatch).
+
+## W2 — Tomba 1 (SCUS-94236) 16:9: HUD at the true wide corners (DEFERRED 2026-07-10)
+
+User ask: in native-wide 16:9, re-anchor the HUD to the wide corners
+(repositioned, never stretched). First attempt shipped and was REVERTED the
+same day (game.toml `nw_hud_corners` back to false; the framework machinery
+stays, inert + A/B-able). What was learned, so the next attempt starts ahead:
+
+- **Mechanism reused:** `[widescreen] nw_hud_corners` (gpu.c `ws_nw_hud_shift`
+  thirds translate, from the MMX4/5 campaign) + a new tag-title scoping: polys
+  and lines never shift (world/characters), rect-family prims shift only when
+  UNTAGGED. TCP `ws_hud_mode {"tag_rects":0|1}` A/Bs the tagged-rect gate live.
+- **What worked:** vitality gauge + life-counter (untagged rects, fully inside
+  one outer third) anchored flush to the wide corners, world untouched.
+- **Failure 1 — composite tear (same class as W1.3):** the in-world dialogue
+  box ("It's locked...") is a composite of untagged rects SPANNING zone
+  boundaries: its left/right end caps sit in the outer thirds and get pulled
+  to opposite screen edges while the text stays centred — the box visibly
+  splits. A blanket per-prim thirds rule cannot ship; it needs composite-group
+  awareness (e.g. group prims drawn adjacently in the packet arena / same OT
+  bucket, shift a group only if the WHOLE group fits in one zone).
+- **Failure 2 — AP counter immobile:** the AP composite (0x65/0x67 rects,
+  x≈220-292, y≈8-12) renders through the TAGGED sprite funnel (0x8005E08C),
+  so the untagged-only gate skips it. Census now records a `tagged` column
+  (gpu.c WsCensusEntry) — verify with `ws_census`. Lifting the gate via
+  ws_hud_mode shifts it, but then tagged world-anchored rects (collectible
+  sprites) near edges would shift too — needs the same group/HUD-band
+  discrimination as Failure 1 or a per-title HUD packet arena range
+  (`nw_left_hud_packet` exists for exactly this; needs Tomba's HUD arena
+  addresses from a census session: HUD prims live in the 0x000Bxxxx/0x000Cxxxx
+  double-buffered packet arenas alongside everything else, so the range must
+  come from finer addresses).
+- **Groundwork landed on `feat/ws-2d-scene-pillarbox`:** census `tagged`
+  column, `ws_hud_mode` live A/B, and the untagged-rect scoping that makes
+  `nw_hud_corners` safe to experiment with on tag titles.

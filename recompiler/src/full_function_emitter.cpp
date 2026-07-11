@@ -1372,6 +1372,55 @@ void FullFunctionEmitter::emit_dispatch(
     }
     out += "};\n\n";
 
+    // --- Kernel body-extent table (runtime kernel-image bless) ---
+    // The BIOS copies Kernel Part 2 from ROM [0x1FC10000,0x1FC18000) to RAM
+    // [0x500,0x8500) at boot; the functions above with keys in that window
+    // were compiled FROM those ROM bytes. The runtime may execute a key's
+    // static native function instead of interpreting the (dirty) kernel page
+    // IFF the live RAM bytes of everything that function can execute still
+    // byte-match the ROM source. This table gives the runtime that judgment
+    // boundary: for each kernel-RAM dispatch key, the FULL RAM extent of the
+    // compiled code reachable from it. A continuation wrapper re-enters its
+    // PARENT (backward branches reachable), so continuations carry the
+    // parent's whole extent. Synthetic vector/alias wrappers are excluded —
+    // their stub bytes are runtime-installed and never ROM-matching.
+    {
+        // Function extents by normalized entry, from discovery (end inclusive).
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> extent_by_norm;
+        for (const auto& fn : dr.functions) {
+            uint32_t lo = normalize_address(fn.entry_addr);
+            uint32_t hi = normalize_address(fn.end_addr) + 4u;
+            extent_by_norm[normalize_address(fn.entry_addr)] = {lo, hi};
+            (void)lo;
+        }
+        std::string kb;
+        size_t kb_count = 0;
+        for (uint32_t norm : emitted_normalized) {
+            if (norm < 0x500u || norm >= 0x8500u) continue;
+            uint32_t owner = norm;
+            if (continuations.count(norm))
+                owner = continuations.at(norm).parent_func_norm;
+            auto it = extent_by_norm.find(owner);
+            if (it == extent_by_norm.end()) continue;
+            uint32_t lo = it->second.first, hi = it->second.second;
+            // Only bodies that live entirely inside the relocated window are
+            // verifiable against the ROM source; skip anything straddling it.
+            if (lo < 0x500u || hi > 0x8500u || lo >= hi) continue;
+            kb += fmt::format("    {{ 0x{:08X}u, 0x{:08X}u, 0x{:08X}u }},\n",
+                              norm, lo, hi);
+            kb_count++;
+        }
+        out += "typedef struct {\n";
+        out += "    uint32_t key;      /* dispatch key (RAM, normalized) */\n";
+        out += "    uint32_t body_lo;  /* RAM extent of code reachable from key */\n";
+        out += "    uint32_t body_hi;  /* exclusive */\n";
+        out += "} PsxKernelBody;\n\n";
+        out += fmt::format("const PsxKernelBody psx_bios_kernel_bodies[{}] = {{\n", kb_count);
+        out += kb;
+        out += "};\n";
+        out += fmt::format("const uint32_t psx_bios_kernel_body_count = {}u;\n\n", kb_count);
+    }
+
     // Dispatch function with binary search.
     out += "static uint32_t normalize(uint32_t addr) {\n";
     out += "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
@@ -1386,6 +1435,7 @@ void FullFunctionEmitter::emit_dispatch(
 
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);\n";
     out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
+    out += "extern int psx_kernel_bless_dispatchable(uint32_t phys);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
@@ -1479,6 +1529,20 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        while (lo <= hi) {\n";
     out += "            int mid = (lo + hi) / 2;\n";
     out += "            if (dispatch_table[mid].addr == phys) {\n";
+    out += "                /* Kernel-image bless guard (CLAUDE.md Rule 18). The keys in\n";
+    out += "                 * the relocated kernel window [0x500,0x8500) were compiled\n";
+    out += "                 * from the ROM source of the BIOS's boot-time kernel copy —\n";
+    out += "                 * but the BIOS (and games) PATCH kernel RAM at runtime (pad/\n";
+    out += "                 * SIO installs land inside compiled bodies). A static hit\n";
+    out += "                 * here may only run if the live RAM bytes of everything the\n";
+    out += "                 * function can execute still byte-match the ROM image\n";
+    out += "                 * (memory.c psx_kernel_bless_dispatchable, lazily verified,\n";
+    out += "                 * invalidated on writes). Mismatched/unverifiable bodies\n";
+    out += "                 * fall through to the faithful dirty-RAM interpreter below.\n";
+    out += "                 * Non-kernel keys are unaffected. */\n";
+    out += "                if (phys - 0x500u < 0x8000u &&\n";
+    out += "                    !psx_kernel_bless_dispatchable(phys))\n";
+    out += "                    break; /* found stays 0 -> dirty_ram_dispatch */\n";
     out += "                g_debug_current_func_addr = phys;\n";
     out += "                debug_server_trace_dispatch(phys);\n";
     out += "                dispatch_table[mid].func(cpu);\n";

@@ -86,6 +86,17 @@ extern uint32_t g_overlay_region_floor;
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
 
+/* Kernel-image bless (memory.c). A dispatch key in the relocated kernel
+ * window (RAM [0x500,0x8500), the BIOS's boot-time copy of ROM 0x1FC10000+)
+ * may run its statically-recompiled native function IFF the live RAM bytes
+ * of the code reachable from it (emitter-supplied body extent) byte-match
+ * the ROM source. Lazily verified, cached per entry, invalidated precisely
+ * on writes into the body. Runtime-patched bodies (pad/SIO install stubs)
+ * never verify and keep interpreting — faithful either way. */
+int      psx_kernel_bless_dispatchable(uint32_t phys);
+void     psx_kernel_bless_note_range(uint32_t phys, uint32_t len);
+void     psx_kernel_bless_stats(uint64_t out[6]);
+
 /* Capture/candidate window membership. Kernel window and overlay region are
  * unconditional; main-EXE text [KERNEL_WINDOW_END, FLOOR) is included only
  * when the page is dirty — i.e. a gameplay overlay overwrote the boot text

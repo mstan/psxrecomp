@@ -47,6 +47,8 @@ typedef struct SpuVoiceState {
     uint8_t  last_flags;    /* flag byte from most recently decoded block */
     uint8_t  sample_idx;    /* position inside the current 28-sample block */
     uint16_t phase;         /* sub-sample phase counter (0..0x1000) */
+    uint16_t env_level;     /* live ADSR envelope level (0..0x7FFF) */
+    uint8_t  adsr_phase;    /* 0=attack 1=decay 2=sustain 3=release */
 } SpuVoiceState;
 
 typedef struct SpuGlobalState {
@@ -64,6 +66,8 @@ typedef struct SpuGlobalState {
 
 void spu_get_voice_state(int voice, SpuVoiceState* out);
 void spu_get_global_state(SpuGlobalState* out);
+/* Debug peek into SPU sample RAM (spu_ram TCP command). */
+uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len);
 
 /* ---- Always-on per-voice event ring. Records KEYON, KEYOFF, voice
  * end-flag-stop and end-flag-loop events with a frame timestamp. Allocated

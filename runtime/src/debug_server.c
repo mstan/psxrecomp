@@ -26,6 +26,7 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
+#include "present_ring.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -289,6 +290,11 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+/* Optional analog-stick override (set_input lx/ly/rx/ry, 0..255, 0x80 =
+ * centre). Lets injected input drive analog-mode movement; consumed by the
+ * pad sampler alongside the button word. */
+static int     s_axis_override = 0;
+static uint8_t s_axis_st[4]    = { 0x80, 0x80, 0x80, 0x80 };
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -4591,7 +4597,9 @@ static void handle_gpu_state(int id, const char *json)
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
              "\"mode\":%d,\"nw_extra\":%d,"
-             "\"cur_frame\":%llu,\"last_tag_frame\":%u}}",
+             "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
+             "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
+             "\"ovh_prims\":%u,\"last_ovh_frame\":%u}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -4606,7 +4614,9 @@ static void handle_gpu_state(int id, const char *json)
              ws.configured, ws.active, ws.game_mode,
              ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
              ws.mode, ws.nw_extra,
-             (unsigned long long)ws.cur_frame, ws.last_tag_frame);
+             (unsigned long long)ws.cur_frame, ws.last_tag_frame,
+             ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
+             ws.ovh_prims, ws.last_ovh_frame);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -4759,6 +4769,8 @@ static void handle_cdrom_state(int id, const char *json)
              "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
+             "\"read_hold_cycles\":%llu,\"read_hold_events\":%llu,"
+             "\"int1_pended\":%llu,\"int1_lost\":%llu,\"int1_pending_now\":%u,"
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
@@ -4772,6 +4784,11 @@ static void handle_cdrom_state(int id, const char *json)
              s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,
              s.read_cmd, s.read_delay,
+             (unsigned long long)s.read_hold_cycles,
+             (unsigned long long)s.read_hold_events,
+             (unsigned long long)s.int1_pended,
+             (unsigned long long)s.int1_lost,
+             s.int1_pending_now,
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
@@ -5700,7 +5717,8 @@ static void handle_spu_voices(int id, const char *json)
             "\"start\":\"0x%05X\",\"loop\":\"0x%05X\","
             "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
             "\"cur_addr\":\"0x%05X\",\"repeat_addr\":\"0x%05X\","
-            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\"}",
+            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\","
+            "\"env\":\"0x%04X\",\"env_phase\":%d}",
             v == 0 ? "" : ",",
             v, s.active,
             s.vol_ctrl_l, s.vol_ctrl_r,
@@ -5709,13 +5727,33 @@ static void handle_spu_voices(int id, const char *json)
             (uint32_t)s.loop_lo  << 3,
             s.adsr_lo, s.adsr_hi,
             s.cur_addr, s.repeat_addr,
-            s.last_flags, s.sample_idx, s.phase);
+            s.last_flags, s.sample_idx, s.phase,
+            s.env_level, s.adsr_phase);
         if (n > 0) off += (size_t)n;
     }
     n = snprintf(out + off, cap - off, "]}");
     if (n > 0) off += (size_t)n;
     send_fmt("%s", out);
     free(out);
+}
+
+/* ---- SPU RAM peek: {"addr":N,"len":M} -> hex bytes. Sample data is the
+ * ground truth for voice-rail triage (what does a parked loop block hold?). */
+static void handle_spu_ram(int id, const char *json)
+{
+    uint32_t addr = (uint32_t)json_get_int(json, "addr", 0);
+    int len = json_get_int(json, "len", 16);
+    if (len < 1) len = 1;
+    if (len > 4096) len = 4096;
+    uint8_t bytes[4096];
+    uint32_t got = spu_ram_peek(addr, bytes, (uint32_t)len);
+    char *hex = (char *)malloc((size_t)got * 2u + 1u);
+    if (!hex) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    for (uint32_t i = 0; i < got; i++)
+        snprintf(hex + i * 2u, 3u, "%02X", bytes[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%05X\",\"len\":%u,\"hex\":\"%s\"}",
+             id, addr, (unsigned)got, hex);
+    free(hex);
 }
 
 /* ---- SPU event ring dump. Returns the most recent N events
@@ -5878,7 +5916,7 @@ static void handle_audio_events(int id, const char *json)
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
     };
 
     size_t cap = 256u + (size_t)got * 192u;
@@ -6640,6 +6678,15 @@ static void handle_set_input(int id, const char *json)
     }
     s_input_override = (int)hex_to_u32(val_str);
     s_input_frames = 0;
+    /* Optional stick override: any of lx/ly/rx/ry (0..255) arms it; omitted
+     * axes centre. Absent entirely -> released (buttons-only injection). */
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6679,7 +6726,38 @@ static void handle_clear_input(int id, const char *json)
     (void)json;
     s_input_override = -1;
     s_input_frames   = 0;
+    s_axis_override  = 0;
+    s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
     send_ok(id);
+}
+
+/* Live A/B for the native-wide HUD corner gate:
+ *   {"cmd":"ws_hud_mode","tag_rects":0|1}
+ * tag_rects=1 lets TAGGED rect-family prims re-anchor too (Tomba's AP
+ * counter renders through the tagged sprite funnel). */
+static void handle_ws_hud_mode(int id, const char *json)
+{
+    int v = json_get_int(json, "tag_rects", -1);
+    if (v < 0) { send_err(id, "missing tag_rects (0|1)"); return; }
+    gpu_ws_set_nw_hud_tag_rects(v);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d}", id, v ? 1 : 0);
+}
+
+/* Kernel-image bless state: {"cmd":"kernel_bless"} ->
+ * entries/clean/mismatch/native_hits/verifies/invalidations.
+ * (memory.c psx_kernel_bless_*; PSX_KERNEL_BLESS=0 disables the mechanism.) */
+static void handle_kernel_bless(int id, const char *json)
+{
+    extern void psx_kernel_bless_stats(uint64_t out[6]);
+    (void)json;
+    uint64_t s[6];
+    psx_kernel_bless_stats(s);
+    send_fmt("{\"id\":%d,\"ok\":true,\"entries\":%llu,\"clean\":%llu,"
+             "\"mismatch\":%llu,\"native_hits\":%llu,\"verifies\":%llu,"
+             "\"invalidations\":%llu}",
+             id, (unsigned long long)s[0], (unsigned long long)s[1],
+             (unsigned long long)s[2], (unsigned long long)s[3],
+             (unsigned long long)s[4], (unsigned long long)s[5]);
 }
 
 static void handle_ws_margin(int id, const char *json)
@@ -6867,7 +6945,7 @@ static void handle_ws_backdrop_stretch(int id, const char *json)
 /* prim<->pixel correlation gate (ws_dbg_stretch). Forces g_ws_bd_stretch_on=1 and
  * sets the selectable match mode used by the GL native-wide 2D-stretch gate so a
  * probe can stretch an exact prim set and screenshot which one fills the void.
- * Args: mode (0..6), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
+ * Args: mode (0..8), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
  * Reports matched/tagged counts (last frame) + applied. */
 static void handle_ws_dbg_stretch(int id, const char *json)
 {
@@ -7015,15 +7093,24 @@ static void handle_mmx6_freshfix(int id, const char *json)
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
 static void handle_savestate(int id, const char *json)
 {
-    extern void savestate_request_save(int slot);
-    extern void savestate_request_load(int slot);
+    extern int savestate_request_save(int slot);
+    extern int savestate_request_load(int slot);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
-    if      (!strcmp(op, "save")) savestate_request_save(slot);
-    else if (!strcmp(op, "load")) savestate_request_load(slot);
+    int staged;
+    if      (!strcmp(op, "save")) staged = savestate_request_save(slot);
+    else if (!strcmp(op, "load")) staged = savestate_request_load(slot);
     else { send_err(id, "op must be save|load"); return; }
+    if (!staged) {
+        /* Refused: bad slot, not configured, or load on an LLE host-fiber run
+         * (cross-fiber unwind is unsafe there — see savestate_request_load).
+         * The old handler ack'd ok:true anyway, which read as a silent no-op. */
+        send_err(id, "savestate request refused (LLE run cannot load states; "
+                     "check slot / configuration)");
+        return;
+    }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
 }
 
@@ -7935,6 +8022,49 @@ static void handle_gl_present_ring(int id, const char *json)
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
                         e.px_r, e.px_g, e.px_b, e.glerr,
                         e.src_r, e.src_g, e.src_b, e.src_valid);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* Present-classification ring (all backends; see present_ring.h): how each
+ * present was classified — 4:3 pillarbox / native-wide / canonical — and
+ * whether a native-wide present fell back to the canonical width (the
+ * "everything stretched for a while" signature). Always-on; this reads a
+ * window.
+ *   {"cmd":"present_ring","n":600}
+ * -> events: [seq, frame, path, present_w, disp_w, disp_h, game_mode,
+ *             native_43, fellback, tag_delta, nw_extra, gte_verts,
+ *             ovh_prims] */
+static void handle_present_ring(int id, const char *json)
+{
+    static const char *pres_path_name[4] =
+        { "blank", "native43", "wide", "canonical" };
+    int n = json_get_int(json, "n", 300);
+    if (n < 1) n = 1;
+    if (n > 4096) n = 4096;
+    uint64_t total = present_ring_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 96 + n * 112;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 128; s++) {
+        PresRingEntry e;
+        if (!present_ring_get(s, &e)) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%u,%u,%u,%u,%u,%u,%ld,%u,%u,%u]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        e.path < 4 ? pres_path_name[e.path] : "?",
+                        e.present_w, e.disp_w, e.disp_h,
+                        e.game_mode, e.native_43, e.wide_fellback,
+                        (long)e.tag_delta, e.nw_extra,
+                        e.gte_verts, e.ovh_prims);
         first = 0;
     }
     pos += snprintf(buf + pos, bufsz - pos, "]}");
@@ -9785,24 +9915,28 @@ static void handle_mdec_state(int id, const char *json)
 static void handle_fmv_state(int id, const char *json)
 {
     (void)json;
-    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, const char **);
+    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, int *, const char **);
     extern uint32_t mdec_get_decode_count(void);
     extern int cdrom_xa_stream_active(void);
     extern uint16_t sio_get_pad_buttons(void);
     extern uint64_t cdrom_get_dataready_fires(void);
     extern uint64_t g_cdrom_deliver_count;
-    int auto_skip = -1; uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
-    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &cfg);
+    int auto_skip = -1, no_xa_hold = 0;
+    uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
+    char cfg_json[1024];
+    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &no_xa_hold, &cfg);
+    json_escape_string(cfg_json, sizeof(cfg_json), cfg ? cfg : "(null)");
     MDECDebugState s; mdec_debug_get_state(&s);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"config_path\":\"%s\","
              "\"auto_skip_fmv\":%d,"
+             "\"fmv_skip_no_xa_hold\":%d,"
              "\"fmv_skip_total_table\":\"0x%08X\",\"fmv_skip_movie_id\":\"0x%08X\","
              "\"mdec_decode_count\":%u,\"mdec_decode_macroblocks\":%u,\"mdec_dma_out_words\":%u,"
              "\"xa_stream_active\":%d,"
              "\"cd_dataready_fires\":%llu,\"cd_irq_delivered\":%llu,"
              "\"pad1\":\"0x%04X\"}",
-             id, cfg ? cfg : "(null)", auto_skip,
+             id, cfg_json, auto_skip, no_xa_hold,
              total_table, movie_id,
              mdec_get_decode_count(), s.decode_macroblocks, s.dma_out_words,
              cdrom_xa_stream_active(),
@@ -11692,6 +11826,8 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
+    { "ws_hud_mode",       handle_ws_hud_mode },
+    { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
@@ -11708,6 +11844,7 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "gl_present_ring",   handle_gl_present_ring },
+    { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
     { "gl_wide_fast",      handle_gl_wide_fast },
@@ -11734,6 +11871,7 @@ static const CmdEntry s_commands[] = {
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },
+    { "spu_ram",           handle_spu_ram },
     { "spu_events",        handle_spu_events },
     { "spu_events_reset",  handle_spu_events_reset },
     { "audio_stats",       handle_audio_stats },
@@ -12641,6 +12779,14 @@ int debug_server_get_input_override(void)
             s_input_override = -1;
     }
     return s_input_override;
+}
+
+int debug_server_get_axis_override(unsigned char st[4])
+{
+    if (!s_axis_override) return 0;
+    st[0] = s_axis_st[0]; st[1] = s_axis_st[1];
+    st[2] = s_axis_st[2]; st[3] = s_axis_st[3];
+    return 1;
 }
 
 int debug_server_turbo_enabled(void)

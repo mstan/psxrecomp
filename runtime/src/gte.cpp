@@ -243,6 +243,23 @@ extern "C" void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den) {
 // dome-expand bracket (the clean alternative to the scene-dependent depth gate).
 extern "C" { extern uint32_t g_debug_current_func_addr; }
 static uint32_t s_gte_caller_ra = 0;   /* guest ra at gte_execute = return into the GAME fn that issued the projection (not the libgte leaf) */
+#define WS_DOME_CALL_SITES_MAX 32
+static uint32_t s_ws_dome_call_sites[WS_DOME_CALL_SITES_MAX];
+static int      s_ws_dome_call_sites_n = 0;
+extern "C" void gte_ws_configure_dome_sites(const uint32_t* sites, int count) {
+    if (count < 0) count = 0;
+    if (count > WS_DOME_CALL_SITES_MAX) count = WS_DOME_CALL_SITES_MAX;
+    s_ws_dome_call_sites_n = count;
+    for (int i = 0; i < count; i++)
+        s_ws_dome_call_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+static inline bool ws_dome_call_matches(void) {
+    // JAL writes pc+8 to RA; config records the call instruction itself.
+    const uint32_t call_pc = (s_gte_caller_ra - 8u) & 0x1FFFFFFFu;
+    for (int i = 0; i < s_ws_dome_call_sites_n; i++)
+        if (s_ws_dome_call_sites[i] == call_pc) return true;
+    return false;
+}
 #define DOME_PROBE_SLOTS 48
 static struct { uint32_t func; uint32_t count; int32_t max_sz; } s_dome_probe[DOME_PROBE_SLOTS];
 static int     s_dome_probe_on  = 0;
@@ -605,6 +622,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
     bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    const bool dome_call = ws_dome_call_matches();
+    // Curved backdrops are authored to cover the original 4:3 projection.
+    // In classic widescreen, leave that projection intact and let the normal
+    // final-frame stretch cover the wide output instead of shrinking it first.
+    if (dome_call) do_squash = false;
     if (do_squash && s_ws_suppress) {
         /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
          * props squashed so they stay aligned. Record SZ stats for tuning. */
@@ -616,9 +638,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     }
     if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
-    // Native-wide sky-dome expand: no squash active (identity), dome mode on,
-    // this frame is stretched, and the vertex is far (sky). Scale X outward from
-    // the projection centre so the finite dome mesh reaches the wider frame.
+    // Native-wide dome expansion remains a diagnostic-only depth probe.
     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
              !gpu_ws_present_native_43()) {
         int32_t sz = gte->SZ[3];

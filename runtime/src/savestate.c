@@ -42,23 +42,25 @@ static int slot_path(int slot, char* out, size_t cap) {
     return 1;
 }
 
-void savestate_request_save(int slot) {
-    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return; }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return;
+int savestate_request_save(int slot) {
+    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
+    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
     s_save_pending = slot;
+    return 1;
 }
 
-void savestate_request_load(int slot) {
-    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return; }
-    if (slot < 0 || slot >= SAVESTATE_SLOTS) return;
+int savestate_request_load(int slot) {
+    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
+    if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
     if (!psx_hle_scheduler_enabled()) {
         /* LLE (host-fiber) mode: the restore longjmp target lives on the
          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */
         fprintf(stderr, "savestate: load requires the HLE scheduler (default); "
                         "PSX_HLE_SCHEDULER=0 run cannot load states.\n");
-        return;
+        return 0;
     }
     s_load_pending = slot;
+    return 1;
 }
 
 void savestate_poll(CPUState* cpu, uint32_t resume_pc) {

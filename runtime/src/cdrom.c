@@ -14,6 +14,7 @@
 #include "dma.h"
 #include "spu.h"
 #include "event_ring.h"
+#include "audio_trace.h"
 #include <string.h>
 #include <stdlib.h>
 #ifndef _WIN32
@@ -784,7 +785,31 @@ static int xa_resample_to_44100(const int16_t* in, int in_frames,
     return out_frames;
 }
 
-static int maybe_deliver_xa_audio(const uint8_t* raw_data,
+/* Always-on XA zero-run scanner (audio_trace event ring). Decoded XA music
+ * must not contain long exact-zero spans when the source sectors are dense;
+ * a run here localizes corruption to a pipeline stage (stage 0 = straight
+ * out of the ADPCM decoder at native rate, stage 1 = after resample +
+ * decode-volume, i.e. exactly what spu_cd_audio_push receives). */
+static void xa_zero_scan(const int16_t *stereo, int frames, int lba,
+                         int stage) {
+    int run = 0, start = 0;
+    for (int i = 0; i <= frames; i++) {
+        int z = (i < frames) && stereo[i * 2 + 0] == 0 && stereo[i * 2 + 1] == 0;
+        if (z) {
+            if (!run) start = i;
+            run++;
+        } else if (run) {
+            if (run >= 64)
+                audio_trace_event(AUDIO_EV_XA_ZERO, (uint32_t)lba,
+                                  ((uint32_t)stage << 28) |
+                                  ((uint32_t)(start & 0x3FFF) << 14) |
+                                  (uint32_t)(run > 0x3FFF ? 0x3FFF : run));
+            run = 0;
+        }
+    }
+}
+
+static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
                                   const CDROMSectorDelivery *delivery) {
     if (!(mode_reg & 0x40u) || !raw_data || !delivery || cd_muted) return 0;
     if (!xa_is_audio_realtime(delivery)) return 0;
@@ -824,11 +849,13 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data,
     int native_frames = stereo
         ? xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native)
         : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
+    xa_zero_scan(native, native_frames, lba, 0);
     int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
     /* Volume is applied after resampling, per PS1 hardware tests (Beetle
      * cdc.cpp GetCDAudio comment). */
     cd_apply_decode_volume(pcm_44100, out_frames);
+    xa_zero_scan(pcm_44100, out_frames, lba, 1);
     spu_cd_audio_push(pcm_44100, out_frames);
     trace_cdrom('A', 0,
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
@@ -859,7 +886,7 @@ static int read_sector_at(int min, int sec, int sect) {
 
     delivery = classify_raw_sector(raw_data, have_raw);
     delivery.xa_audio_delivered =
-        (uint8_t)maybe_deliver_xa_audio(raw_data, &delivery);
+        (uint8_t)maybe_deliver_xa_audio(raw_data, lba, &delivery);
     delivery.data_delivered = 1;
     if (delivery.xa_audio_delivered ||
         ((mode_reg & 0x08u) && xa_is_audio_realtime(&delivery))) {
@@ -943,6 +970,26 @@ static void clear_sector_buffer(void) {
     request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
 }
 
+/* One-deep asynchronous data-ready notification, mirroring Beetle
+ * PS_CDC::SetAIP/CheckAIP (cdc.cpp:829,816): a data sector that comes due
+ * while the guest still has an unacked controller INT does NOT stop disc
+ * time — the sector buffer is overwritten on schedule (hardware clobbers
+ * the FIFO the same way) and its INT1 pends here until the ack clears
+ * irq_flag. If ANOTHER data sector lands while one is still pending, the
+ * old notification is lost exactly like Beetle's "Previous notification
+ * skipped" warning (counted, traced 'P'). */
+static uint8_t  pending_dataready;        /* 0/1: INT1 awaiting presentation */
+static uint8_t  pending_dataready_stat;   /* stat_reg snapshot at pend time */
+static uint64_t s_int1_pended;            /* INT1s that had to wait for ack */
+static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
+
+/* Drive-state changes (Read/Play/Pause/Stop/Seek) cancel a pended
+ * notification, matching Beetle's ClearAIP in every such command. */
+static void cdrom_clear_pending_dataready(void) {
+    pending_dataready = 0;
+    pending_dataready_stat = 0;
+}
+
 static void start_read_stream(uint8_t cmd) {
     cdda_playing = 0;
     cdda_track = 0;
@@ -950,6 +997,9 @@ static void start_read_stream(uint8_t cmd) {
     cdda_data_end_pending = 0;
     stat_reg &= (uint8_t)~CDSTAT_PLAY;
     clear_sector_buffer();
+    /* Drive-state change cancels any pended notification (Beetle clears
+     * AIP on Play/Read/Pause/Stop/Seek alike). */
+    cdrom_clear_pending_dataready();
     if (mode_reg & 0x40u) {
         xa_reset_decode();
         spu_cd_audio_reset();
@@ -971,6 +1021,7 @@ static void stop_read_stream(void) {
     reading = 0;
     read_cmd = 0;
     read_delay = 0;
+    cdrom_clear_pending_dataready();
 }
 
 static void stop_cdda_playback(void) {
@@ -1688,33 +1739,24 @@ static void process_pending(uint32_t cycles) {
     }
 }
 
+/* Read-stream hold accounting (always-on). Before 2026-07-10 the stream
+ * FROZE read_delay whenever the guest had not yet acked the previous INT.
+ * On real hardware the disc never pauses; the accumulated freeze made XA
+ * sectors arrive ~1.5-3% late, starving the XA->SPU ring ~5-6x/second for
+ * ~147 samples each = the audible 6 Hz music crackle (measured on MMX4's
+ * attract/title XA streams). The freeze is gone; these counters must now
+ * stay at zero and exist as a regression tripwire (cdrom_state JSON). */
+static uint64_t s_read_hold_cycles;
+static uint64_t s_read_hold_events;
+
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
-    /*
-     * The controller exposes one sector buffer. Do not let the stream timer
-     * accumulate a data backlog while software is still handling the previous
-     * data-ready IRQ. Once software acknowledges that IRQ, any unread tail is
-     * discardable: later sectors replace the controller's single data buffer.
-     *
-     * Software can also start a multi-sector CD DMA from inside the
-     * data-ready callback before acknowledging the IRQ. In that case the IRQ
-     * line remains asserted, but the disc stream must still refill an empty
-     * sector buffer so the active DMA can continue.
-     */
-    /* Serialized CD responses: hold the read stream while a controller INT is
-     * unacked (presenting a new sector INT would clobber the single irq_flag /
-     * response FIFO the guest is still reading), or while the single sector
-     * buffer holds unread data. The DMA-drain path is the exception: during an
-     * active CD DMA the data-ready INT stays asserted while the guest drains
-     * the sector via DMA, and the stream must still refill the buffer.
-     *
-     * CRITICAL: freeze read_delay while held. Decrementing it during the hold
-     * (the previous shape) accumulates fake time debt and underflows hard once
-     * the guest finally acks, so the next sector is never scheduled correctly. */
-    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return;
-    if (sector_available && irq_flag != 0) return;
-
+    /* Disc time NEVER pauses while the drive reads (Beetle cdc.cpp
+     * HandleSectorRead: the sector pipeline advances on cycle deadlines
+     * regardless of INT ack state). XA-ADPCM realtime audio flows to the
+     * SPU decoder unconditionally inside read_sector_at — gating it on the
+     * guest's INT-ack latency is what caused the 6 Hz XA dropouts. */
     if (cycles > 0) {
         read_delay -= (int)cycles;
     }
@@ -1725,8 +1767,26 @@ static void process_read_stream(uint32_t cycles) {
                 trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
             }
             deliver_read_sector();
-        } else {
+        } else if (dma_cdrom_transfer_active()) {
+            /* Active multi-sector CD DMA with the data-ready INT still
+             * asserted: refill the buffer so the DMA keeps draining, no new
+             * INT (the historical shape; games start the DMA inside the
+             * data-ready callback before acking). */
             deliver_read_sector_without_irq();
+        } else {
+            /* Guest hasn't acked the previous INT yet. Read the sector on
+             * schedule (XA audio + buffer overwrite happen inside), and
+             * pend its data-ready INT1 one deep. */
+            int delivered = deliver_read_sector_without_irq();
+            if (delivered) {
+                if (pending_dataready) {
+                    s_int1_lost++;
+                    trace_cdrom('P', 0, (uint32_t)last_sector_lba, 0);
+                }
+                pending_dataready = 1;
+                pending_dataready_stat = stat_reg;
+                s_int1_pended++;
+            }
         }
         read_delay += sector_delay_cycles();
         /* Clamp pathological underflow to one sector period: never replay a
@@ -1735,6 +1795,19 @@ static void process_read_stream(uint32_t cycles) {
             read_delay = sector_delay_cycles();
         }
     }
+}
+
+/* Present a pended data-ready INT1 the moment the guest fully acks the
+ * previous INT (Beetle CheckAIP: async results present as soon as the IRQ
+ * register clears). Called from the irq_flag ack write. */
+static void present_pending_dataready(void) {
+    if (!pending_dataready || irq_flag != 0) return;
+    pending_dataready = 0;
+    response_clear();
+    response_push(pending_dataready_stat);
+    set_irq(CDIRQ_DATA_READY);
+    fire_cdrom_irq();
+    s_dataready_fires++;
 }
 
 void cdrom_init(const char* cue_path) {
@@ -1907,6 +1980,10 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             if (val & 0x40) {
                 param_count = 0;
             }
+            /* A fully-acked INT presents any pended data-ready first
+             * (Beetle CheckAIP on IRQ-register clear); a queued command
+             * then waits behind that INT1's own ack cycle. */
+            present_pending_dataready();
             try_execute_queued_command();
         }
         break;
@@ -2039,6 +2116,11 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->filter_channel = filter_channel;
     out->muted = cd_muted;
     out->read_delay = read_delay;
+    out->read_hold_cycles = s_read_hold_cycles;
+    out->read_hold_events = s_read_hold_events;
+    out->int1_pended = s_int1_pended;
+    out->int1_lost = s_int1_lost;
+    out->int1_pending_now = pending_dataready;
     out->pending_pending = pending.pending;
     out->pending_delay = pending.delay;
     out->pending_phase = pending.phase;
@@ -2157,7 +2239,9 @@ int cdrom_load_in_progress(void) {
     /* disc-speed timing model */ \
     X(g_disc_speed_divisor) X(g_game_divisor) X(g_instant_max_per_frame) \
     /* pending (delayed second response) + queued command */ \
-    X(pending) X(queued_cmd)
+    X(pending) X(queued_cmd) \
+    /* one-deep pended data-ready INT1 (Beetle SetAIP analog) */ \
+    X(pending_dataready) X(pending_dataready_stat)
 
 uint32_t cdrom_snapshot_bytes(void){ uint32_t n=0;
 #define X(f) n += (uint32_t)sizeof(f);

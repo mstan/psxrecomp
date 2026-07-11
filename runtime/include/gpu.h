@@ -189,6 +189,13 @@ void gpu_ws_begin_linked_list(void);
  * gradient / backdrop image) to fill the wide frame, so it no longer
  * pillarboxes at the reveal margins. Runtime-only. Off by default. */
 void gpu_ws_set_nw_backdrop(int on);
+/* Native-wide flat-polygon backdrop stretch ([widescreen] nw_flat_backdrop):
+ * stretch untextured primitives in the wide mirror without changing the
+ * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
+void gpu_ws_set_nw_flat_backdrop(int on);
+int  gpu_ws_nw_flat_backdrop_enabled(void);
+/* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
+void gpu_ws_set_nw_phase_backdrop(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the
@@ -257,12 +264,23 @@ typedef struct {
     int      nw_extra;          /* native-wide frame growth (display px), 0 if off */
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */
+    uint32_t last_3d_frame;     /* frame of newest shaded prim (diagnostic) */
+    uint32_t gte_verts;         /* RTPS/RTPT verts in the last completed frame */
+    uint32_t last_world3d_frame;/* newest SUSTAINED world-scale projection frame */
+    uint32_t ovh_prims;         /* overhanging polys in the last completed frame */
+    uint32_t last_ovh_frame;    /* newest SUSTAINED polygon-overhang frame (the
+                                   2D-only-scene classifier's world signal) */
 } GpuWsDebug;
 void gpu_ws_get_debug(GpuWsDebug* out);
 
 /* Diagnostic: force psx_ws_x_margin() to return v (>=0) regardless of state,
  * or -1 to restore the normal computed margin. For live cull-margin sweeps. */
 void gpu_ws_set_margin_override(int v);
+
+/* Native-wide HUD corner re-anchoring: allow TAGGED rect-family prims to
+ * shift too (live A/B via TCP ws_hud_mode; some HUD composites render
+ * through the tagged sprite funnel). */
+void gpu_ws_set_nw_hud_tag_rects(int on);
 
 /* Always-on draw-census ring: every drawn primitive records frame / source
  * addr / camera / first-vertex screen pos, so object spawn/despawn and edge

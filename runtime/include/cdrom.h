@@ -113,6 +113,16 @@ typedef struct CDROMDebugState {
     uint32_t last_sector_frame;
     uint8_t last_sector_mode;
     uint8_t last_sector_have_raw;
+    /* Read-stream hold accounting: guest cycles the disc clock was frozen
+     * waiting on guest INT-ack / buffer drain (unfaithful pause; real discs
+     * never stop). Must stay 0 since the 2026-07-10 continuous-disc fix;
+     * nonzero = regression. */
+    uint64_t read_hold_cycles;
+    uint64_t read_hold_events;
+    /* One-deep pended data-ready INT1 accounting (Beetle SetAIP analog). */
+    uint64_t int1_pended;
+    uint64_t int1_lost;
+    uint8_t  int1_pending_now;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {

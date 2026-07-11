@@ -24,12 +24,36 @@ import argparse
 import base64
 import binascii
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+
+
+class _ThreadLocalStdout:
+    """stdout proxy for the parallel region workers: a thread that registered
+    a buffer gets every print() captured there (so one region's log emits as
+    one atomic block instead of interleaving); unregistered threads pass
+    through to the real stream. Subprocesses are unaffected (they all run
+    capture_output=True and never inherit this Python-level object)."""
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+    def set_buffer(self, buf):
+        self._local.buf = buf
+    def write(self, s):
+        buf = getattr(self._local, 'buf', None)
+        if buf is None:
+            self._real.write(s)
+        else:
+            buf.append(s)
+    def flush(self):
+        if getattr(self._local, 'buf', None) is None:
+            self._real.flush()
 
 try:
     import tomllib  # Python 3.11+
@@ -1577,6 +1601,14 @@ def main():
                     help='continuation-passing (RECURSION_BUG.md §25): set PSX_CPS '
                          'when invoking the recompiler so overlay funcs tail-transfer '
                          '+ carry an entry-switch. Must match the runtime build.')
+    ap.add_argument('--jobs',            type=int,
+                    default=max(1, (os.cpu_count() or 4) - 2),
+                    help='parallel region-group workers (default: cores-2). '
+                         'Captures are grouped by region start; regions are '
+                         'independent (dedup coverage, prior-ranges merge, '
+                         'fragments, and filenames all key on the region), '
+                         'captures within one region stay ordered. 1 = the '
+                         'sequential path. --static always runs sequential.')
     args = ap.parse_args()
 
     # ---- Framework-injected cache location wins over CLI flags ----------------
@@ -1657,13 +1689,18 @@ def main():
     # redundant-build elimination). Lazily loaded from existing .ranges, kept warm
     # in-memory and updated as we build, so repeats within one run also dedup.
     region_coverage_cache = {}   # phys_addr -> set((ev, code_crc))
+    cov_lock = threading.Lock()  # guards region_coverage_cache + its sets
     # Per-region info for the post-loop interior-entry fragment pass (decoupled
     # from region-compile success): (phys, load_addr, size, data, interior_pcs,
     # executed_pcs). Collected right after classification so it survives a region
     # whose own compile is skipped or audit-fails.
     interior_frag_jobs = []
 
-    for cap in captures:
+    # Per-capture body, extracted so the region-parallel driver below can call
+    # it. All shared state is either read-only closure (args/toml/cache_dir)
+    # or passed per-region (region_coverage_cache / interior_frag_jobs), so a
+    # worker owning a region owns every mutable it touches.
+    def _do_capture(cap, region_coverage_cache, interior_frag_jobs):
         load_addr = int(cap['load_addr'], 16)
         size      = int(cap['size'])
         data      = base64.b64decode(cap['bytes_b64'])
@@ -1740,11 +1777,11 @@ def main():
         root_seeds = [s for s in seeds if not s.startswith('interior')]
         if not root_seeds:
             print('  SKIP: no walk-root seeds (data-only region)\n')
-            continue
+            return
 
         if not args.static and os.path.exists(dll_path) and not args.force:
             print('  SKIP: DLL already exists (use --force to recompile)\n')
-            continue
+            return
 
         with tempfile.TemporaryDirectory() as tmp:
             # Write fake PS-EXE. The header entry PC becomes a walk root in the
@@ -1788,7 +1825,7 @@ def main():
                                cwd=toml_dir, env=sub_env)
             if r.returncode != 0:
                 print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
-                continue
+                return
 
             # Find the generated _full.c
             stem = os.path.basename(psx_path)
@@ -1798,7 +1835,7 @@ def main():
                 candidates = [f for f in os.listdir(out_dir_tmp) if f.endswith('_full.c')]
                 if not candidates:
                     print(f'  ERROR: no _full.c in {out_dir_tmp}')
-                    continue
+                    return
                 full_c = os.path.join(out_dir_tmp, candidates[0])
 
             with open(full_c) as f:
@@ -1811,7 +1848,7 @@ def main():
                 print_generated_c_audit(load_addr, size, crc32, c_audit)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
-                    continue
+                    return
                 static_parts.append((src, func_addrs))
                 print(f'  recompiled: {len(func_addrs)} functions\n')
             else:
@@ -1827,7 +1864,7 @@ def main():
                     f.write(src)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
-                    continue
+                    return
                 patched_c = os.path.join(tmp, 'overlay_patched.c')
                 with open(patched_c, 'w') as f:
                     f.write(src)
@@ -1849,16 +1886,18 @@ def main():
                             if ranges_src else [])
                 this_set = {(ev, crc) for ev, crc, _ in this_ids}
 
-                covered = region_coverage_cache.get(phys_addr)
-                if covered is None:
-                    covered = load_region_coverage(cache_dir, phys_addr)
-                    region_coverage_cache[phys_addr] = covered
-
-                if this_set and this_set <= covered and not args.force:
+                with cov_lock:
+                    covered = region_coverage_cache.get(phys_addr)
+                    if covered is None:
+                        covered = load_region_coverage(cache_dir, phys_addr)
+                        region_coverage_cache[phys_addr] = covered
+                    fully_covered = (bool(this_set) and this_set <= covered
+                                     and not args.force)
+                if fully_covered:
                     print(f'  SKIP: all {len(this_set)} function(s) already '
                           f'covered by existing DLL(s) at this region — no new '
                           f'native code to build\n')
-                    continue
+                    return
 
                 # Compile to DLL
                 include_dirs = [args.runtime_include]
@@ -1881,8 +1920,14 @@ def main():
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in
-                        # this same run dedup against them.
-                        covered |= this_set
+                        # this same run dedup against them. (Parallel note: the
+                        # check→build→update window is deliberately unlocked, so
+                        # two concurrent captures can both build overlapping DLLs.
+                        # That is redundancy, not corruption — the loader content-
+                        # matches every function by (entry, code_crc) across all
+                        # DLLs at a region.)
+                        with cov_lock:
+                            covered |= this_set
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
                               'loader will leave this region to the interpreter')
@@ -1900,7 +1945,7 @@ def main():
     # compile each as its OWN isolated <region>_<key>.dll that ENTERS at the
     # interior PC (recovers no host). Isolated => a bad fragment fails alone and
     # never poisons a region's trusted DLL.
-    if not args.static:
+    def _do_frags(interior_frag_jobs):
         frag_env = dict(os.environ)
         if args.cps:
             frag_env['PSX_CPS'] = '1'
@@ -1928,6 +1973,64 @@ def main():
                         covered_entries.add(ev & 0x1FFFFFFF)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'executed orphan interior(s) -> isolated island shards')
+
+    # ---- Drive the capture list -------------------------------------------
+    # Captures run CONCURRENTLY on a thread pool: the wall clock is dominated
+    # by the recompiler + gcc subprocesses, which release the GIL. Two locks
+    # keep the shared state sound:
+    #   - cov_lock guards the per-region dedup coverage sets. The
+    #     check→build→update window is deliberately unlocked, so concurrent
+    #     captures may build overlapping DLLs — redundancy, never corruption
+    #     (the loader content-matches functions by (entry, code_crc)).
+    #   - a per-(region, crc32) key lock serializes captures of IDENTICAL
+    #     bytes: they share one output filename (dll/ranges), and the second
+    #     must see the first's build (dll-exists skip / prior-ranges merge)
+    #     exactly as it would sequentially.
+    # The interior-fragment pass runs after the pool drains, same as the
+    # sequential order (it reads the final on-disk entry coverage).
+    if args.static or args.jobs <= 1:
+        for cap in captures:
+            _do_capture(cap, region_coverage_cache, interior_frag_jobs)
+        if not args.static:
+            _do_frags(interior_frag_jobs)
+    else:
+        print(f'Parallel compile: {len(captures)} capture(s) on '
+              f'{args.jobs} worker(s)\n')
+
+        real_stdout = sys.stdout
+        proxy = _ThreadLocalStdout(real_stdout)
+        print_lock = threading.Lock()
+        key_locks = {}
+        key_locks_mu = threading.Lock()
+
+        def _key_lock(phys, crc):
+            with key_locks_mu:
+                return key_locks.setdefault((phys, crc), threading.Lock())
+
+        def _cap_worker(cap):
+            buf = []
+            proxy.set_buffer(buf)
+            try:
+                load_addr = int(cap['load_addr'], 16)
+                phys = load_addr & 0x1FFFFFFF
+                crc = binascii.crc32(base64.b64decode(cap['bytes_b64'])) & 0xFFFFFFFF
+                with _key_lock(phys, crc):
+                    _do_capture(cap, region_coverage_cache, interior_frag_jobs)
+            finally:
+                proxy.set_buffer(None)
+            return ''.join(buf)
+
+        sys.stdout = proxy
+        try:
+            with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+                futs = [ex.submit(_cap_worker, c) for c in captures]
+                for fut in as_completed(futs):
+                    with print_lock:
+                        real_stdout.write(fut.result())
+                        real_stdout.flush()
+            _do_frags(interior_frag_jobs)
+        finally:
+            sys.stdout = real_stdout
 
     # B-2: write combined static C file
     if args.static and static_parts:

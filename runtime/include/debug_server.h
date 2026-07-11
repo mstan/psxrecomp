@@ -184,10 +184,11 @@ void debug_server_check_watchpoints(void);
 /* Returns >= 0 if the debug server wants to override pad input,
  * -1 if no override is active. Value is PS1 16-bit button mask. */
 int debug_server_get_input_override(void);
-int debug_server_get_input_state(uint16_t *buttons,
-                                 int *axes_override,
-                                 uint8_t *lx, uint8_t *ly,
-                                 uint8_t *rx, uint8_t *ry);
+
+/* Optional analog-stick override set alongside set_input (lx/ly/rx/ry,
+ * 0..255, 0x80 = centre). Returns 1 and fills st[lx,ly,rx,ry] when armed,
+ * 0 when the injection is buttons-only. */
+int debug_server_get_axis_override(unsigned char st[4]);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and
  * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */

@@ -244,6 +244,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("fmv_skip_no_xa")) {
             rt.video_fmv_skip_no_xa = toml::find<bool>(video, "fmv_skip_no_xa");
         }
+        if (video.contains("fmv_skip_no_xa_hold")) {
+            rt.video_fmv_skip_no_xa_hold =
+                (int)toml::find<int64_t>(video, "fmv_skip_no_xa_hold");
+            if (rt.video_fmv_skip_no_xa_hold < 4 || rt.video_fmv_skip_no_xa_hold > 3600)
+                throw std::runtime_error(
+                    "[video] fmv_skip_no_xa_hold must be between 4 and 3600 vblanks");
+        }
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }
@@ -696,11 +703,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_hud_sprt_squash = false;
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
+    bool ws_native_wide = true;
     bool ws_nw_hud_corners = false;
     uint32_t ws_nw_left_hud_packet_lo = 0;
     uint32_t ws_nw_left_hud_packet_hi = 0;
     bool ws_nw_backdrop = false;
     bool ws_clear_reveal = false;
+    bool ws_nw_flat_backdrop = false;
+    bool ws_nw_phase_backdrop = false;
     bool ws_offered = true;
     bool ws_ultrawide_offered = false;
     if (cfg.contains("widescreen")) {
@@ -726,6 +736,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_full_2d = toml::find<bool>(ws, "full_2d");
         if (ws.contains("gte_game_mode"))
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
+        if (ws.contains("native_wide"))
+            ws_native_wide = toml::find<bool>(ws, "native_wide");
         if (ws.contains("nw_hud_corners"))
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
         const bool has_nw_left_hud_lo = ws.contains("nw_left_hud_packet_lo");
@@ -751,6 +763,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
         if (ws.contains("clear_reveal"))
             ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
+        if (ws.contains("nw_flat_backdrop"))
+            ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
+        if (ws.contains("nw_phase_backdrop"))
+            ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
         if (ws.contains("offer_ultrawide"))
@@ -864,6 +880,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // (x_sites) + far-backdrop GTE un-squash (unsquash_funcs).
     std::vector<uint32_t> ws_backdrop_x_sites;
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
+    std::vector<uint32_t> ws_dome_call_sites;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("backdrop")) {
@@ -876,6 +893,19 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 for (const auto& a : toml::find<std::vector<std::string>>(bd, "unsquash_funcs"))
                     ws_backdrop_unsquash_funcs.push_back(
                         parse_hex(a, "widescreen.backdrop.unsquash_funcs"));
+        }
+    }
+
+    // Optional [widescreen.dome] block: exact projection calls belonging to
+    // finite curved background meshes that retain authored 4:3 coverage.
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("dome")) {
+            const toml::value& dome = toml::find(ws, "dome");
+            if (dome.contains("call_sites"))
+                for (const auto& a : toml::find<std::vector<std::string>>(dome, "call_sites"))
+                    ws_dome_call_sites.push_back(
+                        parse_hex(a, "widescreen.dome.call_sites"));
         }
     }
 
@@ -912,15 +942,19 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_h_imms*/        ws_cull_h_imms,
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
+        /*ws_dome_call_sites*/    ws_dome_call_sites,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
+        /*ws_native_wide*/        ws_native_wide,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
         /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
         /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
         /*ws_clear_reveal*/       ws_clear_reveal,
+        /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
+        /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
         /*ws_offered*/            ws_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,

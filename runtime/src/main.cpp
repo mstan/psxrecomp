@@ -23,6 +23,7 @@
 #include "overlay_sljit.h"
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "present_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
@@ -296,6 +297,7 @@ static int           g_fmv_skip_end_total   = 3;
  * movies never stream XA, so the default MDEC+XA detector misses them —
  * Tomba2's Whoopee Camp logo). Presentation-side fast-forward only. */
 static int           g_fmv_skip_no_xa       = 0;
+static int           g_fmv_skip_no_xa_hold  = 4;
 /* Low-latency present options (see [video] in config_loader). Measured on a
  * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
  * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
@@ -318,10 +320,12 @@ extern "C" uint32_t mdec_get_decode_count(void);
  * resolved. */
 const char *g_active_config_path = nullptr;
 extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
-                                     uint32_t *movie_id, const char **cfg_path) {
+                                      uint32_t *movie_id, int *no_xa_hold,
+                                      const char **cfg_path) {
     if (auto_skip)   *auto_skip   = g_auto_skip_fmv;
     if (total_table) *total_table = g_fmv_skip_total_table;
     if (movie_id)    *movie_id    = g_fmv_skip_movie_id;
+    if (no_xa_hold)  *no_xa_hold  = g_fmv_skip_no_xa_hold;
     if (cfg_path)    *cfg_path    = g_active_config_path ? g_active_config_path : "(null)";
 }
 
@@ -1649,9 +1653,52 @@ static void dev_any_controller_sticks(uint8_t st[4]) {
     }
 }
 
+/* Debug-server input injection: drive the SAME pad model as a physical
+ * device. The old path set only the button word and returned, which left the
+ * pad type/sticks at whatever the real device last was — a hybrid P1 stayed
+ * analog, so injected d-pad bits never moved games that read the stick in
+ * analog mode (menus reacted, walking didn't). Injected d-pad reads as d-pad
+ * activity (hybrid drops to digital), an injected stick override reads as
+ * stick activity (hybrid rises to analog), and the resolved type goes through
+ * the same coherent request channel as real sampling — never slammed mid-
+ * handshake (the v0.5.0 phantom-input lesson). */
+static void apply_input_override_to_sio(int override_word) {
+    PlayerInput& p = g_players[0];
+    const uint16_t w = (uint16_t)override_word;
+    sio_set_pad_state_slot(0, w);
+
+    uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+    int axes = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    axes = debug_server_get_axis_override(st);
+#endif
+    const bool stick_live = axes != 0 && (st[0] != 0x80 || st[1] != 0x80 ||
+                                          st[2] != 0x80 || st[3] != 0x80);
+    const bool dpad_live  = ((uint16_t)~w & 0x00F0u) != 0;   /* up/right/down/left */
+
+    int mode;
+    if (p.kind != 0)                  mode = p.mode;
+    else if (dev_any_input_enabled()) mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+    else                              mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
+
+    int eff_analog;
+    if (mode == (int)PSXRecompV4::PAD_MODE_DIGITAL) {
+        eff_analog = 0;
+    } else if (mode == (int)PSXRecompV4::PAD_MODE_ANALOG) {
+        eff_analog = 1;
+    } else { /* HYBRID: most-recent input source wins, like the real sampler */
+        if (stick_live)     p.hybrid_analog = true;
+        else if (dpad_live) p.hybrid_analog = false;
+        eff_analog = p.hybrid_analog ? 1 : 0;
+    }
+    if (!eff_analog) { st[0] = st[1] = st[2] = st[3] = 0x80; }
+    sio_set_pad_sticks(0, st[0], st[1], st[2], st[3]);
+    sio_request_pad_type(0, eff_analog);
+}
+
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
-        sio_set_pad_state_slot(0, (uint16_t)override);
+        apply_input_override_to_sio(override);
         return;
     }
     for (int s = 0; s < 2; s++) {
@@ -1718,7 +1765,7 @@ static void sample_pad_into_sio(int override) {
 
 static void sample_headless_pad_into_sio(int override) {
     if (override >= 0) {
-        sio_set_pad_state_slot(0, (uint16_t)override);
+        apply_input_override_to_sio(override);
         return;
     }
 #ifdef PSX_COSIM
@@ -1821,6 +1868,47 @@ extern "C" int stack_profile_json(char *out, int cap) {
     }
     n += snprintf(out + n, cap - n, "]}");
     return n;
+}
+
+/* ---- Present-classification ring (see present_ring.h) -----------------
+ * Always-on record of how each present was classified, for every backend.
+ * A native-wide present that silently falls back to the canonical width is
+ * indistinguishable on screen from a deliberate stretch, so the decision
+ * has to live in a queryable ring rather than be re-derived after the fact. */
+#define PRES_RING_CAP 4096u   /* power of two; ~68 s at 60 Hz */
+static PresRingEntry s_pres_ring[PRES_RING_CAP];
+static uint64_t      s_pres_ring_total = 0;
+
+extern "C" uint64_t present_ring_total(void) { return s_pres_ring_total; }
+extern "C" int present_ring_get(uint64_t seq, PresRingEntry* out) {
+    if (seq >= s_pres_ring_total) return 0;
+    if (s_pres_ring_total - seq > PRES_RING_CAP) return 0;
+    *out = s_pres_ring[seq & (PRES_RING_CAP - 1u)];
+    return 1;
+}
+
+/* Commit this present's classification. Returns the stored entry so the
+ * software wide-fallback (the only post-decision mutation) can amend it. */
+static PresRingEntry* present_ring_commit(uint8_t path, uint16_t disp_w,
+                                          uint16_t disp_h, uint16_t present_w) {
+    GpuWsDebug ws;
+    gpu_ws_get_debug(&ws);
+    PresRingEntry* e = &s_pres_ring[s_pres_ring_total & (PRES_RING_CAP - 1u)];
+    s_pres_ring_total++;
+    e->frame         = (uint32_t)ws.cur_frame;
+    e->disp_w        = disp_w;
+    e->disp_h        = disp_h;
+    e->present_w     = present_w;
+    e->nw_extra      = (uint16_t)(ws.nw_extra < 0 ? 0 : ws.nw_extra);
+    e->path          = path;
+    e->wide_fellback = 0;
+    e->game_mode     = (uint8_t)ws.game_mode;
+    e->native_43     = (uint8_t)ws.present_native_43;
+    int64_t d = (int64_t)ws.cur_frame - (int64_t)ws.last_tag_frame;
+    e->tag_delta     = (d > INT32_MAX || d < INT32_MIN) ? INT32_MAX : (int32_t)d;
+    e->gte_verts     = (uint16_t)(ws.gte_verts > 0xFFFF ? 0xFFFF : ws.gte_verts);
+    e->ovh_prims     = (uint16_t)(ws.ovh_prims > 0xFFFF ? 0xFFFF : ws.ovh_prims);
+    return e;
 }
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
@@ -1966,7 +2054,8 @@ static void sdl_vblank_present(void) {
          * satisfy the MDEC+XA detector; with the per-game opt-in, MDEC
          * activity alone qualifies. */
         int detected = mdec_decoding && (xa || g_fmv_skip_no_xa);
-        if (detected) s_fmv_hold = 4;
+        if (detected) s_fmv_hold = (!xa && g_fmv_skip_no_xa)
+                                     ? g_fmv_skip_no_xa_hold : 4;
         else if (s_fmv_hold > 0) s_fmv_hold--;
         fmv_skip_active = (s_fmv_hold > 0) && (xa || g_fmv_skip_no_xa);
         if (fmv_skip_active) {
@@ -2088,11 +2177,15 @@ static void sdl_vblank_present(void) {
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
     bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
+    bool pin_43    = false;  /* pillarbox this present (FMV, or a native-wide
+                                game frame that could not present wide) */
     {
         static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
+            present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
+                                (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
             if (!disabled_frame_presented) {
                 disabled_frame_presented = true;
@@ -2130,6 +2223,21 @@ static void sdl_vblank_present(void) {
                              ws_native_wide_active() && gr_wide_supported());
         if (wide_present) present_w = w + (uint32_t)ws_nw_extra();
 
+        /* Native-wide invariant: canonical (320-wide) content is NEVER
+         * stretched across the wide window — a game frame that cannot present
+         * wide (compositor unsupported, or the surface fallback below)
+         * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
+         * stretch: its canonical content is pre-squashed FOR the stretch. */
+        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+
+        /* Ring the classification now that it's final (only the software/CPU
+         * wide path below can still fall back — it amends this entry). A
+         * CANONICAL game frame on a widescreen window IS the stretch. */
+        PresRingEntry* pres_entry = present_ring_commit(
+            fmv_frame ? PRES_PATH_NATIVE_43
+                      : (wide_present ? PRES_PATH_WIDE : PRES_PATH_CANONICAL),
+            (uint16_t)w, (uint16_t)h, (uint16_t)present_w);
+
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
          * alternation caused the menu seam/jitter). 24-bit (FMV) frames and
@@ -2151,7 +2259,7 @@ static void sdl_vblank_present(void) {
             } else {
                 gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         fmv_frame ? 1 : 0);
+                                         (fmv_frame || nw_pin) ? 1 : 0);
                 return;
             }
         }
@@ -2181,7 +2289,7 @@ static void sdl_vblank_present(void) {
             } else {
                 vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         fmv_frame ? 1 : 0);
+                                         (fmv_frame || nw_pin) ? 1 : 0);
             }
             return;
         }
@@ -2210,8 +2318,12 @@ static void sdl_vblank_present(void) {
             } else {
                 wide_present = false;
                 present_w = w;
+                pres_entry->path          = PRES_PATH_CANONICAL;
+                pres_entry->wide_fellback = 1;
+                pres_entry->present_w     = (uint16_t)present_w;
             }
         }
+        pin_43 = fmv_frame || (nw_pin && !wide_present);
         if (!wide_present) {
             if (active_scale > 1) {
                 int sw = (int)present_w * active_scale;
@@ -2281,15 +2393,17 @@ static void sdl_vblank_present(void) {
          * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
          * still owns timing. 24-bit (FMV) frames pin to native 4:3. */
         gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0,
-                            fmv_frame ? 1 : 0);
+                            pin_43 ? 1 : 0);
     } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
 
     /* FMV (24-bit) frames are authored 4:3 with no GTE squash to compensate
-     * the widescreen stretch — pillarbox them at native 4:3 instead. */
-    int dst_w = fmv_frame ? 640 * g_video_scale : g_logical_w;
+     * the widescreen stretch — pillarbox them at native 4:3 instead. Same for
+     * native-wide game frames that could not present wide (pin_43): canonical
+     * content is never stretched across the wide window. */
+    int dst_w = pin_43 ? 640 * g_video_scale : g_logical_w;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
@@ -2518,6 +2632,7 @@ int main(int argc, char** argv) {
             if (gc.runtime.video_fmv_skip_end_total)
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
+            g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
@@ -2536,6 +2651,9 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* Keep titles with known native-wide regressions on the original
+             * projection-squash + stretched-present widescreen path. */
+            g_ws_native_wide = gc.ws_native_wide ? 1 : 0;
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
             /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
@@ -2543,6 +2661,12 @@ int main(int argc, char** argv) {
                                                 gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
+             * in the native-wide mirror, preserving the canonical 4:3 image. */
+            gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
+            /* [widescreen] nw_phase_backdrop — stretch only the textured
+             * backdrop phase emitted before shaded 3D foreground geometry. */
+            gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
@@ -2550,6 +2674,8 @@ int main(int argc, char** argv) {
             gpu_ws_set_explicit_cull_sites(
                 gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
                 gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+            gte_ws_configure_dome_sites(
+                gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */

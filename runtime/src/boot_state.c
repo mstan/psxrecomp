@@ -205,6 +205,10 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     case BS_SEC_RAM:
         if (len != RAM_SIZE) return 0;
         memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
+        {   /* Kernel-bless: RAM changed wholesale — force re-verification. */
+            extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
+            psx_kernel_bless_note_range(0, RAM_SIZE);
+        }
         return 1;
     case BS_SEC_SPAD:
         if (len != SPAD_SIZE) return 0;

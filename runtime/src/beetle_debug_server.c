@@ -1134,7 +1134,7 @@ static void h_audio_events(int id, const char *json) {
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
     };
     send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
              id, (unsigned long long)total, (unsigned)got);

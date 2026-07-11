@@ -1118,14 +1118,20 @@ static void wide_target_end(GLint uXoff, GLint uXhalf) {
 
 extern int psx_ws_prim_is_tagged(void);   /* gpu.c: is the current GP0 prim sprite-tagged? */
 extern int psx_ws_prim_in_backdrop(void); /* gpu.c: is its source addr in the flower-field struct? */
+extern int gpu_ws_nw_flat_backdrop_enabled(void); /* gpu.c: per-title flat backdrop opt-in */
 
 /* Per-prim gate: stretch this prim iff native-wide + feature on AND the prim's
  * source address is inside the flower-field backdrop data structure (precise —
  * excludes the 3D rock/foreground, which is untagged AND has narrow prims so the
  * earlier tag/narrow heuristic tore it). mode!=0 falls back to the old
  * tag+narrow heuristic for A/B. */
-static int bd_prim_gate(const int *xs, int n) {
+static int bd_prim_gate(const int *xs, int n, int textured) {
     if (g_wide_w <= 0 || !g_ws_bd_stretch_on) return 0;
+    /* Some games draw their authored 4:3 sky/water as flat-colour polygons.
+     * Stretch those only in the native-wide mirror: the canonical framebuffer
+     * remains byte-for-byte 4:3, while the flat backdrop reaches the reveal
+     * margins. Opt-in because flat foreground geometry is title-dependent. */
+    if (!textured && gpu_ws_nw_flat_backdrop_enabled()) return 1;
     if (g_ws_bd_phase_mode != 0) return psx_ws_prim_in_backdrop();  /* default: precise address gate */
     /* mode 0: legacy tag+narrow heuristic (kept for comparison) */
     int native_w = g_wide_w - 2 * g_wide_off;
@@ -1355,7 +1361,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
         !(!g_ws_bd_stretch_on && mirror_geo_center_only(xs, n))) {
         int dx = wide_dx();
-        s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
+        s_bd_gate = bd_prim_gate(xs, n, 0); /* flat prims are immediate -> gate per prim */
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
@@ -1420,7 +1426,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
      * state goes in the vertex; only these keys force a new draw. */
     {
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
-        int gate = bd_prim_gate(xs, 3);  /* backdrop-stretch gate is also a batch key */
+        int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
         /* STP draw-ORDER correctness. flush_tex_batch draws a batch in two passes
          * over the WHOLE batch (pass 1 = every prim's STP=0/opaque texels, pass 2
          * = every prim's STP=1/semi texels with the PSX blend). For overlapping

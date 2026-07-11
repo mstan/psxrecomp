@@ -53,8 +53,12 @@ enum {
     AUDIO_EV_UNDERRUN  = 4,  /* host queue empty at pump entry; a=queued bytes */
     AUDIO_EV_MUTE      = 5,  /* turbo mute engaged; a=fade tail frames */
     AUDIO_EV_UNMUTE    = 6,  /* pumping resumed; a=fade-in frames pending */
-    AUDIO_EV_CD_PUSH   = 7,  /* a=frames pushed, b=CD ring fill after */
+    AUDIO_EV_CD_PUSH   = 7,  /* a=guest-cycle clock low32, b=ring fill after */
     AUDIO_EV_DMA_WRITE = 8,  /* SPU RAM DMA; a=words, b=transfer addr after */
+    AUDIO_EV_XA_ZERO   = 9,  /* zero-run in decoded XA PCM; a=lba,
+                                b=(stage<<28)|(start_frame<<14)|run_len.
+                                stage 0=post-ADPCM-decode (native rate),
+                                stage 1=post-resample+volume (44100). */
 };
 
 typedef struct {

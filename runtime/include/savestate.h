@@ -29,8 +29,11 @@ void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry
 /* Stage a save/load of slot [0..SAVESTATE_SLOTS-1]. Executed at the next safe
  * boundary by savestate_poll (called every block from psx_check_interrupts).
  * Safe to call from the SDL key handler or a debug-server command. */
-void savestate_request_save(int slot);
-void savestate_request_load(int slot);
+/* Stage a save/load for the next block boundary. Returns 1 if staged, 0 if
+ * the request cannot be honored (not configured, bad slot, or — for load —
+ * an LLE host-fiber run, where the cross-fiber unwind is unsafe). */
+int savestate_request_save(int slot);
+int savestate_request_load(int slot);
 
 /* Called every block from psx_check_interrupts (in_exception == 0). If a save is
  * pending, serialize with cpu->pc = resume_pc; if a load is pending, restore and

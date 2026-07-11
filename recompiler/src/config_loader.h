@@ -228,6 +228,12 @@ struct RuntimeConfig {
     // side only, guest timeline untouched. Per-game opt-in because MDEC use
     // outside movies (loading-screen stills) would briefly trigger it.
     bool                  video_fmv_skip_no_xa = false;
+    // fmv_skip_no_xa_hold: presentation-side fast-forward latch, in guest
+    // vblanks, after the most recent silent MDEC decode. Silent preloaded
+    // logos can retain an authored post-decode wait; a title may opt into a
+    // longer latch so auto-skip covers that wait too. Default preserves the
+    // generic four-frame inter-decode hysteresis.
+    int                   video_fmv_skip_no_xa_hold = 4;
 
     // aspect_ratio: display aspect "W:H" (default "4:3" = native). A wider
     // aspect (e.g. "16:9") enables the widescreen hack: the GTE squashes
@@ -456,6 +462,10 @@ struct GameConfig {
     // frame instead of leaving edge void (8C). Main-EXE addresses; regen-class.
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
 
+    // [widescreen.dome] call_sites: exact guest JAL addresses whose GTE
+    // projections belong to a finite curved backdrop mesh authored for 4:3.
+    std::vector<uint32_t> ws_dome_call_sites;
+
     // [widescreen.cull] auto_screen_x — automatic horizontal-FOV cull widening.
     // GTE-projected render funnels reject a primitive when ALL its vertices fall
     // off the 4:3 frame: a per-vertex `sltiu vN, SX, 0x140` (right edge) paired
@@ -498,6 +508,11 @@ struct GameConfig {
     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
     bool ws_gte_game_mode = false;
 
+    // [widescreen] native_wide — select the newer wide render-target path.
+    // Defaults on for compatibility. Titles can keep the original GTE-squash
+    // + stretched-present path when native-wide is not regression-free.
+    bool ws_native_wide = true;
+
     // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
     // space HUD sprites out to the true wide-frame corners (they otherwise sit
     // inset by the reveal offset). Runtime-only — no regen. Off by default.
@@ -523,6 +538,18 @@ struct GameConfig {
     // sides while preserving the canonical 4:3 surface and guest VRAM. Runtime-
     // only gate; any game-specific init hook remains regen-class. Off by default.
     bool ws_clear_reveal = false;
+
+    // [widescreen] nw_flat_backdrop — in the native-wide mirror only, stretch
+    // untextured flat primitives across the wider output. This is for games
+    // whose authored 4:3 sky/backdrop is emitted as flat polygons rather than
+    // a recognizable full-frame textured quad. Runtime-only; off by default.
+    bool ws_nw_flat_backdrop = false;
+
+    // [widescreen] nw_phase_backdrop — stretch textured primitives emitted
+    // before the frame's first shaded 3D primitive. This isolates an authored
+    // 2D sky/backdrop phase from the later textured foreground. Runtime-only;
+    // off by default because draw ordering is title-specific.
+    bool ws_nw_phase_backdrop = false;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a

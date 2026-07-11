@@ -213,6 +213,17 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-10 (Tomba 2 Whoopee auto-skip dwell + native-wide Beach backdrop):**
+  Added an opt-in silent-MDEC post-decode hold so presentation-side FMV
+  auto-skip remains unpaced through a preloaded logo's authored release wait;
+  the faithful guest timeline is unchanged and the default remains four
+  vblanks. Added title-opted native-wide mirror gates for flat primitives and
+  the textured pre-shaded backdrop phase. This keeps the canonical 4:3 buffer
+  untouched while filling Tomba 2 Beach Town at 16:9 and 21:9 without stretching
+  the later 3D foreground. Also fixed JSON escaping in the `fmv_state` path and
+  extended its resolved-config reporting. Validated Release build, unattended
+  first-attract captures at 4:3/16:9/21:9, and zero unknown dispatches.
+
 - **2026-07-02 (HLE PIVOT implemented — HLE as a first-class swappable tier, gbarecomp model):**
   USER-DIRECTED pivot (supersedes "no HLE" §0; CLAUDE.md amended 2026-07-02, memory
   hle_tier_architecture.md). Built the full stack this session: (1) EMITTER —

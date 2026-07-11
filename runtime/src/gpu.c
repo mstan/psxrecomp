@@ -88,6 +88,7 @@ static int      ws_cfg_num = 4, ws_cfg_den = 3;
 typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
 static WsTag    ws_tags[WS_TAG_BUCKETS];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
+static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
@@ -141,12 +142,61 @@ static uint32_t ws_last_gte_stamp = (uint32_t)-1000;
  * this many consecutive frames (save/options/memory-card) — reverts to 4:3. */
 #define WS_GTE_GAME_MODE_HYSTERESIS 45u
 void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
+
+/* World-scale 3D signal for the 2D-only-scene classifier (sprite-tag titles).
+ * Shaded-prim presence proved to be a FALSE world signal: task-clear /
+ * new-task title cards are gouraud-shaded screen-space tiles animated over
+ * many consecutive frames, which defeated both the shaded test and its
+ * sustained guard (room re-stretched whenever a card played). Projection
+ * volume can't be fooled that way: a real 3D world projects hundreds of
+ * verts per frame through RTPS/RTPT, a room interior projects only its
+ * character anchors (a handful), and screen-space overlays project ZERO.
+ * Sustained rule as elsewhere: 2+ consecutive frames over threshold, so an
+ * isolated projection burst can't flip a 2D scene wide. */
+#define WS_WORLD3D_MIN_VERTS 48u
+static uint32_t ws_gte_prev_verts     = 0;  /* final count of last completed frame */
+static uint32_t ws_last_world3d_stamp = (uint32_t)-1000;
+static uint32_t ws_sust_world3d_stamp = (uint32_t)-1000;
+
+/* Natural-overhang world signal — the classifier's actual input. GTE volume
+ * above proved to be a SECOND false world signal: the task-found/task-clear
+ * jingle projects world-scale vert counts inside a room (stamped world3d at
+ * ≥48 while the room idles at 4). What can't be faked is CONTENT: a real 3D
+ * scene always submits polygons whose raw vertex X extent crosses outside
+ * the canonical display window (that overhang is the very content native-
+ * wide reveals — the working outdoor reveal proves it exists), while rooms,
+ * dialogs, HUDs and jingle popups compose everything inside it. Polygons
+ * only (sprites/rects slide in from edges routinely — the task icon enters
+ * from the right edge), ≥3 prims per frame, sustained 2+ consecutive
+ * frames. Counted at gp0_execute_command via prim_sx_extent (raw SX,
+ * pre-draw_offset, so our native-wide offset injection can't feed back). */
+/* Depth qualifier: only polys crossing DEEP past the canonical edge count.
+ * Census-measured (SCUS-94236): outdoor terrain = 55/frame at >=24px (depths
+ * to 128px); the task-jingle sparkles poke <=20px and its sliding icon is a
+ * single prim at 34px — so >=24px depth + >=4 prims excludes every observed
+ * screen-edge effect with ~14x headroom to the real world's count. */
+#define WS_OVERHANG_DEEP_PX   24
+#define WS_OVERHANG_MIN_PRIMS 4u
+static uint32_t ws_ovh_frame      = (uint32_t)-1;
+static uint32_t ws_ovh_count      = 0;
+static uint32_t ws_ovh_prev       = 0;  /* final count of last completed frame */
+static uint32_t ws_last_ovh_stamp = (uint32_t)-1000;
+static uint32_t ws_sust_ovh_stamp = (uint32_t)-1000;
+
 void psx_ws_note_gte_project(int nverts) {
-    if (!ws_gte_game_mode_cfg) return;
     uint32_t f = (uint32_t)s_frame_count;
-    if (f != ws_gte_frame) { ws_gte_frame = f; ws_gte_count = 0; }
+    if (f != ws_gte_frame) {
+        if (f == ws_gte_frame + 1u) ws_gte_prev_verts = ws_gte_count;
+        else                        ws_gte_prev_verts = 0;
+        ws_gte_frame = f; ws_gte_count = 0;
+    }
     ws_gte_count += (uint32_t)nverts;
-    if (ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS) ws_last_gte_stamp = f;
+    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS)
+        ws_last_gte_stamp = f;
+    if (ws_gte_count >= WS_WORLD3D_MIN_VERTS && ws_last_world3d_stamp != f) {
+        if (f == ws_last_world3d_stamp + 1u) ws_sust_world3d_stamp = f;
+        ws_last_world3d_stamp = f;
+    }
 }
 
 /* Full-2D tile-engine mode (MMX6): config [widescreen] full_2d, or the PSX_WS_FORCE_2D
@@ -173,9 +223,31 @@ static int ws_game_mode(void) {
  * UI (dialog boxes built from tiled cap/middle pieces), so such screens get
  * zero squash + a 4:3 pillarbox instead. The FMV check is cached per frame;
  * game_mode is a cheap live check. */
+/* 2D-only gameplay scenes (sprite-tag titles). A room interior or a sky-only
+ * fall is gameplay-classified (the character prims tag every frame) but has
+ * no world-scale GTE projection — there is no 3D world and nothing beyond
+ * the canonical frame to reveal, so wide presents can only stretch flat art
+ * (the backdrop stretch fires wholesale because the background phase never
+ * ends). Present those scenes native 4:3 instead: the canonical buffer is
+ * always faithful. The signal is natural polygon OVERHANG past the canonical
+ * window (ws_sust_ovh_stamp) — content that would actually be revealed.
+ * Shaded-prim presence and GTE projection volume both proved to be false
+ * world signals (title-card letter tiles; the task-jingle's GTE effect) —
+ * see the overhang block for the full lineage. Scoped to the tag-classified
+ * (2.5D) mechanism: full-2D titles (MMX6) are 2D-only by definition and
+ * genuinely reveal more, and GTE-detector titles (Ape) already classify 2D
+ * screens by projection count. The hysteresis rides out 1-2 frame gaps; a
+ * real scene change crosses it in ~0.1 s. */
+#define WS_2D_SCENE_HYSTERESIS 6u
+static int ws_2d_only_scene(void) {
+    if (ws_full_2d_mode() || ws_gte_game_mode_cfg) return 0;
+    return (uint32_t)s_frame_count - ws_sust_ovh_stamp > WS_2D_SCENE_HYSTERESIS;
+}
+
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
+    if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
     static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
     static int      fmv_cached = 0;
     uint32_t f = (uint32_t)s_frame_count;
@@ -1024,6 +1096,11 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->nw_extra          = ws_nw_extra();
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;
+    out->last_3d_frame     = ws_last_3d_stamp;
+    out->gte_verts         = ws_gte_prev_verts;
+    out->last_world3d_frame = ws_sust_world3d_stamp;
+    out->ovh_prims         = ws_ovh_prev;
+    out->last_ovh_frame    = ws_sust_ovh_stamp;
 }
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
@@ -1105,6 +1182,8 @@ static int ws_tagged_anchor(int32_t *out_ax) {
  * flower-field tiles — the 3D rock/foreground is untagged AND has narrow prims,
  * so tag/narrow heuristics alone mis-stretch and tear it. */
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
+static int ws_nw_phase_backdrop = 0;
+void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -1120,6 +1199,8 @@ static uint32_t bdg_src_frame = 0xFFFFFFFFu;
  *   4 tagged     : prim is sprite-tagged (psx_ws_prim_is_tagged)
  *   5 untag-tex  : textured AND not sprite-tagged
  *   6 all-tex    : every textured prim (sanity: should fill void + distort 3D)
+ *   7 all        : every primitive (coarse correlation sanity check)
+ *   8 all-flat   : every untextured primitive
  * Counters (per-frame, snapshotted by the present hook) report how many prims
  * matched and how many of those were sprite-tagged. */
 int      g_dbg_mode = 0;
@@ -1143,6 +1224,8 @@ static int dbg_gate_match(void) {
         case 4: m = tagged; break;
         case 5: m = (textured && !tagged); break;
         case 6: m = textured; break;
+        case 7: m = 1; break;
+        case 8: m = !textured; break;
         default: m = 0; break;
     }
     if (m) { s_dbg_match_n++; if (tagged) s_dbg_match_tagged++; }
@@ -1166,7 +1249,11 @@ static int      s_bg_phase_over  = 0;
 void ws_bg_phase_note(uint32_t op) {
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
-    if (op >= 0x30u && op <= 0x3Fu) s_bg_phase_over = 1;   /* shaded = 3D world */
+    if (op >= 0x30u && op <= 0x3Fu) {
+        s_bg_phase_over = 1;   /* shaded = 3D world (within-frame draw order) */
+        ws_last_3d_stamp = f;  /* diagnostic only — see ws_2d_only_scene() for
+                                  why shaded prims are NOT the scene classifier */
+    }
 }
 static int ws_bg_phase_over(void) {
     uint32_t f = (uint32_t)s_frame_count;
@@ -1182,6 +1269,7 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both
      * the flower grid and the sky band; HUD/characters (tagged but post-3D) and the
@@ -1290,9 +1378,11 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
  * 4:3 and non-opted titles are byte-identical.
  * Returns the signed x delta to add to the prim's x before draw_offset. */
 static int ws_nw_hud_corners = 0;
+static int ws_nw_hud_tag_rects = 0;   /* rects shift even when tagged (A/B) */
 static uint32_t ws_nw_left_hud_packet_lo = 0;
 static uint32_t ws_nw_left_hud_packet_hi = 0;
 void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_hud_tag_rects(int on) { ws_nw_hud_tag_rects = on ? 1 : 0; }
 void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi) {
     ws_nw_left_hud_packet_lo = lo & 0x1FFFFFFFu;
     ws_nw_left_hud_packet_hi = hi & 0x1FFFFFFFu;
@@ -1310,6 +1400,15 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     int32_t off = ws_nw_offset();
     if (off <= 0) return 0;
     if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
+    /* Sprite-tag titles (anchor configured): HUD ≡ UNTAGGED rect-family prims
+     * — the same discriminator the squash path's hud_sprt_squash used. Tagged
+     * prims are character billboards positioned from their GTE anchor; they
+     * must never re-anchor. (Poly/line sites are excluded wholesale for tag
+     * titles in ws_nw_hud_shift_vertices — their polys are the world.)
+     * ws_nw_hud_tag_rects (TCP ws_hud_mode) lifts the exclusion for rects,
+     * for live A/B: some HUD composites (Tomba's AP counter) render through
+     * the tagged sprite funnel and stay inset without it. */
+    if (ws_anchor_addr && !ws_nw_hud_tag_rects && psx_ws_prim_is_tagged()) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
@@ -1322,6 +1421,10 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
  * the game's dedicated HUD packet arena reaches here, never world polygons. */
 static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
     if (count <= 0) return;
+    /* Sprite-tag titles: polygon/line prims are the GTE world and the tagged
+     * character billboards, never HUD — only the rect-family sites (which
+     * call ws_nw_hud_shift directly, with the untagged filter) re-anchor. */
+    if (ws_anchor_addr) return;
     int32_t lo = vx[0], hi = vx[0];
     for (int i = 1; i < count; i++) {
         if (vx[i] < lo) lo = vx[i];
@@ -1345,6 +1448,9 @@ static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
  * Transforms vx[0..3] IN PLACE (pre-draw_offset); returns 1 if it applied. */
 static int ws_nw_backdrop = 0;
 void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
+static int ws_nw_flat_backdrop = 0;
+void gpu_ws_set_nw_flat_backdrop(int on) { ws_nw_flat_backdrop = on ? 1 : 0; }
+int gpu_ws_nw_flat_backdrop_enabled(void) { return ws_nw_flat_backdrop; }
 static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
     if (!ws_nw_backdrop || !ws_native_wide_active()) return 0;
     int32_t extra = ws_nw_extra();
@@ -3040,7 +3146,7 @@ typedef struct {
     int16_t  xmin, xmax;  /* screen-X extent across the prim's position verts */
     int16_t  base_x;      /* back-buffer origin (draw_area_left) at draw time */
     uint8_t  opcode;
-    uint8_t  pad;
+    uint8_t  tagged;      /* psx_ws_prim_is_tagged() at draw time */
 } WsCensusEntry;
 static WsCensusEntry *ws_census = NULL;
 static uint64_t       ws_census_seq = 0;
@@ -3071,6 +3177,35 @@ static void prim_sx_extent(uint8_t op, int32_t *xmin, int32_t *xmax) {
     *xmin = lo; *xmax = hi;
 }
 
+/* Natural-overhang noter (see the ws_ovh_* block up top for the rationale).
+ * Called for every draw prim; counts POLYGONS whose raw SX extent crosses
+ * outside [0, disp_w] by more than the jitter margin, and stamps the frame
+ * (with the 2-consecutive-frames sustained rule) when enough do. */
+static void ws_note_overhang(uint8_t op) {
+    if (op < 0x20 || op > 0x3F) return;      /* polygons only — the world's prims */
+    /* Sprite-funnel (tagged) prims slide in from off-screen routinely —
+     * title-card letter tiles are tagged poly quads entering from the edges
+     * and stamped a sustained overhang inside the hut (observed at frame
+     * 20245). The WORLD funnel (Cluster-A RTPT terrain) never tags, so
+     * untagged overhang is the uncorrupted "revealable content" signal.
+     * Untagged-only also leaves non-tag titles unchanged (is_tagged == 0). */
+    if (psx_ws_prim_is_tagged()) return;
+    int32_t xmn, xmx;
+    prim_sx_extent(op, &xmn, &xmx);
+    int32_t W = ws_disp_w();
+    if (xmn >= -WS_OVERHANG_DEEP_PX && xmx <= W + WS_OVERHANG_DEEP_PX) return;
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != ws_ovh_frame) {
+        ws_ovh_prev  = (f == ws_ovh_frame + 1u) ? ws_ovh_count : 0;
+        ws_ovh_frame = f; ws_ovh_count = 0;
+    }
+    ws_ovh_count++;
+    if (ws_ovh_count >= WS_OVERHANG_MIN_PRIMS && ws_last_ovh_stamp != f) {
+        if (f == ws_last_ovh_stamp + 1u) ws_sust_ovh_stamp = f;
+        ws_last_ovh_stamp = f;
+    }
+}
+
 static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     if (!ws_census_on) return;
     if (!ws_census) {
@@ -3090,6 +3225,7 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     e->xmax     = (int16_t)xmx;
     e->base_x   = (int16_t)draw_area_left;
     e->opcode   = opcode;
+    e->tagged   = (uint8_t)psx_ws_prim_is_tagged();
     ws_census_seq++;
 }
 
@@ -3098,7 +3234,7 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     if (!ws_census) return 0;
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode\n");
+    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode,tagged\n");
     uint64_t total = ws_census_seq;
     uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
     uint64_t start = total - avail;
@@ -3106,9 +3242,9 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     for (uint64_t s = start; s < total; s++) {
         WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
         if (e->frame < f0 || e->frame > f1) continue;
-        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X\n",
+        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X,%u\n",
                 e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y,
-                e->xmin, e->xmax, e->base_x, e->opcode);
+                e->xmin, e->xmax, e->base_x, e->opcode, e->tagged);
         n++;
     }
     fclose(fp);
@@ -3131,6 +3267,7 @@ static void gp0_execute_command(void) {
         int32_t cvx, cvy;
         parse_vertex(gp0_cmd_buf[1], &cvx, &cvy);
         ws_census_record(opcode, cvx, cvy);
+        ws_note_overhang(opcode);   /* 2D-only-scene classifier world signal */
     }
 
     /* Categorize for diagnostics */
