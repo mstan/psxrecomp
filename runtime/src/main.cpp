@@ -55,6 +55,19 @@
 #include "launcher.h"
 #endif
 #include <SDL.h>
+#if defined(PSX_WEB)
+#include <emscripten.h>
+#include "web_audio_bridge.h"
+#define SDL_InitSubSystem     psx_web_audio_init_subsystem
+#define SDL_OpenAudioDevice  psx_web_audio_open_device
+#define SDL_PauseAudioDevice psx_web_audio_pause_device
+#define SDL_QueueAudio       psx_web_audio_queue
+#define SDL_GetQueuedAudioSize psx_web_audio_queued_size
+#define SDL_ClearQueuedAudio psx_web_audio_clear
+#define SDL_CloseAudioDevice psx_web_audio_close
+#define SDL_LockAudioDevice  psx_web_audio_lock
+#define SDL_UnlockAudioDevice psx_web_audio_unlock
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -410,9 +423,15 @@ static bool       s_drc_ready = false;
  * the bridge from a single build; default (unset) = bridge/pull model. Output
  * health is surfaced through the audio_stats TCP command (no stderr probe). */
 static bool audio_legacy_mode(void) {
+#if defined(PSX_WEB)
+    /* The browser bridge consumes the existing deterministic queued-audio
+     * path; Web Audio performs host-rate conversion. */
+    return true;
+#else
     static int v = -1;
     if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
     return v != 0;
+#endif
 }
 /* Legacy-mode underrun counter: incremented when the SDL queue is found empty
  * at pump time (the device was silence-filling = an audible gap). */
@@ -938,7 +957,6 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
                                    uint64_t *overflow_drops, double *correction,
                                    int *legacy, int *host_rate)
 {
-    extern int g_audio_host_rate;   /* set at device open */
     *legacy = audio_legacy_mode() ? 1 : 0;
     *host_rate = g_audio_host_rate;
     if (*legacy || !s_drc_ready) {
@@ -1031,6 +1049,13 @@ static void sdl_audio_update(int turbo_active) {
 #define PAD_CIRCLE   (1 << 13)
 #define PAD_CROSS    (1 << 14)
 #define PAD_SQUARE   (1 << 15)
+
+#if defined(PSX_WEB_TEST_ASSETS)
+static int g_web_test_start = 0;
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_test_set_start(int down) {
+    g_web_test_start = down != 0;
+}
+#endif
 
 struct ControllerSource {
     enum class Kind {
@@ -1431,7 +1456,11 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
  * Return=Start, RShift=Select) plus T/Y=L3/R3 stick clicks. */
 static uint16_t pad_from_keyboard(int player) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
-    return psx_keybinds_pad_word(keys, player);
+    uint16_t word = psx_keybinds_pad_word(keys, player);
+#if defined(PSX_WEB_TEST_ASSETS)
+    if (player == 1 && g_web_test_start) word &= (uint16_t)~PAD_START;
+#endif
+    return word;
 }
 
 static uint16_t controller_pad_buttons(SDL_GameController* h) {
@@ -1811,6 +1840,9 @@ static void sdl_vblank_present(void) {
     extern uint64_t s_frame_count;
     s_frame_count++;
     int override = -1;
+#if defined(PSX_WEB_TEST_ASSETS)
+    if (g_web_test_start) override = (int)(0xFFFFu & ~(uint16_t)PAD_START);
+#endif
 #endif
 
     /* Host-stack-usage profile sample — frame counter is now current, and we are
@@ -3311,6 +3343,13 @@ int main(int argc, char** argv) {
      * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
      * fall back progressively if a driver can't provide vsync/accel. */
   if (!g_gl_active && !g_vk_active) {
+#if defined(PSX_WEB)
+    /* The PS1 rasterizer is already software. SDL's accelerated web presenter
+     * tries to own a GLES context from the emulation pthread; use the canvas
+     * software presenter, whose browser operations are safely proxied. */
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+    Uint32 rflags = SDL_RENDERER_SOFTWARE;
+#else
 #ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
@@ -3318,9 +3357,15 @@ int main(int argc, char** argv) {
      * latency; the wall-clock pacer still holds 59.94Hz (may tear). */
     Uint32 rflags = SDL_RENDERER_ACCELERATED |
                     (g_video_vsync != 0 ? SDL_RENDERER_PRESENTVSYNC : 0u);
+#endif
     sdl_renderer = SDL_CreateRenderer(sdl_window, -1, rflags);
+#if defined(PSX_WEB)
+    if (!sdl_renderer)
+        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_SOFTWARE);
+#else
     if (!sdl_renderer)
         sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
+#endif
     if (!sdl_renderer) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;

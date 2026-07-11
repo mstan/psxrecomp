@@ -52,7 +52,13 @@ else()
 endif()
 
 if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
-    if(MSVC)
+    if(EMSCRIPTEN)
+        # SDL2 is supplied by Emscripten's maintained port rather than a host
+        # pkg-config package. The actual --use-port flag is target-scoped below
+        # so native targets keep their existing discovery/link behavior.
+        set(SDL2_INCLUDE_DIRS "${CMAKE_SYSROOT}/include/SDL2")
+        set(SDL2_LIBRARIES "__emscripten_sdl2_port__")
+    elseif(MSVC)
         file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_ROOT}/../sdl2-msvc/SDL2-*")
         if(SDL2_MSVC_DIR)
             set(SDL2_INCLUDE_DIRS "${SDL2_MSVC_DIR}/include")
@@ -208,6 +214,26 @@ set(PSXRECOMP_RUNTIME_SOURCES
     # auto-detects the host arch (SLJIT_CONFIG_AUTO). See lib/sljit/LICENSE.
     ${PSXRECOMP_ROOT}/lib/sljit/sljit_src/sljitLir.c
 )
+
+if(EMSCRIPTEN)
+    # Browsers cannot allocate/execute arbitrary native machine code or load
+    # host DLL shards. Keep the documented interpreter correctness floor and
+    # replace only the unavailable Tier-2 producer with an explicit backend.
+    list(REMOVE_ITEM PSXRECOMP_RUNTIME_SOURCES
+        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
+        ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
+        ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
+        ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
+        ${PSXRECOMP_ROOT}/lib/sljit/sljit_src/sljitLir.c)
+    list(APPEND PSXRECOMP_RUNTIME_SOURCES
+        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer_unavailable.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_fiber_single_context.c
+        ${PSXRECOMP_ROOT}/runtime/src/crash_trace_web.c
+        ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat_web.c
+        ${PSXRECOMP_ROOT}/runtime/src/web_audio_bridge.c
+        ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit_unavailable.c)
+endif()
 
 set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_ROOT}/runtime/include
@@ -398,7 +424,27 @@ function(psxrecomp_add_runtime_target target)
     # --static link line (libSDL2.a + the full Windows system-lib chain SDL2
     # needs: winmm, imm32, ole32, oleaut32, version, setupapi, dinput8, ...).
     # Otherwise link the SDL2 import lib (needs SDL2.dll at runtime).
-    if(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
+    if(EMSCRIPTEN)
+        target_compile_options(${target} PRIVATE
+            "--use-port=sdl2"
+            "-pthread")
+        target_link_options(${target} PRIVATE
+            "--use-port=sdl2"
+            "-pthread"
+            "-sPROXY_TO_PTHREAD=1"
+            "-sPTHREAD_POOL_SIZE=2"
+            "-sALLOW_MEMORY_GROWTH=1"
+            "-sINITIAL_MEMORY=402653184"
+            "-sMAXIMUM_MEMORY=1073741824"
+            "-sSTACK_SIZE=8388608"
+            "-sDEFAULT_PTHREAD_STACK_SIZE=16777216"
+            "-sNO_DISABLE_EXCEPTION_CATCHING"
+            "-sFORCE_FILESYSTEM=1"
+            "-sEXIT_RUNTIME=0")
+        target_compile_definitions(${target} PRIVATE
+            PSX_WEB=1
+            PSX_NO_DEBUG_TOOLS=1)
+    elseif(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
         target_link_libraries(${target} PRIVATE ${SDL2_STATIC_LDFLAGS})
     else()
         target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
@@ -487,7 +533,10 @@ function(psxrecomp_add_runtime_target target)
             COMMENT "Copying launcher assets next to ${target}")
     endif()
 
-    if(WIN32 OR MINGW)
+    if(EMSCRIPTEN)
+        # SDL's browser backend owns the WebGL/canvas integration. The first
+        # web milestone deliberately uses the portable software renderer.
+    elseif(WIN32 OR MINGW)
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)

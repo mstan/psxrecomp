@@ -14,10 +14,18 @@
 #include <string.h>
 
 /* 2^22 frames @ 44100 ~= 95 s per tap. Power of two so wrap is a mask. */
+#ifdef PSX_WEB
+#define PCM_RING_FRAMES (1u << 14)
+#else
 #define PCM_RING_FRAMES (1u << 22)
+#endif
 #define PCM_RING_MASK   (PCM_RING_FRAMES - 1u)
 
+#ifdef PSX_WEB
+#define EV_RING_CAP  (1u << 12)
+#else
 #define EV_RING_CAP  (1u << 19)
+#endif
 #define EV_RING_MASK (EV_RING_CAP - 1u)
 
 /* Audibility threshold shared with snesrecomp's dropped_audible metric:

@@ -30,7 +30,11 @@ extern "C" {
 /* 4M entries × 32 bytes = 128 MB.  At ~580K dispatches/s peak (boot)
  * that's ~7s; at ~10K/s during modal idle, ~400s.  Sized for press-
  * window retrospectives without per-second eviction. */
+#ifdef PSX_WEB
+#define FNTRACE_RING_CAP (1u << 12)
+#else
 #define FNTRACE_RING_CAP (1u << 22)
+#endif
 
 typedef struct {
     uint32_t frame;     /* s_frame_count at dispatch */

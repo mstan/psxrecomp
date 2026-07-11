@@ -138,7 +138,11 @@ extern const char *g_dirty_ram_last_unsupported_reason;
  * full-table scan (0.3 fps host burn in pc_table_get_or_insert_in) and
  * silently truncated overlay-capture seed lists (MAX_CAPTURE_PCS aliases
  * this). Probe length is bounded in pc_table_get_or_insert_in either way. */
+#ifdef PSX_WEB
+#define DIRTY_RAM_PC_TABLE_SIZE 16384
+#else
 #define DIRTY_RAM_PC_TABLE_SIZE 262144
+#endif
 typedef struct {
     uint32_t pc;         /* entry PC, 0 = empty slot */
     uint64_t hits;       /* number of times dispatched here */
@@ -169,10 +173,14 @@ extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
  * `ra` is cpu->gpr[31] at dispatch time. For normal JAL-style calls,
  * (ra - 8) gives the caller's PC. For J/JR/tail-calls it's only a
  * heuristic — treat ra as "ra_callsite_guess", not authoritative. */
+#ifdef PSX_WEB
+#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 12)
+#else
 #define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~128 MB).
  * At ~580K dispatches/s during boot, this retains ~7s of history; at
  * ~10K/s during modal idle, ~400s. Sized for retroactive press-window
  * analysis without the prior 16K ring's 28-ms eviction problem. */
+#endif
 typedef struct {
     uint64_t seq;       /* monotonic, unique per entry */
     uint32_t target;    /* entry PC (RAM address) */
@@ -190,7 +198,11 @@ typedef struct {
 extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
 extern uint64_t              g_dirty_ram_block_log_seq;
 
+#ifdef PSX_WEB
+#define DIRTY_RAM_FLOW_LOG_CAP (1u << 10)
+#else
 #define DIRTY_RAM_FLOW_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;
@@ -206,7 +218,11 @@ typedef struct {
 extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
 extern uint64_t             g_dirty_ram_flow_log_seq;
 
+#ifdef PSX_WEB
+#define DIRTY_RAM_INSN_LOG_CAP (1u << 10)
+#else
 #define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;
