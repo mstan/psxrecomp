@@ -137,6 +137,8 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]);
  * state churn without the draw calls, 3 = mirror draws stay on the hr FBO (no
  * per-pass FBO rebind; diagnostic only — corrupts both surfaces' content). */
 void gl_renderer_set_ws_ablate(int mode);
+/* Select centre-splice fast path (on) or complete native-wide mirror (off). */
+void gl_renderer_set_wide_fast(int on);
 int  gl_renderer_get_ws_ablate(void);
 
 /* Cumulative textured fraction of scene primitives since boot (flat vs textured

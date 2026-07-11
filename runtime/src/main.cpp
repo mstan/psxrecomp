@@ -957,7 +957,6 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
                                    uint64_t *overflow_drops, double *correction,
                                    int *legacy, int *host_rate)
 {
-    extern int g_audio_host_rate;   /* set at device open */
     *legacy = audio_legacy_mode() ? 1 : 0;
     *host_rate = g_audio_host_rate;
     if (*legacy || !s_drc_ready) {

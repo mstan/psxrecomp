@@ -105,6 +105,24 @@ for that whole build. If the value must switch live when the player changes
 between 4:3 and 16:9, add a typed widescreen transform that is identity in 4:3;
 do not bake a permanently wide value.
 
+For a signed Q16 `lui` bound that must follow the live aspect ratio, use the
+typed transform instead. It is shared by static generation, captured-overlay
+generation, the overlay JIT, and the dirty-RAM interpreter:
+
+```toml
+[[widescreen.signed_x_bound]]
+address = "0x800AB0CC"
+expected = "0x3C040153" # lui a0, 0x0153 (positive Q16 bound)
+
+[[widescreen.signed_x_bound]]
+address = "0x800AB0E4"
+expected = "0x3C04FEA7" # lui a0, 0xFEA7 (negative Q16 bound)
+```
+
+The helper returns the original signed value outside native-wide gameplay and
+scales it by the active horizontal field during native-wide gameplay. The
+expected instruction must be `lui`; other shapes are rejected by the loader.
+
 ### Combine patches with reusable widescreen features
 
 ```toml
@@ -129,6 +147,23 @@ note = "Title-specific camera limit; rendering and culling remain generic"
 
 The renderer features remain reusable and inert for games that do not opt in;
 only the final title-specific guest constant belongs in the patch table.
+
+### Expand finite textured arena edges
+
+Some 3D arenas already submit textured polygons beyond the 4:3 edges, but not
+far enough to cover 16:9. This typed renderer feature expands only vertices
+already outside the canonical boundary and preserves centre geometry:
+
+```toml
+[widescreen]
+nw_textured_edges = true
+nw_textured_edge_scale = 200 # 100..400; 0 selects aspect-derived scaling
+nw_full_mirror = true        # preserve interpolation across the old boundary
+```
+
+Sprites, rectangles, HUD, actors inside the canonical field, and the faithful
+4:3 path remain unchanged. `nw_full_mirror` is needed when an edge-crossing
+polygon would otherwise be spliced with canonical centre pixels.
 
 ## Optional enhancement profiles
 

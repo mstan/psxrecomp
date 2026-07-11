@@ -108,6 +108,28 @@ address and applies the patch only to the variant whose word matches.
 Use these for small, understood timing/bounds/logic changes; prefer typed
 features such as `[widescreen]` for reusable runtime behavior.
 
+### Typed widescreen extensions
+
+```toml
+[widescreen]
+nw_textured_edges = true
+nw_textured_edge_scale = 200 # 0 or 100..400
+nw_full_mirror = true
+
+[[widescreen.signed_x_bound]]
+address = "0x800AB0CC"
+expected = "0x3C040153" # must decode as LUI
+```
+
+`nw_textured_edges` expands only textured polygon vertices already beyond the
+canonical 4:3 boundary. `nw_full_mirror` disables the centre-splice fast path
+when transformed edge-crossing interpolation must remain continuous.
+
+Each `signed_x_bound` entry identifies a guarded `lui` whose signed Q16 value
+must scale with the active native-wide horizontal field. It is identity outside
+native-wide gameplay and applies consistently in static code, compiled overlay
+variants, SLJIT overlays, and dirty-RAM interpretation.
+
 ## Runtime block
 
 Consumed by the cmake macro `psxrecomp_v4_add_runtime_target` (eventually)

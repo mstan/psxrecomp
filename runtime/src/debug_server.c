@@ -6698,15 +6698,13 @@ static void handle_press(int id, const char *json)
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
     s_input_override = buttons;
     s_input_frames   = frames;
-    int lx = json_get_int(json, "lx", -1);
-    int ly = json_get_int(json, "ly", -1);
-    int rx = json_get_int(json, "rx", -1);
-    int ry = json_get_int(json, "ry", -1);
-    s_input_axes_valid = lx >= 0 || ly >= 0 || rx >= 0 || ry >= 0;
-    s_input_axes[0] = (uint8_t)(lx >= 0 && lx <= 255 ? lx : 0x80);
-    s_input_axes[1] = (uint8_t)(ly >= 0 && ly <= 255 ? ly : 0x80);
-    s_input_axes[2] = (uint8_t)(rx >= 0 && rx <= 255 ? rx : 0x80);
-    s_input_axes[3] = (uint8_t)(ry >= 0 && ry <= 255 ? ry : 0x80);
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6738,8 +6736,8 @@ static void handle_pad_status(int id, const char *json)
              pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
              sticks1[0], sticks1[1], sticks1[2], sticks1[3],
              s_input_override, s_input_frames,
-             s_input_axes[0], s_input_axes[1], s_input_axes[2], s_input_axes[3],
-             s_input_axes_valid ? "true" : "false");
+             s_axis_st[0], s_axis_st[1], s_axis_st[2], s_axis_st[3],
+             s_axis_override ? "true" : "false");
 }
 
 static void handle_clear_input(int id, const char *json)
