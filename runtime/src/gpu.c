@@ -19,6 +19,7 @@
 #include "cpu_state.h"
 #include "event_ring.h"
 #include "color_lut.h"
+#include "gpu_vk_renderer.h"
 #include "ws_cull_detect.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -1927,6 +1928,7 @@ static int       s_screen_kind_cfg = SCREEN_RAW;  /* config/launcher-set; env ov
 
 void gpu_set_screen_kind(int kind) {
     if (kind < SCREEN_RAW || kind > SCREEN_TRINITRON) kind = SCREEN_RAW;
+    vk_renderer_set_screen_kind(kind);   /* Vulkan present applies it as a shader */
     if (kind == s_screen_kind_cfg) return;
     s_screen_kind_cfg = kind;
     s_screen_lut_init = 0;  /* rebuild on next scanout */

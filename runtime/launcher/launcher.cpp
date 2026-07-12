@@ -96,7 +96,7 @@ public:
 
 // Mirror of the user-tunable settings, in the value shapes the RML binds to.
 struct LauncherModel {
-    int  renderer        = 0;  // 0=software, 1=opengl
+    int  renderer        = 0;  // 0=software, 1=opengl, 2=vulkan
     int  supersampling   = 1;  // 1..4
     bool antialiasing    = true;
     int  texture_filter  = 0;  // 0=nearest, 1=bilinear
@@ -381,7 +381,7 @@ int lang_index_for(const std::vector<psx_launcher::GameInfo::Language>& langs,
     return 0;   // unknown/first — the game's declared default sits at [0] by convention
 }
 
-const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
+const char* renderer_name(int v)  { return v == 2 ? "Vulkan" : v == 1 ? "OpenGL" : "Software"; }
 const char* texfilter_name(int v) { return v == 1 ? "Bilinear" : "Nearest"; }
 const char* crt_name(int v) {
     switch (v) {
@@ -948,7 +948,7 @@ Result run(SDL_Window* window, void* gl_context,
 
     c.BindEventCallback("cycle_renderer",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.renderer ^= 1;
+            m.renderer = (m.renderer + 1) % 3;
             refresh_labels(m);
             handle.DirtyVariable("renderer_label");
             handle.DirtyVariable("opengl_renderer");

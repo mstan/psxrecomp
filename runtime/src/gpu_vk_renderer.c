@@ -38,6 +38,7 @@ void vk_renderer_present_cpu(const uint32_t*p,int w,int h,int l,int f){(void)p;(
 void vk_renderer_present_blank(void){}
 void vk_renderer_sync_cpu(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
+void vk_renderer_set_screen_kind(int k){(void)k;}
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
@@ -47,6 +48,7 @@ const GpuRenderBackend *vk_backend_get(void) { return 0; }
 #include <SDL_vulkan.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include "color_lut.h"        /* ScreenKind + screen_kind_from_name (CRT present) */
 #include "vk_shaders_spv.h"   /* generated: spv_geo_vert/frag, spv_geo_tex_vert/frag,
                                *            spv_pack_comp, spv_blit_vert/frag */
 
@@ -182,12 +184,48 @@ static VkBuffer       s_pending_buf[PENDING_STAGING_MAX];
 static VkDeviceMemory s_pending_mem[PENDING_STAGING_MAX];
 static int            s_pending_n;
 
+/* Persistently mapped host-visible staging buffers. CPU-heavy menu screens can
+ * upload nearly all of VRAM every frame; creating, allocating, mapping and
+ * destroying the same ~1 MiB + ~2 MiB buffers at 60 Hz saturated one CPU core
+ * and limited Vulkan to ~57 fps. gpu_sync already drains the queue before a
+ * deferred buffer is released, so released entries are safe to reuse. */
+#define STAGING_CACHE_MAX 16
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkDeviceSize size;
+    void *map;
+    int busy;
+} StagingCacheEntry;
+static StagingCacheEntry s_staging_cache[STAGING_CACHE_MAX];
+
+static void staging_release(VkBuffer buf, VkDeviceMemory mem) {
+    for (int i = 0; i < STAGING_CACHE_MAX; i++) {
+        if (s_staging_cache[i].buf == buf && s_staging_cache[i].mem == mem) {
+            s_staging_cache[i].busy = 0;
+            return;
+        }
+    }
+    p_vkDestroyBuffer(s_dev, buf, NULL);
+    p_vkFreeMemory(s_dev, mem, NULL);
+}
+
 static VkSwapchainKHR   s_swapchain;
 static VkFormat         s_sc_format;
 static VkExtent2D       s_sc_extent;
 static uint32_t         s_sc_count;
 static VkImage          s_sc_images[8];
-static int              s_present_mode_req = 1;   /* 1 FIFO, 0 IMMEDIATE, -1 MAILBOX */
+static int              s_present_mode_req = 1;   /* 1 tear-free, 0 IMMEDIATE, -1 MAILBOX */
+
+/* CRT present pass (screen kind != raw): a fullscreen fragment-shader pass
+ * into the swapchain replaces the plain present blit. Render pass, per-image
+ * views/framebuffers and the pipeline live with the swapchain (rebuilt on
+ * resize / format change). */
+static int              s_crt_kind;               /* effective ScreenKind (0 = raw = off) */
+static VkRenderPass     s_rp_present;
+static VkImageView      s_sc_views[8];
+static VkFramebuffer    s_sc_fbs[8];
+static VkPipeline       s_pipe_crt;               /* lazy; needs s_rp_present + modules */
 
 /* Per-frame sync (double-buffered command recording). */
 #define VK_FRAMES 2
@@ -290,6 +328,8 @@ static int s_ds_blit_idx;
  * a frame that jumps from ~10 to ~2000 allocs is the smoking gun). Always on. */
 typedef struct {
     uint32_t present_idx;
+    uint64_t present_qpc;  /* [DEBUG-vkpresent] QueuePresent return timestamp */
+    uint32_t wait_us, acquire_us, present_us; /* [DEBUG-vkpresent] blocking boundaries */
     uint32_t allocs, alloc_kb, oneshots, submits, syncs, pack_flushes,
              blits, upload_blocks, copy_rects, geo_flushes, tex_flushes,
              wide_passes, wide_clears;
@@ -300,8 +340,15 @@ static uint32_t s_perf_head;          /* number of frames recorded (monotonic) *
 static VkPerf s_perf_cur;             /* current (in-progress) frame */
 static uint32_t s_present_idx;
 
+static uint32_t perf_elapsed_us(uint64_t start) {
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    uint64_t ticks = SDL_GetPerformanceCounter() - start;
+    return freq ? (uint32_t)(ticks * 1000000u / freq) : 0;
+}
+
 static void perf_snapshot_present(void) {
     s_perf_cur.present_idx = s_present_idx++;
+    s_perf_cur.present_qpc = SDL_GetPerformanceCounter();
     s_perf_ring[s_perf_head % VK_PERF_RING] = s_perf_cur;
     s_perf_head++;
     memset(&s_perf_cur, 0, sizeof s_perf_cur);
@@ -327,6 +374,10 @@ static VkPipeline       s_pipe_pack;      /* compute */
 #define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS)
 static VkPipeline s_pipe_cache[PIPE_CACHE_N];
 static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
+static VkShaderModule s_mod_crt_v, s_mod_crt_f;
+static VkSampler         s_samp_lin;              /* linear; CRT pass source sampling */
+static VkPipelineLayout  s_pl_crt;                /* s_dsl_blit + fragment push block */
+static VkDescriptorSet   s_ds_crt[VK_FRAMES];     /* per-frame: present cbs stay in flight */
 
 /* Untextured batch (flat/gouraud triangles, lines-as-quads, flat rects). */
 typedef struct { float x, y, r, g, b, a; } Vert;   /* GEO vertex, stride 24 */
@@ -514,10 +565,18 @@ static uint32_t find_mem_type(uint32_t type_bits, VkMemoryPropertyFlags want) {
 
 static void vk_gpu_sync_internal(void);   /* drain queue + reclaim work pool/staging */
 
-/* Begin a one-shot work command buffer (allocated from s_work_pool, which is
- * bulk-reset at gpu_sync). */
+/* Coalesced work command buffer. Per-op begin/end used to allocate + submit a
+ * fresh CB per op; in-ring gameplay hits 250-650 tex-batch flushes per frame
+ * and the per-submit driver overhead alone blew the 33ms frame budget (~58ms
+ * mean, 110ms p95 measured). Ops now record into ONE open CB; flush_work()
+ * ends + submits it exactly once, at gpu_sync (present / readback / ring
+ * drain). Single-CB recording order is a strict superset of the old queue
+ * submission order, so the per-op image-layout barriers keep working as-is. */
+static VkCommandBuffer s_work_cb;   /* open coalesced work CB (NULL if none) */
+
 static VkCommandBuffer begin_oneshot(void) {
     s_perf_cur.oneshots++;
+    if (s_work_cb) return s_work_cb;
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     ai.commandPool = s_work_pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -527,21 +586,27 @@ static VkCommandBuffer begin_oneshot(void) {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     p_vkBeginCommandBuffer(cb, &bi);
+    s_work_cb = cb;
     return cb;
 }
 
-/* Submit the work CB WITHOUT waiting. Cross-submit ordering is provided by the
- * per-op image-layout barriers (img_to): a barrier's first scope covers all
- * commands earlier in queue submission order, so each op's transitions wait for
- * prior ops' writes. The queue is drained only at gpu_sync (present / readback). */
+/* The op's commands stay in the open work CB; nothing is submitted here. */
 static void end_oneshot(VkCommandBuffer cb) {
-    p_vkEndCommandBuffer(cb);
+    (void)cb;
+    s_work_pending = 1;
+}
+
+/* End + submit the open work CB (no wait). Must run before any host-side wait
+ * on the work and before a present submit consumes its results. */
+static void flush_work(void) {
+    if (!s_work_cb) return;
+    p_vkEndCommandBuffer(s_work_cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
+    si.pCommandBuffers = &s_work_cb;
     p_vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
     s_perf_cur.submits++;
-    s_work_pending = 1;
+    s_work_cb = VK_NULL_HANDLE;
 }
 
 /* Defer a staging buffer's destruction until the queue is next idle (its
@@ -556,8 +621,11 @@ static void defer_staging(VkBuffer buf, VkDeviceMemory mem) {
  * The single sync point for the deferred-submit model. */
 static void vk_gpu_sync_internal(void) {
     s_perf_cur.syncs++;
+    flush_work();   /* submit the open coalesced work CB before waiting */
     if (s_work_pending) {
+        uint64_t wait_start = SDL_GetPerformanceCounter();
         p_vkQueueWaitIdle(s_queue);
+        s_perf_cur.wait_us += perf_elapsed_us(wait_start);
         /* RELEASE_RESOURCES so the per-op command buffers allocated since the
          * last sync are actually freed (a plain reset only recycles them, and
          * begin_oneshot always allocates fresh -> unbounded growth). */
@@ -565,8 +633,7 @@ static void vk_gpu_sync_internal(void) {
         s_work_pending = 0;
     }
     for (int i = 0; i < s_pending_n; i++) {
-        p_vkDestroyBuffer(s_dev, s_pending_buf[i], NULL);
-        p_vkFreeMemory(s_dev, s_pending_mem[i], NULL);
+        staging_release(s_pending_buf[i], s_pending_mem[i]);
     }
     s_pending_n = 0;
     s_ds_blit_idx = 0;
@@ -739,9 +806,14 @@ static VkPresentModeKHR choose_present_mode(void) {
     if (n > 8) n = 8;
     VkPresentModeKHR modes[8];
     p_vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &n, modes);
+    /* The frontend's wall-clock pacer already owns the 59.94 Hz cadence.
+     * FIFO adds a second blocking pacer and produces a beat-frequency tail
+     * (measured on SmackDown 2: 17.88 ms p50 / 19.30 ms p95). MAILBOX stays
+     * tear-free without making acquire/present another metronome (16.68 ms
+     * p50 / 16.70 ms p95 on the identical savestate). Prefer it for both
+     * tear-free modes; FIFO remains the required fallback. */
     VkPresentModeKHR want = (s_present_mode_req == 0) ? VK_PRESENT_MODE_IMMEDIATE_KHR
-                          : (s_present_mode_req < 0)  ? VK_PRESENT_MODE_MAILBOX_KHR
-                          :                             VK_PRESENT_MODE_FIFO_KHR;
+                                                       : VK_PRESENT_MODE_MAILBOX_KHR;
     for (uint32_t i = 0; i < n; i++) if (modes[i] == want) return want;
     return VK_PRESENT_MODE_FIFO_KHR;  /* always supported */
 }
@@ -792,10 +864,63 @@ static int create_swapchain(void) {
     p_vkGetSwapchainImagesKHR(s_dev, s_swapchain, &s_sc_count, NULL);
     if (s_sc_count > 8) s_sc_count = 8;
     p_vkGetSwapchainImagesKHR(s_dev, s_swapchain, &s_sc_count, s_sc_images);
+
+    /* CRT present pass objects (render pass, per-image view+framebuffer). A
+     * failure here just leaves s_rp_present NULL: present falls back to the
+     * plain blit, it is not fatal. */
+    {
+        VkAttachmentDescription att = {0};
+        att.format = s_sc_format; att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;       /* black letterbox bars */
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription sub = {0};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1; sub.pColorAttachments = &cref;
+        VkSubpassDependency dep = {0};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.srcAccessMask = 0;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+        rpi.attachmentCount = 1; rpi.pAttachments = &att;
+        rpi.subpassCount = 1; rpi.pSubpasses = &sub;
+        rpi.dependencyCount = 1; rpi.pDependencies = &dep;
+        if (p_vkCreateRenderPass(s_dev, &rpi, NULL, &s_rp_present) != VK_SUCCESS)
+            s_rp_present = VK_NULL_HANDLE;
+        for (uint32_t i = 0; s_rp_present && i < s_sc_count; i++) {
+            VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vi.image = s_sc_images[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = s_sc_format;
+            vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+            if (p_vkCreateImageView(s_dev, &vi, NULL, &s_sc_views[i]) != VK_SUCCESS) {
+                s_sc_views[i] = VK_NULL_HANDLE; break;
+            }
+            VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+            fi.renderPass = s_rp_present; fi.attachmentCount = 1;
+            fi.pAttachments = &s_sc_views[i];
+            fi.width = s_sc_extent.width; fi.height = s_sc_extent.height; fi.layers = 1;
+            if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_sc_fbs[i]) != VK_SUCCESS) {
+                s_sc_fbs[i] = VK_NULL_HANDLE; break;
+            }
+        }
+    }
     return 1;
 }
 
 static void destroy_swapchain(void) {
+    for (int i = 0; i < 8; i++) {
+        if (s_sc_fbs[i])   { p_vkDestroyFramebuffer(s_dev, s_sc_fbs[i], NULL); s_sc_fbs[i] = VK_NULL_HANDLE; }
+        if (s_sc_views[i]) { p_vkDestroyImageView(s_dev, s_sc_views[i], NULL); s_sc_views[i] = VK_NULL_HANDLE; }
+    }
+    if (s_pipe_crt)   { p_vkDestroyPipeline(s_dev, s_pipe_crt, NULL); s_pipe_crt = VK_NULL_HANDLE; }
+    if (s_rp_present) { p_vkDestroyRenderPass(s_dev, s_rp_present, NULL); s_rp_present = VK_NULL_HANDLE; }
     if (s_swapchain) { p_vkDestroySwapchainKHR(s_dev, s_swapchain, NULL); s_swapchain = VK_NULL_HANDLE; }
 }
 
@@ -885,6 +1010,12 @@ typedef struct {
     int   rect[4];      /* 32..47: x0,y0,x1,y1 native px */
 } BlitPush;             /* 48 bytes */
 typedef struct { int scale, off_x, off_y; } PackPush;          /* 12 bytes */
+typedef struct {
+    float src_rect[4];               /* displayed region, normalized src uv */
+    float out_size[2];               /* letterbox rect px */
+    float native[2];                 /* native source w, h (scanline count) */
+    int   kind;                      /* ScreenKind 1..3 */
+} CrtPush;                           /* 36 bytes; must match crt.frag PC */
 
 /* Create a device-local image + view (color aspect by default). */
 static int make_image(VkFormat fmt, int w, int h, VkImageUsageFlags usage,
@@ -1040,6 +1171,10 @@ static int create_render_targets(void) {
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     if (p_vkCreateSampler(s_dev, &sci, NULL, &s_samp) != VK_SUCCESS) return vk_die("sampler failed");
 
+    /* Linear sampler for the CRT present pass (smooth horizontal sampling). */
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    if (p_vkCreateSampler(s_dev, &sci, NULL, &s_samp_lin) != VK_SUCCESS) return vk_die("linear sampler failed");
+
     /* Descriptor set layouts. */
     {
         VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
@@ -1058,10 +1193,10 @@ static int create_render_targets(void) {
     /* Descriptor pool + sets: ds_tex (1) + ds_pack (1) + blit ring (BLIT_DESC_RING). */
     {
         VkDescriptorPoolSize sizes[2] = {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, BLIT_DESC_RING + 2 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, BLIT_DESC_RING + 2 + VK_FRAMES },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1 } };
         VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pci.maxSets = BLIT_DESC_RING + 2; pci.poolSizeCount = 2; pci.pPoolSizes = sizes;
+        pci.maxSets = BLIT_DESC_RING + 2 + VK_FRAMES; pci.poolSizeCount = 2; pci.pPoolSizes = sizes;
         if (p_vkCreateDescriptorPool(s_dev, &pci, NULL, &s_dpool) != VK_SUCCESS) return vk_die("desc pool");
         VkDescriptorSetLayout layouts[2] = { s_dsl_tex, s_dsl_pack };
         VkDescriptorSet *sets[2] = { &s_ds_tex, &s_ds_pack };
@@ -1074,6 +1209,14 @@ static int create_render_targets(void) {
             VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
             ai.descriptorPool = s_dpool; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_dsl_blit;
             if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_ds_blit_ring[i]) != VK_SUCCESS) return vk_die("blit set alloc");
+        }
+        /* CRT present sets: one per in-flight frame (the frame fence in
+         * acquire_present guarantees the set is idle before it is rewritten;
+         * the blit ring resets at gpu_sync and can't give that guarantee). */
+        for (int i = 0; i < VK_FRAMES; i++) {
+            VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            ai.descriptorPool = s_dpool; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_dsl_blit;
+            if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_ds_crt[i]) != VK_SUCCESS) return vk_die("crt set alloc");
         }
         /* ds_tex: raw mirror sampled. ds_pack: hr sampled + raw storage. */
         VkDescriptorImageInfo raw_smp = { s_samp, s_raw_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -1103,6 +1246,8 @@ static int create_render_targets(void) {
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_blit) != VK_SUCCESS) return vk_die("pl blit");
         pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; pr.size = sizeof(PackPush); li.pSetLayouts = &s_dsl_pack;
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_pack) != VK_SUCCESS) return vk_die("pl pack");
+        pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; pr.size = sizeof(CrtPush); li.pSetLayouts = &s_dsl_blit;
+        if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_crt) != VK_SUCCESS) return vk_die("pl crt");
     }
 
     /* Shader modules (kept for lazy graphics-pipeline creation). */
@@ -1112,7 +1257,10 @@ static int create_render_targets(void) {
     s_mod_tex_f  = make_module(spv_geo_tex_frag, spv_geo_tex_frag_size);
     s_mod_blit_v = make_module(spv_blit_vert, spv_blit_vert_size);
     s_mod_blit_f = make_module(spv_blit_frag, spv_blit_frag_size);
-    if (!s_mod_geo_v || !s_mod_geo_f || !s_mod_tex_v || !s_mod_tex_f || !s_mod_blit_v || !s_mod_blit_f)
+    s_mod_crt_v  = make_module(spv_crt_vert, spv_crt_vert_size);
+    s_mod_crt_f  = make_module(spv_crt_frag, spv_crt_frag_size);
+    if (!s_mod_geo_v || !s_mod_geo_f || !s_mod_tex_v || !s_mod_tex_f || !s_mod_blit_v || !s_mod_blit_f ||
+        !s_mod_crt_v || !s_mod_crt_f)
         return vk_die("shader module failed");
 
     /* Pack compute pipeline. */
@@ -1319,6 +1467,14 @@ void vk_renderer_shutdown(void) {
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
+    for (int i = 0; i < STAGING_CACHE_MAX; i++) {
+        StagingCacheEntry *e = &s_staging_cache[i];
+        if (!e->buf) continue;
+        if (e->map) p_vkUnmapMemory(s_dev, e->mem);
+        p_vkDestroyBuffer(s_dev, e->buf, NULL);
+        p_vkFreeMemory(s_dev, e->mem, NULL);
+        memset(e, 0, sizeof *e);
+    }
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
     for (int i = 0; i < PIPE_CACHE_N; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
@@ -1329,15 +1485,19 @@ void vk_renderer_shutdown(void) {
     if (s_mod_tex_f)   p_vkDestroyShaderModule(s_dev, s_mod_tex_f, NULL);
     if (s_mod_blit_v)  p_vkDestroyShaderModule(s_dev, s_mod_blit_v, NULL);
     if (s_mod_blit_f)  p_vkDestroyShaderModule(s_dev, s_mod_blit_f, NULL);
+    if (s_mod_crt_v)   p_vkDestroyShaderModule(s_dev, s_mod_crt_v, NULL);
+    if (s_mod_crt_f)   p_vkDestroyShaderModule(s_dev, s_mod_crt_f, NULL);
     if (s_pl_geo)  p_vkDestroyPipelineLayout(s_dev, s_pl_geo, NULL);
     if (s_pl_tex)  p_vkDestroyPipelineLayout(s_dev, s_pl_tex, NULL);
     if (s_pl_blit) p_vkDestroyPipelineLayout(s_dev, s_pl_blit, NULL);
     if (s_pl_pack) p_vkDestroyPipelineLayout(s_dev, s_pl_pack, NULL);
+    if (s_pl_crt)  p_vkDestroyPipelineLayout(s_dev, s_pl_crt, NULL);
     if (s_dpool)    p_vkDestroyDescriptorPool(s_dev, s_dpool, NULL);
     if (s_dsl_tex)  p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_tex, NULL);
     if (s_dsl_pack) p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_pack, NULL);
     if (s_dsl_blit) p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_blit, NULL);
     if (s_samp)     p_vkDestroySampler(s_dev, s_samp, NULL);
+    if (s_samp_lin) p_vkDestroySampler(s_dev, s_samp_lin, NULL);
     if (s_fbo)         p_vkDestroyFramebuffer(s_dev, s_fbo, NULL);
     if (s_rpass)       p_vkDestroyRenderPass(s_dev, s_rpass, NULL);
     if (s_vram_view)   p_vkDestroyImageView(s_dev, s_vram_view, NULL);
@@ -1375,6 +1535,95 @@ void vk_renderer_shutdown(void) {
 
 void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
 
+void vk_renderer_set_screen_kind(int kind) {
+    const char *e = getenv("PSX_SCREEN");   /* debug override, like the SW path */
+    ScreenKind envk;
+    if (e && screen_kind_from_name(e, &envk)) kind = (int)envk;
+    s_crt_kind = (kind >= SCREEN_RAW && kind <= SCREEN_TRINITRON) ? kind : SCREEN_RAW;
+}
+
+/* ---- CRT present pass --------------------------------------------------- */
+/* Lazily build the CRT graphics pipeline (needs s_rp_present, which lives
+ * with the swapchain, and the modules/layout from create_render_targets). */
+static int crt_pipeline_ensure(void) {
+    if (s_pipe_crt) return 1;
+    if (!s_rp_present || !s_mod_crt_v || !s_mod_crt_f || !s_pl_crt) return 0;
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_mod_crt_v; stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_mod_crt_f; stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {0};
+    ba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    ci.stageCount = 2; ci.pStages = stages;
+    ci.pVertexInputState = &vin; ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp; ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms; ci.pColorBlendState = &cb; ci.pDynamicState = &dy;
+    ci.layout = s_pl_crt; ci.renderPass = s_rp_present;
+    if (p_vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &ci, NULL, &s_pipe_crt) != VK_SUCCESS) {
+        s_pipe_crt = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+
+/* Record the CRT pass into the present cb: clears the whole swapchain image
+ * black (letterbox bars) and draws the shader-filtered picture into the dst
+ * rect. src_view must already be in SHADER_READ_ONLY_OPTIMAL; the swapchain
+ * image must be untouched this frame (pass takes it UNDEFINED -> PRESENT).
+ * Returns 0 if the pass is unavailable (caller falls back to the blit). */
+static int crt_present_draw(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr,
+                            VkImageView src_view, const VkOffset3D dst[2],
+                            float u0, float v0, float u1, float v1,
+                            float native_w, float native_h) {
+    if (img_idx >= 8 || !s_sc_fbs[img_idx] || !crt_pipeline_ensure()) return 0;
+
+    VkDescriptorImageInfo ii = { s_samp_lin, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w.dstSet = s_ds_crt[fr]; w.dstBinding = 0; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+    p_vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
+
+    VkClearValue clear = {0};
+    clear.color.float32[3] = 1.0f;
+    VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    bi.renderPass = s_rp_present; bi.framebuffer = s_sc_fbs[img_idx];
+    bi.renderArea.extent = s_sc_extent;
+    bi.clearValueCount = 1; bi.pClearValues = &clear;
+    p_vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport view = { (float)dst[0].x, (float)dst[0].y,
+                        (float)(dst[1].x - dst[0].x), (float)(dst[1].y - dst[0].y),
+                        0.0f, 1.0f };
+    VkRect2D sci = { { dst[0].x, dst[0].y },
+                     { (uint32_t)(dst[1].x - dst[0].x), (uint32_t)(dst[1].y - dst[0].y) } };
+    p_vkCmdSetViewport(cb, 0, 1, &view);
+    p_vkCmdSetScissor(cb, 0, 1, &sci);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipe_crt);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_crt, 0, 1, &s_ds_crt[fr], 0, NULL);
+    CrtPush pc = { { u0, v0, u1, v1 }, { view.width, view.height },
+                   { native_w, native_h }, s_crt_kind };
+    p_vkCmdPushConstants(cb, s_pl_crt, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    p_vkCmdDraw(cb, 3, 1, 0, 0);
+    p_vkCmdEndRenderPass(cb);
+    return 1;
+}
+
 /* ---- present ----------------------------------------------------------- */
 /* Acquire a swapchain image, run `record` (which leaves it in
  * PRESENT_SRC_KHR-ready state), submit, present. record may be NULL for a
@@ -1384,8 +1633,10 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
     uint32_t fr = s_frame_idx % VK_FRAMES;
     p_vkWaitForFences(s_dev, 1, &s_fence[fr], VK_TRUE, UINT64_MAX);
     uint32_t img_idx = 0;
+    uint64_t acquire_start = SDL_GetPerformanceCounter();
     VkResult r = p_vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX,
                                          s_sem_acquire[fr], VK_NULL_HANDLE, &img_idx);
+    s_perf_cur.acquire_us += perf_elapsed_us(acquire_start);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         p_vkDeviceWaitIdle(s_dev);
         destroy_swapchain();
@@ -1427,7 +1678,9 @@ static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s_sem_render[fr];
     pi.swapchainCount = 1; pi.pSwapchains = &s_swapchain;
     pi.pImageIndices = &img_idx;
+    uint64_t present_start = SDL_GetPerformanceCounter();
     p_vkQueuePresentKHR(s_queue, &pi);
+    s_perf_cur.present_us += perf_elapsed_us(present_start);
     s_frame_idx++;
 }
 
@@ -1541,6 +1794,26 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1; /* frame skipped/recreated */
 
     int S = s_scale;
+    VkOffset3D dst[2];
+    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+              force_4_3 ? 4 : 4, force_4_3 ? 3 : 3, dst);
+
+    /* Screen simulation: route the present through the CRT shader pass
+     * instead of the blit. Falls through to the blit if unavailable. */
+    if (s_crt_kind != SCREEN_RAW && s_ready) {
+        vram_to(cb, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        int ok = crt_present_draw(cb, idx, fr, s_vram_view, dst,
+                                  disp_x / (float)VRAM_W, disp_y / (float)VRAM_H,
+                                  (disp_x + w) / (float)VRAM_W, (disp_y + h) / (float)VRAM_H,
+                                  (float)w, (float)h);
+        vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);   /* re-park */
+        if (ok) {
+            submit_present(cb, idx, fr);
+            perf_snapshot_present();
+            return 1;
+        }
+    }
+
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1548,10 +1821,6 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
     VkClearColorValue black = {{0,0,0,1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
-
-    VkOffset3D dst[2];
-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
-              force_4_3 ? 4 : 4, force_4_3 ? 3 : 3, dst);
 
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1702,6 +1971,28 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
 
     int S = s_scale;
+    int native_w = s_wide_w - 2 * s_wide_offset;
+    if (native_w <= 0) native_w = s_wide_w;
+    VkOffset3D dst[2];
+    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+              4 * s_wide_w, 3 * native_w, dst);
+
+    /* Screen simulation: CRT shader pass instead of the blit (see
+     * vk_renderer_present_vram). */
+    if (s_crt_kind != SCREEN_RAW) {
+        img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        int ok = crt_present_draw(cb, idx, fr, s_wide_view[i], dst,
+                                  0.0f, disp_y / (float)VRAM_H,
+                                  1.0f, (disp_y + disp_h) / (float)VRAM_H,
+                                  (float)s_wide_w, (float)disp_h);
+        img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (ok) {
+            submit_present(cb, idx, fr);
+            perf_snapshot_present();
+            return 1;
+        }
+    }
+
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1710,12 +2001,6 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
 
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-
-    int native_w = s_wide_w - 2 * s_wide_offset;
-    if (native_w <= 0) native_w = s_wide_w;
-    VkOffset3D dst[2];
-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
-              4 * s_wide_w, 3 * native_w, dst);
 
     int sy0 = disp_y * S, sy1 = (disp_y + disp_h) * S;
     if (sy0 < 0) sy0 = 0;
@@ -1759,11 +2044,14 @@ int vk_perf_json(char *out, int cap, int count) {
         uint32_t k = total - n + i;          /* frame index, oldest..newest */
         VkPerf *p = &s_perf_ring[k % VK_PERF_RING];
         o += snprintf(out + o, cap - o,
-            "%s{\"f\":%u,\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
+            "%s{\"f\":%u,\"qpc\":%llu,\"wait_us\":%u,\"acquire_us\":%u,\"present_us\":%u,"
+            "\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
             "\"sync\":%u,\"pack\":%u,\"blit\":%u,\"upload\":%u,\"copy\":%u,"
             "\"geo\":%u,\"tex\":%u,\"wide\":%u,\"wclr\":%u}",
             i ? "," : "",
-            p->present_idx, p->allocs, p->alloc_kb, p->oneshots, p->submits,
+            p->present_idx, (unsigned long long)p->present_qpc,
+            p->wait_us, p->acquire_us, p->present_us,
+            p->allocs, p->alloc_kb, p->oneshots, p->submits,
             p->syncs, p->pack_flushes, p->blits, p->upload_blocks, p->copy_rects,
             p->geo_flushes, p->tex_flushes, p->wide_passes, p->wide_clears);
         if (o >= cap - 256) break;
@@ -1864,6 +2152,20 @@ static void bind_masked_stencil_only(VkCommandBuffer cb, int prog, int topo, int
 
 /* Host-visible staging buffer (TRANSFER_SRC). */
 static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map) {
+    int best = -1;
+    for (int i = 0; i < STAGING_CACHE_MAX; i++) {
+        if (!s_staging_cache[i].busy && s_staging_cache[i].buf &&
+            s_staging_cache[i].size >= bytes &&
+            (best < 0 || s_staging_cache[i].size < s_staging_cache[best].size))
+            best = i;
+    }
+    if (best >= 0) {
+        StagingCacheEntry *e = &s_staging_cache[best];
+        e->busy = 1;
+        *buf = e->buf; *mem = e->mem; *map = e->map;
+        return 1;
+    }
+
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -1877,13 +2179,26 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
         p_vkDestroyBuffer(s_dev, *buf, NULL); return 0;
     }
     p_vkBindBufferMemory(s_dev, *buf, *mem, 0);
-    p_vkMapMemory(s_dev, *mem, 0, bytes, 0, map);
+    if (p_vkMapMemory(s_dev, *mem, 0, bytes, 0, map) != VK_SUCCESS) {
+        p_vkDestroyBuffer(s_dev, *buf, NULL); p_vkFreeMemory(s_dev, *mem, NULL);
+        return 0;
+    }
+    for (int i = 0; i < STAGING_CACHE_MAX; i++) {
+        if (!s_staging_cache[i].buf) {
+            s_staging_cache[i].buf = *buf;
+            s_staging_cache[i].mem = *mem;
+            s_staging_cache[i].size = bytes;
+            s_staging_cache[i].map = *map;
+            s_staging_cache[i].busy = 1;
+            break;
+        }
+    }
     s_perf_cur.allocs++;
     s_perf_cur.alloc_kb += (uint32_t)(bytes / 1024);
     return 1;
 }
 static void free_staging(VkBuffer buf, VkDeviceMemory mem) {
-    p_vkDestroyBuffer(s_dev, buf, NULL); p_vkFreeMemory(s_dev, mem, NULL);
+    staging_release(buf, mem);
 }
 
 /* hr -> raw mirror: pack the dirty rect via the compute pass (top-left sample of
@@ -1982,7 +2297,6 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
     VkBuffer rbuf; VkDeviceMemory rmem; void *rmap;
     if (make_staging((VkDeviceSize)w * h * 2, &rbuf, &rmem, &rmap)) {
         memcpy(rmap, data, (size_t)w * h * 2);
-        p_vkUnmapMemory(s_dev, rmem);
         VkCommandBuffer cb = begin_oneshot();
         img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy rc = {0};
@@ -2000,7 +2314,6 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
     if (make_staging((VkDeviceSize)w * h * 4, &ubuf, &umem, &umap)) {
         uint8_t *m = (uint8_t*)umap;
         for (int i = 0; i < w * h; i++) rgb555_to_rgba8(data[i], m + (size_t)i * 4);
-        p_vkUnmapMemory(s_dev, umem);
         VkCommandBuffer cb = begin_oneshot();
         img_to(cb, s_up_img, &s_up_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy uc = {0};
@@ -2049,7 +2362,6 @@ static void flush_cpu_upload(void) {
     if (!make_staging((VkDeviceSize)total * 2, &rbuf, &rmem, &rmap)) return;
     VkBuffer ubuf; VkDeviceMemory umem; void *umap;
     if (!make_staging((VkDeviceSize)total * 4, &ubuf, &umem, &umap)) {
-        p_vkUnmapMemory(s_dev, rmem);
         defer_staging(rbuf, rmem);
         return;
     }
@@ -2083,8 +2395,6 @@ static void flush_cpu_upload(void) {
          * the R16 offset (texoff*2 ≡ 2 mod 4) for every following rect. */
         texoff += ((size_t)w * h + 1) & ~(size_t)1;
     }
-    p_vkUnmapMemory(s_dev, rmem);
-    p_vkUnmapMemory(s_dev, umem);
 
     /* Submit 1: both image copy sets. */
     VkCommandBuffer cb = begin_oneshot();
@@ -2322,7 +2632,7 @@ static int wide_surf_for(int base_x) {
         int S = s_scale, w = s_wide_w * S, h = VRAM_H * S;
         if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, &s_wide_img[i], &s_wide_mem[i], &s_wide_view[i]))
             return -1;
         if (!make_image(s_ds_format, w, h,
