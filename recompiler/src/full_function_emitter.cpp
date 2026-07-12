@@ -1656,9 +1656,17 @@ void FullFunctionEmitter::emit_dispatch(
         // RECURSION_BUG.md §25 — mark CPS mode at startup for runtime code that
         // must emit the CPS contract (the overlay sljit JIT, overlay_sljit.c).
         out += "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-        out += "__attribute__((constructor)) static void psx_cps_mark_bios(void) {\n";
+        out += "static void psx_cps_mark_bios(void) {\n";
         out += "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
         out += "}\n";
+        // Run psx_cps_mark_bios before main(). __attribute__((constructor)) is
+        // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
+        out += "#if defined(_MSC_VER)\n";
+        out += "#pragma section(\".CRT$XCU\", read)\n";
+        out += "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_bios_ctor)(void) = psx_cps_mark_bios;\n";
+        out += "#else\n";
+        out += "__attribute__((constructor)) static void psx_cps_mark_bios_ctor(void) { psx_cps_mark_bios(); }\n";
+        out += "#endif\n";
     }
 }
 

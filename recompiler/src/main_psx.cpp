@@ -1006,9 +1006,17 @@ int main(int argc, char** argv) {
             // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
             // with the BIOS dispatch's marker.
             ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "static void psx_cps_mark_game(void) {\n";
             ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
             ds << "}\n";
+            // Run psx_cps_mark_game before main(). __attribute__((constructor)) is
+            // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
+            ds << "#if defined(_MSC_VER)\n";
+            ds << "#pragma section(\".CRT$XCU\", read)\n";
+            ds << "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_game_ctor)(void) = psx_cps_mark_game;\n";
+            ds << "#else\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game_ctor(void) { psx_cps_mark_game(); }\n";
+            ds << "#endif\n";
         }
 
         std::ofstream dispatch_file(dispatch_filename);

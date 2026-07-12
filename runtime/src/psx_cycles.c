@@ -3,6 +3,9 @@
 #include "psx_cycles.h"
 #include "cpu_state.h"
 #include <stdlib.h>
+#if defined(_MSC_VER)
+#include <intrin.h>       /* MSVC intrinsics: _BitScanReverse (no __builtin_clz) */
+#endif
 #include "cdrom.h"
 #include "dma.h"
 #include "interrupts.h"
@@ -451,7 +454,13 @@ static const uint8_t PSX_MULT_TAB24[24] = {
 
 static inline uint32_t psx_clz32(uint32_t v) {
     /* v is never 0 here (callers OR in 0x400). */
+#if defined(_MSC_VER)
+    unsigned long _idx;
+    _BitScanReverse(&_idx, v);   /* index of highest set bit */
+    return (uint32_t)(31u - _idx);
+#else
     return (uint32_t)__builtin_clz(v);
+#endif
 }
 
 uint32_t psx_mult_latency_s(uint32_t rs) {  /* MULT (signed): sign-fold magnitude */

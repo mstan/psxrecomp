@@ -93,6 +93,21 @@
 
 extern "C" uint64_t gte_get_exec_count(void);
 
+/* Cross-language globals defined in C translation units. Declared extern "C" at
+ * file scope so MSVC gives them C linkage (matching the C definitions); without
+ * this MSVC name-mangles the C++ references and they fail to link. GCC/Clang do
+ * not mangle namespace-scope variables, so this is a no-op there. The existing
+ * block-scope `extern` redeclarations inside functions inherit this C linkage. */
+extern "C" {
+    extern uint64_t psx_cycle_count;
+    extern uint64_t s_frame_count;
+    extern uint32_t g_overlay_region_floor;
+    extern int      g_psx_cps_mode;
+    extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+    extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+    extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+}
+
 /* memory.c */
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);

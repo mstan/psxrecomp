@@ -28,6 +28,9 @@
 #define PSX_CYC_H
 
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
+#endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
 
 #ifdef __cplusplus
@@ -49,7 +52,13 @@ static inline void psx_cyc_base(CPUState* cpu) {
 static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
     while (reg_mask) {
+#if defined(_MSC_VER)
+        unsigned long _psx_ctz_idx;
+        _BitScanForward(&_psx_ctz_idx, reg_mask);
+        unsigned n = (unsigned)_psx_ctz_idx;
+#else
         unsigned n = (unsigned)__builtin_ctz(reg_mask);
+#endif
         cpu->read_absorb[n] = 0u;
         reg_mask &= reg_mask - 1u;
     }
