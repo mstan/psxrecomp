@@ -363,6 +363,7 @@ static int            s_tb_twin[4] = {0,0,0,0};
 static void flush_geometry(void);         /* commit pending untextured batch */
 static void flush_tex_batch(void);        /* commit pending textured batch */
 static void flush_cpu_upload(void);       /* pending CPU writes -> GPU images */
+static int  vk_eager_upload(void);        /* [DEBUG-vk01] env diagnostic gate */
 static void pack_flush(void);             /* hr -> raw mirror (dirty rect) */
 static void flush_pack_if_sampling(int tpx, int tpy, int depth, int clx, int cly);
 static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data);
@@ -429,7 +430,14 @@ static void up_add(int x0, int y0, int x1, int y1) {
     if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
     if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
     if (x0 > x1 || y0 > y1) return;
-    for (int i = 0; i < s_up_nrects; i++) {
+    /* [DEBUG-vk01] PSX_VK_NO_MERGE=1: append raw rects, no merging — isolates
+     * the merge rule from the batching machinery at full speed. */
+    static int no_merge = -1;
+    if (no_merge < 0) {
+        const char *e = getenv("PSX_VK_NO_MERGE");
+        no_merge = (e && e[0] == '1') ? 1 : 0;
+    }
+    for (int i = 0; !no_merge && i < s_up_nrects; i++) {
         DirtyRect *r = &s_up_rects[i];
         if (x0 >= r->x0 && x1 <= r->x1 && y0 >= r->y0 && y1 <= r->y1)
             return;                                   /* contained */
@@ -1399,7 +1407,15 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
 
 static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
     p_vkEndCommandBuffer(cb);
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    /* The present cb writes the swapchain image with TRANSFER ops (layout
+     * barrier + clear + blit), not color-attachment output. Waiting the
+     * acquire semaphore at COLOR_ATTACHMENT_OUTPUT leaves those transfer
+     * writes UNORDERED against the acquire — the GPU may write the image
+     * before the presentation engine releases it (visible garbage on AMD;
+     * the NVIDIA driver this was developed on happened to tolerate it).
+     * Wait at every stage that touches the image. */
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_sem_acquire[fr];
     si.pWaitDstStageMask = &wait_stage;
@@ -1425,11 +1441,102 @@ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
     off[1].x = x + tw;  off[1].y = y + th;  off[1].z = 1;
 }
 
+/* [DEBUG-vk01] PSX_VK_VERIFY=1: every 30th present, read the GPU raw mirror
+ * back into a temp buffer (full hr->raw pack first, like ensure_cpu) and diff
+ * it against the CPU s_vram mirror over the displayed rect. CPU-uploaded
+ * content (MDEC/FMV stills) must match exactly; a mismatch bbox localizes
+ * which pixels the upload chain lost or stomped. */
+static void vk_verify_probe(int disp_x, int disp_y, int w, int h) {
+    static int en = -1, calls = 0;
+    if (en < 0) { const char *e = getenv("PSX_VK_VERIFY"); en = (e && e[0]=='1') ? 1 : 0; }
+    if (!en || !s_ready || !s_vram) return;
+    if ((calls++ % 30) != 0) return;
+    rect_add(&s_pack_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
+    pack_flush();
+    VkBuffer buf; VkDeviceMemory mem; void *map;
+    if (!make_staging((VkDeviceSize)VRAM_W * VRAM_H * 2, &buf, &mem, &map)) return;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rc = {0};
+    rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rc.imageSubresource.layerCount = 1;
+    rc.imageExtent.width = VRAM_W; rc.imageExtent.height = VRAM_H; rc.imageExtent.depth = 1;
+    p_vkCmdCopyImageToBuffer(cb, s_raw_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+    img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    end_oneshot(cb);
+    gpu_sync();
+    const uint16_t *g = (const uint16_t *)map;
+    int mism = 0, bx0 = 1 << 30, by0 = 1 << 30, bx1 = -1, by1 = -1, logged = 0;
+    for (int row = 0; row < h; row++) {
+        int y = disp_y + row; if (y >= VRAM_H) break;
+        for (int col = 0; col < w; col++) {
+            int x = disp_x + col; if (x >= VRAM_W) break;
+            uint16_t a = g[y * VRAM_W + x] & 0x7FFF;
+            uint16_t b = s_vram[y * VRAM_W + x] & 0x7FFF;
+            if (a != b) {
+                mism++;
+                if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y; if (y > by1) by1 = y;
+                if (logged < 4 && (mism == 1 || (mism % 5000) == 0)) {
+                    fprintf(stdout, "[DEBUG-vk01] mism@(%d,%d) gpu=%04x cpu=%04x\n",
+                            x, y, a, b);
+                    logged++;
+                }
+            }
+        }
+    }
+    fprintf(stdout, "[DEBUG-vk01] verify present#%d disp=(%d,%d %dx%d) mism=%d bbox=(%d,%d)-(%d,%d)\n",
+            calls - 1, disp_x, disp_y, w, h, mism, bx0, by0, bx1, by1);
+    fflush(stdout);
+    free_staging(buf, mem);
+}
+
+/* [DEBUG-vk01] PSX_VK_DUMP=1: at presents 60/120/180 dump three VRAM states
+ * as raw 1024x512 u16 files into the CWD: cpu (s_vram mirror), rawpre (GPU
+ * raw mirror as-is, no pack), rawpost (raw after a full hr->raw pack = hr
+ * content). Comparing them offline localizes which surface holds the black. */
+static void vk_dump_probe(void) {
+    static int en = -1, calls = 0;
+    if (en < 0) { const char *e = getenv("PSX_VK_DUMP"); en = (e && e[0]=='1') ? 1 : 0; }
+    if (!en || !s_ready || !s_vram) return;
+    int c = calls++;
+    if (c != 60 && c != 120 && c != 180) return;
+    char name[64];
+    FILE *f;
+    snprintf(name, sizeof name, "vkdump_%d_cpu.bin", c);
+    if ((f = fopen(name, "wb"))) { fwrite(s_vram, 2, VRAM_W * VRAM_H, f); fclose(f); }
+    VkBuffer buf; VkDeviceMemory mem; void *map;
+    if (!make_staging((VkDeviceSize)VRAM_W * VRAM_H * 2, &buf, &mem, &map)) return;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {   /* full hr -> raw pack, then read hr content */
+            rect_add(&s_pack_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
+            pack_flush();
+        }
+        VkCommandBuffer cb = begin_oneshot();
+        img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy rc = {0};
+        rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rc.imageSubresource.layerCount = 1;
+        rc.imageExtent.width = VRAM_W; rc.imageExtent.height = VRAM_H; rc.imageExtent.depth = 1;
+        p_vkCmdCopyImageToBuffer(cb, s_raw_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+        img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        end_oneshot(cb);
+        gpu_sync();
+        snprintf(name, sizeof name, "vkdump_%d_%s.bin", c, pass ? "rawpost" : "rawpre");
+        if ((f = fopen(name, "wb"))) { fwrite(map, 2, VRAM_W * VRAM_H, f); fclose(f); }
+    }
+    free_staging(buf, mem);
+    fprintf(stdout, "[DEBUG-vk01] dumped VRAM states at present %d\n", c);
+    fflush(stdout);
+}
+
 int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
                              int linear, int force_4_3) {
     if (!s_ctx_ok) return 0;
     flush_cpu_upload();   /* displayed VRAM may include pending CPU writes */
     flush_tex_batch(); flush_geometry(); gpu_sync();   /* drain all draws; VRAM in TRANSFER_SRC */
+    vk_verify_probe(disp_x, disp_y, w, h);   /* [DEBUG-vk01] */
+    vk_dump_probe();                         /* [DEBUG-vk01] */
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1; /* frame skipped/recreated */
 
@@ -1589,6 +1696,8 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     if (i < 0) return 0;
     flush_cpu_upload();
     flush_tex_batch(); flush_geometry(); gpu_sync();
+    vk_verify_probe(disp_x, disp_y, 320, disp_h);   /* [DEBUG-vk01] */
+    vk_dump_probe();                                /* [DEBUG-vk01] */
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
 
@@ -1679,6 +1788,32 @@ static void set_scissor_px(VkCommandBuffer cb, int x, int y, int w, int h) {
     VkRect2D sc = { { x * s_scale, y * s_scale }, { (uint32_t)(w * s_scale), (uint32_t)(h * s_scale) } };
     p_vkCmdSetScissor(cb, 0, 1, &sc);
 }
+/* Same hazard as the stencil self-barrier below, COLOR aspect: when the target
+ * image is already in COLOR_ATTACHMENT layout, img_to()/vram_to() emit NO
+ * barrier, so back-to-back geo/blit passes (loadOp=LOAD, render pass declares
+ * no EXTERNAL subpass dependency) have no memory dependency on the color
+ * attachment. The NVIDIA driver this backend was developed on tolerates that;
+ * AMD (RDNA3 DCC) returns compression-block garbage — the growing black block
+ * confetti on the BIOS/FMV screens. Order prior color writes before this
+ * pass's load/blend reads and writes. */
+static void color_self_barrier(VkCommandBuffer cb, VkImage img) {
+    VkImageMemoryBarrier cbar = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    cbar.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    cbar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    cbar.srcQueueFamilyIndex = cbar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    cbar.image = img;
+    cbar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cbar.subresourceRange.levelCount = 1;
+    cbar.subresourceRange.layerCount = 1;
+    cbar.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    cbar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    p_vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0, 0, NULL, 0, NULL, 1, &cbar);
+}
+
 static void begin_geo_pass(VkCommandBuffer cb) {
     /* Explicit stencil ordering across one-shot submits: this pass both TESTS
      * and WRITES the stencil (PSX mask bits) that a PRIOR submit's pass wrote.
@@ -1703,6 +1838,7 @@ static void begin_geo_pass(VkCommandBuffer cb) {
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         0, 0, NULL, 0, NULL, 1, &db);
+    color_self_barrier(cb, s_vram_img);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_fbo;
     rp.renderArea.extent.width = VRAM_W * s_scale;
@@ -1905,8 +2041,8 @@ static void flush_cpu_upload(void) {
      * ONE RGBA8 staging, addressed via VkBufferImageCopy bufferOffset. */
     size_t total = 0;
     for (int i = 0; i < nrects; i++)
-        total += (size_t)(rects[i].x1 - rects[i].x0 + 1) *
-                 (size_t)(rects[i].y1 - rects[i].y0 + 1);
+        total += ((size_t)(rects[i].x1 - rects[i].x0 + 1) *
+                  (size_t)(rects[i].y1 - rects[i].y0 + 1) + 1) & ~(size_t)1;
     if (total == 0) return;
 
     VkBuffer rbuf; VkDeviceMemory rmem; void *rmap;
@@ -1942,7 +2078,10 @@ static void flush_cpu_upload(void) {
         rcopies[i].imageExtent.depth = 1;
         ucopies[i] = rcopies[i];
         ucopies[i].bufferOffset = (VkDeviceSize)texoff * 4;
-        texoff += (size_t)w * h;
+        /* Keep every rect's bufferOffset 4-byte aligned (VUID: bufferOffset
+         * must be a multiple of 4/texel size): an odd w*h rect would misalign
+         * the R16 offset (texoff*2 ≡ 2 mod 4) for every following rect. */
+        texoff += ((size_t)w * h + 1) & ~(size_t)1;
     }
     p_vkUnmapMemory(s_dev, rmem);
     p_vkUnmapMemory(s_dev, umem);
@@ -1988,14 +2127,28 @@ static void flush_cpu_upload(void) {
         bp.shift = px_shift(); bp.maskset = 0; bp.src_div = s_scale;
         bp.src_off[0] = 0; bp.src_off[1] = 0;
         bp.rect[0] = x; bp.rect[1] = y; bp.rect[2] = x + w; bp.rect[3] = y + h;
-        bind_masked(cb, 2, 0, 0, 0, 0);
-        bp.stp_pass = 1;
-        p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
-        p_vkCmdDraw(cb, 6, 1, 0, 0);
-        bind_masked(cb, 2, 0, 0, 0, 1);
-        bp.stp_pass = 2;
-        p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
-        p_vkCmdDraw(cb, 6, 1, 0, 0);
+        /* [DEBUG-vk01] PSX_VK_ONEPASS=1: single non-discarding blit pass
+         * (stencil mirror not updated) to isolate the two-pass STP split. */
+        static int onepass = -1;
+        if (onepass < 0) {
+            const char *e = getenv("PSX_VK_ONEPASS");
+            onepass = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (onepass) {
+            bind_masked(cb, 2, 0, 0, 0, 0);
+            bp.stp_pass = 0;
+            p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
+            p_vkCmdDraw(cb, 6, 1, 0, 0);
+        } else {
+            bind_masked(cb, 2, 0, 0, 0, 0);
+            bp.stp_pass = 1;
+            p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
+            p_vkCmdDraw(cb, 6, 1, 0, 0);
+            bind_masked(cb, 2, 0, 0, 0, 1);
+            bp.stp_pass = 2;
+            p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
+            p_vkCmdDraw(cb, 6, 1, 0, 0);
+        }
     }
     p_vkCmdEndRenderPass(cb);
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2068,12 +2221,25 @@ static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
     if (x + w > VRAM_W) w = VRAM_W - x; if (y + h > VRAM_H) h = VRAM_H - y;
     if (w <= 0 || h <= 0) return;
     up_add(x, y, x + w - 1, y + h - 1);
+    if (vk_eager_upload()) flush_cpu_upload();   /* [DEBUG-vk01] */
+}
+
+/* [DEBUG-vk01] diagnostic: PSX_VK_EAGER_UPLOAD=1 flushes after every CPU
+ * write path so the rect batching/merge is out of the loop (slow; test only). */
+static int vk_eager_upload(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PSX_VK_EAGER_UPLOAD");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
 }
 
 static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
     sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
     up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
+    if (vk_eager_upload()) flush_cpu_upload();
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
     ensure_cpu();   /* sync GPU-rendered content down to the CPU mirror first */
@@ -2226,6 +2392,7 @@ static void wide_pass_begin(VkCommandBuffer cb) {
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         0, 0, NULL, 0, NULL, 1, &db);
+    color_self_barrier(cb, s_wide_img[i]);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
@@ -2719,6 +2886,7 @@ static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
     if (y1 <= y0) return;
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    color_self_barrier(cb, s_wide_img[i]);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
@@ -2756,6 +2924,7 @@ static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     if (y1 <= y0 || margin * 2 >= W) return;
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    color_self_barrier(cb, s_wide_img[i]);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)W;
