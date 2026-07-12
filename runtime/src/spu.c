@@ -4,10 +4,11 @@
  * This is intentionally still a compact hardware model: it accepts SPU
  * register reads/writes, DMA4 transfers into 512KB SPU RAM, mixes the
  * 24 direct ADPCM voices, and accepts decoded CD/XA audio on the SPU CD
- * input bus. Reverb, noise, sweep volumes, and IRQ timing are not modeled yet.
+ * input bus. Noise, sweep volumes, and IRQ timing are not modeled yet.
  */
 
 #include "spu.h"
+#include "spu_gauss.h"
 #include "spu_shadow.h"
 #include "audio_trace.h"
 #include "psx_cycles.h"
@@ -38,6 +39,137 @@ static uint32_t endx_latch;
  * BIOS clears them quickly. */
 static uint32_t kon_latch;
 static uint32_t koff_latch;
+
+static inline int16_t clamp16(int32_t v);
+static inline uint32_t reg_index(uint32_t addr);
+
+/* PS1 reverb engine. Register indices 0xE0..0xFF correspond to
+ * 0x1F801DC0..0x1F801DFF in spu_regs. The implementation follows Beetle's
+ * integer work-area and 44.1<->22.05 kHz resampling model. */
+static uint32_t reverb_wa;
+static uint32_t reverb_cur;
+static int16_t reverb_down[2][128];
+static int16_t reverb_up[2][64];
+static uint32_t reverb_res_pos;
+
+enum {
+    RV_FB_SRC_A, RV_FB_SRC_B, RV_IIR_ALPHA, RV_ACC_COEF_A,
+    RV_ACC_COEF_B, RV_ACC_COEF_C, RV_ACC_COEF_D, RV_IIR_COEF,
+    RV_FB_ALPHA, RV_FB_X, RV_IIR_DEST_A0, RV_IIR_DEST_A1,
+    RV_ACC_SRC_A0, RV_ACC_SRC_A1, RV_ACC_SRC_B0, RV_ACC_SRC_B1,
+    RV_IIR_SRC_A0, RV_IIR_SRC_A1, RV_IIR_DEST_B0, RV_IIR_DEST_B1,
+    RV_ACC_SRC_C0, RV_ACC_SRC_C1, RV_ACC_SRC_D0, RV_ACC_SRC_D1,
+    RV_IIR_SRC_B0, RV_IIR_SRC_B1, RV_MIX_DEST_A0, RV_MIX_DEST_A1,
+    RV_MIX_DEST_B0, RV_MIX_DEST_B1, RV_IN_COEF_L, RV_IN_COEF_R
+};
+
+static inline uint16_t rv_u(int r) { return spu_regs[0xE0u + (uint32_t)r]; }
+static inline int16_t rv_s(int r) { return (int16_t)rv_u(r); }
+
+static inline int16_t reverb_sat(int32_t v) { return clamp16(v); }
+
+static uint32_t reverb_offset(uint32_t offset) {
+    uint32_t out = reverb_cur + (offset & 0x3FFFFu);
+    if (out & 0x40000u) out += reverb_wa;
+    return out & 0x3FFFFu;
+}
+
+static int16_t reverb_ram_read(uint16_t raw, int32_t extra) {
+    uint32_t word = reverb_offset(((uint32_t)raw << 2) + (uint32_t)extra);
+    uint32_t byte = word << 1;
+    return (int16_t)((uint16_t)spu_ram[byte] |
+                     ((uint16_t)spu_ram[byte + 1u] << 8));
+}
+
+static void reverb_ram_write(uint16_t raw, int16_t sample) {
+    uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
+    if (!(ctrl & 0x0080u)) return;
+    uint32_t byte = reverb_offset((uint32_t)raw << 2) << 1;
+    spu_ram[byte] = (uint8_t)sample;
+    spu_ram[byte + 1u] = (uint8_t)((uint16_t)sample >> 8);
+}
+
+static int32_t reverb_iiasm(int16_t alpha, int16_t sample) {
+    if (alpha == (int16_t)0x8000)
+        return sample == (int16_t)0x8000 ? 0 : (int32_t)sample * -65536;
+    return (int32_t)sample * (32768 - alpha);
+}
+
+static const int16_t reverb_resamp[20] = {
+    -1, 2, -10, 35, -103, 266, -616, 1332, -2960, 10246,
+    10246, -2960, 1332, -616, 266, -103, 35, -10, 2, -1
+};
+
+static int32_t reverb_4422(const int16_t *src) {
+    int32_t out = 0;
+    for (int i = 0; i < 20; i++) out += reverb_resamp[i] * src[i * 2];
+    out += 0x4000 * src[19];
+    return reverb_sat(out >> 15);
+}
+
+static int32_t reverb_2244(const int16_t *src) {
+    int32_t out = 0;
+    for (int i = 0; i < 20; i++) out += reverb_resamp[i] * src[i];
+    return reverb_sat(out >> 14);
+}
+
+static int16_t reverb_neg(int16_t v) {
+    return v == (int16_t)0x8000 ? 0x7FFF : (int16_t)-v;
+}
+
+static void reverb_run_channel(unsigned lr, int32_t input) {
+    int a = (int)lr;
+    int b = a ^ 1;
+    int16_t in_coef = rv_s(lr ? RV_IN_COEF_R : RV_IN_COEF_L);
+    int16_t iir_coef = rv_s(RV_IIR_COEF);
+    int16_t alpha = rv_s(RV_IIR_ALPHA);
+    int16_t iir_in_a = reverb_sat((((reverb_ram_read(rv_u(RV_IIR_SRC_A0 + a), 0) * iir_coef) >> 14) +
+                                  ((input * in_coef) >> 14)) >> 1);
+    int16_t iir_in_b = reverb_sat((((reverb_ram_read(rv_u(RV_IIR_SRC_B0 + b), 0) * iir_coef) >> 14) +
+                                  ((input * in_coef) >> 14)) >> 1);
+    int16_t iir_a = reverb_sat((((iir_in_a * alpha) >> 14) +
+        (reverb_iiasm(alpha, reverb_ram_read(rv_u(RV_IIR_DEST_A0 + a), -1)) >> 14)) >> 1);
+    int16_t iir_b = reverb_sat((((iir_in_b * alpha) >> 14) +
+        (reverb_iiasm(alpha, reverb_ram_read(rv_u(RV_IIR_DEST_B0 + a), -1)) >> 14)) >> 1);
+    reverb_ram_write(rv_u(RV_IIR_DEST_A0 + a), iir_a);
+    reverb_ram_write(rv_u(RV_IIR_DEST_B0 + a), iir_b);
+
+    int32_t acc = ((reverb_ram_read(rv_u(RV_ACC_SRC_A0 + a), 0) * rv_s(RV_ACC_COEF_A)) >> 14) +
+                  ((reverb_ram_read(rv_u(RV_ACC_SRC_B0 + a), 0) * rv_s(RV_ACC_COEF_B)) >> 14) +
+                  ((reverb_ram_read(rv_u(RV_ACC_SRC_C0 + a), 0) * rv_s(RV_ACC_COEF_C)) >> 14) +
+                  ((reverb_ram_read(rv_u(RV_ACC_SRC_D0 + a), 0) * rv_s(RV_ACC_COEF_D)) >> 14);
+    int16_t fb_a = reverb_ram_read((uint16_t)(rv_u(RV_MIX_DEST_A0 + a) - rv_u(RV_FB_SRC_A)), 0);
+    int16_t fb_b = reverb_ram_read((uint16_t)(rv_u(RV_MIX_DEST_B0 + a) - rv_u(RV_FB_SRC_B)), 0);
+    int16_t fb_alpha = rv_s(RV_FB_ALPHA);
+    int16_t fb_x = rv_s(RV_FB_X);
+    int16_t mda = reverb_sat((acc + ((fb_a * reverb_neg(fb_alpha)) >> 14)) >> 1);
+    int16_t mdb = reverb_sat(fb_a + ((((mda * fb_alpha) >> 14) +
+                                      ((fb_b * reverb_neg(fb_x)) >> 14)) >> 1));
+    int16_t ivb = reverb_sat(fb_b + ((mdb * fb_x) >> 15));
+    reverb_ram_write(rv_u(RV_MIX_DEST_A0 + a), mda);
+    reverb_ram_write(rv_u(RV_MIX_DEST_B0 + a), mdb);
+    reverb_up[a][(reverb_res_pos >> 1) | 0x20u] = ivb;
+    reverb_up[a][reverb_res_pos >> 1] = ivb;
+}
+
+static void reverb_run(const int32_t in[2], int32_t out[2]) {
+    for (int lr = 0; lr < 2; lr++) {
+        reverb_down[lr][reverb_res_pos] = (int16_t)in[lr];
+        reverb_down[lr][reverb_res_pos | 0x40u] = (int16_t)in[lr];
+    }
+    if (reverb_res_pos & 1u) {
+        reverb_run_channel(0, reverb_4422(&reverb_down[0][(reverb_res_pos - 38u) & 0x3Fu]));
+    } else {
+        reverb_run_channel(1, reverb_4422(&reverb_down[1][(reverb_res_pos - 38u) & 0x3Fu]));
+        reverb_cur = (reverb_cur + 1u) & 0x3FFFFu;
+        if (!reverb_cur) reverb_cur = reverb_wa;
+    }
+    const int16_t *l = &reverb_up[0][((reverb_res_pos >> 1) - 19u) & 0x1Fu];
+    const int16_t *r = &reverb_up[1][((reverb_res_pos >> 1) - 19u) & 0x1Fu];
+    if (reverb_res_pos & 1u) { out[0] = reverb_2244(l); out[1] = r[9]; }
+    else { out[0] = l[9]; out[1] = reverb_2244(r); }
+    reverb_res_pos = (reverb_res_pos + 1u) & 0x3Fu;
+}
 
 /* External vblank counter (debug_server.c) used as event timestamp. */
 extern uint64_t s_frame_count;
@@ -72,6 +204,8 @@ typedef struct {
     uint32_t cur_addr;
     uint32_t repeat_addr;
     int16_t samples[SPU_BLOCK_SAMPLES];
+    int16_t prev[3];   /* last 3 decoded samples of the previous block:
+                          prev[0]=s[-3] prev[1]=s[-2] prev[2]=s[-1] */
     int sample_idx;
     uint32_t phase;
     int16_t hist1;
@@ -312,6 +446,12 @@ static void decode_block(SpuVoice *v) {
     uint32_t addr = v->cur_addr & (SPU_RAM_SIZE - 1u);
     if (addr + 16u > SPU_RAM_SIZE) addr = 0;
 
+    /* Carry the tail of the outgoing block so Gaussian interpolation has
+     * continuous history across the block boundary (hw keeps 3 samples). */
+    v->prev[0] = v->samples[SPU_BLOCK_SAMPLES - 3];
+    v->prev[1] = v->samples[SPU_BLOCK_SAMPLES - 2];
+    v->prev[2] = v->samples[SPU_BLOCK_SAMPLES - 1];
+
     uint8_t header = spu_ram[addr + 0u];
     uint8_t flags = spu_ram[addr + 1u];
     int shift = header & 0x0F;
@@ -445,7 +585,24 @@ static int16_t voice_next_sample(int idx) {
         decode_block(v);
     }
 
-    int16_t raw_s = v->samples[v->sample_idx];
+    /* Hardware 4-tap Gaussian interpolation (No$ formula, spu_gauss.h).
+     * s[-3..-1] come from prev[] when the tap window crosses the block
+     * boundary backwards. Replaces the old nearest-sample pick, whose
+     * aliasing images put a flat noise shelf across 8-22 kHz. */
+    int gi = (int)((v->phase >> 4) & 0xFFu);
+    int si = v->sample_idx;
+    int32_t acc = 0;
+    static const int gtap[4] = { 3, 2, 1, 0 };
+    for (int k = 0; k < 4; k++) {
+        int off = si - gtap[k];
+        int16_t sv = (off >= 0) ? v->samples[off] : v->prev[3 + off];
+        int gidx = (k == 0) ? (0x0FF - gi)
+                 : (k == 1) ? (0x1FF - gi)
+                 : (k == 2) ? (0x100 + gi)
+                 :            gi;
+        acc += (int32_t)spu_gauss_table[gidx] * (int32_t)sv;
+    }
+    int16_t raw_s = (int16_t)(acc >> 15);
     /* Apply envelope (0..0x7FFF as a 15-bit gain). */
     int32_t shaped = ((int32_t)raw_s * (int32_t)v->env_level) >> 15;
     if (shaped > 32767)  shaped = 32767;
@@ -540,6 +697,11 @@ void spu_init(void) {
     endx_latch = 0;
     kon_latch = 0;
     koff_latch = 0;
+    reverb_wa = 0;
+    reverb_cur = 0;
+    reverb_res_pos = 0;
+    memset(reverb_down, 0, sizeof(reverb_down));
+    memset(reverb_up, 0, sizeof(reverb_up));
     s_event_idx = 0;
     s_event_seq = 0;
     spu_cd_audio_reset();
@@ -557,11 +719,15 @@ void spu_render(int16_t* out_stereo, int frames) {
     int16_t main_r = direct_volume(spu_regs[reg_index(0x1F801D82u)]);
     int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
     int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
+    uint32_t reverb_mode = (uint32_t)spu_regs[reg_index(0x1F801D98u)] |
+                           ((uint32_t)spu_regs[reg_index(0x1F801D9Au)] << 16);
 
     /* Shadow tap: arm recording for this block if the float SPU shadow is on.
      * Off by default => s_shadow_tap_on stays 0 and the mix loop is unchanged
      * and byte-identical to upstream. */
-    s_shadow_tap_on = spu_shadow_enabled() ? 1 : 0;
+    /* The enhancement shadow currently models only the dry voice mix. Never
+     * let it replace the canonical output while any voice has a reverb send. */
+    s_shadow_tap_on = (spu_shadow_enabled() && reverb_mode == 0u) ? 1 : 0;
     s_shadow_tap_frame = 0;
     if (s_shadow_tap_on) {
         int cap = frames < SPU_SHADOW_TAP_FRAMES ? frames : SPU_SHADOW_TAP_FRAMES;
@@ -572,6 +738,8 @@ void spu_render(int16_t* out_stereo, int frames) {
     for (int f = 0; f < frames; f++) {
         int32_t mix_l = 0;
         int32_t mix_r = 0;
+        int32_t reverb_in[2] = {0, 0};
+        int32_t reverb_out[2] = {0, 0};
 
         if (enabled) {
             for (int v = 0; v < SPU_VOICE_COUNT; v++) {
@@ -587,6 +755,10 @@ void spu_render(int16_t* out_stereo, int frames) {
                 if (!s) continue;
                 mix_l += ((int32_t)s * vl) >> 14;
                 mix_r += ((int32_t)s * vr) >> 14;
+                if (reverb_mode & (1u << v)) {
+                    reverb_in[0] += ((int32_t)s * vl) >> 14;
+                    reverb_in[1] += ((int32_t)s * vr) >> 14;
+                }
             }
             {   /* T0 tap: voice sum only (pre CD mix, pre main volume) so the
                  * final mix can be decomposed source-by-source offline. */
@@ -599,12 +771,23 @@ void spu_render(int16_t* out_stereo, int frames) {
                 int16_t cd_l = 0;
                 int16_t cd_r = 0;
                 if (cd_audio_pop(&cd_l, &cd_r)) {
-                    mix_l += ((int32_t)cd_l * cd_vol_l) >> 15;
-                    mix_r += ((int32_t)cd_r * cd_vol_r) >> 15;
+                    int32_t cd_mix_l = ((int32_t)cd_l * cd_vol_l) >> 15;
+                    int32_t cd_mix_r = ((int32_t)cd_r * cd_vol_r) >> 15;
+                    mix_l += cd_mix_l;
+                    mix_r += cd_mix_r;
+                    if (ctrl & 0x0004u) {
+                        reverb_in[0] += cd_mix_l;
+                        reverb_in[1] += cd_mix_r;
+                    }
                 } else if (cd_push_frames != 0) {
                     cd_underflow_frames++;
                 }
             }
+            reverb_in[0] = reverb_sat(reverb_in[0]);
+            reverb_in[1] = reverb_sat(reverb_in[1]);
+            reverb_run(reverb_in, reverb_out);
+            mix_l += (reverb_out[0] * (int16_t)spu_regs[reg_index(0x1F801D84u)]) >> 15;
+            mix_r += (reverb_out[1] * (int16_t)spu_regs[reg_index(0x1F801D86u)]) >> 15;
             mix_l = (mix_l * main_l) >> 14;
             mix_r = (mix_r * main_r) >> 14;
         }
@@ -744,6 +927,11 @@ void spu_write(uint32_t addr, uint32_t value) {
             if (addr == 0x1F801DA6u) {
                 transfer_addr = ((uint32_t)(uint16_t)value) << 3;
                 if (transfer_addr >= SPU_RAM_SIZE) transfer_addr = 0;
+            }
+
+            if (addr == 0x1F801DA2u) {
+                reverb_wa = ((uint32_t)(uint16_t)value << 2) & 0x3FFFFu;
+                reverb_cur = reverb_wa;
             }
 
             if (addr == 0x1F801DA8u) {
