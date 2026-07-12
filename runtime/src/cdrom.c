@@ -240,6 +240,7 @@ int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
 
 /* Frontend XA-stream probe (FMV auto-skip / turbo-load gating in main.cpp). */
 int cdrom_xa_stream_active(void) { return xa_stream_active; }
+int cdrom_cdda_track(void) { return cdda_playing ? cdda_track : 0; }
 
 /* Response-overwrite diagnostics consumed by debug_server.c. master's CD
  * response arbiter tracks how often an undelivered response was overwritten;

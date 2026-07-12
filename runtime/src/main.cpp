@@ -312,6 +312,13 @@ static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
 #if defined(PSX_WEB)
 static std::atomic<int> g_web_paused{0};
+static std::atomic<uint32_t> g_web_input_word{0xFFFFu};
+static std::atomic<int> g_web_input_frames{0};
+static std::atomic<int> g_web_pause_request{0};
+static uint16_t g_web_input_sequence[128];
+static std::atomic<int> g_web_sequence_length{0};
+static std::atomic<int> g_web_sequence_position{0};
+static int g_web_start_was_down = 0;
 #endif
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
@@ -847,7 +854,6 @@ static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
  * frames in one spu_render call. 1764 frames = 40 ms. */
 static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
 static int       sdl_audio_fadein_left  = 0;
-
 static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
@@ -1303,6 +1309,54 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_keybind(uint32_t button,
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_paused(int paused) {
     g_web_paused.store(paused ? 1 : 0, std::memory_order_release);
 }
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_input_override(uint32_t word,
+                                                                   int frames) {
+    g_web_sequence_length.store(0, std::memory_order_release);
+    g_web_input_word.store(word & 0xFFFFu, std::memory_order_release);
+    g_web_input_frames.store(frames > 0 ? frames : 0, std::memory_order_release);
+}
+
+static void psx_web_arm_input_sequence(const uint16_t* words, int count) {
+    if (!words || count <= 0) return;
+    if (count > (int)(sizeof(g_web_input_sequence) / sizeof(g_web_input_sequence[0])))
+        count = (int)(sizeof(g_web_input_sequence) / sizeof(g_web_input_sequence[0]));
+    g_web_sequence_length.store(0, std::memory_order_release);
+    g_web_input_frames.store(0, std::memory_order_release);
+    for (int i = 0; i < count; i++) g_web_input_sequence[i] = words[i];
+    g_web_sequence_position.store(0, std::memory_order_release);
+    g_web_sequence_length.store(count, std::memory_order_release);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_get_cdda_track(void) {
+    return cdrom_cdda_track();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_restart_level(void) {
+    /* Pepsiman has no verified same-level restart command. The commonly
+     * published L1+R1+Select+Start chord was tested against SLPS-01762 and
+     * returns to the main menu. Keep this export inert until the game's scene
+     * reload path has been identified; never strand the guest in PAUSE. */
+    return 0;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_consume_pause_request(void) {
+    return g_web_pause_request.exchange(0, std::memory_order_acq_rel);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_return_to_title(void) {
+    /* Verified on SLPS-01762: enter the game's PAUSE state, let its scene
+     * settle, then hold L1+R1+Select+Start. The command must be held because
+     * the game does not poll it on every vblank. */
+    uint16_t sequence[112];
+    int n = 0;
+    for (int i = 0; i < 3;  i++) sequence[n++] = 0xFFF7u; /* Start */
+    for (int i = 0; i < 24; i++) sequence[n++] = 0xFFFFu; /* settle */
+    for (int i = 0; i < 60; i++) sequence[n++] = 0xF3F6u; /* chord */
+    for (int i = 0; i < 12; i++) sequence[n++] = 0xFFFFu; /* release */
+    psx_web_arm_input_sequence(sequence, n);
+    return 1;
+}
 #endif
 
 static void load_input_config(const char* argv0) {
@@ -1747,6 +1801,23 @@ static void sample_pad_into_sio(int override) {
             btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
             btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
         }
+#if defined(PSX_WEB)
+        if (s == 0) {
+            const int start_down = (btn & (uint16_t)PAD_START) == 0;
+            const int start_edge = start_down && !g_web_start_was_down;
+            g_web_start_was_down = start_down;
+            const int track = cdrom_cdda_track();
+            if (track >= 2 && track <= 6) {
+                if (start_edge)
+                    g_web_pause_request.store(1, std::memory_order_release);
+                /* The Web QoL menu owns Start during gameplay. Pepsiman never
+                 * receives its original pause toggle, eliminating nested pause
+                 * state and controller-timing races. Injected reset commands
+                 * use the override path above and intentionally bypass this. */
+                btn |= (uint16_t)PAD_START;
+            }
+        }
+#endif
         sio_set_pad_state_slot(s, btn);
 
         /* Resolve the pad type this frame. An assigned device keeps its configured
@@ -1971,6 +2042,26 @@ static void sdl_vblank_present(void) {
 #if defined(PSX_WEB_TEST_ASSETS)
     if (g_web_test_start) override = (int)(0xFFFFu & ~(uint16_t)PAD_START);
 #endif
+#endif
+
+#if defined(PSX_WEB)
+    /* Short frontend-authored button chords (pause-menu actions) join the
+     * normal input path at the same frame boundary as physical controls. */
+    int sequence_length = g_web_sequence_length.load(std::memory_order_acquire);
+    int sequence_position = g_web_sequence_position.load(std::memory_order_acquire);
+    if (sequence_position < sequence_length) {
+        override = (int)g_web_input_sequence[sequence_position];
+        sequence_position++;
+        g_web_sequence_position.store(sequence_position, std::memory_order_release);
+        if (sequence_position >= sequence_length)
+            g_web_sequence_length.store(0, std::memory_order_release);
+    } else {
+        int web_override_frames = g_web_input_frames.load(std::memory_order_acquire);
+        if (web_override_frames > 0) {
+            override = (int)g_web_input_word.load(std::memory_order_acquire);
+            g_web_input_frames.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
 #endif
 
     /* Host-stack-usage profile sample — frame counter is now current, and we are

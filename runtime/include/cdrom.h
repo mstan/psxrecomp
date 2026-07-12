@@ -34,6 +34,9 @@ int  cdrom_get_instant_rate(void);
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA
  * sectors desyncs and hangs the player). */
 int  cdrom_xa_stream_active(void);
+/* Active Red Book audio track, or 0 while CD-DA is stopped. Frontends use
+ * this read-only signal for game-specific presentation/QoL affordances. */
+int  cdrom_cdda_track(void);
 
 /* CD load-burst ring (always-on). One record per gap-separated run of
  * delivered data sectors. `out` receives up to `max` records, newest first
