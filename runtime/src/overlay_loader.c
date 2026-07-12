@@ -2298,6 +2298,7 @@ static int overlay_find_by_range(uint32_t phys) {
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    if (!s_active) return 0;
     int lazy_loaded = 0;
 retry_candidates:
     int head = idx_head(phys);
@@ -2791,6 +2792,7 @@ static FpEnt    s_fp[FP_CAP];
 static uint64_t s_fp_seq = 0;
 
 int overlay_loader_is_candidate(uint32_t phys) {
+    if (!s_active) return 0;
     phys &= 0x1FFFFFFFu;
     return idx_head(phys) >= 0 || lazy_has_exact_entry(phys);
 }
@@ -3137,7 +3139,8 @@ void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
  * leaks (root cause of the dwarf->overworld native blue screen).
  * Returns 1 iff a native candidate ran. */
 int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
-    if (!s_native_exec) return 0;  /* interp mode: keep the legacy inline path */
+    if (!s_active || !s_native_exec)
+        return 0;  /* inactive/interp mode: keep the legacy inline path */
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (idx_head(phys) < 0 && !lazy_has_exact_entry(phys))
         return 0; /* neither a registered nor an exact cached entry */
