@@ -1495,6 +1495,25 @@ static uint16_t vram_write_x, vram_write_y;   /* start coords */
 static uint16_t vram_write_w, vram_write_h;   /* dimensions */
 static uint16_t vram_write_col, vram_write_row; /* current offset */
 static uint32_t vram_write_remaining;          /* words remaining */
+/* Stage one complete GP0(A0) transfer so renderer backends receive one bulk
+ * rectangle instead of hundreds of thousands of single-pixel callbacks. The
+ * CPU-visible transfer remains ordered because GP0 accepts no next command
+ * until this payload is complete. Maximum PS1 transfer = full VRAM (1 MiB). */
+static uint16_t vram_write_pixels[1024 * 512];
+
+static void gp0_commit_cpu_to_vram(void) {
+    for (uint32_t row = 0; row < vram_write_h; row++)
+        for (uint32_t col = 0; col < vram_write_w; col++)
+            vram_write_pixels[row * vram_write_w + col] =
+                vram[((vram_write_y + row) & 511u) * 1024u +
+                     ((vram_write_x + col) & 1023u)];
+    gr_vram_transfer_in(vram_write_x, vram_write_y,
+                        vram_write_w, vram_write_h, vram_write_pixels);
+    gp0_state = GP0_IDLE;
+    vram_write_remaining = 0;
+    text_xlate_vram_upload(vram_write_x, vram_write_y,
+                           vram_write_w, vram_write_h);
+}
 
 /* VRAM read transfer state (VRAM→CPU, command 0xC0) */
 static int      vram_read_active;
@@ -3637,34 +3656,31 @@ static void gpu_write_gp0_body(uint32_t val) {
             /* Respect mask bit settings. The check reads through the facade:
              * under the GL backend GPU-drawn mask bits live in the FBO, not
              * the CPU array (one sync per burst; free when check is off). */
-            if (check_mask_bit && (gr_vram_read((int)wx, (int)wy) & 0x8000))
+            if (check_mask_bit && (gr_vram_read((int)wx, (int)wy) & 0x8000)) {
                 goto next_pixel;
+            }
 
             if (set_mask_bit)
                 pixel |= 0x8000;
 
-            /* Route through the renderer so the hi-res supersampling mirror
-             * is kept coherent (writes native VRAM identically when off). */
-            gr_vram_write((int)wx, (int)wy, pixel);
+            /* CPU VRAM remains immediately authoritative, preserving mid-DMA
+             * reads/savestates. The renderer mirror is committed in bulk when
+             * the GP0 payload completes. */
+            vram[(uint32_t)wy * 1024u + wx] = pixel;
 
         next_pixel:
             if (++vram_write_col == vram_write_w) {
                 vram_write_col = 0;
                 if (++vram_write_row == vram_write_h) {
                     /* Transfer complete */
-                    gp0_state = GP0_IDLE;
-                    vram_write_remaining = 0;
-                    text_xlate_vram_upload(vram_write_x, vram_write_y,
-                                           vram_write_w, vram_write_h);
+                    gp0_commit_cpu_to_vram();
                     return;
                 }
             }
         }
 
         if (--vram_write_remaining == 0) {
-            gp0_state = GP0_IDLE;
-            text_xlate_vram_upload(vram_write_x, vram_write_y,
-                                   vram_write_w, vram_write_h);
+            gp0_commit_cpu_to_vram();
         }
 
         return;

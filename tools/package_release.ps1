@@ -51,6 +51,30 @@ if ($nonSystem) {
 }
 Write-Host "Verified self-contained: imports only system DLLs ($($imports.Count) total)"
 
+# No baked build-machine paths: an absolute BIOS default baked into the exe
+# makes it silently load the BUILDER'S BIOS wherever that path exists, so the
+# clean-install picker flow is never exercised where releases are validated.
+$exeBytes = [System.IO.File]::ReadAllBytes((Join-Path $Stage "PSXRecomp.exe"))
+$exeText  = [System.Text.Encoding]::ASCII.GetString($exeBytes)
+$bakedBios = [regex]::Matches($exeText, '[A-Za-z]:[/\\][ -~]*?SCPH1001\.BIN') | ForEach-Object { $_.Value } | Select-Object -Unique
+if ($bakedBios) {
+    throw "Release exe contains baked absolute BIOS path(s): $($bakedBios -join '; ') — build with a relative DEFAULT_BIOS_PATH"
+}
+Write-Host "Verified no baked absolute BIOS path in the exe"
+
+# No user-machine or copyrighted files may ride along in the stage.
+$strayPatterns = @("SCPH*.BIN","*.cue","*.iso","*.mcd","bios.cfg","disc.cfg",
+                   "settings.toml","keybinds.ini","overlay_captures.json")
+$stray = foreach ($pat in $strayPatterns) { Get-ChildItem $Stage -Recurse -File -Filter $pat -ErrorAction SilentlyContinue }
+if ($stray) {
+    throw "Stage contains files that must never ship: $(($stray | ForEach-Object FullName) -join '; ')"
+}
+$savesFiles = Get-ChildItem (Join-Path $Stage "saves") -Recurse -File -ErrorAction SilentlyContinue
+if ($savesFiles) {
+    throw "Stage saves/ directory must be empty, contains: $(($savesFiles | ForEach-Object FullName) -join '; ')"
+}
+Write-Host "Verified stage carries no BIOS/disc/save/sidecar files"
+
 @"
 ; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.
 ; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,

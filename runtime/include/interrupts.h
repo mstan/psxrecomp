@@ -35,6 +35,14 @@ void psx_irq_raise(uint32_t bit, uint32_t detail);
  * Services due scheduled edges, checks (i_stat & i_mask), and if pending + COP0
  * allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
+
+/* Cheap block-edge predicate for generated/native code. Device events are
+ * raised by psx_advance_cycles(); this reports whether the comparatively
+ * expensive delivery/scheduler path can have an architectural effect now. */
+int psx_interrupt_delivery_needed(const struct CPUState* cpu);
+void psx_interrupt_delivery_diag(uint64_t *need_defer, uint64_t *need_irq,
+                                 uint64_t *skip_none, uint64_t *skip_sr,
+                                 uint64_t *skip_cooldown, uint64_t *skip_nested);
 /* Interrupt check with the compiled guest PC to resume if a game-installed
  * handler later RFEs to the sentinel outside the synchronous host window. */
 void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);

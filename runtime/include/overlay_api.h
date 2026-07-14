@@ -43,7 +43,10 @@
  *        gte_write_data/gte_write_ctrl) — the emitter emits direct calls for
  *        flag/IR/derived GTE regs; GTE-heavy overlays failed to LINK without
  *        shims (undefined gte_read_ctrl), silently blocking new coverage. */
-#define PSX_OVERLAY_ABI_VERSION 10
+/* v11 batches per-instruction cycle charges inside overlay DLLs and flushes at
+ * block/device/store boundaries, removing a cross-DLL callback per instruction
+ * without changing the shared guest-cycle timeline. */
+#define PSX_OVERLAY_ABI_VERSION 11
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is

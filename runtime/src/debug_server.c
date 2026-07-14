@@ -2367,22 +2367,28 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
     extern uint64_t g_dirty_ram_guard_yields;
+    extern uint64_t g_dirty_ram_native_handoffs;
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
+    extern uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index);
+    extern uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index);
+    extern void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
+                                                     uint32_t out[5]);
     (void)json;
 
-    char buf[16 * 1024];
+    char buf[32 * 1024];
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
-             "\"guard_yields\":%llu,"
+             "\"guard_yields\":%llu,\"native_handoffs\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
              (unsigned long long)g_dirty_ram_insns_run,
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_guard_yields,
+             (unsigned long long)g_dirty_ram_native_handoffs,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;
@@ -2398,7 +2404,8 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       (unsigned long long)e->insns,
                       (unsigned long long)e->entry_hits);
         first = 0;
-        if (n >= (int)sizeof(buf) - 128) break;
+        /* Reserve enough tail room for all bitmap/guard diagnostics below. */
+        if (n >= (int)sizeof(buf) - 2048) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "],\"dirty_bitmap_words\":[");
     uint32_t word_count = dirty_ram_get_bitmap_word_count();
@@ -2407,6 +2414,41 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       "%s\"0x%08X\"",
                       i == 0 ? "" : ",",
                       (unsigned)dirty_ram_get_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    uint64_t exact_mismatches = 0;
+    uint32_t exact_last[5] = {0};
+    dirty_ram_text_exact_mismatch_stats(&exact_mismatches, exact_last);
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_native_blocked\":%llu,"
+                  "\"text_diverged_pages\":%u,"
+                  "\"text_exact_mismatches\":%llu,"
+                  "\"text_exact_last_range\":\"0x%08X\","
+                  "\"text_exact_last_len\":%u,"
+                  "\"text_exact_last_mismatch\":\"0x%08X\","
+                  "\"text_exact_last_live\":%u,"
+                  "\"text_exact_last_ref\":%u,"
+                  "\"text_modified_bitmap_words\":[",
+                  (unsigned long long)dirty_ram_text_native_blocked(),
+                  (unsigned)dirty_ram_text_diverged_pages(),
+                  (unsigned long long)exact_mismatches,
+                  (unsigned)exact_last[0], (unsigned)exact_last[1],
+                  (unsigned)exact_last[2], (unsigned)exact_last[3],
+                  (unsigned)exact_last[4]);
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_modified_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_diverged_bitmap_words\":[");
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_diverged_bitmap_word(i));
         if (n >= (int)sizeof(buf) - 64) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
@@ -6813,8 +6855,11 @@ static void handle_frame_perf(int id, const char *json)
     double wcanon = wide[5] - wide[10]; if (wcanon < 0) wcanon = 0;
     double wmpp   = wide[12] > 0 ? wide[10] * 1000.0 / wide[12] : 0.0;
     double tex_frac = 0.0; gl_renderer_perf_prim_split(&tex_frac);
+    uint64_t br[8]; extern void gl_renderer_batch_diag(uint64_t out[8]);
+    gl_renderer_batch_diag(br);
     send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
              "\"tex_frac\":%.3f,\"ws_ablate\":%d,"
+             "\"batch_diag\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
              "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f},"
@@ -6830,6 +6875,10 @@ static void handle_frame_perf(int id, const char *json)
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
              "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f}}",
              id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
+             (unsigned long long)br[0], (unsigned long long)br[1],
+             (unsigned long long)br[2], (unsigned long long)br[3],
+             (unsigned long long)br[4], (unsigned long long)br[5],
+             (unsigned long long)br[6], (unsigned long long)br[7],
              all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8], all[9],
              (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7], wide[9], wpp,
              wide[10], wide[11], wcanon, wide[12], wmpp,
@@ -6847,6 +6896,20 @@ static void handle_gl_ws_ablate(int id, const char *json)
     int mode = json_get_int(json, "mode", -1);
     if (mode >= 0) gl_renderer_set_ws_ablate(mode);
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
+}
+
+static void handle_gl_interp(int id, const char *json)
+{
+    (void)json;
+    int enabled = 0, suspended = 0, history = 0;
+    double host_hz = 0.0, target_hz = 0.0;
+    uint64_t swaps = 0;
+    gl_renderer_interpolation_diag(&enabled, &suspended, &history,
+                                   &host_hz, &target_hz, &swaps);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"suspended\":%d,\"history\":%d,"
+             "\"host_hz\":%.3f,\"target_hz\":%.3f,\"swaps\":%llu}",
+             id, enabled, suspended, history, host_hz, target_hz,
+             (unsigned long long)swaps);
 }
 
 /* gl_wide_fast on=<0|1>: native-wide centre-blit fast path. 1 (default) = skip
@@ -7537,6 +7600,16 @@ static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
 {
+    /* Full-VRAM GL readback is intentionally expensive and can perturb the
+     * performance issue being measured. Keep the forensic ring default-on, but
+     * allow a controlled acceptance run to disable continuous capture while
+     * retaining the TCP server and one-shot screenshot command. */
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_DISPLAY_RING");
+        enabled = (!e || !*e || *e != '0') ? 1 : 0;
+    }
+    if (!enabled) return;
     if (!s_disp_ring_px) {
         size_t per  = (size_t)DISP_RING_MAX_W * DISP_RING_MAX_H;
         size_t vram = (size_t)1024 * 512;
@@ -7999,7 +8072,7 @@ extern uint64_t gl_renderer_pres_total(void);
 
 static void handle_gl_present_ring(int id, const char *json)
 {
-    static const char *path_name[4] = { "vram", "wide", "cpu", "blank" };
+    static const char *path_name[5] = { "vram", "wide", "cpu", "blank", "interp" };
     int n = json_get_int(json, "n", 300);
     if (n < 1) n = 1;
     if (n > 4096) n = 4096;
@@ -8018,7 +8091,7 @@ static void handle_gl_present_ring(int id, const char *json)
         pos += snprintf(buf + pos, bufsz - pos,
                         "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u]]",
                         first ? "" : ",", (unsigned long long)s, e.frame,
-                        e.path < 4 ? path_name[e.path] : "?", e.t_ms,
+                        e.path < 5 ? path_name[e.path] : "?", e.t_ms,
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
                         e.px_r, e.px_g, e.px_b, e.glerr,
                         e.src_r, e.src_g, e.src_b, e.src_valid);
@@ -10661,7 +10734,7 @@ static void handle_overlay_loader_status(int id, const char *json)
         if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
         esc_msg[di++] = msg[si];
     }
-    char buf[1536];
+    char buf[4096];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
         "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
@@ -10698,9 +10771,54 @@ static void handle_overlay_loader_status(int id, const char *json)
             ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
             "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
             "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\","
-            "\"gen_fastpath\":%llu",
+            "\"gen_fastpath\":%llu,\"range_links\":%d,\"range_index_overflow\":%d,"
+            "\"lazy_manifests\":%d,\"lazy_manifest_overflow\":%d",
             r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast,
-            (unsigned long long)overlay_loader_gen_fastpath());
+            (unsigned long long)overlay_loader_gen_fastpath(),
+            overlay_loader_range_link_count(),
+            overlay_loader_range_index_overflow(),
+            overlay_loader_lazy_manifest_count(),
+            overlay_loader_lazy_manifest_overflow());
+        uint64_t nd=0, ni=0, sn=0, ss=0, sc=0, sx=0;
+        psx_interrupt_delivery_diag(&nd, &ni, &sn, &ss, &sc, &sx);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"irq_need_defer\":%llu,\"irq_need_delivery\":%llu,"
+            "\"irq_skip_none\":%llu,\"irq_skip_sr\":%llu,"
+            "\"irq_skip_cooldown\":%llu,\"irq_skip_nested\":%llu",
+            (unsigned long long)nd, (unsigned long long)ni,
+            (unsigned long long)sn, (unsigned long long)ss,
+            (unsigned long long)sc, (unsigned long long)sx);
+        extern volatile long g_overlay_image_warm_loaded;
+        extern volatile long g_overlay_image_warm_pending;
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"image_warm_loaded\":%ld,\"image_warm_pending\":%ld",
+            g_overlay_image_warm_loaded, g_overlay_image_warm_pending);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+        {
+            uint64_t checks=0, hits=0, variant_misses=0, address_misses=0;
+            uint64_t rehashes=0, crc_misses=0, static_gen_fastpath=0;
+            extern void psx_overlay_static_get_stats(uint64_t *, uint64_t *,
+                                                     uint64_t *, uint64_t *);
+            extern void overlay_loader_static_match_stats(uint64_t *, uint64_t *,
+                                                          uint64_t *);
+            psx_overlay_static_get_stats(&checks, &hits, &variant_misses,
+                                         &address_misses);
+            overlay_loader_static_match_stats(&rehashes, &crc_misses,
+                                              &static_gen_fastpath);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                ",\"static_checks\":%llu,\"static_hits\":%llu,"
+                "\"static_variant_misses\":%llu,\"static_address_misses\":%llu,"
+                "\"static_rehashes\":%llu,\"static_crc_misses\":%llu,"
+                "\"static_gen_fastpath\":%llu",
+                (unsigned long long)checks,
+                (unsigned long long)hits,
+                (unsigned long long)variant_misses,
+                (unsigned long long)address_misses,
+                (unsigned long long)rehashes,
+                (unsigned long long)crc_misses,
+                (unsigned long long)static_gen_fastpath);
+        }
+#endif
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
@@ -10710,10 +10828,17 @@ static void handle_overlay_loader_status(int id, const char *json)
  * vs live code hash, generation) so reload-on-return can be inspected directly. */
 static void handle_overlay_candidates(int id, const char *json)
 {
-    (void)json;
     extern int overlay_loader_dump_candidates(char *out, int cap);
+    extern int overlay_loader_dump_candidates_at(uint32_t addr, char *out, int cap);
+    extern int overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap);
     static char cbuf[65536];
-    int len = overlay_loader_dump_candidates(cbuf, (int)sizeof(cbuf));
+    char pcbuf[32];
+    int filtered = json_get_str(json, "pc", pcbuf, sizeof(pcbuf)) != NULL;
+    int lazy = json_get_int(json, "lazy", 0);
+    int len = filtered
+        ? (lazy ? overlay_loader_dump_lazy_at(hex_to_u32(pcbuf), cbuf, (int)sizeof(cbuf))
+                : overlay_loader_dump_candidates_at(hex_to_u32(pcbuf), cbuf, (int)sizeof(cbuf)))
+        : overlay_loader_dump_candidates(cbuf, (int)sizeof(cbuf));
     if (len < 0) len = 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"candidates\":%s}\n", id, cbuf);
 }
@@ -11847,6 +11972,7 @@ static const CmdEntry s_commands[] = {
     { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
+    { "gl_interp",         handle_gl_interp },
     { "gl_wide_fast",      handle_gl_wide_fast },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },

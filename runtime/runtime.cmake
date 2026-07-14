@@ -310,8 +310,22 @@ function(psxrecomp_add_runtime_target target)
     if(NOT PSXRT_WINDOW_TITLE)
         set(PSXRT_WINDOW_TITLE "${target}")
     endif()
+    # The baked default BIOS path must never be absolute: an absolute path is a
+    # build-machine path, and a promoted/release exe carrying it will silently
+    # load the BUILDER'S BIOS wherever that path exists (i.e. on the dev box) —
+    # so the "prompts for a BIOS on a clean install" flow is never exercised
+    # where releases are validated. Dev checkouts still resolve the relative
+    # default without prompting via the exe-dir upward search, which also tries
+    # <ancestor>/psxrecomp-v4/<relative> for game-project layouts.
     if(NOT PSXRT_DEFAULT_BIOS_PATH)
-        set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN")
+        set(PSXRT_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN")
+    elseif(IS_ABSOLUTE "${PSXRT_DEFAULT_BIOS_PATH}")
+        message(WARNING
+            "DEFAULT_BIOS_PATH '${PSXRT_DEFAULT_BIOS_PATH}' is absolute; refusing to "
+            "bake a build-machine path into the binary (release exes must prompt on "
+            "user machines). Using relative 'bios/SCPH1001.BIN' instead — drop the "
+            "DEFAULT_BIOS_PATH argument from this game's CMakeLists.")
+        set(PSXRT_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN")
     endif()
     if(NOT DEFINED PSXRT_DEFAULT_GAME_CONFIG_PATH)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")

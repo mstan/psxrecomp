@@ -84,6 +84,8 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *last_write_addr,
                                  uint32_t *last_write_size,
                                  int *regions, uint32_t *revalidations);
+void overlay_loader_get_load_timing(uint64_t *total_us, uint64_t *max_us,
+                                    uint64_t *last_us);
 
 void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
                                      uint32_t *r0_fn_lo, uint32_t *r0_fn_hi,
@@ -95,6 +97,11 @@ void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
 /* Dispatches that skipped the per-dispatch code-range crc32 via the unchanged
  * page-generation fast path (overlay-cache v2 P2). */
 uint64_t overlay_loader_gen_fastpath(void);
+int      overlay_loader_range_link_count(void);
+int      overlay_loader_range_index_overflow(void);
+int      overlay_loader_lazy_manifest_count(void);
+int      overlay_loader_lazy_manifest_overflow(void);
+int      overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap);
 
 #ifdef __cplusplus
 }

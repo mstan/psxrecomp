@@ -15,6 +15,24 @@ int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
 
 int gl_renderer_init_context(struct SDL_Window *win) { (void)win; return 0; }
 void gl_renderer_set_swap_interval(int interval) { (void)interval; }
+void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz) {
+    (void)enabled; (void)host_hz; (void)target_hz;
+}
+void gl_renderer_set_interpolation_suspended(int suspended) { (void)suspended; }
+void gl_renderer_interpolation_diag(int *enabled, int *suspended,
+                                    int *history_frames,
+                                    double *host_hz, double *target_hz,
+                                    uint64_t *swaps) {
+    if (enabled) *enabled = 0;
+    if (suspended) *suspended = 0;
+    if (history_frames) *history_frames = 0;
+    if (host_hz) *host_hz = 0.0;
+    if (target_hz) *target_hz = 0.0;
+    if (swaps) *swaps = 0;
+}
+void gl_renderer_runtime_diag(uint64_t out[6]) {
+    if (out) memset(out, 0, 6 * sizeof(uint64_t));
+}
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h,
                          int linear, int force_4_3) {
     (void)pixels; (void)src_w; (void)src_h; (void)linear; (void)force_4_3;
@@ -53,6 +71,9 @@ void gl_renderer_set_ws_ablate(int mode) { (void)mode; }
 int gl_renderer_get_ws_ablate(void) { return 0; }
 uint64_t gl_renderer_perf_prim_split(double *fraction) {
     if (fraction) *fraction = 0.0; return 0;
+}
+void gl_renderer_batch_diag(uint64_t out[8]) {
+    if (out) memset(out, 0, 8 * sizeof(uint64_t));
 }
 void gl_renderer_set_wide_fast(int on) { (void)on; }
 int gl_renderer_get_wide_fast(void) { return 0; }

@@ -34,7 +34,13 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
  * target = -0.4% chronic audio underrun). Only debt beyond this window —
  * sustained sub-realtime emulation, not a hiccup — is forgiven, else the
  * pacer would demand unbounded catch-up. */
-#define FRAME_PACER_CATCHUP_MAX_PERIODS 8u
+/* Vigilante 8's streamed FMV transitions have measured host stalls near
+ * 140 ms. Eight 60 Hz periods are only 133.3 ms, so the old bound classified
+ * those finite transitions as sustained slowness and permanently forgave the
+ * guest/audio debt. Keep a bounded 12-period (200 ms at 60 Hz) window: enough
+ * to repay the observed transition without turning a real hang, suspend, or
+ * sub-realtime workload into an unbounded catch-up burst. */
+#define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
 
 void frame_pacer_wait(FramePacer *p, double period_ms) {
     uint64_t freq = SDL_GetPerformanceFrequency();

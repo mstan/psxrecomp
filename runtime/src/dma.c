@@ -881,6 +881,29 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
     return best;
 }
 
+uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 3))) return 0xFFFFFFFFu;
+    uint32_t best = 0xFFFFFFFFu;
+    const int async_num[3] = { 0, 1, 3 };
+    const DMAAsyncChannel *async_ch[3] = {
+        &mdec_async[0], &mdec_async[1], &cdrom_async
+    };
+    for (int i = 0; i < 3; i++) {
+        const DMAAsyncChannel *a = async_ch[i];
+        if (!channel_irq_flag_armed(async_num[i]) ||
+            !a->active || a->remaining_words == 0) continue;
+        uint32_t est = a->remaining_words > a->cycles_accum
+                         ? (a->remaining_words - a->cycles_accum) : 0u;
+        if (est < best) best = est;
+    }
+    for (int ch = 0; ch < 7; ch++) {
+        if (channel_irq_flag_armed(ch) && delayed_complete[ch].active &&
+            delayed_complete[ch].cycles_remaining < best)
+            best = delayed_complete[ch].cycles_remaining;
+    }
+    return best;
+}
+
 void dma_advance(uint32_t cycles) {
     if (cycles == 0) return;
     g_dma_exec_depth++;   /* async to-RAM DMA writes below run through psx_write_word */

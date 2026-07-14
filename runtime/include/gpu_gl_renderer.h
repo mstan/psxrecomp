@@ -23,6 +23,18 @@ int  gl_renderer_init_context(struct SDL_Window *win);
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
 
+/* Presentation-only frame interpolation. High-refresh sub-presents blend the
+ * two most recent stable display images; guest simulation timing is unchanged. */
+void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz);
+void gl_renderer_set_interpolation_suspended(int suspended);
+void gl_renderer_interpolation_diag(int *enabled, int *suspended,
+                                    int *history_frames,
+                                    double *host_hz, double *target_hz,
+                                    uint64_t *swaps);
+/* Cumulative CPU-upload diagnostics: calls, rects, pixels, conversion ticks,
+ * texture-upload ticks, FBO-draw ticks. Active only with PSX_RUNTIME_PERF_DIAG. */
+void gl_renderer_runtime_diag(uint64_t out[6]);
+
 /* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
  * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic.
  * force_4_3 = pillarbox at native 4:3 even on a wide display aspect (FMVs
@@ -102,6 +114,7 @@ enum {
     GL_PRES_WIDE  = 1,   /* native-wide FBO blit present                       */
     GL_PRES_CPU   = 2,   /* CPU-readout quad present (24-bit FMV / forced)     */
     GL_PRES_BLANK = 3,   /* display-disabled black present                     */
+    GL_PRES_INTERP = 4,  /* host-refresh interpolation sub-present              */
 };
 
 typedef struct {
@@ -142,6 +155,9 @@ int  gl_renderer_get_ws_ablate(void);
 /* Cumulative textured fraction of scene primitives since boot (flat vs textured
  * batching decision). Sets *out_tex_frac; returns total prim count. */
 uint64_t gl_renderer_perf_prim_split(double *out_tex_frac);
+/* Cumulative textured-batch diagnostics: total, then flushes caused by
+ * isolation, blend-mode, mask, filter, backdrop-gate, texture-window, capacity. */
+void gl_renderer_batch_diag(uint64_t out[8]);
 
 #ifdef __cplusplus
 }

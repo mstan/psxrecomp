@@ -91,6 +91,23 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     return best;
 }
 
+/* Wait-loop observation boundary. Device catch-up remains mask-blind and
+ * replays every intermediate timer/DMA/SIO transition, but a CPU loop with no
+ * stores or MMIO cannot observe a masked IRQ until it becomes deliverable.
+ * Stopping at every masked timer target turned a safe VBlank/CD wait skip into
+ * tens of thousands of host-side re-detections per second. VBlank remains an
+ * unconditional ceiling so frame pacing is never crossed in one jump. */
+static uint32_t devices_cycles_to_next_idle_event(void) {
+    extern uint32_t i_mask;
+    uint32_t best = interrupts_cycles_to_vblank();
+    uint32_t t = timers_cycles_to_irq(i_mask);  if (t < best) best = t;
+    uint32_t c = cdrom_cycles_to_irq(i_mask);   if (c < best) best = c;
+    uint32_t d = dma_cycles_to_deliverable_irq(i_mask); if (d < best) best = d;
+    uint32_t s = sio_cycles_to_irq(i_mask);     if (s < best) best = s;
+    if (best == 0) best = 1;
+    return best;
+}
+
 static void psx_devices_recompute_deadline(void) {
     uint32_t next = devices_cycles_to_next_internal_event();
     if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
@@ -256,21 +273,27 @@ uint64_t g_idle_skip_count  = 0;     /* skips performed                */
 uint64_t g_idle_skip_cycles = 0;     /* guest cycles fast-forwarded    */
 uint32_t g_idle_skip_last_pc = 0;    /* loop PC of the last skip       */
 uint32_t g_idle_skip_last_quantum = 0;
+/* Overlay CPS code reports several interrupt-safe PCs per logical loop
+ * iteration. The loader suppresses internal/return observations so they do not
+ * erase evidence collected at the repeated external poll boundary; interrupt
+ * delivery still runs normally. */
+int g_idle_note_suppress = 0;
 
 static uint32_t s_idle_pc = 0;
 static uint32_t s_idle_quantum = 0;
 static uint32_t s_idle_streak = 0;
-static uint32_t s_idle_fp = 0;
+static uint32_t s_idle_gpr[32];
+static uint32_t s_idle_hi = 0, s_idle_lo = 0;
+static int      s_idle_progress_reg = -2; /* -2 unknown, -1 stable, 1..31 countdown */
+static int32_t  s_idle_progress_delta = 0;
 static uint64_t s_idle_last_cycle = 0;
 static uint64_t s_idle_last_stores = 0;
 static uint64_t s_idle_last_mmio = 0;
 
-static uint32_t idle_reg_fp(const CPUState *cpu) {
-    uint32_t h = 0x811C9DC5u;                 /* FNV-1a over r1..r31 + hi/lo */
-    for (int i = 1; i < 32; i++) { h ^= cpu->gpr[i]; h *= 16777619u; }
-    h ^= cpu->hi; h *= 16777619u;
-    h ^= cpu->lo; h *= 16777619u;
-    return h;
+static void idle_snapshot_regs(const CPUState *cpu) {
+    for (int i = 1; i < 32; i++) s_idle_gpr[i] = cpu->gpr[i];
+    s_idle_hi = cpu->hi;
+    s_idle_lo = cpu->lo;
 }
 
 static int idle_skip_on(void) {
@@ -290,6 +313,8 @@ static int idle_skip_on(void) {
     return g_idle_skip_enabled;
 }
 
+int psx_idle_skip_is_enabled(void) { return idle_skip_on(); }
+
 void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 #ifdef PSX_COSIM
     (void)cpu; (void)check_pc;
@@ -299,7 +324,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     extern int psx_get_in_exception(void);
     extern uint64_t g_guest_store_count, g_mmio_access_count;
 
-    if (!idle_skip_on()) return;
+    if (!idle_skip_on() || g_idle_note_suppress) return;
     if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
         g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
         s_idle_pc = 0;
@@ -311,25 +336,49 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     if (check_pc == s_idle_pc &&
         g_guest_store_count == s_idle_last_stores &&
         g_mmio_access_count == s_idle_last_mmio) {
-        uint32_t fp = idle_reg_fp(cpu);
-        uint32_t delta = (uint32_t)(cyc - s_idle_last_cycle);
-        if (fp == s_idle_fp && delta > 0 && delta <= IDLE_QUANTUM_MAX) {
-            if (delta == s_idle_quantum) {
+        int changed = -1, changed_count = 0;
+        for (int i = 1; i < 32; i++) {
+            if (cpu->gpr[i] != s_idle_gpr[i]) {
+                changed = i;
+                changed_count++;
+                if (changed_count > 1) break;
+            }
+        }
+        if (cpu->hi != s_idle_hi || cpu->lo != s_idle_lo) changed_count = 2;
+        int32_t progress_delta = changed_count == 1
+            ? (int32_t)(cpu->gpr[changed] - s_idle_gpr[changed]) : 0;
+        /* Besides the original invariant-register loop, accept exactly one
+         * monotonically decrementing timeout register. Skipped iterations apply
+         * the same decrements and stop before zero so the real exit branch still
+         * executes. No stores/MMIO are allowed, so there is no hidden work. */
+        int progress_reg = changed_count == 0 ? -1
+                         : (changed_count == 1 && progress_delta == -1 ? changed : -2);
+        uint32_t quantum = (uint32_t)(cyc - s_idle_last_cycle);
+        if (progress_reg != -2 && quantum > 0 && quantum <= IDLE_QUANTUM_MAX) {
+            if (quantum == s_idle_quantum &&
+                progress_reg == s_idle_progress_reg &&
+                progress_delta == s_idle_progress_delta) {
                 if (s_idle_streak < 1000000u) s_idle_streak++;
             } else {
-                s_idle_quantum = delta;
+                s_idle_quantum = quantum;
+                s_idle_progress_reg = progress_reg;
+                s_idle_progress_delta = progress_delta;
                 s_idle_streak = 1;
             }
         } else {
             s_idle_streak = 0;
             s_idle_quantum = 0;
+            s_idle_progress_reg = -2;
+            s_idle_progress_delta = 0;
         }
-        s_idle_fp = fp;
+        idle_snapshot_regs(cpu);
     } else {
         s_idle_pc = check_pc;
         s_idle_streak = 0;
         s_idle_quantum = 0;
-        s_idle_fp = idle_reg_fp(cpu);
+        s_idle_progress_reg = -2;
+        s_idle_progress_delta = 0;
+        idle_snapshot_regs(cpu);
     }
     s_idle_last_cycle  = cyc;
     s_idle_last_stores = g_guest_store_count;
@@ -337,11 +386,20 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 
     if (s_idle_streak < IDLE_STREAK_MIN) return;
     uint32_t q = s_idle_quantum;
-    uint32_t dist = devices_cycles_to_next_internal_event();
+    uint32_t dist = devices_cycles_to_next_idle_event();
     if (dist <= q) return;               /* one real iteration reaches it */
     uint32_t k = (dist + q - 1u) / q;    /* first check boundary >= event */
+    if (s_idle_progress_reg > 0) {
+        uint32_t value = cpu->gpr[s_idle_progress_reg];
+        uint32_t max_k = value > 1u ? value - 1u : 0u;
+        if (k > max_k) k = max_k;
+        if (k == 0) return;
+    }
     uint64_t skip = (uint64_t)k * q;
     if (skip > IDLE_SKIP_MAX_CYCLES) return;
+
+    if (s_idle_progress_reg > 0)
+        cpu->gpr[s_idle_progress_reg] -= k;
 
     g_idle_skip_count++;
     g_idle_skip_cycles += skip;
@@ -353,6 +411,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
      * (psx_check_interrupts) evaluates deliverability right after this with
      * the post-skip state. Re-detect from scratch either way. */
     s_idle_streak = 0;
+    idle_snapshot_regs(cpu);
     s_idle_last_cycle  = psx_cycle_count;
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;

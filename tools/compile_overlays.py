@@ -871,6 +871,18 @@ DISPATCH_PREAMBLE = """\
 
 /* ---- Overlay dispatch shim (inserted by compile_overlays.py) ----------- */
 static OverlayCallbacks g_cbs;
+static uint32_t s_pending_cycles;
+
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void overlay_flush_cycles(void) {
+    uint32_t cycles = s_pending_cycles;
+    s_pending_cycles = 0;
+    if (cycles && g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
+}
 
 /* Call-contract state (ABI v2): generated code reads/bumps the runtime's
  * bail state through these pointers (cpu_state.h PSX_OVERLAY_DLL_BUILD
@@ -901,35 +913,44 @@ void overlay_init(const OverlayCallbacks *cbs) {
 }
 
 void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
+    overlay_flush_cycles();
     (void)ra;
     g_cbs.dispatch_call(cpu, addr, cpu->gpr[31]);
 }
 void psx_check_interrupts(CPUState *cpu) {
+    overlay_flush_cycles();
     g_cbs.check_interrupts(cpu);
 }
 void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
+    overlay_flush_cycles();
     if (g_cbs.check_interrupts_at) g_cbs.check_interrupts_at(cpu, resume_pc);
     else g_cbs.check_interrupts(cpu);
 }
 void psx_advance_cycles(uint32_t cycles) {
-    if (g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
+    if (cycles > UINT32_MAX - s_pending_cycles) overlay_flush_cycles();
+    s_pending_cycles += cycles;
 }
 void gte_execute(CPUState *cpu, uint32_t cmd) {
+    overlay_flush_cycles();
     g_cbs.gte_execute(cpu, cmd);
 }
 int psx_syscall(CPUState *cpu, uint32_t code) {
+    overlay_flush_cycles();
     return g_cbs.psx_syscall(cpu, code);
 }
 void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
+    overlay_flush_cycles();
     if (g_cbs.psx_native_bad_entry) g_cbs.psx_native_bad_entry(cpu, owner, pc);
 }
 void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
+    overlay_flush_cycles();
     g_cbs.psx_unknown_dispatch(cpu, addr, phys);
 }
 void debug_server_log_call_entry(uint32_t func_addr) {
     if (g_cbs.log_call_entry) g_cbs.log_call_entry(func_addr);
 }
 void psx_restore_state_escape(void) {
+    overlay_flush_cycles();
     if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
 /* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
@@ -937,24 +958,31 @@ void psx_restore_state_escape(void) {
  * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a
  * v9 DLL stays safe on a host that predates a given callback. */
 uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    overlay_flush_cycles();
     return g_cbs.cyc_load_word ? g_cbs.cyc_load_word(cpu, addr, rt, reg_mask) : cpu->read_word(addr);
 }
 uint16_t psx_cyc_load_half(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    overlay_flush_cycles();
     return g_cbs.cyc_load_half ? g_cbs.cyc_load_half(cpu, addr, rt, reg_mask) : cpu->read_half(addr);
 }
 uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    overlay_flush_cycles();
     return g_cbs.cyc_load_byte ? g_cbs.cyc_load_byte(cpu, addr, rt, reg_mask) : cpu->read_byte(addr);
 }
 uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
+    overlay_flush_cycles();
     return g_cbs.cyc_lwc2_read ? g_cbs.cyc_lwc2_read(cpu, addr) : cpu->read_word(addr);
 }
 void psx_icache_fetch(CPUState *cpu, uint32_t addr) {
+    overlay_flush_cycles();
     if (g_cbs.icache_fetch) g_cbs.icache_fetch(cpu, addr);
 }
 void psx_muldiv_set(CPUState *cpu, uint32_t latency) {
+    overlay_flush_cycles();
     if (g_cbs.muldiv_set) g_cbs.muldiv_set(cpu, latency);
 }
 void psx_muldiv_stall(CPUState *cpu) {
+    overlay_flush_cycles();
     if (g_cbs.muldiv_stall) g_cbs.muldiv_stall(cpu);
 }
 uint32_t psx_mult_latency_s(uint32_t rs) {
@@ -964,12 +992,15 @@ uint32_t psx_mult_latency_u(uint32_t rs) {
     return g_cbs.mult_latency_u ? g_cbs.mult_latency_u(rs) : 0u;
 }
 void psx_gte_stall(CPUState *cpu) {
+    overlay_flush_cycles();
     if (g_cbs.gte_stall) g_cbs.gte_stall(cpu);
 }
 void psx_gte_read(CPUState *cpu, uint32_t rt) {
+    overlay_flush_cycles();
     if (g_cbs.gte_read) g_cbs.gte_read(cpu, rt);
 }
 int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    overlay_flush_cycles();
     return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
 }
 /* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/mtc2/
@@ -984,15 +1015,19 @@ int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_
  * direct CPUState accesses in emitted code — only the derived/flag registers
  * come through here, matching code_generator.cpp's COP2 case. */
 uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
+    overlay_flush_cycles();
     return g_cbs.gte_read_data(cpu, reg);
 }
 uint32_t gte_read_ctrl(CPUState *cpu, uint8_t reg) {
+    overlay_flush_cycles();
     return g_cbs.gte_read_ctrl(cpu, reg);
 }
 void gte_write_data(CPUState *cpu, uint8_t reg, uint32_t value) {
+    overlay_flush_cycles();
     g_cbs.gte_write_data(cpu, reg, value);
 }
 void gte_write_ctrl(CPUState *cpu, uint8_t reg, uint32_t value) {
+    overlay_flush_cycles();
     g_cbs.gte_write_ctrl(cpu, reg, value);
 }
 /* g_debug_last_store_pc: a provenance breadcrumb the emitter writes before stores.
@@ -1167,18 +1202,181 @@ def patch_generated_c_static(src: str, load_addr: int, size: int) -> tuple:
     return src, sorted(func_virt_addrs)
 
 
-def generate_overlay_dispatch(all_virt_addrs: list) -> str:
-    """Generate psx_overlay_dispatch() covering all statically-compiled overlays."""
+def namespace_generated_static(src: str, namespace: str,
+                               func_virt_addrs: list) -> tuple:
+    """Give one generated overlay image private C symbols.
+
+    Static mode combines several independently-generated C files into one
+    translation unit. The recompiler deliberately gives each file the same
+    helper names, and different overlay images may define functions at the same
+    guest address. Namespace the four common helpers, every in-image function,
+    and every alias-body helper. Return the guest-entry -> C-symbol map used by
+    the content-validated dispatcher.
+    """
+    func_set = set(func_virt_addrs)
+
+    for helper in ('psx_lwl', 'psx_lwr', 'psx_swl', 'psx_swr'):
+        src = re.sub(rf'\b{helper}\b', f'{namespace}_{helper}', src)
+
+    def rename_func(m):
+        addr = (int(m.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        if addr not in func_set:
+            return m.group(0)
+        return f'{namespace}_func_{addr:08X}'
+
+    src = re.sub(r'\bfunc_([0-9A-Fa-f]{8})\b', rename_func, src)
+
+    def rename_alias(m):
+        addr = (int(m.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        if addr not in func_set:
+            return m.group(0)
+        return f'{namespace}_alias_body_{addr:08X}'
+
+    src = re.sub(r'\bpsx_alias_body_([0-9A-Fa-f]{8})\b', rename_alias, src)
+    symbols = {va: f'{namespace}_func_{va:08X}' for va in func_set}
+    return src, symbols
+
+
+def parse_cps_continuation_owners(src: str) -> dict:
+    """Return compiled block entry -> owning function for generated CPS C.
+
+    Runtime captures can prove a block label as a dispatch entry even when an
+    earlier capture never needed that label in the host's ``cpu->pc`` resume
+    switch. Static mode can add the missing switch arm and synthesize a wrapper
+    as long as the host's exact compiled code ranges match live RAM.
+    """
+    definition_re = re.compile(
+        r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)\n\{',
+        re.MULTILINE)
+    definitions = list(definition_re.finditer(src))
+    owners = {}
+    for index, match in enumerate(definitions):
+        host = (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        end = definitions[index + 1].start() if index + 1 < len(definitions) else len(src)
+        body = src[match.end():end]
+        for block in re.finditer(r'^block_([0-9A-Fa-f]{8}):', body,
+                                 re.MULTILINE):
+            entry = (int(block.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+            owners.setdefault(entry, host)
+    return owners
+
+
+def add_cps_resume_case(src: str, host_symbol: str,
+                        host: int, entry: int) -> tuple:
+    """Make ``entry`` a legal ``cpu->pc`` resume point in one native host."""
+    definition = re.search(
+        rf'^void {re.escape(host_symbol)}\(CPUState\* cpu\)\n\{{',
+        src, re.MULTILINE)
+    if not definition:
+        return src, False
+    next_definition = re.search(r'^void [A-Za-z_][A-Za-z0-9_]*\(CPUState\* cpu\)',
+                                src[definition.end():], re.MULTILINE)
+    end = (definition.end() + next_definition.start()
+           if next_definition else len(src))
+    segment = src[definition.start():end]
+    if not re.search(rf'^block_{entry:08X}:', segment, re.MULTILINE):
+        return src, False
+    if f'case 0x{entry:08X}u: goto block_{entry:08X};' in segment:
+        return src, True
+
+    hook = segment.find('debug_server_log_call_entry')
+    prologue = segment[:hook] if hook >= 0 else ''
+    default_match = re.search(r'^\s+default:', prologue, re.MULTILINE)
+    if 'if (cpu->pc != 0u)' in prologue and default_match:
+        insert = definition.start() + default_match.start()
+        indent = re.match(r'\s*', prologue[default_match.start():]).group(0)
+        arm = f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
+        return src[:insert] + arm + src[insert:], True
+
+    prologue_text = (
+        '\n    if (cpu->pc != 0u) {\n'
+        '        uint32_t _cont = cpu->pc; cpu->pc = 0;\n'
+        '        switch (_cont) {\n'
+        f'            case 0x{entry:08X}u: goto block_{entry:08X};\n'
+        f'            case 0x{host:08X}u: break;  /* entry at prologue */\n'
+        f'            default: cpu->pc = _cont; psx_native_bad_entry(cpu, '
+        f'0x{host:08X}u, _cont); return;\n'
+        '        }\n'
+        '    }')
+    return src[:definition.end()] + prologue_text + src[definition.end():], True
+
+
+def generate_overlay_dispatch(variants: list) -> str:
+    """Generate byte-validated dispatch for all static overlay variants."""
+    unique = []
+    seen = set()
+    for variant in variants:
+        ranges = tuple((lo & 0x1FFFFFFF, length)
+                       for lo, length in variant['ranges'])
+        key = (variant['addr'], variant['crc'], ranges)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = dict(variant)
+        item['ranges'] = ranges
+        unique.append(item)
+
+    unique.sort(key=lambda v: (v['addr'], v['crc'], v['ranges'], v['symbol']))
+    by_addr = {}
+    for index, variant in enumerate(unique):
+        variant['range_symbol'] = f'psx_ov_static_ranges_{index:05d}'
+        by_addr.setdefault(variant['addr'], []).append(variant)
+
     lines = [
         '',
-        '/* Auto-generated overlay dispatch — do not edit. */',
-        'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
-        '    switch (addr) {',
+        '/* Auto-generated, content-validated overlay dispatch -- do not edit. */',
+        'extern int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,',
+        '                                           uint32_t count,',
+        '                                           uint32_t expected_crc);',
+        'static uint64_t psx_ov_static_checks = 0;',
+        'static uint64_t psx_ov_static_hits = 0;',
+        'static uint64_t psx_ov_static_variant_misses = 0;',
+        'static uint64_t psx_ov_static_address_misses = 0;',
+        '',
     ]
-    for va in sorted(all_virt_addrs):
-        lines.append(f'        case 0x{va:08X}u: func_{va:08X}(cpu); return 1;')
+    for variant in unique:
+        flat = []
+        for lo, length in variant['ranges']:
+            flat.extend((f'0x{lo:08X}u', f'0x{length:X}u'))
+        lines.append(
+            f'static const uint32_t {variant["range_symbol"]}[] = '
+            '{ ' + ', '.join(flat) + ' };')
+
     lines += [
-        '        default: return 0;',
+        '',
+        'void psx_overlay_static_get_stats(uint64_t *checks, uint64_t *hits,',
+        '                                  uint64_t *variant_misses,',
+        '                                  uint64_t *address_misses) {',
+        '    if (checks) *checks = psx_ov_static_checks;',
+        '    if (hits) *hits = psx_ov_static_hits;',
+        '    if (variant_misses) *variant_misses = psx_ov_static_variant_misses;',
+        '    if (address_misses) *address_misses = psx_ov_static_address_misses;',
+        '}',
+        '',
+        'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
+        '    const uint32_t key = (addr & 0x1FFFFFFFu) | 0x80000000u;',
+        '    switch (key) {',
+    ]
+    for addr in sorted(by_addr):
+        lines.append(f'        case 0x{addr:08X}u:')
+        for variant in by_addr[addr]:
+            count = len(variant['ranges'])
+            lines += [
+                '            psx_ov_static_checks++;',
+                f'            if (psx_overlay_static_code_matches('
+                f'{variant["range_symbol"]}, {count}u, '
+                f'0x{variant["crc"]:08X}u)) {{',
+                '                psx_ov_static_hits++;',
+                f'                {variant["symbol"]}(cpu);',
+                '                return 1;',
+                '            }',
+                '            psx_ov_static_variant_misses++;',
+            ]
+        lines.append('            return 0;')
+    lines += [
+        '        default:',
+        '            psx_ov_static_address_misses++;',
+        '            return 0;',
         '    }',
         '}',
         '',
@@ -1354,6 +1552,81 @@ def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
     return out
 
 
+def generate_interior_fragment_static(interior: int, data: bytes,
+                                      load_addr: int, size: int,
+                                      phys_addr: int, args):
+    """Generate one isolated, exact-range-gated static interior shard."""
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, 'frag.psx')
+        with open(psx, 'wb') as f:
+            f.write(make_psxexe(load_addr, interior, data))
+        seeds_path = os.path.join(tmp, 'seeds.txt')
+        with open(seeds_path, 'w') as f:
+            f.write(f'dispatch_root 0x{interior:08X}\n')
+        out_dir_tmp = os.path.join(tmp, 'out')
+        os.makedirs(out_dir_tmp)
+        cmd = [args.recompiler, psx, '--seeds', seeds_path,
+               '--out-dir', out_dir_tmp, '--overlay',
+               '--ws-config', os.path.abspath(args.game_toml)]
+        sub_env = dict(os.environ)
+        if args.cps:
+            sub_env['PSX_CPS'] = '1'
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.abspath(args.game_toml)), env=sub_env)
+        if result.returncode != 0:
+            return None
+
+        full_c = ranges_src = None
+        for filename in os.listdir(out_dir_tmp):
+            if filename.endswith('_full.c'):
+                full_c = os.path.join(out_dir_tmp, filename)
+            elif filename.endswith('_full.ranges'):
+                ranges_src = os.path.join(out_dir_tmp, filename)
+        if not full_c or not ranges_src:
+            return None
+
+        with open(full_c) as f:
+            src, func_addrs = patch_generated_c_static(
+                f.read(), load_addr, size)
+        image_crc = binascii.crc32(data) & 0xFFFFFFFF
+        audit = audit_generated_c(src, load_addr, size, image_crc, {})
+        if audit['unknown_bad'] or audit['unsupported_todo_addrs']:
+            return None
+        func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+        ids_by_addr = {}
+        for ev, code_crc, ranges in func_ids:
+            ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
+        if set(func_addrs) - set(ids_by_addr):
+            return None
+
+        entry = (interior & 0x1FFFFFFF) | 0x80000000
+        if entry not in ids_by_addr or entry not in set(func_addrs):
+            return None
+        namespace = (f'ov_frag_{phys_addr:08X}_{image_crc:08X}_'
+                     f'{entry:08X}')
+        continuation_owners = parse_cps_continuation_owners(src)
+        src, symbols = namespace_generated_static(src, namespace, func_addrs)
+        variants = []
+        for ev in sorted(func_addrs):
+            for code_crc, ranges in ids_by_addr[ev]:
+                variants.append({
+                    'addr': ev,
+                    'symbol': symbols[ev],
+                    'crc': code_crc,
+                    'ranges': ranges,
+                })
+        return {
+            'src': src,
+            'variants': variants,
+            'namespace': namespace,
+            'func_addrs': set(func_addrs),
+            'symbols': symbols,
+            'ids_by_addr': ids_by_addr,
+            'continuation_owners': continuation_owners,
+        }
+
+
 def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                               size: int, phys_addr: int, cache_dir: str,
                               args, sub_env: dict):
@@ -1418,6 +1691,14 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             return frag_ids   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
         with open(patched_c, 'w') as f:
+            f.write(src)
+        # Keep the exact generated fragment beside other retained overlay
+        # sources. Orphan interiors are the hardest shards to audit when a
+        # native/interpreter differential finds a timing or device mismatch;
+        # deleting their only C representation with the temp directory made
+        # the responsible lowering impossible to inspect after compilation.
+        retained_c = os.path.join(cache_dir, f'{key:08X}_fragment_patched.c')
+        with open(retained_c, 'w') as f:
             f.write(src)
         include_dirs = [args.runtime_include]
         recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
@@ -1591,6 +1872,11 @@ def main():
                     help='TinyCC binary (used when --compiler tcc)')
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
+    ap.add_argument('--force-interior',  action='append', default=[],
+                    help='also compile this virtual/physical PC as an isolated '
+                         'interior fragment (repeatable; diagnostic recovery for '
+                         'an observed dispatch PC whose classifier provenance was '
+                         'lost after a later capture)')
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
     ap.add_argument('--flavor',          type=int, default=0,
@@ -1610,6 +1896,7 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
+    forced_interiors = {int(v, 0) for v in args.force_interior}
 
     # ---- Framework-injected cache location wins over CLI flags ----------------
     # The runtime (autocompile.c) exports PSX_OVERLAY_CACHE_DIR / PSX_OVERLAY_CAPTURES
@@ -1681,8 +1968,11 @@ def main():
 
     print(f'Captures: {len(captures)} overlay(s) to process\n')
 
-    # B-2 static mode: accumulate all overlay C into one file
-    static_parts = []   # list of (patched_src, func_virt_addrs)
+    # B-2 static mode: accumulate privately-namespaced generated C plus exact
+    # per-function identities for the content-validated dispatcher.
+    static_parts = []
+    static_requested_entries = set()
+    static_entry_sources = {}
 
     # overlay-cache v2: per-region_start function-identity coverage, so a capture
     # that adds no NEW (entry, code_crc) skips the gcc compile (volatile-data
@@ -1706,6 +1996,26 @@ def main():
         data      = base64.b64decode(cap['bytes_b64'])
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
+        if args.static:
+            for captured_entry in _parse_addr_list(
+                    cap.get('dispatch_entry_pcs', [])):
+                entry = ((captured_entry & 0x1FFFFFFF) | 0x80000000)
+                static_requested_entries.add(entry)
+                static_entry_sources[entry] = (
+                    data, load_addr, size, phys_addr)
+            # --force-interior is an explicit operator assertion that a live
+            # dispatch entry was observed even if the retained capture lost its
+            # classifier provenance. Static mode must honor it just like DLL
+            # mode: bind the requested PC to this capture's exact bytes, then
+            # the post-pass will build a content-validated isolated shard.
+            region_hi = phys_addr + size
+            for forced_entry in forced_interiors:
+                forced_phys = forced_entry & 0x1FFFFFFF
+                if phys_addr <= forced_phys < region_hi:
+                    entry = forced_phys | 0x80000000
+                    static_requested_entries.add(entry)
+                    static_entry_sources[entry] = (
+                        data, load_addr, size, phys_addr)
 
         # Merge evidence from a prior build of the SAME bytes: every F entry
         # in an existing ranges manifest for this exact image was proven
@@ -1841,16 +2151,66 @@ def main():
             with open(full_c) as f:
                 src = f.read()
 
+            ranges_src = None
+            for fn in os.listdir(out_dir_tmp):
+                if fn.endswith('_full.ranges'):
+                    ranges_src = os.path.join(out_dir_tmp, fn)
+                    break
+
             # Post-process
             if args.static:
                 src, func_addrs = patch_generated_c_static(src, load_addr, size)
+                continuation_owners = parse_cps_continuation_owners(src)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
                 print_generated_c_audit(load_addr, size, crc32, c_audit)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
                     return
-                static_parts.append((src, func_addrs))
-                print(f'  recompiled: {len(func_addrs)} functions\n')
+                if not ranges_src:
+                    print('  STATIC RANGE AUDIT FAILED: no _full.ranges manifest\n')
+                    return
+
+                func_ids = parse_overlay_func_ids(ranges_src, data,
+                                                  load_addr, size)
+                ids_by_addr = {}
+                for ev, code_crc, ranges in func_ids:
+                    ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
+                missing = sorted(set(func_addrs) - set(ids_by_addr))
+                if missing:
+                    sample = ', '.join(f'0x{a:08X}' for a in missing[:8])
+                    print(f'  STATIC RANGE AUDIT FAILED: {len(missing)} '
+                          f'dispatchable function(s) lack exact ranges: {sample}\n')
+                    return
+
+                # Whole-image identity plus compiled-entry coverage makes the
+                # namespace deterministic while allowing a later, richer seed
+                # capture of identical bytes to coexist without symbol clashes.
+                cov_blob = ','.join(f'{a:08X}'
+                                    for a in sorted(func_addrs)).encode()
+                cov_crc = binascii.crc32(cov_blob) & 0xFFFFFFFF
+                namespace = f'ov_{phys_addr:08X}_{crc32:08X}_{cov_crc:08X}'
+                src, symbols = namespace_generated_static(src, namespace,
+                                                          func_addrs)
+                variants = []
+                for ev in sorted(func_addrs):
+                    for code_crc, ranges in ids_by_addr[ev]:
+                        variants.append({
+                            'addr': ev,
+                            'symbol': symbols[ev],
+                            'crc': code_crc,
+                            'ranges': ranges,
+                        })
+                static_parts.append({
+                    'src': src,
+                    'variants': variants,
+                    'namespace': namespace,
+                    'func_addrs': set(func_addrs),
+                    'symbols': symbols,
+                    'ids_by_addr': ids_by_addr,
+                    'continuation_owners': continuation_owners,
+                })
+                print(f'  recompiled: {len(func_addrs)} functions, '
+                      f'{len(variants)} exact identities\n')
             else:
                 src = patch_generated_c(src, load_addr, size)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
@@ -1877,11 +2237,6 @@ def main():
                 # skip the build. This is what stops volatile-data regions (a
                 # changing whole-region CRC over byte-identical code) from minting
                 # an endless pile of redundant DLLs.
-                ranges_src = None
-                for fn in os.listdir(out_dir_tmp):
-                    if fn.endswith('_full.ranges'):
-                        ranges_src = os.path.join(out_dir_tmp, fn)
-                        break
                 this_ids = (parse_overlay_func_ids(ranges_src, data, load_addr, size)
                             if ranges_src else [])
                 this_set = {(ev, crc) for ev, crc, _ in this_ids}
@@ -1951,6 +2306,12 @@ def main():
             frag_env['PSX_CPS'] = '1'
         for job in interior_frag_jobs:
             phys_addr, load_addr, size, data, interior_pcs, executed = job
+            region_lo = load_addr & 0x1FFFFFFF
+            region_hi = region_lo + size
+            interior_pcs = set(interior_pcs)
+            interior_pcs.update(
+                a for a in forced_interiors
+                if region_lo <= (a & 0x1FFFFFFF) < region_hi)
             # ENTRY-based orphan test, not range-based: native code is
             # enterable only at manifest F entries, so "inside a compiled
             # range" does NOT make a dispatch target servable — a range-
@@ -1958,7 +2319,7 @@ def main():
             # chain on every dispatch. Demand an entry at exactly this PC.
             covered_entries = load_region_entry_set(cache_dir, phys_addr)
             orphans = sorted(a for a in interior_pcs
-                             if a in executed
+                             if (a in executed or a in forced_interiors)
                              and (a & 0x1FFFFFFF) not in covered_entries)
             if not orphans:
                 continue
@@ -2034,17 +2395,99 @@ def main():
 
     # B-2: write combined static C file
     if args.static and static_parts:
-        all_addrs = []
+        # CPS can yield at every compiled block leader, not just leaders that a
+        # particular capture happened to observe. Give every block in every
+        # variant a content-gated resume wrapper. This makes static coverage
+        # independent of host timing / slice boundaries.
+        synthesized = 0
+
+        def synthesize_all_resume_wrappers(parts):
+            nonlocal synthesized
+            for part in parts:
+                done = part.setdefault('resume_entries', set())
+                for entry, host in sorted(part['continuation_owners'].items()):
+                    if entry in part['func_addrs'] or entry in done:
+                        continue
+                    if host not in part['ids_by_addr']:
+                        continue
+                    symbol = f'{part["namespace"]}_func_{entry:08X}'
+                    host_symbol = part['symbols'][host]
+                    part['src'], resume_ok = add_cps_resume_case(
+                        part['src'], host_symbol, host, entry)
+                    if not resume_ok:
+                        continue
+                    part['src'] += (
+                        f'\n/* CPS block resume entry owned by 0x{host:08X}. */\n'
+                        f'void {symbol}(CPUState* cpu)\n{{\n'
+                        f'    cpu->pc = 0x{entry:08X}u;\n'
+                        f'    {host_symbol}(cpu);\n'
+                        f'}}\n')
+                    for code_crc, ranges in part['ids_by_addr'][host]:
+                        part['variants'].append({
+                            'addr': entry,
+                            'symbol': symbol,
+                            'crc': code_crc,
+                            'ranges': ranges,
+                        })
+                    done.add(entry)
+                    synthesized += 1
+
+        synthesize_all_resume_wrappers(static_parts)
+        existing_entries = {
+            variant['addr']
+            for part in static_parts
+            for variant in part['variants']
+        }
+
+        # Captured entries not owned by any compiled host are genuine orphan
+        # interiors. Compile each as an isolated dispatch-root shard, then give
+        # every block in those fragments the same universal resume treatment.
+        unresolved = sorted(static_requested_entries - existing_entries)
+        fragment_built = 0
+        new_fragment_parts = []
+        for entry in unresolved:
+            if entry in existing_entries:
+                continue
+            source = static_entry_sources.get(entry)
+            if source is None:
+                continue
+            data, load_addr, size, phys_addr = source
+            part = generate_interior_fragment_static(
+                entry, data, load_addr, size, phys_addr, args)
+            if part is None:
+                continue
+            static_parts.append(part)
+            new_fragment_parts.append(part)
+            existing_entries.update(
+                variant['addr'] for variant in part['variants'])
+            fragment_built += 1
+
+        synthesize_all_resume_wrappers(new_fragment_parts)
+        existing_entries = {
+            variant['addr']
+            for part in static_parts
+            for variant in part['variants']
+        }
+        unresolved = sorted(static_requested_entries - existing_entries)
+        print(f'Static universal CPS resume wrappers: {synthesized}')
+        print(f'Static isolated interior shards: {fragment_built}')
+        if unresolved:
+            sample = ', '.join(f'0x{entry:08X}' for entry in unresolved[:12])
+            print(f'STATIC COVERAGE WARNING: {len(unresolved)} captured dispatch '
+                  f'entry(s) have no compiled body/owner: {sample}')
+
+        all_variants = []
         combined = '/* Auto-generated overlay dispatch — do not edit.\n'
         combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
         combined += ' */\n'
-        for src, addrs in static_parts:
-            combined += src
-            all_addrs.extend(addrs)
-        combined += generate_overlay_dispatch(all_addrs)
+        for part in static_parts:
+            combined += part['src']
+            all_variants.extend(part['variants'])
+        combined += generate_overlay_dispatch(all_variants)
         with open(static_out, 'w') as f:
             f.write(combined)
-        print(f'Static output: {static_out}  ({len(all_addrs)} functions total)')
+        print(f'Static output: {static_out}  '
+              f'({len(all_variants)} exact function identities total)')
 
     print('Done.')
 

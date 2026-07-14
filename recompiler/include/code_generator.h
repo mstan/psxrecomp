@@ -194,6 +194,10 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // Exact manifest for the final function/CFG set emitted by the most recent
+    // generate_file() call, including functions synthesized by its split pass.
+    const std::string& last_ranges_manifest() const { return last_ranges_manifest_; }
+
     // Set known functions for this compilation unit (for linking)
     void set_known_functions(const std::set<uint32_t>& functions) {
         known_functions_ = functions;
@@ -206,6 +210,7 @@ private:
     const PS1Executable& exe_;
     CodeGenConfig config_;
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
+    std::string last_ranges_manifest_;
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
 

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <SDL.h>
 
 /* ---- Capture set --------------------------------------------------------
  * Tracks which physical addresses have received CD DMA loads since game
@@ -118,7 +119,11 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
  * shift). Dirty boot-text runs ARE captured — post-baseline they are live
  * overlay code (see dirty_ram_interp.h window model). */
 static void write_json_window(FILE *f, uint32_t win_lo_page,
-                              uint32_t win_hi_page, int *first_region)
+                              uint32_t win_hi_page, int *first_region,
+                              const uint32_t *bitmap,
+                              const DirtyRamPcEntry *pc_table,
+                              const DirtyRamPcEntry *exec_pc_table,
+                              const uint8_t *ram_base)
 {
     uint32_t page_sz = 4096u;
     uint32_t page, run_start;
@@ -130,7 +135,7 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
     for (page = win_lo_page; page <= win_hi_page; page++) {
         int dirty = 0;
         if (page < win_hi_page) {
-            uint32_t word = dirty_ram_get_bitmap_word(page >> 5);
+            uint32_t word = bitmap[page >> 5];
             dirty = (word >> (page & 31u)) & 1u;
         }
 
@@ -160,13 +165,13 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
             }
 
             for (j = 0; j < DIRTY_RAM_PC_TABLE_SIZE; j++) {
-                DirtyRamPcEntry *pe = &g_dirty_ram_pc_table[j];
+                const DirtyRamPcEntry *pe = &pc_table[j];
                 if (pe->pc == 0 || pe->hits == 0) continue;
                 if (pe->pc < phys || pe->pc >= phys + size) continue;
                 dispatch[ndisp++] = pe->pc;
             }
             for (j = 0; j < DIRTY_RAM_PC_TABLE_SIZE; j++) {
-                DirtyRamPcEntry *pe = &g_dirty_ram_exec_pc_table[j];
+                const DirtyRamPcEntry *pe = &exec_pc_table[j];
                 if (pe->pc == 0 || pe->hits == 0) continue;
                 if (pe->pc < phys || pe->pc >= phys + size) continue;
                 executed[nexec++] = pe->pc;
@@ -189,16 +194,6 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
              * (the village→overworld blue screen). Live RAM is the faithful
              * image. (Capture at a COHERENT moment — one overlay freshly loaded,
              * via overlay_capture_dump — to avoid merging overlay generations.) */
-            extern uint8_t *memory_get_ram_ptr(void);
-            uint8_t *ram_base = memory_get_ram_ptr();
-            uint8_t *image = (uint8_t *)malloc(size);
-            if (!image) {
-                free(executed);
-                free(dispatch);
-                continue;
-            }
-            memcpy(image, ram_base + phys, size);
-
             if (!*first_region) fprintf(f, ",\n");
             *first_region = 0;
 
@@ -207,8 +202,7 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
             fprintf(f, "    \"load_addr\": \"0x%08X\",\n", virt);
             fprintf(f, "    \"size\": %u,\n", size);
             fprintf(f, "    \"bytes_b64\": \"");
-            write_b64(f, image, size);
-            free(image);
+            write_b64(f, ram_base + phys, size);
             fprintf(f, "\",\n");
 
             fprintf(f, "    \"executed_pcs\": [");
@@ -243,21 +237,18 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
     }
 }
 
-void overlay_capture_write_json(void)
+static int write_json_snapshot(const char *path, uint32_t bw,
+                               const uint32_t *bitmap,
+                               const DirtyRamPcEntry *pc_table,
+                               const DirtyRamPcEntry *exec_pc_table,
+                               const uint8_t *ram_base)
 {
-    char     path[600];
     FILE    *f;
-    uint32_t bw, page_sz;
+    uint32_t page_sz;
     int      first_region;
-
-    if (!s_active) return;
-
-    bw      = dirty_ram_get_bitmap_word_count();
     page_sz = 4096u;
-
-    snprintf(path, sizeof(path), "%s/overlay_captures.json", s_out_dir);
     f = fopen(path, "w");
-    if (!f) return;
+    if (!f) return 0;
 
     fprintf(f, "[\n");
     first_region = 1;
@@ -271,14 +262,33 @@ void overlay_capture_write_json(void)
      * try_load_region's clamped walkback (existing overlay-region DLL keys
      * are unchanged). */
     write_json_window(f, 0u,
-                      DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region);
+                      DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region,
+                      bitmap, pc_table, exec_pc_table, ram_base);
     write_json_window(f, DIRTY_RAM_KERNEL_WINDOW_END / page_sz,
-                      OVERLAY_REGION_FLOOR / page_sz, &first_region);
+                      OVERLAY_REGION_FLOOR / page_sz, &first_region,
+                      bitmap, pc_table, exec_pc_table, ram_base);
     write_json_window(f, OVERLAY_REGION_FLOOR / page_sz, bw * 32u,
-                      &first_region);
+                      &first_region, bitmap, pc_table, exec_pc_table, ram_base);
 
     fprintf(f, "\n]\n");
     fclose(f);
+    return 1;
+}
+
+void overlay_capture_write_json(void)
+{
+    extern uint8_t *memory_get_ram_ptr(void);
+    char path[600];
+    uint32_t bw = dirty_ram_get_bitmap_word_count();
+    uint32_t *bitmap;
+    if (!s_active) return;
+    bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
+    if (!bitmap) return;
+    for (uint32_t i = 0; i < bw; i++) bitmap[i] = dirty_ram_get_bitmap_word(i);
+    snprintf(path, sizeof(path), "%s/overlay_captures.json", s_out_dir);
+    write_json_snapshot(path, bw, bitmap, g_dirty_ram_pc_table,
+                        g_dirty_ram_exec_pc_table, memory_get_ram_ptr());
+    free(bitmap);
 }
 
 int overlay_capture_count(void)
@@ -319,8 +329,8 @@ int overlay_capture_count(void)
  * (cp->busy defers fires while a compile is in flight) and identical images
  * dedup downstream (compile_overlays.py skips cached CRCs). */
 #define AUTOCAP_CHECK_FRAMES    120u   /* ~2 s between pressure samples     */
-#define AUTOCAP_MIN_DISPATCHES  256u   /* dispatch-count pressure gate      */
-#define AUTOCAP_MIN_INSNS       250000ull /* interp-insn pressure gate      */
+#define AUTOCAP_MIN_DISPATCHES  128u   /* catches ~120/s FMV helper gaps    */
+#define AUTOCAP_MIN_INSNS       100000ull /* long compute gap pressure gate */
 #define AUTOCAP_COOLDOWN_FRAMES 300u   /* >= ~5 s between auto-fires        */
 #define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
 
@@ -338,7 +348,35 @@ static int      s_autocap_reg_at_req = -1;   /* loader candidates at last req */
 static uint32_t s_autocap_backoff    = 1;    /* cooldown multiplier (futile)  */
 static uint32_t s_autocap_futile     = 0;    /* futile skips (telemetry)      */
 
-void overlay_autocapture_set_enabled(int on) { s_autocap_enabled = on ? 1 : 0; }
+typedef struct {
+    uint8_t *ram;
+    DirtyRamPcEntry *pc_table;
+    DirtyRamPcEntry *exec_pc_table;
+    uint32_t *bitmap;
+    uint32_t bitmap_words;
+    uint64_t manifest_sig;
+    char path[600];
+} AutocapWriteJob;
+static SDL_atomic_t s_autocap_write_state; /* 0 idle, 1 writing, 2 complete */
+static SDL_Thread *s_autocap_write_thread;
+static AutocapWriteJob *s_autocap_write_job;
+static int s_autocap_seeded_existing;
+
+static uint64_t autocap_manifest_sig(void);
+
+void overlay_autocapture_set_enabled(int on) {
+    s_autocap_enabled = on ? 1 : 0;
+    /* Seed the shipped/previous-session contribution file before gameplay.
+     * An unchanged first auto-capture can then back off without launching a
+     * compiler merely because this process has no request history yet. */
+    if (s_autocap_enabled && s_autocap_sig_at_req == 0) {
+        uint64_t sig = autocap_manifest_sig();
+        if (sig) {
+            s_autocap_sig_at_req = sig;
+            s_autocap_seeded_existing = 1;
+        }
+    }
+}
 
 void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
                                     uint64_t *last_delta) {
@@ -376,13 +414,97 @@ static uint64_t autocap_manifest_sig(void)
     return h;
 }
 
+static void autocap_write_job_free(AutocapWriteJob *job)
+{
+    if (!job) return;
+    free(job->ram); free(job->pc_table); free(job->exec_pc_table);
+    free(job->bitmap); free(job);
+}
+
+static int autocap_write_thread_main(void *opaque)
+{
+    AutocapWriteJob *job = (AutocapWriteJob *)opaque;
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    if (write_json_snapshot(job->path, job->bitmap_words, job->bitmap,
+                            job->pc_table, job->exec_pc_table, job->ram))
+        job->manifest_sig = autocap_manifest_sig();
+    SDL_AtomicSet(&s_autocap_write_state, 2);
+    return 0;
+}
+
+/* Copy coherent inputs on the emulation thread, then perform base64 formatting,
+ * file I/O, and verification reread on a worker. */
+static int autocap_write_start(void)
+{
+    extern uint8_t *memory_get_ram_ptr(void);
+    const size_t ram_size = 2u * 1024u * 1024u;
+    uint32_t bw = dirty_ram_get_bitmap_word_count();
+    AutocapWriteJob *job = (AutocapWriteJob *)calloc(1, sizeof(*job));
+    if (!job) return 0;
+    job->ram = (uint8_t *)malloc(ram_size);
+    job->pc_table = (DirtyRamPcEntry *)malloc(sizeof(g_dirty_ram_pc_table));
+    job->exec_pc_table = (DirtyRamPcEntry *)malloc(sizeof(g_dirty_ram_exec_pc_table));
+    job->bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
+    if (!job->ram || !job->pc_table || !job->exec_pc_table || !job->bitmap) {
+        autocap_write_job_free(job); return 0;
+    }
+    memcpy(job->ram, memory_get_ram_ptr(), ram_size);
+    memcpy(job->pc_table, g_dirty_ram_pc_table, sizeof(g_dirty_ram_pc_table));
+    memcpy(job->exec_pc_table, g_dirty_ram_exec_pc_table,
+           sizeof(g_dirty_ram_exec_pc_table));
+    for (uint32_t i = 0; i < bw; i++) job->bitmap[i] = dirty_ram_get_bitmap_word(i);
+    job->bitmap_words = bw;
+    snprintf(job->path, sizeof(job->path), "%s/overlay_captures.json", s_out_dir);
+    s_autocap_write_job = job;
+    SDL_AtomicSet(&s_autocap_write_state, 1);
+    s_autocap_write_thread = SDL_CreateThread(autocap_write_thread_main,
+                                               "overlay-capture-write", job);
+    if (!s_autocap_write_thread) {
+        SDL_AtomicSet(&s_autocap_write_state, 0);
+        s_autocap_write_job = NULL;
+        autocap_write_job_free(job);
+        return 0;
+    }
+    return 1;
+}
+
 void overlay_autocapture_tick(void)
 {
     extern uint64_t s_frame_count;
     extern int cdrom_load_in_progress(void);
     const CodeProvider *cp = code_provider_active();
 
+    if (SDL_AtomicGet(&s_autocap_write_state) == 2) {
+        AutocapWriteJob *job = s_autocap_write_job;
+        SDL_WaitThread(s_autocap_write_thread, NULL);
+        s_autocap_write_thread = NULL;
+        s_autocap_write_job = NULL;
+        SDL_AtomicSet(&s_autocap_write_state, 0);
+        uint64_t sig = job ? job->manifest_sig : 0;
+        int reg = overlay_loader_registered_count();
+        if (sig && sig == s_autocap_sig_at_req &&
+            (s_autocap_seeded_existing || reg == s_autocap_reg_at_req)) {
+            s_autocap_futile++;
+            s_autocap_reg_at_req = reg;
+            s_autocap_seeded_existing = 0;
+            if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
+                s_autocap_backoff <<= 1;
+            s_autocap_next_ok = s_frame_count +
+                (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+        } else if (sig) {
+            s_autocap_seeded_existing = 0;
+            s_autocap_backoff = 1;
+            s_autocap_sig_at_req = sig;
+            s_autocap_reg_at_req = reg;
+            s_autocap_triggers++;
+            if (cp->request) cp->request();
+        }
+        autocap_write_job_free(job);
+        return;
+    }
+
     if (!s_autocap_enabled || !s_active) return;
+    if (SDL_AtomicGet(&s_autocap_write_state) != 0) return;
     if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES) return;
     s_autocap_last_check = s_frame_count;
 
@@ -401,34 +523,12 @@ void overlay_autocapture_tick(void)
     if (cp->busy && cp->busy()) return;
     if (s_frame_count < s_autocap_next_ok) return; /* cooldown (x backoff)  */
 
-    /* Always write the backend-neutral coverage manifest (the player-shareable
-     * contribution file). It doubles as the futility probe: unchanged content
-     * since the last compile request, with no new candidates registered by
-     * that request, means the provider would redo identical work — skip and
-     * back off instead of spawning it. */
-    overlay_capture_write_json();
-    {
-        uint64_t sig = autocap_manifest_sig();
-        int      reg = overlay_loader_registered_count();
-        if (sig == s_autocap_sig_at_req && reg == s_autocap_reg_at_req) {
-            s_autocap_futile++;
-            if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
-                s_autocap_backoff <<= 1;
-            s_autocap_next_ok = s_frame_count +
-                (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
-            return;
-        }
-        s_autocap_backoff    = 1;
-        s_autocap_sig_at_req = sig;
-        s_autocap_reg_at_req = reg;
-    }
-
+    /* Snapshot coherent inputs for the player-shareable coverage manifest;
+     * a worker writes/hashes it, then a later vblank applies futility/backoff.
+     * Unchanged content with no new candidates backs off without a provider run. */
     s_autocap_last_fire = s_frame_count;
-    s_autocap_triggers++;
     s_autocap_next_ok = s_frame_count + AUTOCAP_COOLDOWN_FRAMES;
-    /* gcc spawns the background compile; sljit (sync producer) declines here
-     * and JITs on the dispatch miss instead. */
-    if (cp->request) cp->request();
+    autocap_write_start();
 }
 
 uint32_t overlay_capture_get_region_crc(uint32_t region_start,

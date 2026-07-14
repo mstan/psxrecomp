@@ -144,6 +144,32 @@ static const Form kForms[] = {
     { R_TYPE(V1, A0, V0, 0, 0x2B), "sltu_v0_v1_a0",
       must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "<"}) },
 
+    // JR $at: target must be snapshotted before its delay slot.
+    { R_TYPE(1, 0, 0, 0, 0x08), "jr_at_latches_target",
+      [](const TranslateResult& r) -> std::string {
+          if (!r.supported) return fmt::format("unsupported: {}", r.fail_reason);
+          if (!contains(r.pre_delay_code, "psx_jt_00000000 = cpu->gpr[1]"))
+              return fmt::format("missing pre-delay target latch: {}", r.pre_delay_code);
+          if (!contains(r.c_code, "cpu->pc = psx_jt_00000000"))
+              return fmt::format("terminator does not use latched target: {}", r.c_code);
+          if (contains(r.c_code, "cpu->pc = cpu->gpr[1]"))
+              return fmt::format("terminator rereads target after delay: {}", r.c_code);
+          return "";
+      }},
+
+    // JALR $at,$at: capture must precede link write (rd==rs alias-safe).
+    { R_TYPE(1, 0, 1, 0, 0x09), "jalr_at_at_latches_before_link",
+      [](const TranslateResult& r) -> std::string {
+          if (!r.supported) return fmt::format("unsupported: {}", r.fail_reason);
+          const auto latch = r.pre_delay_code.find("psx_jt_00000000 = cpu->gpr[1]");
+          const auto link = r.pre_delay_code.find("cpu->gpr[1] = 0x00000008u");
+          if (latch == std::string::npos || link == std::string::npos || latch > link)
+              return fmt::format("target not latched before aliased link: {}", r.pre_delay_code);
+          if (!contains(r.c_code, "cpu->pc = psx_jt_00000000"))
+              return fmt::format("terminator does not use latched target: {}", r.c_code);
+          return "";
+      }},
+
     // ADD $v0, $v1, $a0  (with overflow trap)
     { R_TYPE(V1, A0, V0, 0, 0x20), "add_v0_v1_a0",
       must_contain({"gpr[2]", "gpr[3]", "gpr[4]", "psx_arith_overflow"}) },
@@ -212,7 +238,7 @@ static const Form kForms[] = {
     // === Load/Store ===
     // LW $v0, 0($v1)
     { I_TYPE(0x23, V1, V0, 0), "lw_v0_0_v1",
-      must_contain({"gpr[2]", "gpr[3]", "read_word"}) },
+      must_contain({"gpr[2]", "gpr[3]", "load_word"}) },
 
     // SW $a0, 0($v1)
     { I_TYPE(0x2B, V1, A0, 0), "sw_a0_0_v1",
@@ -220,19 +246,19 @@ static const Form kForms[] = {
 
     // LB $v0, 0($v1)
     { I_TYPE(0x20, V1, V0, 0), "lb_v0_0_v1",
-      must_contain({"gpr[2]", "gpr[3]", "read_byte", "int8_t"}) },
+      must_contain({"gpr[2]", "gpr[3]", "load_byte", "int8_t"}) },
 
     // LBU $v0, 0($v1)
     { I_TYPE(0x24, V1, V0, 0), "lbu_v0_0_v1",
-      must_contain({"gpr[2]", "gpr[3]", "read_byte"}) },
+      must_contain({"gpr[2]", "gpr[3]", "load_byte"}) },
 
     // LH $v0, 0($v1)
     { I_TYPE(0x21, V1, V0, 0), "lh_v0_0_v1",
-      must_contain({"gpr[2]", "gpr[3]", "read_half", "int16_t"}) },
+      must_contain({"gpr[2]", "gpr[3]", "load_half", "int16_t"}) },
 
     // LHU $v0, 0($v1)
     { I_TYPE(0x25, V1, V0, 0), "lhu_v0_0_v1",
-      must_contain({"gpr[2]", "gpr[3]", "read_half"}) },
+      must_contain({"gpr[2]", "gpr[3]", "load_half"}) },
 
     // SB $a0, 0($v1)
     { I_TYPE(0x28, V1, A0, 0), "sb_a0_0_v1",

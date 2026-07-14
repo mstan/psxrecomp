@@ -371,6 +371,11 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle wide" data-event-click="cycle_winsize"><span class="value">{{winsize_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Renderer</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button></span></div>
+			<div class="set-row" data-if="opengl_renderer"><span class="set-lbl">Frame interpolation</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_frame_interpolation"><span class="value" data-if="frame_interpolation">On</span><span class="value" data-if="frame_interpolation == false">Off</span></button></span></div>
+			<div class="set-row" data-if="interpolation_target_visible"><span class="set-lbl">Presentation target</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_interpolation_fps"><span class="value">{{interpolation_fps_label}}</span></button>
+				<span class="ws-hint">Gameplay remains at its original speed</span></span></div>
 			<div class="set-row"><span class="set-lbl">Supersampling</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_ss"><span class="value">{{supersampling}}x</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Antialiasing</span><span class="set-ctl">

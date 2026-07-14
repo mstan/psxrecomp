@@ -461,6 +461,9 @@ static std::atomic<int> g_web_pepsiman_level_route{0};
 static std::atomic<int> g_web_pepsiman_unlimited_lives{0};
 static int g_web_start_was_down = 0;
 #endif
+static int           g_frame_interpolation = 0;
+static int           g_frame_interpolation_fps = 0;
+static double        g_host_refresh_hz = 0.0;
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -951,6 +954,16 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
     // Anchor on the exe directory — never cwd (see exe_dir_from_argv).
     fs::path found = find_upward(exe_dir_from_argv(argv0), p);
     if (!found.empty()) return found / p;
+
+    // Dev-checkout rung: game projects keep the framework at
+    // <game root>/psxrecomp-v4 (junction/worktree), so a relative default like
+    // "bios/SCPH1001.BIN" lives under that prefix rather than at the game root.
+    // A user install has no psxrecomp-v4 directory, so this rung cannot
+    // resolve a build-machine BIOS there — it falls through to bios.cfg or the
+    // interactive picker.
+    const fs::path dev_marker = fs::path("psxrecomp-v4") / p;
+    found = find_upward(exe_dir_from_argv(argv0), dev_marker);
+    if (!found.empty()) return found / dev_marker;
     return p;
 }
 
@@ -1132,6 +1145,78 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
     *overflow_drops = st.overflow_drops;
     *correction = st.last_correction;
     return 1;
+}
+
+/* Lightweight production-safe cadence probe. Unlike the TCP debug build this
+ * adds no per-block recording; it is intended for long, representative attract
+ * runs where instrumentation overhead would itself cause audio starvation. */
+static void runtime_perf_diag_tick() {
+    static int enabled = -1;
+    static uint64_t last_counter = 0, last_frame = 0, last_spu = 0;
+    static uint64_t last_underruns = 0, last_overflows = 0;
+    static uint64_t last_up[6] = {0};
+    static uint32_t last_overlay_loads = 0;
+    static uint64_t last_overlay_load_us = 0;
+    if (enabled < 0) {
+        const char *e = std::getenv("PSX_RUNTIME_PERF_DIAG");
+        enabled = e && e[0] && e[0] != '0';
+    }
+    if (!enabled) return;
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    extern uint64_t s_frame_count;
+    AudioTraceStats audio;
+    audio_trace_get_stats(&audio);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t underruns = 0, overflows = 0;
+    int legacy = 0, host_rate = 0;
+    psx_audio_out_stats(&fill_ms, &underruns, &overflows, &correction,
+                        &legacy, &host_rate);
+    uint64_t up[6] = {0};
+    gl_renderer_runtime_diag(up);
+    uint32_t overlay_loads = 0;
+    uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
+    overlay_loader_get_counters(&overlay_loads, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    overlay_loader_get_load_timing(&overlay_load_us, &overlay_load_max_us,
+                                   &overlay_load_last_us);
+    if (!last_counter) {
+        last_counter = now; last_frame = s_frame_count;
+        last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+        last_underruns = underruns; last_overflows = overflows;
+        last_overlay_loads = overlay_loads;
+        last_overlay_load_us = overlay_load_us;
+        for (int i = 0; i < 6; i++) last_up[i] = up[i];
+        return;
+    }
+    if (now - last_counter < freq * 5u) return;
+    double dt = (double)(now - last_counter) / (double)freq;
+    fprintf(stdout, "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+            "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
+            "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
+            "cpu=%.1f tex=%.1f draw=%.1f ms/s; overlay loads=+%u "
+            "wall=%.1f ms max=%.1f last=%.1f ms\n",
+            (double)(s_frame_count - last_frame) / dt,
+            (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+            fill_ms, (unsigned long long)(underruns - last_underruns),
+            (unsigned long long)(overflows - last_overflows), correction,
+            (double)(up[0] - last_up[0]) / dt,
+            (double)(up[1] - last_up[1]) / dt,
+            (double)(up[2] - last_up[2]) / dt / 1.0e6,
+            (double)(up[3] - last_up[3]) * 1000.0 / (double)freq / dt,
+            (double)(up[4] - last_up[4]) * 1000.0 / (double)freq / dt,
+            (double)(up[5] - last_up[5]) * 1000.0 / (double)freq / dt,
+            overlay_loads - last_overlay_loads,
+            (double)(overlay_load_us - last_overlay_load_us) / 1000.0,
+            (double)overlay_load_max_us / 1000.0,
+            (double)overlay_load_last_us / 1000.0);
+    fflush(stdout);
+    last_counter = now; last_frame = s_frame_count;
+    last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+    last_underruns = underruns; last_overflows = overflows;
+    last_overlay_loads = overlay_loads;
+    last_overlay_load_us = overlay_load_us;
+    for (int i = 0; i < 6; i++) last_up[i] = up[i];
 }
 
 static void sdl_audio_update(int turbo_active) {
@@ -1892,11 +1977,34 @@ static uint16_t pad_from_keyboard(int player) {
     return word;
 }
 
-static uint16_t controller_pad_buttons(SDL_GameController* h) {
+/* A left/right ANALOG-STICK axis source (LEFTX/LEFTY/RIGHTX/RIGHTY), as opposed
+ * to a trigger axis (L2/R2) or a button. The default map folds the left stick
+ * onto the D-pad bits (up=dpup,lefty- … right=dpright,leftx+) so the stick works
+ * as a D-pad for DIGITAL games. In ANALOG mode that fold is WRONG: the stick
+ * already drives the analog axes, and on a real DualShock the stick and D-pad
+ * are independent — so a dual-analog game that uses the D-pad as its own control
+ * (e.g. Ape Escape's camera rotate) would see phantom D-pad presses from every
+ * stick movement, and constant rotation from centre drift. controller_pad_buttons
+ * suppresses these sources when the pad presents as analog. Trigger axes and
+ * button sources are never suppressed. */
+static bool source_is_stick_axis(const ControllerSource& s) {
+    if (s.kind != ControllerSource::Kind::AxisPositive &&
+        s.kind != ControllerSource::Kind::AxisNegative) return false;
+    return s.id == SDL_CONTROLLER_AXIS_LEFTX  || s.id == SDL_CONTROLLER_AXIS_LEFTY ||
+           s.id == SDL_CONTROLLER_AXIS_RIGHTX || s.id == SDL_CONTROLLER_AXIS_RIGHTY;
+}
+
+/* Build the active-low PSX button word from a controller's input.ini map. When
+ * suppress_stick_axes is set (the pad is presenting as analog this frame), the
+ * left/right analog-stick axes do NOT contribute button bits — see
+ * source_is_stick_axis above. Digital mode passes false, so the stick still
+ * folds onto the D-pad (its only outlet there). */
+static uint16_t controller_pad_buttons(SDL_GameController* h, bool suppress_stick_axes) {
     uint16_t buttons = 0xFFFF;  /* all released */
     if (!h) return buttons;
     for (const auto& entry : controller_map) {
         for (const auto& source : entry.sources) {
+            if (suppress_stick_axes && source_is_stick_axis(source)) continue;
             if (controller_source_pressed_h(h, source)) {
                 buttons &= (uint16_t)~entry.bit;
                 break;
@@ -1937,9 +2045,9 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby)
 
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
-static uint16_t pad_buttons_for(const PlayerInput& p, int player) {
+static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
     if (p.kind == 1) return pad_from_keyboard(player);
-    if (p.kind == 2) return controller_pad_buttons(p.handle);
+    if (p.kind == 2) return controller_pad_buttons(p.handle, suppress_stick_axes);
     return 0xFFFF;
 }
 
@@ -2043,7 +2151,7 @@ static bool dev_any_input_enabled() {
  * closes a shared device this self-heals by reopening next frame). This does NOT
  * disturb per-slot routing — SDL returns the same handle for an already-open
  * device, so reads are shared and harmless. */
-static uint16_t dev_all_controllers_buttons() {
+static uint16_t dev_all_controllers_buttons(bool suppress_stick_axes) {
     uint16_t btn = 0xFFFF;
     const int n = SDL_NumJoysticks();
     for (int i = 0; i < n; i++) {
@@ -2051,7 +2159,7 @@ static uint16_t dev_all_controllers_buttons() {
         SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
         SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
         if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
-        if (h) btn &= controller_pad_buttons(h);
+        if (h) btn &= controller_pad_buttons(h, suppress_stick_axes);
     }
     return btn;
 }
@@ -2135,13 +2243,45 @@ static void sample_pad_into_sio(int override) {
         const bool dev_here = (dev_any_input_enabled() && s == 0);
         if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
+        /* Resolve the pad type this frame FIRST — the effective analog/digital
+         * state gates how the left stick is read for BOTH the button word and the
+         * analog axes below. An assigned device keeps its configured mode (a
+         * launcher-selected analog DualShock stays analog, so its input path / SIO
+         * handshake cadence is preserved exactly). A P1 with no assigned device but
+         * dev-any-input on presents as HYBRID — boots analog like a DualShock and
+         * auto-drops to digital on the d-pad — so any plugged controller and the
+         * keyboard both navigate. The hybrid latch reads raw device state, so it is
+         * safe to resolve here before the button word is built. */
+        int mode;
+        if (p.kind != 0)      mode = p.mode;
+        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
+        int eff_analog;
+        if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
+            eff_analog = 0;
+        } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
+            eff_analog = 1;
+        } else { /* HYBRID */
+            if (hybrid_stick_active(p))                       p.hybrid_analog = true;
+            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
+            eff_analog = p.hybrid_analog ? 1 : 0;
+        }
+
         /* Buttons: merge the assigned device with the keyboard (PSX pad word is
          * active-low, so AND combines "pressed on either source"). In dev mode P1
-         * also folds in the keyboard binds and EVERY connected controller. */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
+         * also folds in the keyboard binds and EVERY connected controller. When the
+         * pad presents as ANALOG this frame (eff_analog), the left/right analog-
+         * stick axes are suppressed as button sources so the stick drives ONLY the
+         * analog axes — the D-pad bits then come solely from the physical D-pad,
+         * exactly as on a real DualShock. This is what stops a dual-analog game's
+         * D-pad control (Ape Escape's camera rotate) from being spun by stick
+         * movement or centre drift. Digital mode keeps the stick->D-pad fold. */
+        const bool suppress_stick = (eff_analog != 0);
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player, suppress_stick)
+                                     : (uint16_t)0xFFFF;
         if (dev_here) {
-            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
-            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
+            btn &= pad_from_keyboard(1);                        /* keyboard P1 binds  */
+            btn &= dev_all_controllers_buttons(suppress_stick); /* any plugged-in pad */
         }
 #if defined(PSX_WEB)
         if (s == 0) {
@@ -2162,28 +2302,15 @@ static void sample_pad_into_sio(int override) {
 #endif
         sio_set_pad_state_slot(s, btn);
 
-        /* Resolve the pad type this frame. An assigned device keeps its configured
-         * mode (a launcher-selected analog DualShock stays analog, so its input
-         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
-         * device but dev-any-input on presents as HYBRID — boots analog like a
-         * DualShock and auto-drops to digital on the d-pad — so any plugged
-         * controller and the keyboard both navigate. */
-        int mode;
-        if (p.kind != 0)      mode = p.mode;
-        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
-        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
-        int eff_analog;
+        /* Analog axes. Pinned-ANALOG folds the physical D-pad onto the left axes
+         * (fold_dpad) so the D-pad still moves stick-only games; HYBRID feeds the
+         * raw stick when currently analog (no fold — the D-pad drives its own
+         * digital path there); DIGITAL leaves the axes centred. */
         uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
-        if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
-            eff_analog = 0;
-        } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
-            eff_analog = 1;
+        if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             pad_sticks_for(p, player, st, /*fold_dpad=*/true);
-        } else { /* HYBRID */
-            if (hybrid_stick_active(p))                       p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
-            eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
+        } else if (eff_analog) {  /* HYBRID, currently presenting analog */
+            pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
         /* Dev mode: fold the keyboard's stick binds AND any connected controller's
          * sticks onto the analog stick, so an analog-mode P1 steers from whatever
@@ -2412,6 +2539,8 @@ static void sdl_vblank_present(void) {
         }
     }
 #endif
+
+    runtime_perf_diag_tick();
 
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
@@ -2691,6 +2820,14 @@ static void sdl_vblank_present(void) {
          * of truth, shared with the GTE/GPU squash so content and present stay
          * locked: we squash IFF we stretch. */
         fmv_frame = !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* MDEC movies are already decoded at their authored cadence and are
+         * CPU/upload heavy. High-refresh crossfades only contend with decoding
+         * and can starve audio, so present native-4:3/MDEC phases directly.
+         * The classification catches the transition frame before the first
+         * decode; the activity stamp also covers authentic 4:3 configurations. */
+        if (g_gl_active)
+            gl_renderer_set_interpolation_suspended(
+                fmv_frame || mdec_recently_active(2));
 
         /* Canonical present width. Native-wide does NOT widen the canonical read
          * (that bled across adjacent framebuffers); it composites into a separate
@@ -3118,6 +3255,8 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
+            g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
+            g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
             g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
             g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
             if (gc.runtime.video_fmv_skip_end_total)
@@ -3366,6 +3505,27 @@ int main(int argc, char** argv) {
             exe_dir_from_argv(argv[0]) / "settings.toml";
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
+        if (us.parse_error) {
+            /* The file exists but is not valid TOML: every setting in it (the
+             * user's renderer choice, BIOS/disc paths, ...) is being ignored,
+             * and any later launcher save would overwrite it with defaults.
+             * Preserve their file and say so loudly instead of both failing
+             * silently (GH Tomba2Recomp#1 triage: a stray character disabled a
+             * user's whole settings file with no indication anywhere). */
+            std::error_code rn_ec;
+            std::filesystem::path bad = settings_path;
+            bad += ".bad";
+            std::filesystem::remove(bad, rn_ec);
+            rn_ec.clear();
+            std::filesystem::rename(settings_path, bad, rn_ec);
+            launcher_warning("Settings file ignored",
+                "settings.toml has a TOML syntax error, so ALL settings in it were "
+                "ignored this run (renderer, BIOS/disc paths, everything).\n\n" +
+                (rn_ec ? "The broken file was left at:\n" + settings_path.string()
+                       : "The broken file was preserved as:\n" + bad.string()) +
+                "\n\nFix the syntax error and restore the file, or set your options "
+                "again from the launcher (a fresh settings.toml will be written).");
+        }
         if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
         if (us.has_renderer)       g_video_renderer  = us.renderer;
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
@@ -3401,6 +3561,10 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+        if (us.has_frame_interpolation)
+            g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+        if (us.has_frame_interpolation_fps)
+            g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
 
     /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
@@ -3437,13 +3601,20 @@ int main(int argc, char** argv) {
     }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
-     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
+     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
+     * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS")) {
         g_smooth_60fps.store(atoi(e) ? 1 : 0, std::memory_order_release);
         std::fprintf(stdout, "psxrecomp: 60 FPS smoothing = %s\n",
                      atoi(e) ? "on" : "off");
+    }
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
+        g_frame_interpolation = atoi(e) ? 1 : 0;
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
+        int fps = atoi(e);
+        if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
     }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
@@ -3517,6 +3688,10 @@ int main(int argc, char** argv) {
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
+            seed.frame_interpolation = (g_frame_interpolation != 0);
+            seed.has_frame_interpolation = true;
+            seed.frame_interpolation_fps = g_frame_interpolation_fps;
+            seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
@@ -3597,6 +3772,8 @@ int main(int argc, char** argv) {
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
+                g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
+                g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
                 g_audio_spu_hq    = seed.spu_hq;
@@ -3897,6 +4074,7 @@ int main(int argc, char** argv) {
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
         if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
             double host_hz = (double)dm.refresh_rate;
+            g_host_refresh_hz = host_hz;
             if (host_hz >= 58.8 && host_hz <= 61.2) {
                 g_frame_period_ms = 1000.0 / host_hz;
                 std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
@@ -3922,6 +4100,8 @@ int main(int argc, char** argv) {
          * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
+        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init

@@ -39,10 +39,10 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
                                uint64_t freq, uint64_t period);
 
 /* Block until the pacer's next deadline (sleep + final sub-ms spin),
- * then advance the deadline by one period. If the pacer has not
- * started, or the caller fell more than one period behind, re-anchors
- * to now + period without sleeping. period_ms is the frame period in
- * milliseconds (e.g. 1000.0 / 59.94). */
+ * then advance the deadline by one period. If the pacer has not started,
+ * or the caller fell beyond the implementation's bounded transient-catch-up
+ * window, re-anchor to now + period without sleeping. period_ms is the frame
+ * period in milliseconds (e.g. 1000.0 / 59.94). */
 void frame_pacer_wait(FramePacer *p, double period_ms);
 
 #ifdef __cplusplus

@@ -464,9 +464,12 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 r.supported = true;
                 r.is_terminator = true;
                 r.terminator_kind = "jr";
+                r.pre_delay_code = fmt::format(
+                    "uint32_t psx_jt_{:08X} = cpu->gpr[{}];",
+                    d.address, static_cast<int>(rs));
                 r.c_code = fmt::format(
-                    "cpu->pc = cpu->gpr[{}]; /* jr {} -- slice terminator (indirect) */ return;",
-                    static_cast<int>(rs), gpr_name(rs));
+                    "cpu->pc = psx_jt_{:08X}; /* jr {} -- slice terminator (latched indirect) */ return;",
+                    d.address, gpr_name(rs));
                 r.comment = fmt::format("jr {}", gpr_name(rs));
                 return r;
             }
@@ -480,9 +483,12 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                         "cpu->gpr[{}] = 0x{:08X}u; /* link */ ",
                         static_cast<int>(rd), d.address + 8);
                 }
+                r.pre_delay_code = fmt::format(
+                    "uint32_t psx_jt_{:08X} = cpu->gpr[{}]; {}",
+                    d.address, static_cast<int>(rs), link);
                 r.c_code = fmt::format(
-                    "{}cpu->pc = cpu->gpr[{}]; /* jalr {}, {} -- slice terminator (indirect) */ return;",
-                    link, static_cast<int>(rs), gpr_name(rd), gpr_name(rs));
+                    "cpu->pc = psx_jt_{:08X}; /* jalr {}, {} -- slice terminator (latched indirect) */ return;",
+                    d.address, gpr_name(rd), gpr_name(rs));
                 r.comment = fmt::format("jalr {}, {}", gpr_name(rd), gpr_name(rs));
                 return r;
             }

@@ -121,12 +121,12 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
          * baseline mid-load (the v0.0.2/v0.0.3 release-install boot crash).
          * Without an image, only the exact entry_pc dispatch may latch. */
         extern int psx_game_address_in_text(uint32_t addr);
-        extern int dirty_ram_text_native_ok(uint32_t phys);
+        extern int psx_game_text_native_ok(uint32_t addr);
         extern int dirty_ram_text_image_registered(void);
         uint32_t _tphys = target & 0x1FFFFFFFu;
         if (_tphys == s_game_entry_phys ||
             (dirty_ram_text_image_registered() &&
-             psx_game_address_in_text(target) && dirty_ram_text_native_ok(_tphys))) {
+             psx_game_address_in_text(target) && psx_game_text_native_ok(target))) {
             s_game_started = 1;
             /* Establish the clean compiled-image baseline now: the boot EXE is fully
              * loaded into the game-text region (== compiled image) and no gameplay

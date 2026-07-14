@@ -188,6 +188,8 @@ struct RuntimeConfig {
     // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
     bool                  video_low_latency_input = true;
     int                   video_vsync             = 1;
+    bool                  video_frame_interpolation = false;
+    int                   video_frame_interpolation_fps = 0; // 0 = display refresh
 
     // crt_filter: present-time screen-colour model (verified-enhancement LUT).
     // "raw" (default, byte-identical 5->8 passthrough) | "crt" | "composite" |
@@ -620,6 +622,12 @@ struct GameConfig {
 // Unlike game.toml, paths here are stored verbatim (the user picked them); they
 // are NOT resolved against a project root.
 struct UserSettings {
+    // Set when the file existed but failed to parse as TOML: every field below
+    // is defaults and the caller must warn loudly — silently dropping a user's
+    // hand-edited settings looks like the settings "don't work", and a later
+    // launcher save would overwrite their file with defaults.
+    bool parse_error = false;
+
     // [video]
     bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4
@@ -650,6 +658,8 @@ struct UserSettings {
     // display latency, may tear), -1=adaptive.
     bool has_low_latency_input = false; bool low_latency_input = true;
     bool has_vsync             = false; int  vsync             = 1;
+    bool has_frame_interpolation = false; bool frame_interpolation = false;
+    bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.

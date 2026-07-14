@@ -213,6 +213,24 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
+  Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
+  FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,
+  batches Tomba's painter-ordered blend stream, and suppresses unchanged 30 Hz
+  source presents. Overlay dispatch now distinguishes exact lazy entries from
+  CPS interior continuations: continuations use the loaded range owner first,
+  while exact entries reached inside local dirty flow can publish their cached
+  native DLL. The hot `0x80106424`/`0x80106688` FMV helpers consequently dropped
+  from ~60 interpreted entries/frame to zero. Small dynamic-text DLL images are
+  mapped on a bounded worker (141 Tomba variants, not the 712-DLL vault), and
+  auto-capture base64/file I/O now runs from a coherent RAM/seed snapshot on a
+  low-priority worker. The audio bridge uses real callback duration, bounded
+  P-only correction, and a measured 160 ms reserve inside its existing 250 ms
+  ring. Release acceptance: 540 s / 107 five-second records, Beach -> Whoopee ->
+  Mines -> Mine Cart -> repeat, guest min 59.76 Hz / median 59.94 Hz, **zero
+  output underruns**, zero post-start overflows, and no cache growth (849 DLLs).
+  Current-code screenshots visually confirmed Beach, FMV, Mines, and Mine Cart.
+
 - **2026-07-10 (Tomba 2 Whoopee auto-skip dwell + native-wide Beach backdrop):**
   Added an opt-in silent-MDEC post-decode hold so presentation-side FMV
   auto-skip remains unpaced through a preloaded logo's authored release wait;

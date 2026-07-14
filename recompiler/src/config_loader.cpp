@@ -262,6 +262,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
         }
+        if (video.contains("frame_interpolation")) {
+            rt.video_frame_interpolation =
+                toml::find<bool>(video, "frame_interpolation");
+        }
+        if (video.contains("frame_interpolation_fps")) {
+            rt.video_frame_interpolation_fps =
+                toml::find<int>(video, "frame_interpolation_fps");
+            if (rt.video_frame_interpolation_fps != 0 &&
+                rt.video_frame_interpolation_fps < 90)
+                throw std::runtime_error(
+                    "[video] frame_interpolation_fps must be 0 (display) or >= 90");
+        }
         if (video.contains("aspect_ratio")) {
             const auto mode = toml::find<std::string>(video, "aspect_ratio");
             int n = 0, d = 0;
@@ -1024,7 +1036,10 @@ UserSettings load_user_settings(const fs::path& path) {
     try {
         doc = toml::parse(path.string());
     } catch (const std::exception&) {
-        // Malformed file: fall back to all-defaults rather than refuse to boot.
+        // Malformed file: fall back to all-defaults rather than refuse to boot,
+        // but tell the caller so the user hears about it (and so the file can
+        // be preserved before any launcher save overwrites it with defaults).
+        s.parse_error = true;
         return s;
     }
 
@@ -1086,6 +1101,15 @@ UserSettings load_user_settings(const fs::path& path) {
             if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
             else if (m == "off" || m == "immediate"){ s.vsync = 0;  s.has_vsync = true; }
             else if (m == "adaptive")               { s.vsync = -1; s.has_vsync = true; }
+        });
+        if (v.contains("frame_interpolation")) try_get([&]{
+            s.frame_interpolation = toml::find<bool>(v, "frame_interpolation");
+            s.has_frame_interpolation = true;
+        });
+        if (v.contains("frame_interpolation_fps")) try_get([&]{
+            s.frame_interpolation_fps = toml::find<int>(v, "frame_interpolation_fps");
+            if (s.frame_interpolation_fps == 0 || s.frame_interpolation_fps >= 90)
+                s.has_frame_interpolation_fps = true;
         });
         if (v.contains("aspect_ratio")) try_get([&]{
             const auto m = toml::find<std::string>(v, "aspect_ratio");
@@ -1239,6 +1263,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
     if (s.has_vsync)
         f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive" : "on") << "\"\n";
+    if (s.has_frame_interpolation)
+        f << "frame_interpolation = " << (s.frame_interpolation ? "true" : "false") << "\n";
+    if (s.has_frame_interpolation_fps)
+        f << "frame_interpolation_fps = " << s.frame_interpolation_fps << "\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     f << "\n[audio]\n";

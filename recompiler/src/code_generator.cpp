@@ -1095,8 +1095,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 {
                     uint32_t rs = get_rs(instr);
                     uint32_t rd = get_rd(instr);
-                    code = fmt::format("{} = 0x{:08X};  cpu->pc = {};  /* jalr */",
-                                      reg_name(rd), addr + 8, reg_name(rs));
+                    code = fmt::format("{{ uint32_t _jt_{0:08X} = {1};  {2} = 0x{3:08X};  "
+                                       "cpu->pc = _jt_{0:08X}; }}  /* jalr */",
+                                       addr, reg_name(rs), reg_name(rd), addr + 8);
                 }
                 break;
             case 0x0C:                                          // syscall
@@ -1498,6 +1499,9 @@ std::string CodeGenerator::translate_basic_block(
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {
+                std::string delay_saved_cond;    // branch condition captured before delay
+                std::string delay_saved_target;  // JR/JALR target captured before delay
+
                 // Per-instruction interlock ORDER (Beetle): the branch's §1+deps+DO_LDS
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
@@ -1506,6 +1510,19 @@ std::string CodeGenerator::translate_basic_block(
                     emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
                     emit_pre_timing(block.exit_instr.instruction, config_.indent);
+
+                // Register-indirect targets are resolved at the jump instruction.
+                // The delay slot may overwrite the source register, so all JR/JALR
+                // paths below consume this pre-delay snapshot.
+                if (block.exit_instr.type == ControlFlowType::Return ||
+                    block.exit_instr.type == ControlFlowType::JumpRegister ||
+                    block.exit_instr.type == ControlFlowType::JumpLinkReg) {
+                    const uint32_t target_rs = get_rs(block.exit_instr.instruction);
+                    delay_saved_target = fmt::format("_jt_{:08X}", addr);
+                    ss << config_.indent
+                       << fmt::format("uint32_t {} = {};  /* latch indirect target before delay slot */\n",
+                                      delay_saved_target, reg_name(target_rs));
+                }
 
                 if (block.exit_instr.type == ControlFlowType::JumpLink) {
                     ss << config_.indent
@@ -1530,7 +1547,6 @@ std::string CodeGenerator::translate_basic_block(
                 }
 
                 // MIPS delay slot handling: emit delay slot instruction BEFORE branch/jump
-                std::string delay_saved_cond;  // non-empty if condition was pre-captured
                 if (block.exit_instr.has_delay_slot) {
                     uint32_t delay_slot_addr = addr + 4;
                     auto delay_instr_opt = exe_.read_word(delay_slot_addr);
@@ -1569,21 +1585,6 @@ std::string CodeGenerator::translate_basic_block(
 
                 // Now emit the branch/jump
                 if (block.exit_instr.type == ControlFlowType::Branch) {
-                    // Check if this is a branch-and-link (bgezal/bltzal)
-                    // For REGIMM (opcode=0x01), rt=0x10 (bltzal) or rt=0x11 (bgezal)
-                    // The link always happens unconditionally (even if branch not taken)
-                    {
-                        uint32_t branch_instr = block.exit_instr.instruction;
-                        uint32_t b_opcode = (branch_instr >> 26) & 0x3F;
-                        if (b_opcode == 0x01) {
-                            uint32_t regimm_op = (branch_instr >> 16) & 0x1F;
-                            if (regimm_op == 0x10 || regimm_op == 0x11) {
-                                // bltzal or bgezal: link register always set
-                                ss << config_.indent
-                                   << fmt::format("cpu->gpr[31] = 0x{:08X};  /* branch-and-link return addr */\n", addr + 8);
-                            }
-                        }
-                    }
                     // Conditional branch - use pre-captured condition if available
                     std::string condition = delay_saved_cond.empty()
                         ? generate_branch_condition(block.exit_instr.instruction, block.exit_instr.address)
@@ -1703,18 +1704,18 @@ std::string CodeGenerator::translate_basic_block(
                            << "gte_ws_set_suppress(0);  /* widescreen: end far-backdrop un-squash (8C) */\n";
                     }
                     if (ra_loaded_from_non_sp) {
-                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
+                        ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                         ss << config_.indent
-                           << "cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;"
+                           << "cpu->pc = " << delay_saved_target << "; psx_restore_state_escape(); return;"
                            << "  /* jr $ra — longjmp-return (ra loaded from non-sp) */\n";
                     } else if (cps_enabled_) {
                         // CPS: publish $ra so the flat trampoline dispatches the
                         // caller's continuation (no host C-return to nest).
-                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
+                        ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                         ss << config_.indent
-                           << "cpu->pc = cpu->gpr[31]; return;  /* CPS: jr $ra */\n";
+                           << "cpu->pc = " << delay_saved_target << "; return;  /* CPS: jr $ra */\n";
                     } else {
-                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
+                        ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                         ss << config_.indent << "return;  /* jr $ra */\n";
                     }
                 } else if (block.exit_instr.type == ControlFlowType::JumpRegister) {
@@ -1833,7 +1834,7 @@ std::string CodeGenerator::translate_basic_block(
                         if (!targets.empty()) {
                             ss << config_.indent << fmt::format("/* jump table 0x{:08X} (rom 0x{:08X}), {} entries */\n",
                                                                 table_base, rom_table_base, table_count);
-                            ss << config_.indent << fmt::format("switch ({}) {{\n", reg_name(jr_rs));
+                            ss << config_.indent << fmt::format("switch ({}) {{\n", delay_saved_target);
                             for (auto& [rt, rom] : targets) {
                                 if (partial_block_cycle_count(rom, cfg) != 0) {
                                     ss << config_.indent << fmt::format("    case 0x{:08X}u:\n", rt);
@@ -1848,13 +1849,13 @@ std::string CodeGenerator::translate_basic_block(
                             }
                             if (cps_enabled_) {
                                 ss << config_.indent << "    default:\n";
-                                ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent + "        ");
-                                ss << config_.indent << "        cpu->pc = " << reg_name(jr_rs)
+                                ss << emit_interrupt_check_expr(delay_saved_target, config_.indent + "        ");
+                                ss << config_.indent << "        cpu->pc = " << delay_saved_target
                                    << "; return;  /* CPS: jr table miss — tail-transfer */\n";
                             } else {
                                 ss << config_.indent << "    default:\n";
-                                ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent + "        ");
-                                ss << config_.indent << "        call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
+                                ss << emit_interrupt_check_expr(delay_saved_target, config_.indent + "        ");
+                                ss << config_.indent << "        call_by_address(cpu, " << delay_saved_target << "); return;\n";
                             }
                             ss << config_.indent << "}\n";
                             emitted_switch = true;
@@ -1864,14 +1865,14 @@ std::string CodeGenerator::translate_basic_block(
                         if (cps_enabled_) {
                             // CPS: indirect jump / BIOS-call gate — tail-transfer
                             // to the target (the flat trampoline dispatches it).
-                            ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent);
+                            ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                             ss << config_.indent << fmt::format("cpu->pc = {}; return;  /* CPS: jr {} */\n",
-                                                                reg_name(jr_rs), reg_name(jr_rs));
+                                                                delay_saved_target, reg_name(jr_rs));
                         } else {
                             // BIOS call or unrecognised indirect jump
-                            ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent);
+                            ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                             ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jr {} */\n",
-                                                                reg_name(jr_rs), reg_name(jr_rs));
+                                                                delay_saved_target, reg_name(jr_rs));
                             ss << config_.indent << "return;\n";
                         }
                     }
@@ -1887,8 +1888,6 @@ std::string CodeGenerator::translate_basic_block(
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
-                        ss << config_.indent
-                           << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* CPS jal return addr */\n", cont_addr);
                         ss << emit_interrupt_check(target, config_.indent);
                         ss << config_.indent
                            << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS jal -> 0x{:08X} */\n",
@@ -1898,7 +1897,6 @@ std::string CodeGenerator::translate_basic_block(
                     // guards the continuation: it may only run if the guest
                     // actually returned here with the caller's $sp.
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
-                    ss << config_.indent << "cpu->gpr[31] = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
                     ss << emit_interrupt_check(target, config_.indent);
                     if (known_functions_.count(target) > 0) {
                         ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
@@ -1927,33 +1925,24 @@ std::string CodeGenerator::translate_basic_block(
                 } else if (block.exit_instr.type == ControlFlowType::JumpLinkReg) {
                     // Register indirect call (jalr $rs, $rd) — call function at rs, return to rd
                     uint32_t rs = get_rs(block.exit_instr.instruction);
-                    uint32_t rd = get_rd(block.exit_instr.instruction);
                     uint32_t cont_addr = block.exit_instr.address + 8;
 
                     if (cps_enabled_) {
-                        // CPS: capture the target reg BEFORE writing the link
-                        // (rd==rs alias-safe), set $rd to the return point and
-                        // register it as a dispatchable continuation, then
-                        // tail-transfer. The flat trampoline drives the rest.
+                        // The target and link were committed before the delay
+                        // slot above. Register the continuation and tail-transfer
+                        // using the latched target.
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
-                        ss << config_.indent << fmt::format("{{ uint32_t _t = {};\n", reg_name(rs));
-                        if (rd != 0) {
-                            ss << config_.indent << fmt::format("    {} = 0x{:08X};  /* CPS jalr return addr */\n",
-                                                                reg_name(rd), cont_addr);
-                        }
-                        ss << emit_interrupt_check_expr("_t", config_.indent + "    ");
-                        ss << config_.indent << "cpu->pc = _t; return; }  /* CPS jalr */\n";
+                        ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
+                        ss << config_.indent << "cpu->pc = " << delay_saved_target
+                           << "; return;  /* CPS jalr */\n";
                     } else {
-                    // Set link register to return address (PC + 8, past delay slot)
-                    ss << config_.indent << fmt::format("{} = 0x{:08X};  /* jalr return addr */\n",
-                                                        reg_name(rd), addr + 8);
-
+                    // Dispatch the pre-delay latched indirect target.
                     // Dispatch indirect call — target is a runtime register value
-                    ss << emit_interrupt_check_expr(reg_name(rs), config_.indent);
+                    ss << emit_interrupt_check_expr(delay_saved_target, config_.indent);
                     ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jalr {} */\n",
-                                                        reg_name(rs), reg_name(rs));
+                                                        delay_saved_target, reg_name(rs));
                     /* psx_dispatch_call validated the (ra, sp) contract;
                      * only propagate an active bail unwind here. */
                     ss << config_.indent << "if (g_psx_call_bail) return;\n";
@@ -2952,6 +2941,11 @@ std::string CodeGenerator::generate_file(
     for (const auto& gen_func : gen_funcs) {
         ss << gen_func.full_code << "\n";
     }
+
+    // Preserve the exact post-split CFG inventory used by the emitted C. The
+    // dispatch generator consumes this so synthesized fallthrough functions
+    // receive the same byte-precise native-validity ranges as ordinary entries.
+    last_ranges_manifest_ = generate_ranges_manifest(functions_mut, cfgs_mut);
 
     return ss.str();
 }

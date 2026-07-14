@@ -47,7 +47,7 @@ struct RootDirectoryInfo {
 struct CDTrack {
     int      number;     // 1-based track number
     bool     is_audio;   // true = CD-DA audio (Red Book); false = data
-    uint32_t start_lba;  // .bin-relative start LBA (cue INDEX 01; track 1 = 0)
+    uint32_t start_lba;  // disc-relative start LBA (cue INDEX 01; track 1 = 0)
     uint32_t pregap_lba = 0; // cue INDEX 00, or INDEX 01 when no pregap exists
 };
 

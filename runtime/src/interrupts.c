@@ -664,6 +664,44 @@ uint32_t cycles_to_next_event(void) {
     return best;
 }
 
+static uint64_t s_need_defer, s_need_irq, s_skip_none, s_skip_sr;
+static uint64_t s_skip_cooldown, s_skip_nested;
+
+void psx_interrupt_delivery_diag(uint64_t *need_defer, uint64_t *need_irq,
+                                 uint64_t *skip_none, uint64_t *skip_sr,
+                                 uint64_t *skip_cooldown, uint64_t *skip_nested) {
+    if (need_defer)    *need_defer    = s_need_defer;
+    if (need_irq)      *need_irq      = s_need_irq;
+    if (skip_none)     *skip_none     = s_skip_none;
+    if (skip_sr)       *skip_sr       = s_skip_sr;
+    if (skip_cooldown) *skip_cooldown = s_skip_cooldown;
+    if (skip_nested)   *skip_nested   = s_skip_nested;
+}
+
+int psx_interrupt_delivery_needed(const CPUState* cpu) {
+    if (s_defer_switch_pending) { s_need_defer++; return 1; }
+    if ((i_stat & i_mask) == 0) { s_skip_none++; return 0; }
+
+    uint32_t sr = cpu->cop0[COP0_SR];
+    if (!(sr & 0x01u) || !(sr & (1u << 10))) { s_skip_sr++; return 0; }
+
+    if (post_exception_cooldown_until != 0 &&
+        psx_get_cycle_count() < post_exception_cooldown_until) {
+        s_skip_cooldown++;
+        return 0;
+    }
+
+    if (in_exception &&
+        (exception_nest_depth >= 2 ||
+         g_rfe_escape_pending ||
+         g_exc_escape_reason != PSX_EXC_ESCAPE_NONE)) {
+        s_skip_nested++;
+        return 0;
+    }
+    s_need_irq++;
+    return 1;
+}
+
 void psx_check_interrupts(CPUState* cpu) {
     extern int g_ls_suppress_record;
 #define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
@@ -672,6 +710,31 @@ void psx_check_interrupts(CPUState* cpu) {
 #define COSIM_IRQ_TAKE_PC() (g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc)
 #define COSIM_IRQ_NOTE(kind_) cosim_irq_note(cpu, (kind_), COSIM_IRQ_TAKE_PC(), g_dirty_safe_resume_pc, s_compiled_interrupt_resume_pc, cpu->cop0[COP0_SR])
 #endif
+
+    /* Genuine entry fast paths. Generated resident code calls this at every
+     * basic-block edge, which can mean tens of millions of calls inside an FMV
+     * polling loop. psx_advance_cycles() has already serviced every device
+     * deadline before this point, so no-pending and IEc-clear checks have no
+     * architectural work to do. The old fast paths came after diagnostics and
+     * savestate_poll, making a harmless callback expensive enough to reduce
+     * Tomba 2's Whoopee FMV to ~1 guest fps.
+     *
+     * Poll host maintenance periodically so save/load and the debug socket stay
+     * responsive even when the guest spends a long time in this path. At the
+     * observed 1M+ block edges/s this is sub-frame latency. */
+    static uint32_t s_fast_maintenance;
+    if (g_idle_skip_enabled < 0) (void)psx_idle_skip_is_enabled();
+    if (!in_exception && (i_stat & i_mask) == 0 &&
+        !s_defer_switch_pending && g_idle_skip_enabled == 0) {
+        if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+            savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+            debug_server_poll();
+        }
+        return;
+    }
+    if (in_exception && !(cpu->cop0[COP0_SR] & 0x01u)) return;
+
     {
         uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                    : s_compiled_interrupt_resume_pc;
@@ -1044,6 +1107,15 @@ void psx_check_interrupts(CPUState* cpu) {
         uint32_t hi_val = (w0 & 0xFFFF) << 16;
         int16_t lo_val = (int16_t)(w1 & 0xFFFF);
         target_pc = hi_val + (uint32_t)(int32_t)lo_val;
+        /* The RAM exception vector is a LUI/ADDIU pair that materializes the
+         * installed handler address in $k0 before transferring to it.  The
+         * host-side fast path decodes that pair and dispatches straight to the
+         * target, so it must also commit the pair's architectural register
+         * result.  Vigilante 8's handler uses $k0 as its table base on its very
+         * first instruction; leaving the interrupted value in $k0 made it load
+         * a BIOS instruction word (0xAD400000) as a jump target. */
+        uint32_t vector_reg = (w1 >> 16) & 31u;
+        if (vector_reg != 0u) cpu->gpr[vector_reg] = target_pc;
     }
 
     /* Record which fiber owns this setjmp. Any subsequent longjmp must

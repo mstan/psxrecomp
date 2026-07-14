@@ -113,6 +113,10 @@ struct LauncherModel {
     bool ultrawide       = false; // separate EXPERIMENTAL 21:9 choice
     bool uw_eligible     = false; // per-game offer_ultrawide gate
     bool fullscreen      = false; // launch the game window in desktop fullscreen
+    bool frame_interpolation = false;
+    int  frame_interpolation_fps = 0; // 0 = current display refresh
+    bool opengl_renderer = false;
+    bool interpolation_target_visible = false;
     // Skip-launcher: boot straight into the game on subsequent launches. Turning
     // it ON shows a confirmation modal (show_skip_modal) so the user is told how
     // to get the launcher back (run with --launcher). Mirrors SMW's feature.
@@ -128,6 +132,7 @@ struct LauncherModel {
     Rml::String texfilter_label;
     Rml::String aspect_label;
     Rml::String winsize_label;
+    Rml::String interpolation_fps_label;
 
     // Disc verification (recomputed whenever disc_path changes).
     Rml::String disc_file;      // file name only, e.g. "tomba.cue"
@@ -410,6 +415,21 @@ int aspect_index_for(int num, int den) {
 const int kWinWidths[] = { 960, 1280, 1600, 1920 };
 const int kNumWinWidths = (int)(sizeof(kWinWidths) / sizeof(kWinWidths[0]));
 
+// Presentation targets offered by the launcher. Zero follows the current
+// display refresh; explicit values are useful for repeatable comparisons.
+const int kInterpFps[] = { 0, 90, 120, 144, 165, 240 };
+const int kNumInterpFps = (int)(sizeof(kInterpFps) / sizeof(kInterpFps[0]));
+
+int interp_fps_index(int fps) {
+    for (int i = 0; i < kNumInterpFps; i++)
+        if (kInterpFps[i] == fps) return i;
+    return 0;
+}
+
+std::string interp_fps_label(int fps) {
+    return fps == 0 ? "Display refresh" : std::to_string(fps) + " FPS";
+}
+
 // Snap an arbitrary width to the nearest offered option index.
 int winsize_index(int width) {
     int best = 1, bestd = 1 << 30;  // default to 1280
@@ -431,6 +451,9 @@ void refresh_labels(LauncherModel& m) {
     m.texfilter_label = texfilter_name(m.texture_filter);
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
+    m.interpolation_fps_label = interp_fps_label(m.frame_interpolation_fps);
+    m.opengl_renderer = (m.renderer == 1);
+    m.interpolation_target_visible = m.opengl_renderer && m.frame_interpolation;
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
     m.ultrawide       = (m.aspect_index == 2);   // 21:9 is offered separately
     /* ws_eligible is set once at model init from GameInfo.ws_offered ([widescreen]
@@ -700,6 +723,9 @@ Result run(SDL_Window* window, void* gl_context,
     m.auto_skip_fmv  = io.auto_skip_fmv;
     m.turbo_loads    = io.turbo_loads;
     m.fullscreen     = io.fullscreen;
+    m.frame_interpolation = io.has_frame_interpolation && io.frame_interpolation;
+    m.frame_interpolation_fps = kInterpFps[interp_fps_index(
+        io.has_frame_interpolation_fps ? io.frame_interpolation_fps : 0)];
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
@@ -780,6 +806,10 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
     c.Bind("turbo_loads",    &m.turbo_loads);
     c.Bind("fullscreen",     &m.fullscreen);
+    c.Bind("frame_interpolation", &m.frame_interpolation);
+    c.Bind("interpolation_fps_label", &m.interpolation_fps_label);
+    c.Bind("opengl_renderer", &m.opengl_renderer);
+    c.Bind("interpolation_target_visible", &m.interpolation_target_visible);
     c.Bind("skip_launcher",  &m.skip_launcher);
     c.Bind("show_skip_modal",&m.show_skip_modal);
     c.Bind("spu_hq",         &m.spu_hq);
@@ -921,6 +951,8 @@ Result run(SDL_Window* window, void* gl_context,
             m.renderer ^= 1;
             refresh_labels(m);
             handle.DirtyVariable("renderer_label");
+            handle.DirtyVariable("opengl_renderer");
+            handle.DirtyVariable("interpolation_target_visible");
         });
     c.BindEventCallback("cycle_ss",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1001,6 +1033,20 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.fullscreen = !m.fullscreen;
             handle.DirtyVariable("fullscreen");
+        });
+    c.BindEventCallback("toggle_frame_interpolation",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.frame_interpolation = !m.frame_interpolation;
+            refresh_labels(m);
+            handle.DirtyVariable("frame_interpolation");
+            handle.DirtyVariable("interpolation_target_visible");
+        });
+    c.BindEventCallback("cycle_interpolation_fps",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            int i = (interp_fps_index(m.frame_interpolation_fps) + 1) % kNumInterpFps;
+            m.frame_interpolation_fps = kInterpFps[i];
+            refresh_labels(m);
+            handle.DirtyVariable("interpolation_fps_label");
         });
     // Skip launcher: turning OFF is immediate; turning ON opens a confirm modal
     // first, so the user learns the --launcher escape hatch before committing.
@@ -1271,6 +1317,10 @@ Result run(SDL_Window* window, void* gl_context,
         io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
+        io.frame_interpolation = m.frame_interpolation;
+        io.has_frame_interpolation = true;
+        io.frame_interpolation_fps = m.frame_interpolation_fps;
+        io.has_frame_interpolation_fps = true;
         io.skip_launcher = m.skip_launcher;   io.has_skip_launcher = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
         io.aspect_num = kAspects[m.aspect_index][0];

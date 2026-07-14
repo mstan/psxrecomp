@@ -106,6 +106,9 @@
 #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
 #define PSXGL_CONSTANT_ALPHA        0x8003
 #define PSXGL_UNPACK_ROW_LENGTH     0x0CF2
+#define PSXGL_SRC1_ALPHA            0x8589
+#define PSXGL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define PSXGL_TIMEOUT_IGNORED       0xFFFFFFFFFFFFFFFFull
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -133,6 +136,7 @@ typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
+typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 typedef void   (APIENTRY *PFN_glBlendEquationSeparate)(GLenum, GLenum);
@@ -144,6 +148,10 @@ typedef void   (APIENTRY *PFN_glBindBuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glBufferData)(GLenum, ptrdiff_t, const void *, GLenum);
 typedef void   (APIENTRY *PFN_glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
 typedef void   (APIENTRY *PFN_glEnableVertexAttribArray)(GLuint);
+typedef void   (APIENTRY *PFN_glBindFragDataLocationIndexed)(GLuint, GLuint, GLuint, const char *);
+typedef GLsync (APIENTRY *PFN_glFenceSync)(GLenum, GLbitfield);
+typedef void   (APIENTRY *PFN_glWaitSync)(GLsync, GLbitfield, GLuint64);
+typedef void   (APIENTRY *PFN_glDeleteSync)(GLsync);
 typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glDeleteFramebuffers)(GLsizei, const GLuint *);
 typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
@@ -193,6 +201,7 @@ static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
 static PFN_glUniform2i         p_glUniform2i;
 static PFN_glUniform4i         p_glUniform4i;
+static PFN_glUniform4f         p_glUniform4f;
 static PFN_glBlendColor        p_glBlendColor;
 static PFN_glBlendFuncSeparate p_glBlendFuncSeparate;
 static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
@@ -204,6 +213,10 @@ static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
 static PFN_glVertexAttribPointer p_glVertexAttribPointer;
 static PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
+static PFN_glBindFragDataLocationIndexed p_glBindFragDataLocationIndexed;
+static PFN_glFenceSync p_glFenceSync;
+static PFN_glWaitSync p_glWaitSync;
+static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glGenFramebuffers   p_glGenFramebuffers;
 static PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
 static PFN_glBindFramebuffer   p_glBindFramebuffer;
@@ -244,6 +257,7 @@ static int load_modern_gl(void) {
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
     LOAD(p_glUniform1f, "glUniform1f");
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
+    LOAD(p_glUniform4f, "glUniform4f");
     LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glBlendFuncSeparate, "glBlendFuncSeparate");
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
@@ -252,6 +266,10 @@ static int load_modern_gl(void) {
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
+    LOAD(p_glBindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
+    LOAD(p_glFenceSync, "glFenceSync");
+    LOAD(p_glWaitSync, "glWaitSync");
+    LOAD(p_glDeleteSync, "glDeleteSync");
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
     LOAD(p_glDeleteFramebuffers, "glDeleteFramebuffers");
     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
@@ -287,7 +305,32 @@ static int           s_req_scale = 1;      /* requested before context init */
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
-static GLint         s_present_uTex = -1;
+static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+static GLuint        s_interp_prog = 0, s_interp_tex[3];
+static GLsync        s_interp_fence[3];
+static GLsync        s_interp_draw_fence = NULL;
+static GLint         s_interp_uPrev = -1, s_interp_uCurr = -1;
+static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
+static int           s_interp_enabled = 0, s_interp_valid = 0;
+static int           s_interp_suspended = 0;
+static int           s_interp_prev = 0, s_interp_cur = 0;
+static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
+static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
+static uint64_t      s_interp_start = 0, s_interp_duration = 1;
+static uint64_t      s_interp_last_capture = 0, s_interp_swaps = 0;
+static uint64_t      s_interp_captures = 0;
+static int           s_interp_diag = 0;
+static double        s_interp_host_hz = 0.0;
+static double        s_interp_target_hz = 0.0;
+static SDL_GLContext s_interp_ctx = NULL;
+static SDL_Thread   *s_interp_thread = NULL;
+static SDL_mutex    *s_interp_mutex = NULL;
+static SDL_atomic_t  s_interp_thread_run;
+static GLuint        s_interp_thread_vao = 0;
+static void interp_reset_history(void);
+static int interp_thread_main(void *opaque);
+static int interp_present(void);
+static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh);
 
 static int           s_raster_ok = 0;      /* full GPU pipeline available */
 
@@ -305,13 +348,14 @@ static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
 /* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
  * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch). */
-#define TEXV 18
+#define TEXV 19
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
-static GLuint s_pack_prog = 0, s_empty_vao = 0;
+static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
 /* TEX program uniforms. */
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
-static GLint s_uRaw = -1, s_uSemipass = -1, s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
+static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
@@ -357,6 +401,7 @@ static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
 static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
 /* PACK program uniforms. */
 static GLint s_uPackHr = -1, s_uPackScale = -1;
+static GLint s_uStencilSrc = -1;
 
 static uint32_t     *s_conv = NULL;        /* RGBA8 staging for uploads      */
 static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
@@ -385,6 +430,20 @@ static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror *
 #define UP_RECTS_MAX 16
 static DirtyRect s_up_rects[UP_RECTS_MAX];
 static int       s_up_nrects = 0;
+static uint64_t  s_rt_up_diag[6];
+
+static int runtime_upload_diag_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_RUNTIME_PERF_DIAG");
+        enabled = e && e[0] && e[0] != '0';
+    }
+    return enabled;
+}
+
+void gl_renderer_runtime_diag(uint64_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = s_rt_up_diag[i];
+}
 
 /* Draw state mirrored from the vtable set_* calls. */
 static int s_off_x = 0, s_off_y = 0;
@@ -394,6 +453,9 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
 static int s_mask_set = 0, s_mask_check = 0;
 static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
 static int s_tex_filter = 0;
+/* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
+ * duplicate stencil copy current is deferred until mask checking is requested. */
+static int s_stencil_valid = 1;
 
 /* ---- native-wide compositor (mirrors gpu_sw_renderer.c g_wide_*) ----------
  * Canonical VRAM (the hr FBO) stays 100% faithful. Native-wide lives in
@@ -535,6 +597,37 @@ extern uint64_t s_frame_count;  /* defined in debug_server.c */
 static GlCohEvent s_coh_ring[GL_COH_RING_CAP];
 static uint64_t   s_coh_seq = 0;
 
+/* 16x16 native-pixel tiles changed since their last on-screen present. This
+ * lets a double-buffered 30 Hz game avoid swapping the unchanged front buffer
+ * on the intervening 60 Hz vblank without guessing from game identity. */
+#define PRES_TILE 16
+#define PRES_ROWS (VRAM_H / PRES_TILE)
+static uint64_t s_present_dirty[PRES_ROWS];
+static int s_last_present_path = -1;
+static int s_last_dx, s_last_dy, s_last_dw, s_last_dh;
+
+static void present_dirty_rect(int x0, int y0, int x1, int y1, int set) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 >= VRAM_W) x1 = VRAM_W - 1; if (y1 >= VRAM_H) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+    int tx0 = x0 / PRES_TILE, tx1 = x1 / PRES_TILE;
+    uint64_t mask = (~0ull << tx0) & (~0ull >> (63 - tx1));
+    for (int ty = y0 / PRES_TILE; ty <= y1 / PRES_TILE; ty++) {
+        if (set) s_present_dirty[ty] |= mask; else s_present_dirty[ty] &= ~mask;
+    }
+}
+
+static int present_dirty_test(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 >= VRAM_W) x1 = VRAM_W - 1; if (y1 >= VRAM_H) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1) return 0;
+    int tx0 = x0 / PRES_TILE, tx1 = x1 / PRES_TILE;
+    uint64_t mask = (~0ull << tx0) & (~0ull >> (63 - tx1));
+    for (int ty = y0 / PRES_TILE; ty <= y1 / PRES_TILE; ty++)
+        if (s_present_dirty[ty] & mask) return 1;
+    return 0;
+}
+
 static void coh_record(int kind, int x0, int y0, int x1, int y1) {
     GlCohEvent *e = &s_coh_ring[s_coh_seq % GL_COH_RING_CAP];
     e->frame = (uint32_t)s_frame_count;
@@ -542,6 +635,9 @@ static void coh_record(int kind, int x0, int y0, int x1, int y1) {
     e->x0 = (int16_t)x0; e->y0 = (int16_t)y0;
     e->x1 = (int16_t)x1; e->y1 = (int16_t)y1;
     s_coh_seq++;
+    if (kind == GL_COH_FLUSH || kind == GL_COH_FILL ||
+        kind == GL_COH_COPY || kind == GL_COH_DRAW)
+        present_dirty_rect(x0, y0, x1, y1, 1);
 }
 
 uint64_t gl_renderer_coh_total(void) { return s_coh_seq; }
@@ -552,23 +648,30 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out) {
     return 1;
 }
 
-/* ---- present ring (always-on, debug server "gl_present_ring") ------------ */
-/* Records EVERY SwapWindow (all four paths — vram/wide/cpu/blank), with the
- * source + letterbox rects, a drained glGetError, and a 1px backbuffer sample
- * at the letterbox centre taken right before the swap: the ground truth for
- * "did this swap present black". Per the ring-buffer rule: always-on capture,
- * observers query a window after the fact. */
+/* ---- present ring (always-on, debug server "present_ring") --------------- */
+/* Records every SwapWindow (vram/wide/cpu/blank/interpolated) and its
+ * source + letterbox rects. PSX_GL_PRESENT_PROBE=1 additionally drains
+ * glGetError and samples one backbuffer pixel before the swap; that synchronous
+ * diagnostic is intentionally opt-in. Observers query a window after the fact. */
 #define GL_PRES_RING_CAP 4096
 static GlPresEvent s_pres_ring[GL_PRES_RING_CAP];
 static uint64_t    s_pres_seq = 0;
 
 static void pres_record(int path, int dx, int dy, int w, int h,
                         int lx, int ly, int lw, int lh) {
+    /* The ring metadata stays always-on, but pixel probing must not: each
+     * glReadPixels synchronously drains queued GPU work. Two probes per frame
+     * were enough to make Tomba 2 miss its frame budget. */
+    static int probe_pixels = -1;
+    if (probe_pixels < 0) {
+        const char *cfg = getenv("PSX_GL_PRESENT_PROBE");
+        probe_pixels = (cfg && cfg[0] == '1') ? 1 : 0;
+    }
     GlPresEvent *e = &s_pres_ring[s_pres_seq % GL_PRES_RING_CAP];
     e->frame = (uint32_t)s_frame_count;
     e->t_ms  = (uint32_t)SDL_GetTicks();
     e->path  = (uint8_t)path;
-    e->glerr = (uint16_t)glGetError();   /* drain the sticky error */
+    e->glerr = probe_pixels ? (uint16_t)glGetError() : 0;
     e->dx = (int16_t)dx; e->dy = (int16_t)dy;
     e->w  = (int16_t)w;  e->h  = (int16_t)h;
     e->lx = (int16_t)lx; e->ly = (int16_t)ly;
@@ -576,7 +679,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
     /* Backbuffer sample at the letterbox centre (GL bottom-origin; the rects
      * we pass in are already bottom-origin GL window coords). */
     uint8_t px[3] = { 0, 0, 0 };
-    if (lw > 0 && lh > 0) {
+    if (probe_pixels && lw > 0 && lh > 0) {
         glReadBuffer(GL_BACK);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(lx + lw / 2, ly + lh / 2, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
@@ -587,7 +690,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
      * "FBO content was black" from "the blit malfunctioned". */
     uint8_t sp[3] = { 0, 0, 0 };
     e->src_valid = 0;
-    if ((path == GL_PRES_VRAM) && w > 0 && h > 0 && s_hr_fbo) {
+    if (probe_pixels && (path == GL_PRES_VRAM) && w > 0 && h > 0 && s_hr_fbo) {
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels((dx + w / 2) * s_scale, (dy + h / 2) * s_scale,
@@ -612,12 +715,20 @@ int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out) {
 static const char *PRESENT_VS =
     "#version 330\n"
     "out vec2 v_uv;\n"
+    "uniform vec4 u_uv_rect;\n"
     "void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);\n"
-    "  v_uv = vec2(p.x, 1.0 - p.y); gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
+    "  v_uv = vec2(mix(u_uv_rect.x,u_uv_rect.z,p.x),\n"
+    "              mix(u_uv_rect.y,u_uv_rect.w,1.0-p.y));\n"
+    "  gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
 static const char *PRESENT_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_tex; out vec4 frag;\n"
     "void main(){ frag = texture(u_tex, v_uv); }\n";
+static const char *INTERP_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_prev; uniform sampler2D u_curr;\n"
+    "uniform float u_alpha; out vec4 frag;\n"
+    "void main(){ frag=mix(texture(u_prev,v_uv),texture(u_curr,v_uv),u_alpha); }\n";
 
 /* Geometry: position in VRAM pixels (draw offset already applied by gpu.c),
  * color rgb in 0..1, color a = mask bit (0/1). The clip transform is in
@@ -671,6 +782,7 @@ static const char *TEX_VS =
     "layout(location=5) in float a_depth;\n"
     "layout(location=6) in float a_raw;\n"
     "layout(location=7) in vec4 a_limits;\n"
+    "layout(location=8) in float a_semi;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
@@ -678,10 +790,11 @@ static const char *TEX_VS =
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
-    "flat out int v_raw; flat out ivec4 v_limits;\n"
+    "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
     "void main(){ v_uv = a_uv; v_col = a_col;\n"
     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
     "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
+    "  v_semi = int(a_semi + 0.5);\n"
     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
@@ -689,14 +802,17 @@ static const char *TEX_VS =
     "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
-    "noperspective in vec2 v_uv; noperspective in vec4 v_col; out vec4 frag;\n"
+    "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+    "out vec4 frag; out vec4 blend_factor;\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
     "flat in int v_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
     "flat in int v_raw;       /* 1 = no color modulation */\n"
     "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
+    "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
     "uniform usampler2D u_vram;\n"
     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
+    "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
@@ -760,7 +876,13 @@ static const char *TEX_FS =
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
     "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  float dst_factor = 0.0;\n"
+    "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+    "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+    "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
+    "  }\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
+    "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
 
 /* Quad blit: used for CPU->VRAM upload flushes and VRAM->VRAM copies.
@@ -812,6 +934,14 @@ static const char *PACK_FS =
     "  o_pix = r | (g << 5) | (b << 10) | (c.a >= 0.5 ? 0x8000u : 0u);\n"
     "}\n";
 
+/* Rebuild stencil bit 0 from a copied RGBA target's alpha. Color writes are
+ * disabled while this shader runs; only alpha>=0.5 fragments replace stencil. */
+static const char *STENCIL_FS =
+    "#version 330\n"
+    "uniform sampler2D u_src; out vec4 frag;\n"
+    "void main(){ vec4 c=texelFetch(u_src,ivec2(gl_FragCoord.xy),0);\n"
+    "  if(c.a<0.5) discard; frag=vec4(0.0); }\n";
+
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint s = p_glCreateShader(type);
     p_glShaderSource(s, 1, &src, NULL);
@@ -822,16 +952,24 @@ static GLuint compile_shader(GLenum type, const char *src) {
         p_glDeleteShader(s); return 0; }
     return s;
 }
-static GLuint build_program(const char *vs, const char *fs) {
+static GLuint build_program_ex(const char *vs, const char *fs, int dual_source) {
     GLuint v = compile_shader(PSXGL_VERTEX_SHADER, vs), f = compile_shader(PSXGL_FRAGMENT_SHADER, fs);
     if (!v || !f) return 0;
     GLuint p = p_glCreateProgram();
-    p_glAttachShader(p, v); p_glAttachShader(p, f); p_glLinkProgram(p);
+    p_glAttachShader(p, v); p_glAttachShader(p, f);
+    if (dual_source) {
+        p_glBindFragDataLocationIndexed(p, 0, 0, "frag");
+        p_glBindFragDataLocationIndexed(p, 0, 1, "blend_factor");
+    }
+    p_glLinkProgram(p);
     p_glDeleteShader(v); p_glDeleteShader(f);
     GLint ok = 0; p_glGetProgramiv(p, PSXGL_LINK_STATUS, &ok);
     if (!ok) { char log[1024]; log[0]=0; p_glGetProgramInfoLog(p, sizeof log, NULL, log);
         fprintf(stdout, "psxrecomp: GL program link failed: %s\n", log); return 0; }
     return p;
+}
+static GLuint build_program(const char *vs, const char *fs) {
+    return build_program_ex(vs, fs, 0);
 }
 
 /* ---- pixel conversion (PS1 1555: bit15=mask, B[14:10] G[9:5] R[4:0]) ---- */
@@ -918,6 +1056,8 @@ static void hr_end(void) {
  * next GPU op (or readback/present) preserves PS1 command order. */
 static void flush_cpu_upload(void) {
     if (!s_raster_ok || s_up_nrects == 0) return;
+    const int diag = runtime_upload_diag_enabled();
+    if (diag) { s_rt_up_diag[0]++; s_rt_up_diag[1] += (uint64_t)s_up_nrects; }
     flush_tex_batch();   /* queued draws must land before this upload writes VRAM */
     /* Snapshot + clear first (re-entrancy safe; up_add overflow calls back in). */
     DirtyRect rects[UP_RECTS_MAX];
@@ -933,14 +1073,18 @@ static void flush_cpu_upload(void) {
         int x = rects[i].x0, y = rects[i].y0;
         int w = rects[i].x1 - rects[i].x0 + 1;
         int h = rects[i].y1 - rects[i].y0 + 1;
+        if (diag) s_rt_up_diag[2] += (uint64_t)w * (uint64_t)h;
         coh_record(GL_COH_FLUSH, x, y, x + w - 1, y + h - 1);
 
         /* RGBA8 staging for the hr quad draw. */
+        uint64_t t0 = diag ? SDL_GetPerformanceCounter() : 0;
         for (int row = 0; row < h; row++) {
             const uint16_t *src = s_vram + (size_t)(y + row) * VRAM_W + x;
             uint32_t *dst = s_conv + (size_t)row * w;
             for (int col = 0; col < w; col++) dst[col] = conv_1555_to_rgba8(src[col]);
         }
+        if (diag) s_rt_up_diag[3] += SDL_GetPerformanceCounter() - t0;
+        t0 = diag ? SDL_GetPerformanceCounter() : 0;
         glBindTexture(GL_TEXTURE_2D, s_up_tex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
 
@@ -952,11 +1096,13 @@ static void flush_cpu_upload(void) {
                         PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
                         s_vram + (size_t)y * VRAM_W + x);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
     }
 
     /* Quads into the hr FBO; two passes split by bit15 so the stencil mirror
      * stays exact. gpu.c applied mask set/check per pixel already — no check
      * here, the data is final. up_tex is VRAM-aligned: src texel = frag/S. */
+    uint64_t draw_t0 = diag ? SDL_GetPerformanceCounter() : 0;
     hr_begin(0);
     glDisable(GL_BLEND);
     p_glUseProgram(s_blit_prog);
@@ -983,6 +1129,51 @@ static void flush_cpu_upload(void) {
         plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     }
     hr_end();
+    if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
+}
+
+/* Recreate one target's stencil mask from its authoritative alpha channel.
+ * Sampling an attached render target is undefined, so copy color to the shared
+ * scratch texture first. Wide targets never exceed the 1024-pixel VRAM width. */
+static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h) {
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+    p_glBlitFramebuffer(0, 0, target_w, target_h, 0, 0, target_w, target_h,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, target_fbo);
+    glViewport(0, 0, target_w, target_h);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0x01);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glStencilFunc(GL_ALWAYS, 1, 0x01);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    p_glUseProgram(s_stencil_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_scratch_tex);
+    p_glUniform1i(s_uStencilSrc, 0);
+    p_glBindVertexArray(s_empty_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_STENCIL_TEST);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
+static void rebuild_mask_stencils(void) {
+    if (s_stencil_valid || !s_raster_ok) return;
+    int hw = VRAM_W * s_scale, hh = VRAM_H * s_scale;
+    rebuild_target_stencil(s_hr_fbo, hw, hh);
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        if (s_wide_fbo[i])
+            rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_scale, hh);
+    }
+    s_stencil_valid = 1;
 }
 
 /* ---- coherency: hr FBO -> raw mirror (pack) ------------------------------ */
@@ -1214,6 +1405,12 @@ static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
+static uint64_t s_batch_total = 0, s_batch_reason[7];
+
+void gl_renderer_batch_diag(uint64_t out[8]) {
+    out[0] = s_batch_total;
+    for (int i = 0; i < 7; i++) out[i + 1] = s_batch_reason[i];
+}
 
 /* Draw the queued textured batch with correct PSX mask-bit handling AND correct
  * painter's order. The mask bit lives in both the colour-attachment alpha
@@ -1233,16 +1430,35 @@ static int   s_tb_twin[4] = {0, 0, 0, 0};
  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
  * whose two passes do not self-overlap. */
 static void tex_batch_draw_passes(int nverts, int semi) {
+    p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
     if (semi < 0) {
         glDisable(GL_BLEND);
         mask_stencil(s_tb_mask);
         p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
         glDrawArrays(GL_TRIANGLES, 0, nverts);
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
-        mask_stencil(1);
-        p_glUniform1i(s_uSemipass, 2);                 /* STP=1 texels set the mask bit */
+        if (s_mask_check) {
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
+            mask_stencil(1);
+            p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
+            glDrawArrays(GL_TRIANGLES, 0, nverts);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        } else if (!s_tb_mask) {
+            /* Alpha is already exact; defer its duplicate stencil encoding
+             * until a later GP0(E6h) actually enables destination masking. */
+            s_stencil_valid = 0;
+        }
+    } else if (!s_mask_check && semi == 4) {
+        /* Modes 0/1/3 can select opaque-vs-semi behavior per fragment with
+         * dual-source factors, so the whole painter-ordered batch is one draw.
+         * Mode 2 needs a different blend equation and stays on the conservative
+         * isolated path below. */
+        glEnable(GL_BLEND);
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+        p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
+        if (s_tb_mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
+        p_glUniform1i(s_uSemipass, 0);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (!s_tb_mask) s_stencil_valid = 0;
     } else {
         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
         mask_stencil(s_tb_mask);
@@ -1290,7 +1506,7 @@ static void flush_tex_batch(void) {
     int nverts = s_tb_n, semi = s_tb_semi;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
-    s_cw_batches++; s_cw_flush_depth++;
+    s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
@@ -1427,6 +1643,10 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     {
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
         int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
+        /* With mask checking off, opaque and mode-0 semi primitives use the
+         * same dual-source blend state. The per-vertex a_semi flag selects
+         * replace vs half-blend without breaking painter order. */
+        int batch_semi = (!s_mask_check && semi != 2) ? 4 : semi;
         /* STP draw-ORDER correctness. flush_tex_batch draws a batch in two passes
          * over the WHOLE batch (pass 1 = every prim's STP=0/opaque texels, pass 2
          * = every prim's STP=1/semi texels with the PSX blend). For overlapping
@@ -1443,14 +1663,24 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * optimization for modes 0/1/3 via GL_ONE,GL_SRC_ALPHA with a per-fragment
          * destination factor in alpha could re-batch semi prims — see memory
          * tomba_sprite_zorder_bug; mode 2 subtractive still needs isolation.) */
-        int isolate = (semi >= 0);
-        if (s_tb_n > 0 &&
-            (isolate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter || gate != s_tb_gate ||
-             twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
+        int isolate = (semi >= 0 && (semi == 2 || s_mask_check));
+        int reason = -1;
+        if (s_tb_n > 0) {
+            if (isolate) reason = 0;
+            else if (batch_semi != s_tb_semi) reason = 1;
+            else if (s_mask_set != s_tb_mask) reason = 2;
+            else if (s_tex_filter != s_tb_filter) reason = 3;
+            else if (gate != s_tb_gate) reason = 4;
+            else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
+                     tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+        }
+        if (reason >= 0) {
+            s_batch_reason[reason]++;
             flush_tex_batch();
-        if (s_tb_n + 3 > TEXBATCH_MAXV) flush_tex_batch();
+        }
+        if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
-            s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
+            s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -1463,6 +1693,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[12] = (float)depth;   vp[13] = (float)rawtex;        /* a_depth, a_raw */
             vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+            vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -1678,7 +1909,18 @@ static void glb_set_texture_filter(int b) { s_tex_filter = b ? 1 : 0; sw_set_tex
 static int  glb_texture_filter(void) { return s_tex_filter; }
 
 static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m & 3; sw_set_semi_transparency(e, m); }
-static void glb_set_mask_bits(int s, int c) { s_mask_set = s ? 1 : 0; s_mask_check = c ? 1 : 0; sw_set_mask_bits(s, c); }
+static void glb_set_mask_bits(int s, int c) {
+    int next_check = c ? 1 : 0;
+    if (next_check && !s_mask_check) {
+        /* Land all alpha-authoritative work before deriving stencil from it. */
+        flush_tex_batch();
+        flush_cpu_upload();
+        rebuild_mask_stencils();
+    }
+    s_mask_set = s ? 1 : 0;
+    s_mask_check = next_check;
+    sw_set_mask_bits(s, c);
+}
 static void glb_set_texture_window(uint32_t r) {
     s_tw_mask_x = (int)(r & 0x1F);
     s_tw_mask_y = (int)((r >> 5) & 0x1F);
@@ -1826,10 +2068,11 @@ static int init_gpu_raster(void) {
     s_scale = s_req_scale;
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
-    s_tex_prog  = build_program(TEX_VS, TEX_FS);
+    s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
-    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog) return 0;
+    s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
+    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog || !s_stencil_prog) return 0;
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -1839,6 +2082,20 @@ static int init_gpu_raster(void) {
     s_scratch_tex = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
     s_up_tex      = make_tex(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE);
     s_raw_tex     = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
+    /* Force the driver's first texture-upload allocation while the renderer is
+     * initializing. NVIDIA otherwise defers it until the first MDEC frame,
+     * producing a measured ~33 ms glTexSubImage hitch and an audible underrun. */
+    {
+        const uint32_t zero_rgba = 0;
+        const uint16_t zero_raw = 0;
+        glBindTexture(GL_TEXTURE_2D, s_up_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, &zero_rgba);
+        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1,
+                        PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, &zero_raw);
+        glFinish();
+    }
 
     p_glGenRenderbuffers(1, &s_hr_rb);
     p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_hr_rb);
@@ -1855,6 +2112,7 @@ static int init_gpu_raster(void) {
     s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
     s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
     s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
+    s_uSemimode = p_glGetUniformLocation(s_tex_prog, "u_semimode");
     s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
@@ -1866,6 +2124,7 @@ static int init_gpu_raster(void) {
     s_uBlitSrcOff  = p_glGetUniformLocation(s_blit_prog, "u_src_off");
     s_uPackHr    = p_glGetUniformLocation(s_pack_prog, "u_hr");
     s_uPackScale = p_glGetUniformLocation(s_pack_prog, "u_scale");
+    s_uStencilSrc = p_glGetUniformLocation(s_stencil_prog, "u_src");
     s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
     s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
@@ -1930,6 +2189,7 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, st, (void*)(12*sizeof(float))); p_glEnableVertexAttribArray(5); /* depth  */
         p_glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, st, (void*)(13*sizeof(float))); p_glEnableVertexAttribArray(6); /* raw    */
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
+        p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);
@@ -1956,6 +2216,9 @@ static int init_gpu_raster(void) {
     s_up_nrects = 0;
     up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
     s_gpu_dirty = 0;
+    s_stencil_valid = 1;
+    for (int i = 0; i < PRES_ROWS; i++) s_present_dirty[i] = ~0ull;
+    s_last_present_path = -1;
 
     /* Native-wide compositor surfaces start unallocated (lazily created when a
      * widescreen game calls wide_configure + wide_set_target). */
@@ -2000,9 +2263,21 @@ int gl_renderer_init_context(SDL_Window *win) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         s_present_prog = build_program(PRESENT_VS, PRESENT_FS);
-        if (s_present_prog) {
+        s_interp_prog = build_program(PRESENT_VS, INTERP_FS);
+        if (s_present_prog && s_interp_prog) {
             p_glGenVertexArrays(1, &s_present_vao);
             s_present_uTex = p_glGetUniformLocation(s_present_prog, "u_tex");
+            s_present_uUvRect = p_glGetUniformLocation(s_present_prog, "u_uv_rect");
+            s_interp_uPrev = p_glGetUniformLocation(s_interp_prog, "u_prev");
+            s_interp_uCurr = p_glGetUniformLocation(s_interp_prog, "u_curr");
+            s_interp_uAlpha = p_glGetUniformLocation(s_interp_prog, "u_alpha");
+            s_interp_uUvRect = p_glGetUniformLocation(s_interp_prog, "u_uv_rect");
+            glGenTextures(3, s_interp_tex);
+            for (int i = 0; i < 3; i++) {
+                glBindTexture(GL_TEXTURE_2D, s_interp_tex[i]);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
         } else ok = 0;
     }
     if (ok) ok = init_gpu_raster();
@@ -2029,9 +2304,33 @@ void gl_renderer_set_swap_interval(int interval) {
 }
 
 void gl_renderer_shutdown(void) {
+    if (s_interp_thread) {
+        SDL_AtomicSet(&s_interp_thread_run, 0);
+        SDL_WaitThread(s_interp_thread, NULL);
+        s_interp_thread = NULL;
+    }
+    if (s_interp_ctx) {
+        SDL_GL_DeleteContext(s_interp_ctx);
+        s_interp_ctx = NULL;
+    }
     if (s_ctx) {
+        SDL_GL_MakeCurrent(s_win, s_ctx);
+        if (s_interp_draw_fence) {
+            p_glDeleteSync(s_interp_draw_fence);
+            s_interp_draw_fence = NULL;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (s_interp_fence[i]) {
+                p_glDeleteSync(s_interp_fence[i]);
+                s_interp_fence[i] = NULL;
+            }
+        }
         ensure_cpu();
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
+    }
+    if (s_interp_mutex) {
+        SDL_DestroyMutex(s_interp_mutex);
+        s_interp_mutex = NULL;
     }
     free(s_conv); s_conv = NULL;
     s_raster_ok = 0;
@@ -2045,6 +2344,7 @@ void gl_renderer_shutdown(void) {
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3) {
     if (!s_ctx) return;
+    interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
@@ -2058,16 +2358,19 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, linear);
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+    p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
+    s_last_present_path = GL_PRES_CPU;
 }
 
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
+    interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
@@ -2075,6 +2378,7 @@ void gl_renderer_present_blank(void) {
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
+    s_last_present_path = GL_PRES_BLANK;
 }
 
 /* Sync the authoritative FBO down into CPU VRAM (no-op when current).
@@ -2504,6 +2808,14 @@ static void gl_perf_init(void) {
 #ifdef PSX_NO_DEBUG_TOOLS
     return;
 #else
+    /* Timer queries are intentionally available in diagnostics builds, but a
+     * driver may serialize command submission while collecting them.  Keep an
+     * escape hatch so frame cadence can be A/B tested without rebuilding or
+     * losing the rest of the debug server telemetry. */
+    {
+        const char *enabled = getenv("PSX_GL_PERF");
+        if (enabled && enabled[0] == '0') return;
+    }
     if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
     p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
     p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
@@ -2665,11 +2977,298 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
 void gl_renderer_set_ws_ablate(int mode) { s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
 int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
 
+static void interp_reset_history_unlocked(void) {
+    s_interp_valid = 0;
+    s_interp_w = s_interp_h = 0;
+    s_interp_start = s_interp_last_capture = 0;
+    s_interp_duration = 1;
+    s_interp_source_path = -1;
+}
+
+static void interp_reset_history(void) {
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    interp_reset_history_unlocked();
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz) {
+    int active = (enabled && host_hz >= 90.0) ? 1 : 0;
+    double effective_hz = target_hz >= 90.0 ? target_hz : host_hz;
+    const char *diag = getenv("PSX_GL_INTERP_DIAG");
+    s_interp_diag = diag && diag[0] && diag[0] != '0';
+    if (active && !s_interp_ctx && s_ctx) {
+        if (!s_interp_mutex) s_interp_mutex = SDL_CreateMutex();
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        s_interp_ctx = SDL_GL_CreateContext(s_win);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+        SDL_GL_MakeCurrent(s_win, s_ctx);
+        /* The wall-clock pacer and interpolation scheduler own cadence. Keeping
+         * driver vsync on the main context adds a 6-11 ms block whenever an
+         * FMV temporarily suspends interpolation and the main context presents. */
+        SDL_GL_SetSwapInterval(0);
+        if (s_interp_ctx && s_interp_mutex) {
+            SDL_AtomicSet(&s_interp_thread_run, 1);
+            s_interp_thread = SDL_CreateThread(interp_thread_main,
+                                               "psx-gl-interp", NULL);
+        }
+        if (!s_interp_thread) {
+            SDL_AtomicSet(&s_interp_thread_run, 0);
+            if (s_interp_ctx) SDL_GL_DeleteContext(s_interp_ctx);
+            s_interp_ctx = NULL;
+            active = 0;
+        }
+    }
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    if (active != s_interp_enabled) interp_reset_history_unlocked();
+    s_interp_enabled = active;
+    s_interp_host_hz = host_hz;
+    s_interp_target_hz = active ? effective_hz : 0.0;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+    if (active)
+        fprintf(stdout, "psxrecomp: GL frame interpolation enabled: %.1f FPS "
+                "target on %.1f Hz display\n", effective_hz, host_hz);
+    else
+        fprintf(stdout, "psxrecomp: GL frame interpolation disabled (host %.1f Hz)\n", host_hz);
+}
+
+void gl_renderer_set_interpolation_suspended(int suspended) {
+    suspended = suspended ? 1 : 0;
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    if (suspended != s_interp_suspended) interp_reset_history_unlocked();
+    s_interp_suspended = suspended;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+void gl_renderer_interpolation_diag(int *enabled, int *suspended,
+                                    int *history_frames,
+                                    double *host_hz, double *target_hz,
+                                    uint64_t *swaps) {
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    if (enabled) *enabled = s_interp_enabled;
+    if (suspended) *suspended = s_interp_suspended;
+    if (history_frames) *history_frames = s_interp_valid;
+    if (host_hz) *host_hz = s_interp_host_hz;
+    if (target_hz) *target_hz = s_interp_target_hz;
+    if (swaps) *swaps = s_interp_swaps;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+/* Copy a stable display image out of the mutable VRAM/wide render target.
+ * Returns true once both previous and current images are available. */
+static int interp_capture(GLuint fbo, int x, int y, int w, int h,
+                          int linear, int force_4_3, int source_path) {
+    if (!s_interp_enabled || s_interp_suspended || !fbo || w <= 0 || h <= 0) return 0;
+    SDL_LockMutex(s_interp_mutex);
+    /* The presentation context may still have a draw queued which samples one
+     * of the shared history textures.  Order this context's next allocation or
+     * copy after that draw before recycling a texture.  glWaitSync keeps the
+     * dependency on the GPU; unlike glFinish it does not stall the guest CPU. */
+    if (s_interp_draw_fence) {
+        p_glWaitSync(s_interp_draw_fence, 0, PSXGL_TIMEOUT_IGNORED);
+        p_glDeleteSync(s_interp_draw_fence);
+        s_interp_draw_fence = NULL;
+    }
+    int pw = w * s_scale, ph = h * s_scale;
+    if (pw != s_interp_w || ph != s_interp_h ||
+        source_path != s_interp_source_path || force_4_3 != s_interp_force_4_3) {
+        s_interp_valid = 0;
+        s_interp_w = pw; s_interp_h = ph;
+        s_interp_prev = s_interp_cur = 0;
+        for (int i = 0; i < 3; i++) {
+            glBindTexture(GL_TEXTURE_2D, s_interp_tex[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pw, ph, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        }
+    }
+
+    int dst = 0;
+    if (s_interp_valid == 1) dst = s_interp_cur == 0 ? 1 : 0;
+    else if (s_interp_valid >= 2) dst = s_interp_prev;
+    if (s_interp_fence[dst]) {
+        p_glDeleteSync(s_interp_fence[dst]);
+        s_interp_fence[dst] = NULL;
+    }
+
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    glBindTexture(GL_TEXTURE_2D, s_interp_tex[dst]);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                        x * s_scale, y * s_scale, pw, ph);
+    s_interp_fence[dst] = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    if (s_interp_valid > 0 && s_interp_last_capture && now > s_interp_last_capture) {
+        uint64_t d = now - s_interp_last_capture;
+        uint64_t lo = freq / 240u, hi = freq / 10u;
+        if (d < lo) d = lo;
+        if (d > hi) d = hi;
+        s_interp_duration = d;
+    }
+    s_interp_last_capture = now;
+    s_interp_start = now;
+    if (s_interp_valid == 0) {
+        s_interp_cur = dst;
+        s_interp_valid = 1;
+    } else {
+        s_interp_prev = s_interp_cur;
+        s_interp_cur = dst;
+        s_interp_valid = 2;
+    }
+    s_interp_linear = linear;
+    s_interp_force_4_3 = force_4_3;
+    s_interp_source_path = source_path;
+    s_interp_captures++;
+    int ready = s_interp_valid >= 2;
+    SDL_UnlockMutex(s_interp_mutex);
+    return ready;
+}
+
+static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
+    int prev = s_interp_prev, curr = s_interp_cur;
+    if (s_interp_fence[prev])
+        p_glWaitSync(s_interp_fence[prev], 0, PSXGL_TIMEOUT_IGNORED);
+    if (s_interp_fence[curr])
+        p_glWaitSync(s_interp_fence[curr], 0, PSXGL_TIMEOUT_IGNORED);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glViewport(lx, ly, lw, lh);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_interp_tex[prev]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_interp_tex[curr]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s_interp_linear ? GL_LINEAR : GL_NEAREST);
+    p_glUseProgram(s_interp_prog);
+    p_glUniform1i(s_interp_uPrev, 0);
+    p_glUniform1i(s_interp_uCurr, 1);
+    p_glUniform1f(s_interp_uAlpha, alpha);
+    p_glUniform4f(s_interp_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    p_glBindVertexArray(s_interp_thread_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+}
+
+static int interp_present(void) {
+    if (!s_ctx || !s_interp_enabled || s_interp_suspended || s_interp_valid < 2) return 0;
+    uint64_t now = SDL_GetPerformanceCounter();
+    if (now <= s_interp_start || !s_interp_duration) return 0;
+    double a = (double)(now - s_interp_start) / (double)s_interp_duration;
+    /* Keep swapping at the host cadence after the blend completes.  Holding
+     * alpha at one is visually identical to leaving the current image on the
+     * front buffer, but avoids an irregular 2/3-swap pattern on 120/144/165 Hz
+     * displays while the next 59.94 Hz guest frame is being produced. */
+    if (a > 1.0) a = 1.0;
+    if (a < 0.0) a = 0.0;
+
+    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int lx, ly, lw, lh;
+    if (s_interp_force_4_3)
+        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    interp_draw_quad((float)a, lx, ly, lw, lh);
+    if (s_interp_draw_fence) p_glDeleteSync(s_interp_draw_fence);
+    s_interp_draw_fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    pres_record(GL_PRES_INTERP, 0, 0, s_interp_w, s_interp_h,
+                lx, ly, lw, lh);
+    SDL_GL_SwapWindow(s_win);
+    s_interp_swaps++;
+    return 1;
+}
+
+static int interp_thread_main(void *opaque) {
+    (void)opaque;
+    if (SDL_GL_MakeCurrent(s_win, s_interp_ctx) != 0) return -1;
+    SDL_GL_SetSwapInterval(0); /* host-period scheduler owns cadence */
+    p_glGenVertexArrays(1, &s_interp_thread_vao);
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    uint64_t deadline = SDL_GetPerformanceCounter();
+    uint64_t diag_start = deadline, diag_swaps = 0, diag_captures = 0;
+
+    while (SDL_AtomicGet(&s_interp_thread_run)) {
+        SDL_LockMutex(s_interp_mutex);
+        double hz = s_interp_target_hz >= 90.0 ? s_interp_target_hz : 120.0;
+        SDL_UnlockMutex(s_interp_mutex);
+        uint64_t period = (uint64_t)((double)freq / hz);
+        if (!period) period = 1;
+        deadline += period;
+        uint64_t now = SDL_GetPerformanceCounter();
+        if (now > deadline + period * 4u) deadline = now + period;
+        for (;;) {
+            now = SDL_GetPerformanceCounter();
+            if (now >= deadline) break;
+            uint64_t remain = deadline - now;
+            uint32_t ms = (uint32_t)((remain * 1000u) / (freq ? freq : 1u));
+            if (ms > 1) SDL_Delay(ms - 1);
+        }
+        while (SDL_GetPerformanceCounter() < deadline) {}
+
+        SDL_LockMutex(s_interp_mutex);
+        if (SDL_AtomicGet(&s_interp_thread_run) && s_interp_enabled)
+            interp_present();
+        if (s_interp_diag && now - diag_start >= freq * 5u) {
+            double seconds = (double)(now - diag_start) / (double)freq;
+            fprintf(stdout, "psxrecomp: GL interpolation cadence: "
+                    "%.2f captures/s, %.2f presents/s\n",
+                    (double)(s_interp_captures - diag_captures) / seconds,
+                    (double)(s_interp_swaps - diag_swaps) / seconds);
+            fflush(stdout);
+            diag_start = now;
+            diag_captures = s_interp_captures;
+            diag_swaps = s_interp_swaps;
+        }
+        SDL_UnlockMutex(s_interp_mutex);
+    }
+    p_glBindVertexArray(0);
+    SDL_GL_MakeCurrent(s_win, NULL);
+    return 0;
+}
+
+static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+                                int x, int y, int w, int h, int linear,
+                                int lx, int ly, int lw, int lh) {
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glViewport(lx, ly, lw, lh);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glUniform4f(s_present_uUvRect,
+                  (float)x / (float)tex_w, (float)y / (float)tex_h,
+                  (float)(x + w) / (float)tex_w, (float)(y + h) / (float)tex_h);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+}
+
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
     flush_tex_batch();
     flush_cpu_upload();
+    if (s_last_present_path == GL_PRES_VRAM &&
+        s_last_dx == disp_x && s_last_dy == disp_y &&
+        s_last_dw == w && s_last_dh == h &&
+        !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1)) {
+        gl_perf_present_enter();
+        gl_perf_present_exit(0);
+        return;
+    }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
@@ -2681,20 +3280,28 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
-    glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-    int S = s_scale;
-    /* FBO y matches VRAM y; the window's y=0 is at the bottom, so flip
-     * vertically: display top row lands at the letterbox rect's top. */
-    p_glBlitFramebuffer(disp_x * S, disp_y * S, (disp_x + w) * S, (disp_y + h) * S,
-                        lx, ly + lh, lx + lw, ly,
-                        GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+        glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    }
+    int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
+                                     linear, force_4_3, GL_PRES_VRAM);
+    if (interp_pair) {
+        gl_perf_present_exit(0);
+        present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
+        s_last_present_path = GL_PRES_VRAM;
+        s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
+        return;
+    }
+    present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
+                        disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(0);
+    present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
+    s_last_present_path = GL_PRES_VRAM;
+    s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
 
@@ -2739,36 +3346,54 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
-    GLuint fbo = 0;
+    GLuint fbo = 0, tex = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
-        if (s_wide_fbo[i] && s_wide_base[i] == disp_x) { fbo = s_wide_fbo[i]; break; }
+        if (s_wide_fbo[i] && s_wide_base[i] == disp_x) {
+            fbo = s_wide_fbo[i]; tex = s_wide_tex[i]; break;
+        }
     if (!fbo) return 0;
     flush_tex_batch();
     flush_cpu_upload();
+    if (s_last_present_path == GL_PRES_WIDE &&
+        s_last_dx == disp_x && s_last_dy == disp_y &&
+        s_last_dw == g_wide_w && s_last_dh == disp_h &&
+        !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1)) {
+        gl_perf_present_enter();
+        gl_perf_present_exit(1);
+        return 1;
+    }
     gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
-    int S = s_scale;
-
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
-    glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
-    /* Source: full wide width [0, g_wide_w], displayed Y band [disp_y, +disp_h].
-     * V-flip the dst (ly+lh .. ly) so the top scanline lands at the rect top. */
-    p_glBlitFramebuffer(0, disp_y * S, g_wide_w * S, (disp_y + disp_h) * S,
-                        lx, ly + lh, lx + lw, ly,
-                        GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+        glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+    }
+    int interp_pair = interp_capture(fbo, 0, disp_y, g_wide_w, disp_h,
+                                     linear, 0, GL_PRES_WIDE);
+    if (interp_pair) {
+        gl_perf_present_exit(1);
+        present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
+        s_last_present_path = GL_PRES_WIDE;
+        s_last_dx = disp_x; s_last_dy = disp_y;
+        s_last_dw = g_wide_w; s_last_dh = disp_h;
+        return 1;
+    }
+    present_target_quad(tex, g_wide_w, VRAM_H,
+                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(1);
+    present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
+    s_last_present_path = GL_PRES_WIDE;
+    s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = g_wide_w; s_last_dh = disp_h;
     coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
     return 1;
 }

@@ -36,6 +36,7 @@ uint64_t psx_get_cycle_count(void);
  * Counters/toggle are the TCP `idle_skip` command's surface. */
 struct CPUState;
 void psx_idle_note_check(struct CPUState *cpu, uint32_t check_pc);
+int  psx_idle_skip_is_enabled(void);
 extern int      g_idle_skip_enabled;
 extern uint64_t g_idle_skip_count;
 extern uint64_t g_idle_skip_cycles;

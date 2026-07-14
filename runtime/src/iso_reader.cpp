@@ -74,11 +74,15 @@ bool ISOReader::Open(const std::string& filename) {
         while (std::getline(cue_file, line)) {
             // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
-            size_t binary_pos = line.find("BINARY");
-            if (file_pos != std::string::npos && binary_pos != std::string::npos) {
+            if (file_pos != std::string::npos) {
                 size_t quote1 = line.find('"', file_pos);
                 size_t quote2 = line.find('"', quote1 + 1);
                 if (quote1 != std::string::npos && quote2 != std::string::npos) {
+                    // Compressed/audio-container payloads have no fixed raw
+                    // sector geometry. Refuse them instead of silently mapping
+                    // the following track onto the previous BINARY file.
+                    if (line.find("BINARY", quote2) == std::string::npos)
+                        return false;
                     std::string bin_name = line.substr(quote1 + 1, quote2 - quote1 - 1);
                     std::filesystem::path cue_path(filename);
                     std::filesystem::path bin_path(bin_name);
@@ -197,6 +201,9 @@ void ISOReader::Close() {
     files_.clear();
     tracks_.clear();
     bin_path_.clear();
+    volume_id_.clear();
+    root_dir_.lba = 0;
+    root_dir_.size = 0;
     is_open_ = false;
 }
 
