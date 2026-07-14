@@ -2553,7 +2553,7 @@ void psx_sljit_cop2(CPUState *cpu, uint32_t insn) {
     int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
     uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
     if      (op == 0x32) { gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr)); }   /* LWC2 */
-    else if (op == 0x3A) { cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt)); }   /* SWC2 */
+    else if (op == 0x3A) { cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt)); gte_precision_store_word(addr, (uint8_t)rt); }   /* SWC2 */
 }
 
 /* Unaligned load/store helper — mirrors dirty_ram_interp.c interp_lwl/lwr/swl/swr

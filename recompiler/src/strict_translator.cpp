@@ -1380,13 +1380,17 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         if (offset == 0) {
             r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word(cpu->gpr[{}], {});",
-                d.address, static_cast<int>(rs), value);
+                "cpu->write_word(cpu->gpr[{}], {}); "
+                "gte_precision_store_word(cpu->gpr[{}], {});",
+                d.address, static_cast<int>(rs), value,
+                static_cast<int>(rs), static_cast<int>(rt));
         } else {
             r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
-                d.address, static_cast<int>(rs), static_cast<int>(offset), value);
+                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {}); "
+                "gte_precision_store_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
+                d.address, static_cast<int>(rs), static_cast<int>(offset), value,
+                static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
         }
         r.comment = fmt::format("swc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));

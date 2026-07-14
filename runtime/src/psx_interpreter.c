@@ -500,6 +500,7 @@ static void exec_one(CPUState* cpu) {
     case 0x3A: { /* SWC2 */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         cpu->write_word(addr, gte_read_data(cpu, RT(insn)));
+        gte_precision_store_word(addr, RT(insn));
         break;
     }
 

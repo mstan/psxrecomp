@@ -22,6 +22,20 @@ void sw_renderer_init(uint16_t* vram);
 void sw_renderer_set_scale(int scale);
 int  sw_renderer_scale(void);
 
+/* Visual-only high-resolution vertex override for the next triangle. Values
+ * are signed 16.16 screen coordinates; native VRAM still uses the integer GP0
+ * positions, while the supersampled mirror consumes these fractions. */
+void sw_set_precise_triangle(int enabled,
+                             int32_t x0, int32_t y0,
+                             int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2);
+
+/* Perspective-correct UV override for the next triangle. q values are the
+ * homogeneous interpolation weights associated with each screen vertex. */
+void sw_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2);
+uint32_t sw_perspective_triangle_count(void);
+
 /* Texture filtering. 0 = nearest (native PSX look, default), 1 = bilinear
  * (smooths textures/2D backgrounds; blends in RGB after the CLUT lookup,
  * transparency-aware). Independent of supersampling. */

@@ -189,6 +189,7 @@ extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
+extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 
 /* ============================================================================
  * Dispatch call contract (Bug D / wild-return family fix)

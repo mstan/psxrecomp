@@ -274,6 +274,142 @@ static PlayerInput g_players[2];
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
 
+/* Pepsiman publishes one new gameplay image every two 59.94 Hz vblanks. A
+ * guest-side VSync(2)->VSync(1) patch also runs its fixed-step simulation,
+ * hazards, timers, and audio twice as fast, so the release-safe 60 Hz option
+ * lives entirely in the presenter. On the first vblank of a new 30 Hz image
+ * it displays the midpoint between the previous and current images; on the
+ * duplicate vblank it displays the exact current image. This adds one vblank
+ * of visual latency, but never changes guest execution or SPU timing. */
+static std::atomic<int> g_smooth_60fps{0};
+
+struct Smooth60State {
+    std::vector<uint32_t> previous_source;
+    uint64_t source_hash = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool have_source = false;
+    bool previous_was_duplicate = false;
+    bool armed_announced = false;
+    bool announced = false;
+};
+
+static Smooth60State g_smooth_60_state;
+
+static void smooth_60_reset(void) {
+    g_smooth_60_state.previous_source.clear();
+    g_smooth_60_state.source_hash = 0;
+    g_smooth_60_state.width = 0;
+    g_smooth_60_state.height = 0;
+    g_smooth_60_state.have_source = false;
+    g_smooth_60_state.previous_was_duplicate = false;
+}
+
+/* A sparse hash rejects almost every changed frame cheaply. memcmp below is
+ * still the authority when hashes match, so a tiny animation between sampled
+ * pixels can never be mistaken for a duplicate. */
+static uint64_t smooth_60_frame_hash(const uint32_t* pixels, size_t count) {
+    uint64_t hash = 1469598103934665603ull;
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    for (size_t i = 0; i < count; i += step) {
+        hash ^= pixels[i];
+        hash *= 1099511628211ull;
+    }
+    hash ^= count;
+    return hash * 1099511628211ull;
+}
+
+/* Do not briefly ghost two unrelated scenes together. This samples at most
+ * ~4K pixels and rejects only a very large, high-energy image change; normal
+ * camera motion still interpolates, while a hard cut presents immediately. */
+static bool smooth_60_scene_cut(const uint32_t* current,
+                                const uint32_t* previous,
+                                size_t count) {
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    uint64_t difference = 0;
+    size_t samples = 0;
+    size_t large_changes = 0;
+    for (size_t i = 0; i < count; i += step) {
+        const uint32_t a = current[i];
+        const uint32_t b = previous[i];
+        const unsigned dr = (unsigned)std::abs((int)((a >> 16) & 0xFFu) -
+                                               (int)((b >> 16) & 0xFFu));
+        const unsigned dg = (unsigned)std::abs((int)((a >> 8) & 0xFFu) -
+                                               (int)((b >> 8) & 0xFFu));
+        const unsigned db = (unsigned)std::abs((int)(a & 0xFFu) -
+                                               (int)(b & 0xFFu));
+        const unsigned pixel_difference = dr + dg + db;
+        difference += pixel_difference;
+        if (pixel_difference > 320u) large_changes++;
+        samples++;
+    }
+    return samples && large_changes * 4u > samples * 3u &&
+           difference > (uint64_t)samples * 360u;
+}
+
+static void smooth_60_present(uint32_t* pixels, uint32_t width, uint32_t height,
+                              bool eligible) {
+    if (!eligible || !pixels || !g_smooth_60fps.load(std::memory_order_acquire)) {
+        if (g_smooth_60_state.have_source) smooth_60_reset();
+        return;
+    }
+
+    Smooth60State& state = g_smooth_60_state;
+    if (!state.armed_announced) {
+        std::fprintf(stdout, "psxrecomp: 60 FPS smoothing armed\n");
+        state.armed_announced = true;
+    }
+    const size_t count = (size_t)width * height;
+    if (!count) {
+        smooth_60_reset();
+        return;
+    }
+
+    const uint64_t hash = smooth_60_frame_hash(pixels, count);
+    if (!state.have_source || state.width != width || state.height != height) {
+        state.previous_source.assign(pixels, pixels + count);
+        state.source_hash = hash;
+        state.width = width;
+        state.height = height;
+        state.have_source = true;
+        state.previous_was_duplicate = false;
+        return;
+    }
+
+    const bool duplicate = hash == state.source_hash &&
+        std::memcmp(pixels, state.previous_source.data(), count * sizeof(uint32_t)) == 0;
+    if (duplicate) {
+        /* The exact current guest image is already in pixels. This duplicate
+         * confirms the title's 30 Hz cadence and arms interpolation for the
+         * next distinct image. */
+        state.previous_was_duplicate = true;
+        return;
+    }
+
+    const bool interpolate = state.previous_was_duplicate &&
+        !smooth_60_scene_cut(pixels, state.previous_source.data(), count);
+    state.previous_was_duplicate = false;
+    state.source_hash = hash;
+    if (!interpolate) {
+        std::copy(pixels, pixels + count, state.previous_source.begin());
+        return;
+    }
+
+    if (!state.announced) {
+        std::fprintf(stdout,
+            "psxrecomp: 60 FPS smoothing active (30 Hz guest timing preserved)\n");
+        state.announced = true;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t current = pixels[i];
+        const uint32_t previous = state.previous_source[i];
+        state.previous_source[i] = current; /* retain the exact, unblended source */
+        pixels[i] = 0xFF000000u |
+            (((current & 0x00FEFEFEu) >> 1) + ((previous & 0x00FEFEFEu) >> 1));
+    }
+}
+
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
@@ -318,6 +454,11 @@ static std::atomic<int> g_web_pause_request{0};
 static uint16_t g_web_input_sequence[128];
 static std::atomic<int> g_web_sequence_length{0};
 static std::atomic<int> g_web_sequence_position{0};
+static std::atomic<int> g_web_pepsiman_level_action{0};
+static std::atomic<int> g_web_pepsiman_level_stage{0};
+static std::atomic<int> g_web_pepsiman_level_scene{1};
+static std::atomic<int> g_web_pepsiman_level_route{0};
+static std::atomic<int> g_web_pepsiman_unlimited_lives{0};
 static int g_web_start_was_down = 0;
 #endif
 
@@ -1299,6 +1440,31 @@ static void load_keyboard_config(const char* argv0) {
 }
 
 #if defined(PSX_WEB)
+extern "C" void gte_geometry_correction_set(int enabled);
+extern "C" void gpu_texture_correction_set(int enabled);
+extern "C" uint32_t gpu_texture_correction_hits(void);
+extern "C" uint32_t gte_geometry_correction_hits(void);
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_geometry_correction(int enabled) {
+    gte_geometry_correction_set(enabled);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_texture_correction(int enabled) {
+    gpu_texture_correction_set(enabled);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
+    g_smooth_60fps.store(enabled ? 1 : 0, std::memory_order_release);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t psx_web_texture_correction_hits(void) {
+    return gpu_texture_correction_hits();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t psx_web_geometry_correction_hits(void) {
+    return gte_geometry_correction_hits();
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_keybind(uint32_t button,
                                                           uint32_t scancode) {
     if (button >= (uint32_t)PSX_KB_COUNT || scancode >= (uint32_t)SDL_NUM_SCANCODES)
@@ -1332,22 +1498,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_get_cdda_track(void) {
     return cdrom_cdda_track();
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_restart_level(void) {
-    /* Pepsiman has no verified same-level restart command. The commonly
-     * published L1+R1+Select+Start chord was tested against SLPS-01762 and
-     * returns to the main menu. Keep this export inert until the game's scene
-     * reload path has been identified; never strand the guest in PAUSE. */
-    return 0;
-}
-
-extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_consume_pause_request(void) {
-    return g_web_pause_request.exchange(0, std::memory_order_acq_rel);
-}
-
-extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_return_to_title(void) {
+static int psx_web_pepsiman_return_sequence(void) {
     /* Verified on SLPS-01762: enter the game's PAUSE state, let its scene
-     * settle, then hold L1+R1+Select+Start. The command must be held because
-     * the game does not poll it on every vblank. */
+     * settle, then hold L1+R1+Select+Start. In normal play this returns to the
+     * main menu; in Free Play it returns to the native stage selector. */
     uint16_t sequence[112];
     int n = 0;
     for (int i = 0; i < 3;  i++) sequence[n++] = 0xFFF7u; /* Start */
@@ -1356,6 +1510,194 @@ extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_return_to_title(void) {
     for (int i = 0; i < 12; i++) sequence[n++] = 0xFFFFu; /* release */
     psx_web_arm_input_sequence(sequence, n);
     return 1;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_restart_level(void) {
+    return psx_web_pepsiman_return_sequence();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_consume_pause_request(void) {
+    return g_web_pause_request.exchange(0, std::memory_order_acq_rel);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_pepsiman_set_free_play(int enabled) {
+    /* SLPS-01762's persistent Free Play unlock is the big-endian-looking
+     * halfword 0x0100 at 0x800958A4 (little-endian bytes 00 01). Change only
+     * this live copy; the game's memory-card data remains untouched. */
+    psx_write_half(0x800958A4u, enabled ? 0x0100u : 0u);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_get_scene(void) {
+    /* SLPS-01762 stores one linear level index (0..11) and computes stage /
+     * scene by division and remainder by three in the original executable. */
+    int level = (int)psx_read_byte(0x80095830u);
+    return (level >= 0 && level < 12) ? (level % 3) + 1 : 0;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_get_stage(void) {
+    int level = (int)psx_read_byte(0x80095830u);
+    return (level >= 0 && level < 12) ? (level / 3) + 1 : 0;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_pepsiman_set_unlimited_lives(int enabled) {
+    g_web_pepsiman_unlimited_lives.store(enabled ? 1 : 0, std::memory_order_release);
+    if (enabled) psx_write_half(0x80095770u, 99u);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_get_lives(void) {
+    return (int)psx_read_half(0x80095770u);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_is_main_menu(void) {
+    /* SLPS-01762 keeps the top-level flow state at 8 for both menus. The
+     * active callback distinguishes the normal menu from Free Play. */
+    return psx_read_half(0x80095880u) == 8u &&
+           psx_read_word(0x80095884u) == 0x800A7318u;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_is_free_play_selector(void) {
+    return psx_read_half(0x80095880u) == 8u &&
+           psx_read_word(0x80095884u) == 0x800A732Cu;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_open_free_play(void) {
+    /* Main menu starts on GAME START. A short Down edge selects FREE PLAY;
+     * Circle confirms in this Japanese release. */
+    uint16_t sequence[32];
+    int n = 0;
+    for (int i = 0; i < 3;  i++) sequence[n++] = 0xFFBFu; /* Down */
+    for (int i = 0; i < 8;  i++) sequence[n++] = 0xFFFFu;
+    for (int i = 0; i < 12; i++) sequence[n++] = 0xDFFFu; /* Circle */
+    for (int i = 0; i < 8;  i++) sequence[n++] = 0xFFFFu;
+    psx_web_arm_input_sequence(sequence, n);
+    return 1;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_select_level(int stage,
+                                                                    int scene) {
+    if (stage < 0 || stage > 3 || scene < 1 || scene > 3) return 0;
+    /* These are the native Free Play cursor values. Writing them was verified
+     * across Stage 1/2 and Scene 1/2; the game redraws the selector from the
+     * same values and its own Circle handler performs the real scene load. */
+    psx_write_byte(0x80095998u, (uint8_t)stage);
+    psx_write_byte(0x80095984u, (uint8_t)scene);
+    uint16_t sequence[24];
+    int n = 0;
+    for (int i = 0; i < 16; i++) sequence[n++] = 0xDFFFu; /* Circle */
+    for (int i = 0; i < 8;  i++) sequence[n++] = 0xFFFFu;
+    psx_web_arm_input_sequence(sequence, n);
+    return 1;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_leave_selector(void) {
+    uint16_t sequence[20];
+    int n = 0;
+    for (int i = 0; i < 12; i++) sequence[n++] = 0xBFFFu; /* Cross / cancel */
+    for (int i = 0; i < 8;  i++) sequence[n++] = 0xFFFFu;
+    psx_web_arm_input_sequence(sequence, n);
+    return 1;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_request_level(int stage,
+                                                                      int scene,
+                                                                      int route) {
+    if (stage < 0 || stage > 3 || scene < 1 || scene > 3 || route < 0 || route > 2)
+        return 0;
+    int action = g_web_pepsiman_level_action.load(std::memory_order_acquire);
+    if (action == 1 || action == 2) return 0;
+    g_web_pepsiman_level_stage.store(stage, std::memory_order_release);
+    g_web_pepsiman_level_scene.store(scene, std::memory_order_release);
+    g_web_pepsiman_level_route.store(route, std::memory_order_release);
+    g_web_pepsiman_level_action.store(1, std::memory_order_release);
+    return 1;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_pepsiman_level_action_status(void) {
+    return g_web_pepsiman_level_action.load(std::memory_order_acquire);
+}
+
+/* Drive the whole level-selection handshake on emulated vblanks. Browser
+ * timers can be throttled and CD audio can stop between scenes, so neither is
+ * suitable for sequencing guest input. route: 0=campaign, 1=Free Play level,
+ * 2=already at the selector. Returns a pad override or -1 when idle. */
+static int psx_web_pepsiman_level_action_tick(void) {
+    static int phase = 0;
+    static int wait_frames = 0;
+    static int pulse_frame = 0;
+    static int attempts = 0;
+    static int stage = 0;
+    static int scene = 1;
+    static int route = 0;
+
+    int action = g_web_pepsiman_level_action.load(std::memory_order_acquire);
+    if (action == 1) {
+        stage = g_web_pepsiman_level_stage.load(std::memory_order_acquire);
+        scene = g_web_pepsiman_level_scene.load(std::memory_order_acquire);
+        route = g_web_pepsiman_level_route.load(std::memory_order_acquire);
+        phase = route == 2 ? 3 : 1;
+        wait_frames = route == 2 ? 12 : 0;
+        pulse_frame = 0;
+        attempts = 0;
+        psx_write_half(0x800958A4u, 0x0100u);
+        g_web_pepsiman_level_action.store(2, std::memory_order_release);
+        if (route != 2) psx_web_pepsiman_return_sequence();
+        return 0xFFFF;
+    }
+    if (action != 2) return -1;
+
+    int sequence_active = g_web_sequence_length.load(std::memory_order_acquire) > 0;
+    if (phase == 1) {
+        if (sequence_active) return 0xFFFF;
+        /* `route` is more reliable than the game's reused menu callback slots:
+         * campaign returns to the main menu; Free Play returns to its selector.
+         * All waits are emulated vblanks, so slower hosts do not alter timing. */
+        if (wait_frames++ < 180) return 0xFFFF;
+        wait_frames = 0;
+        if (route == 0) {
+            psx_web_pepsiman_open_free_play();
+            phase = 2;
+        } else {
+            phase = 3;
+            wait_frames = 12;
+        }
+        return 0xFFFF;
+    }
+    if (phase == 2) {
+        if (sequence_active) return 0xFFFF;
+        if (wait_frames++ < 180) return 0xFFFF;
+        phase = 3;
+        wait_frames = 12;
+        return 0xFFFF;
+    }
+    if (phase == 3) {
+        if (wait_frames > 0) {
+            wait_frames--;
+            return 0xFFFF;
+        }
+        psx_write_byte(0x80095998u, (uint8_t)stage);
+        psx_write_byte(0x80095984u, (uint8_t)scene);
+        if (attempts > 0 && psx_read_half(0x80095880u) != 8u) {
+            psx_write_half(0x800958A4u, 0u);
+            g_web_pepsiman_level_action.store(3, std::memory_order_release);
+            return 0xFFFF;
+        }
+        int word = pulse_frame < 12 ? 0xDFFF : 0xFFFF;
+        pulse_frame++;
+        if (pulse_frame >= 48) {
+            pulse_frame = 0;
+            attempts++;
+            if (attempts >= 5) {
+                psx_write_half(0x800958A4u, 0u);
+                g_web_pepsiman_level_action.store(-1, std::memory_order_release);
+            }
+        }
+        return word;
+    }
+    return 0xFFFF;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int psx_web_return_to_title(void) {
+    return psx_web_pepsiman_return_sequence();
 }
 #endif
 
@@ -2023,6 +2365,11 @@ static void sdl_vblank_present(void) {
         SDL_Delay(16);
     }
     starvation_watchdog_heartbeat();
+    /* SLPS-01762 lives/people counter. Pinning the live halfword is equivalent
+     * to the established 80095770 0063 Action Replay code and does not modify
+     * the memory-card profile. */
+    if (g_web_pepsiman_unlimited_lives.load(std::memory_order_acquire))
+        psx_write_half(0x80095770u, 99u);
 #endif
 #ifndef PSX_NO_DEBUG_TOOLS
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
@@ -2047,6 +2394,8 @@ static void sdl_vblank_present(void) {
 #if defined(PSX_WEB)
     /* Short frontend-authored button chords (pause-menu actions) join the
      * normal input path at the same frame boundary as physical controls. */
+    int pepsiman_level_override = psx_web_pepsiman_level_action_tick();
+    if (pepsiman_level_override >= 0) override = pepsiman_level_override;
     int sequence_length = g_web_sequence_length.load(std::memory_order_acquire);
     int sequence_position = g_web_sequence_position.load(std::memory_order_acquire);
     if (sequence_position < sequence_length) {
@@ -2315,6 +2664,7 @@ static void sdl_vblank_present(void) {
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
+            smooth_60_present(nullptr, 0, 0, false);
             present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
                                 (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
@@ -2470,6 +2820,15 @@ static void sdl_vblank_present(void) {
             }
         }
 
+        /* Pepsiman's original fixed-step loop stays at 30 Hz. The software
+         * presenter fills its otherwise duplicated vblank with a temporal
+         * midpoint, producing a smooth 59.94 Hz output without accelerating
+         * gameplay or audio. FMV/24-bit and GPU-direct paths remain exact. */
+        smooth_60_present(sdl_pixel_buf,
+                          present_w * (uint32_t)active_scale,
+                          h * (uint32_t)active_scale,
+                          !g_gl_active && !g_vk_active && !di.depth24 && !fmv_frame);
+
         /* Frame blending (CRT-persistence masker for 30fps double-buffered
          * content). Some games (e.g. Crash Bash menus/characters) leave a
          * dynamic object in only one of the two display buffers per 30fps cycle,
@@ -2488,7 +2847,8 @@ static void sdl_vblank_present(void) {
             }
             const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
                                    !di.depth24 && active_scale == 1;
-            if (blend_cfg && simple_sw) {
+            if (blend_cfg && simple_sw &&
+                !g_smooth_60fps.load(std::memory_order_acquire)) {
                 static uint32_t prev_buf[640 * 512];
                 static uint32_t prev_px = 0;
                 const uint32_t npx = present_w * h;
@@ -3080,6 +3440,11 @@ int main(int argc, char** argv) {
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_SMOOTH_60FPS")) {
+        g_smooth_60fps.store(atoi(e) ? 1 : 0, std::memory_order_release);
+        std::fprintf(stdout, "psxrecomp: 60 FPS smoothing = %s\n",
+                     atoi(e) ? "on" : "off");
+    }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used

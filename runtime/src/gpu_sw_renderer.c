@@ -50,6 +50,11 @@ static uint16_t *g_hr      = NULL;
 static int       g_scale   = 1;
 static int       g_hr_w    = VRAM_WIDTH;
 static int       g_hr_h    = VRAM_HEIGHT;
+static int       g_precise_valid = 0;
+static int32_t   g_precise_x16[3], g_precise_y16[3];
+static int       g_perspective_valid = 0;
+static float     g_perspective_q[3];
+static uint32_t  g_perspective_triangles = 0;
 
 /* ---- Native-wide compositor (separate present surfaces) ------------------
  * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
@@ -489,6 +494,49 @@ void sw_renderer_set_scale(int scale) {
 
 int sw_renderer_scale(void) { return g_scale; }
 
+void sw_set_precise_triangle(int enabled,
+                             int32_t x0, int32_t y0,
+                             int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2) {
+    g_precise_valid = enabled ? 1 : 0;
+    g_precise_x16[0] = x0; g_precise_y16[0] = y0;
+    g_precise_x16[1] = x1; g_precise_y16[1] = y1;
+    g_precise_x16[2] = x2; g_precise_y16[2] = y2;
+}
+
+void sw_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2) {
+    g_perspective_valid = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    g_perspective_q[0] = q0;
+    g_perspective_q[1] = q1;
+    g_perspective_q[2] = q2;
+    if (g_perspective_valid) g_perspective_triangles++;
+}
+
+uint32_t sw_perspective_triangle_count(void) {
+    return g_perspective_triangles;
+}
+
+static inline int precise_scaled(int axis, int vertex, int fallback, int scale) {
+    if (!g_precise_valid) return fallback * scale;
+    int64_t fixed = axis ? g_precise_y16[vertex] : g_precise_x16[vertex];
+    int64_t scaled = fixed * scale;
+    if (scaled >= 0) return (int)((scaled + 0x8000) >> 16);
+    return -(int)((-scaled + 0x8000) >> 16);
+}
+
+static inline int precise_wide_x(int vertex, int fallback, int scale,
+                                 int dx, const WideBd *bd) {
+    if (g_precise_valid)
+        return precise_scaled(0, vertex, fallback, scale) + dx * scale;
+    return (wide_bd_x(bd, fallback) + dx) * scale;
+}
+
+static inline void precise_consumed(void) {
+    g_precise_valid = 0;
+    g_perspective_valid = 0;
+}
+
 void sw_set_texture_filter(int bilinear) { g_texture_filter = bilinear ? 1 : 0; }
 int  sw_texture_filter(void) { return g_texture_filter; }
 
@@ -722,14 +770,21 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_flat_triangle(&hr, x0*s, y0*s, x1*s, y1*s, x2*s, y2*s, color);
+        raster_flat_triangle(&hr,
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s),
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s),
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), color);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_flat_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, (wide_bd_x(&bd,x1)+dx)*s, y1*s, (wide_bd_x(&bd,x2)+dx)*s, y2*s, color);
+        raster_flat_triangle(&wt,
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s),
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s),
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), color);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */
@@ -836,14 +891,21 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_gouraud_triangle(&hr, x0*s, y0*s, c0, x1*s, y1*s, c1, x2*s, y2*s, c2);
+        raster_gouraud_triangle(&hr,
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), c0,
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), c1,
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), c2);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_gouraud_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, c0, (wide_bd_x(&bd,x1)+dx)*s, y1*s, c1, (wide_bd_x(&bd,x2)+dx)*s, y2*s, c2);
+        raster_gouraud_triangle(&wt,
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), c0,
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), c1,
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), c2);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */
@@ -855,22 +917,27 @@ static void raster_textured_triangle(const RTarget *t,
                                      int x1, int y1, int u1, int v1,
                                      int x2, int y2, int u2, int v2,
                                      uint16_t clut_x, uint16_t clut_y,
-                                     uint16_t texpage) {
+                                     uint16_t texpage,
+                                     int perspective,
+                                     float q0, float q1, float q2) {
     /* Sort by Y, keeping UV in sync */
     if (y0 > y1) {
         int tt;
         tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
         tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
+        float tq=q0; q0=q1; q1=tq;
     }
     if (y0 > y2) {
         int tt;
         tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
         tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
+        float tq=q0; q0=q2; q2=tq;
     }
     if (y1 > y2) {
         int tt;
         tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
         tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
+        float tq=q1; q1=q2; q2=tq;
     }
 
     int dy_total = y2 - y0;
@@ -895,13 +962,23 @@ static void raster_textured_triangle(const RTarget *t,
 
         float ua = u0 + (float)(u2 - u0) * alpha;
         float va = v0 + (float)(v2 - v0) * alpha;
+        float qa = q0 + (q2 - q0) * alpha;
+        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
+        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
         float ub, vb;
+        float qb, uqb, vqb;
         if (second_half) {
             ub = u1 + (float)(u2 - u1) * beta;
             vb = v1 + (float)(v2 - v1) * beta;
+            qb = q1 + (q2 - q1) * beta;
+            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
+            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
         } else {
             ub = u0 + (float)(u1 - u0) * beta;
             vb = v0 + (float)(v1 - v0) * beta;
+            qb = q0 + (q1 - q0) * beta;
+            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
+            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
         }
 
         if (xa > xb) {
@@ -909,6 +986,9 @@ static void raster_textured_triangle(const RTarget *t,
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
+            tf = qa; qa = qb; qb = tf;
+            tf = uqa; uqa = uqb; uqb = tf;
+            tf = vqa; vqa = vqb; vqb = tf;
         }
 
         int span = xb - xa;
@@ -921,6 +1001,13 @@ static void raster_textured_triangle(const RTarget *t,
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
+            if (perspective) {
+                float q = qa + (qb - qa) * t_val;
+                if (q > 1.0e-12f) {
+                    fu = (uqa + (uqb - uqa) * t_val) / q;
+                    fv = (vqa + (vqb - vqa) * t_val) / q;
+                }
+            }
 
             uint16_t texel = g_texture_filter
                 ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
@@ -937,7 +1024,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                uint16_t texpage) {
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
+    if (area2 == 0) { precise_consumed(); return; }
 
     if (g_texture_filter) {
         int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
@@ -947,22 +1034,31 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
 
     RTarget n = rt_native();
     raster_textured_triangle(&n, x0, y0, u0, v0, x1, y1, u1, v1,
-                             x2, y2, u2, v2, clut_x, clut_y, texpage);
+                             x2, y2, u2, v2, clut_x, clut_y, texpage,
+                             g_perspective_valid,
+                             g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_textured_triangle(&hr, x0*s, y0*s, u0, v0,
-                                 x1*s, y1*s, u1, v1,
-                                 x2*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+        raster_textured_triangle(&hr,
+                                 precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0,
+                                 precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1,
+                                 precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2,
+                                 clut_x, clut_y, texpage, g_perspective_valid,
+                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_textured_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0,
-                                 (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1,
-                                 (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+        raster_textured_triangle(&wt,
+                                 precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0,
+                                 precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1,
+                                 precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2,
+                                 clut_x, clut_y, texpage, g_perspective_valid,
+                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
+    precise_consumed();
 }
 
 static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
@@ -979,25 +1075,30 @@ static void raster_shaded_textured_triangle(const RTarget *t,
                                             int x2, int y2, int u2, int v2,
                                             int r2, int g2, int b2,
                                             uint16_t clut_x, uint16_t clut_y,
-                                            uint16_t texpage, int raw_texture) {
+                                            uint16_t texpage, int raw_texture,
+                                            int perspective,
+                                            float q0, float q1, float q2) {
     /* Sort by Y, keeping UV and color modulation in sync */
     if (y0 > y1) {
         int tt;
         tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
         tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
         tt=r0; r0=r1; r1=tt; tt=g0; g0=g1; g1=tt; tt=b0; b0=b1; b1=tt;
+        float tq=q0; q0=q1; q1=tq;
     }
     if (y0 > y2) {
         int tt;
         tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
         tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
         tt=r0; r0=r2; r2=tt; tt=g0; g0=g2; g2=tt; tt=b0; b0=b2; b2=tt;
+        float tq=q0; q0=q2; q2=tq;
     }
     if (y1 > y2) {
         int tt;
         tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
         tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
         tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
+        float tq=q1; q1=q2; q2=tq;
     }
 
     int dy_total = y2 - y0;
@@ -1022,20 +1123,29 @@ static void raster_shaded_textured_triangle(const RTarget *t,
 
         float ua = u0 + (float)(u2 - u0) * alpha;
         float va = v0 + (float)(v2 - v0) * alpha;
+        float qa = q0 + (q2 - q0) * alpha;
+        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
+        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
         float ra = r0 + (float)(r2 - r0) * alpha;
         float ga = g0 + (float)(g2 - g0) * alpha;
         float ba = b0 + (float)(b2 - b0) * alpha;
 
-        float ub, vb, rb, gb, bb;
+        float ub, vb, qb, uqb, vqb, rb, gb, bb;
         if (second_half) {
             ub = u1 + (float)(u2 - u1) * beta;
             vb = v1 + (float)(v2 - v1) * beta;
+            qb = q1 + (q2 - q1) * beta;
+            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
+            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
             rb = r1 + (float)(r2 - r1) * beta;
             gb = g1 + (float)(g2 - g1) * beta;
             bb = b1 + (float)(b2 - b1) * beta;
         } else {
             ub = u0 + (float)(u1 - u0) * beta;
             vb = v0 + (float)(v1 - v0) * beta;
+            qb = q0 + (q1 - q0) * beta;
+            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
+            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
             rb = r0 + (float)(r1 - r0) * beta;
             gb = g0 + (float)(g1 - g0) * beta;
             bb = b0 + (float)(b1 - b0) * beta;
@@ -1046,6 +1156,9 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
+            tf = qa; qa = qb; qb = tf;
+            tf = uqa; uqa = uqb; uqb = tf;
+            tf = vqa; vqa = vqb; vqb = tf;
             tf = ra; ra = rb; rb = tf;
             tf = ga; ga = gb; gb = tf;
             tf = ba; ba = bb; bb = tf;
@@ -1061,6 +1174,13 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
+            if (perspective) {
+                float q = qa + (qb - qa) * t_val;
+                if (q > 1.0e-12f) {
+                    fu = (uqa + (uqb - uqa) * t_val) / q;
+                    fv = (vqa + (vqb - vqa) * t_val) / q;
+                }
+            }
             int mr = (int)(ra + (rb - ra) * t_val);
             int mg = (int)(ga + (gb - ga) * t_val);
             int mb = (int)(ba + (bb - ba) * t_val);
@@ -1086,7 +1206,7 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint16_t texpage, int raw_texture) {
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
+    if (area2 == 0) { precise_consumed(); return; }
 
     if (g_texture_filter) {
         int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
@@ -1104,26 +1224,30 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
         x0, y0, u0, v0, r0, g0, b0,
         x1, y1, u1, v1, r1, g1, b1,
         x2, y2, u2, v2, r2, g2, b2,
-        clut_x, clut_y, texpage, raw_texture);
+        clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+        g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
         raster_shaded_textured_triangle(&hr,
-            x0*s, y0*s, u0, v0, r0, g0, b0,
-            x1*s, y1*s, u1, v1, r1, g1, b1,
-            x2*s, y2*s, u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture);
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
         raster_shaded_textured_triangle(&wt,
-            (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0, r0, g0, b0,
-            (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1, r1, g1, b1,
-            (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture);
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */

@@ -186,6 +186,144 @@ static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 
+/* Optional visual-only geometry precision cache. The PS1-visible SXY FIFO
+ * remains integer and fully faithful; this side cache retains the discarded
+ * 16.16 projection fraction so the high-resolution software mirror can match
+ * a later GP0 polygon and place its vertices between native pixels. */
+#define GEOM_CACHE_SIZE 8192u
+struct GeomVertex {
+    uint32_t packed;
+    int32_t x16, y16;
+    uint32_t generation;
+};
+static GeomVertex s_geom_cache[GEOM_CACHE_SIZE];
+static uint32_t s_geom_generation = 1;
+static int s_geom_enabled = 0;
+static uint32_t s_geom_hits = 0;
+
+/* Exact GTE projection provenance for perspective texture correction. The
+ * recompiler/interpreters call gte_precision_store after SWC2 writes an SXY
+ * register into guest RAM. GPU DMA later supplies that exact RAM address, so
+ * depth lookup follows the packet rather than guessing from rounded X/Y. */
+struct PreciseProjection {
+    uint32_t packed;
+    int32_t x16, y16;
+    uint16_t z;
+    uint8_t valid;
+};
+static PreciseProjection s_precise_sxy[4] = {};
+
+#define PRECISION_STORE_SIZE 65536u
+struct PrecisionStoreEntry {
+    uint32_t addr;
+    PreciseProjection projection;
+    uint32_t generation;
+};
+static PrecisionStoreEntry s_precision_store[PRECISION_STORE_SIZE];
+static uint32_t s_precision_generation = 1;
+static int s_precision_tracking = 0;
+
+static inline uint32_t precision_hash(uint32_t addr) {
+    addr >>= 2;
+    addr ^= addr >> 11;
+    return (addr * 2654435761u) & (PRECISION_STORE_SIZE - 1u);
+}
+
+static inline int precision_ram_address(uint32_t addr, uint32_t *physical) {
+    uint32_t mapped = addr & 0x1FFFFFFFu;
+    if (mapped >= 0x00800000u) return 0;
+    *physical = mapped & 0x1FFFFCu;
+    return 1;
+}
+
+extern "C" void gte_precision_tracking_set(int enabled) {
+    s_precision_tracking = enabled ? 1 : 0;
+    s_precision_generation++;
+    if (!s_precision_generation) s_precision_generation = 1;
+}
+
+extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    if (!s_precision_tracking || reg < 12 || reg > 15) return;
+    int index = reg == 15 ? 2 : (int)reg - 12;
+    const PreciseProjection &projection = s_precise_sxy[index];
+    if (!projection.valid) return;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return;
+    PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
+    entry.addr = physical;
+    entry.projection = projection;
+    entry.generation = s_precision_generation;
+}
+
+extern "C" void gte_precision_invalidate_word(uint32_t addr) {
+    if (!s_precision_tracking) return;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return;
+    PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
+    if (entry.generation == s_precision_generation && entry.addr == physical)
+        entry.generation = 0;
+}
+
+extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
+                                        int32_t *x16, int32_t *y16,
+                                        uint16_t *z) {
+    if (!s_precision_tracking) return 0;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return 0;
+    const PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
+    if (entry.generation != s_precision_generation || entry.addr != physical ||
+        !entry.projection.valid || entry.projection.packed != packed)
+        return 0;
+    if (x16) *x16 = entry.projection.x16;
+    if (y16) *y16 = entry.projection.y16;
+    if (z) *z = entry.projection.z;
+    return entry.projection.z != 0;
+}
+
+static inline uint32_t geom_hash(uint32_t packed) {
+    packed ^= packed >> 16;
+    return (packed * 2654435761u) & (GEOM_CACHE_SIZE - 1u);
+}
+
+extern "C" void gte_geometry_correction_set(int enabled) {
+    s_geom_enabled = enabled ? 1 : 0;
+    s_geom_hits = 0;
+    s_geom_generation++;
+    if (!s_geom_generation) s_geom_generation = 1;
+}
+
+extern "C" int gte_geometry_correction_enabled(void) {
+    return s_geom_enabled;
+}
+
+extern "C" uint32_t gte_geometry_correction_hits(void) {
+    return s_geom_hits;
+}
+
+extern "C" int gte_geometry_correction_lookup(uint32_t packed,
+                                                int32_t *x16, int32_t *y16) {
+    if (!s_geom_enabled) return 0;
+    const GeomVertex &entry = s_geom_cache[geom_hash(packed)];
+    if (entry.generation != s_geom_generation || entry.packed != packed) return 0;
+    if (x16) *x16 = entry.x16;
+    if (y16) *y16 = entry.y16;
+    s_geom_hits++;
+    return 1;
+}
+
+static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
+    if (!s_geom_enabled) return;
+    /* Saturated off-screen projections are unsuitable for subpixel recovery. */
+    int32_t x = (int16_t)(packed & 0xFFFFu);
+    int32_t y = (int16_t)(packed >> 16);
+    if (x <= -0x400 || x >= 0x3FF || y <= -0x400 || y >= 0x3FF) return;
+    GeomVertex &entry = s_geom_cache[geom_hash(packed)];
+    entry.packed = packed;
+    entry.x16 = (int32_t)x16;
+    entry.y16 = (int32_t)y16;
+    entry.generation = s_geom_generation;
+}
+
 // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
 // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
 // infinity: squashing it toward centre leaves its geometry short of the
@@ -651,9 +789,20 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
         }
     }
     dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
-    int64_t sx = (gte->OFX + xterm) >> 16;
-    int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
+    int64_t sx16 = gte->OFX + xterm;
+    int64_t sy16 = gte->OFY + (int64_t)gte->IR2 * h_div_sz;
+    int64_t sx = sx16 >> 16;
+    int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
+    s_precise_sxy[0] = s_precise_sxy[1];
+    s_precise_sxy[1] = s_precise_sxy[2];
+    s_precise_sxy[2].packed = (uint32_t)gte->SXY[2];
+    s_precise_sxy[2].x16 = (int32_t)sx16;
+    s_precise_sxy[2].y16 = (int32_t)sy16;
+    s_precise_sxy[2].z = gte->SZ[3];
+    s_precise_sxy[2].valid = gte->SZ[3] != 0;
+    s_precise_sxy[3] = s_precise_sxy[2];
+    geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
     if (setMac0) {
@@ -1384,6 +1533,8 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
     GTEState gte;
     gte_load_data(gte, cpu);
     gte_mtc2(&gte, reg, val);
+    if (reg >= 12 && reg <= 15)
+        for (int i = 0; i < 4; i++) s_precise_sxy[i].valid = 0;
     for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
 }

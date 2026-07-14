@@ -1279,11 +1279,14 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                         : fmt::format("cpu->gte_data[{}]", rt);
                     std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
                     if (offset == 0) {
-                        code = gte_stall + swc2_store_pc + fmt::format("cpu->write_word({}, {});  /* swc2 gte[{}], ({}) */",
-                                          reg_name(rs), value, rt, reg_name(rs));
+                        code = gte_stall + swc2_store_pc + fmt::format(
+                            "cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
+                            reg_name(rs), value, reg_name(rs), rt, rt, reg_name(rs));
                     } else {
-                        code = gte_stall + swc2_store_pc + fmt::format("cpu->write_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
-                                          reg_name(rs), offset, value, rt, offset, reg_name(rs));
+                        code = gte_stall + swc2_store_pc + fmt::format(
+                            "cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                            reg_name(rs), offset, value, reg_name(rs), offset, rt,
+                            rt, offset, reg_name(rs));
                     }
                 }
                 break;
