@@ -200,6 +200,20 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         memcpy(cpu->cop0,     c->cop0,     sizeof cpu->cop0);
         memcpy(cpu->gte_data, c->gte_data, sizeof cpu->gte_data);
         memcpy(cpu->gte_ctrl, c->gte_ctrl, sizeof cpu->gte_ctrl);
+        /* The mult/div and GTE completion-stall deadlines (cpu->muldiv_ts_done,
+         * cpu->gte_ts_done) are ABSOLUTE guest-cycle values and are not part of
+         * CpuRegs (the struct predates them), so a restore leaves the LIVE
+         * session's values in place. If the restore moves psx_cycle_count
+         * BACKWARD — loading a state whose snapshot clock is older than the
+         * running session's — those deadlines can land billions of cycles "in
+         * the future", and the next MFLO/MFHI or GTE register read stalls the
+         * guest for that entire span (minutes of wall clock at reduced speed;
+         * long enough to trip the starvation watchdog). Re-anchor them to
+         * "already completed": any in-flight latency window at snapshot time
+         * was microscopic, and the hi/lo/GTE results the stall would guard are
+         * already materialized in the restored registers. */
+        cpu->muldiv_ts_done = 0;
+        cpu->gte_ts_done    = 0;
         return 1;
     }
     case BS_SEC_RAM:
