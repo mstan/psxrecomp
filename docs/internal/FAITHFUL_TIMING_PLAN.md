@@ -223,6 +223,56 @@ _wt-tomba2/psxrecomp/recompiler/build-t2 --target psxrecomp-game`. Regen:
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
+  Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
+  accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
+  flush at IRQ check / MMIO sync / savestate / advance-past-deadline.
+  Absorb/fudge still per-insn; guest totals at barriers unchanged; no MotK
+  regen. Dual headless MotK (`PSX_NETPLAY_TIMING=1`, pinned halves): heavy
+  25–50 band host med ≈39.7 fps / guest ≈21.9 ms/f / admit ≈3.1 (guest peer
+  ≈39.8 / 22.5 / 2.8) — same floor as pre-batch (~21 ms / ~40–42). Counter
+  publish was not the dual-peer tax; residual remains load-delay volume /
+  LLC under phase-locked VLC. Next: PGO retrain after hot-path edits, or
+  accept same-machine lockstep FMV floor.
+- **2026-07-21 (MotK FMV host cost — MDEC/IRQ/charge; dual still ~21 ms):**
+  Aimed to cut MotK FMV host work so two lockstep peers fit ~16.7 ms/f.
+  Shipped bit-exact host opts: MDEC MB output reserve (no per-byte
+  ensure_capacity), sparse-column IDCT, ch0 DMA burst feed
+  (`mdec_dma_write_words`), sticky-IRQ undeliverable early-out in
+  `psx_check_interrupts`, `psx_cyc_charge` pre-deadline bump on compiled
+  loads/steps. Dual headless MotK (`PSX_NETPLAY_TIMING=1`, pinned halves):
+  band 25–50 fps still guest ≈21 ms/f / fps ≈40–42 (admit ≈2.5–3) — same
+  floor as before. HARD_CAP 16K→64K tried, no gain (real CD/timer events
+  already shorten the deadline); reverted. Residual is phase-locked dual
+  VLC load-delay volume / LLC contention, not MDEC FIFO or present/admit.
+  Next: emitter-level load-charge batching for VLC leaves, PGO retrain
+  after these hot-path edits, or accept same-machine lockstep FMV floor.
+- **2026-07-21 (netplay FMV — lockstep guest inflation, not present/admit):**
+  User A/B: two windowed offline MotK intros fine; headless netplay FMV still
+  slow vs offline headless. Opt-in `PSX_NETPLAY_TIMING=1` splits the [FPS]
+  line into guest ms/f vs admit ms/f. Heavy FMV (~25–50 fps samples): guest
+  ≈21 ms/f, admit ≈3 ms/f (median) — frame time is dominated by the guest
+  quantum under phase-locked dual MDEC, not Swap and not INPUT_CONFIRM wait.
+  Offline headless same stretch is ~17 ms/f (≈57 fps). Pipelined CONFIRM
+  tried in recomp-net (tip publish, drain next tick) — no FPS gain on
+  localhost (~41→~41.5); reverted. Present-path / half-rate work is a dead
+  end for this regression. Next lever: reduce MotK FMV host cost so two
+  aligned peers fit a 16.7 ms budget (or accept same-machine lockstep floor).
+- **2026-07-21 (netplay FMV — restore present-before-admit):**
+  User confirmed early same-machine netplay FMV was ~50–60 and gameplay
+  under lockstep stays ~60 — so the rematch-safe `finish→admit→pace→present`
+  order was the FMV regression (expensive depth24 CPU present after admit).
+  Restored `finish→present→admit/pace` via RAII `NetplayVblankTail` (admit
+  on every return path; offline still paces before present). Kept half-rate
+  depth24 present skip + UDP `poll()` barrier; no `SDL_Delay(0)`. Verify
+  MotK intro FPS + tick-0 arm after rebuild.
+- **2026-07-21 (netplay FMV — re-land half-rate depth24 present):**
+  Windowed same-machine MotK netplay FMV was back at ~30–40 after the
+  rematch-safe `finish→admit→pace→present` order. Re-landed host-only
+  half-rate depth24 present: after admit, skip pace+Swap every other
+  depth24 vblank (present first, then alternate); admit/barrier unchanged
+  (no `SDL_Delay(0)` / present-before-admit). Offline path untouched.
+  Rebuild MotK `build-release` + verify intro FPS and tick-0 arm.
 - **2026-07-21 (lobby game_version + release pins):**
   WS lobby now carries `game_version` alongside `game_name` (create/list/join).
   Server rejects `version_mismatch` / `game_mismatch`; list can filter by either.

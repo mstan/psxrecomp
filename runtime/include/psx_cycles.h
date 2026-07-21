@@ -50,6 +50,12 @@ void psx_cycles_pc_sample_fire(void);
 /* Lockstep replay flag (defined in dirty_ram_interp.c). */
 extern int g_ls_replay_active;
 
+/* Deferred under-deadline charges (MotK VLC load-charge batching).
+ * psx_cyc_charge accumulates here; publish via psx_cyc_batch_flush /
+ * psx_advance_cycles before IRQ checks, MMIO, or any cycle read that must
+ * match the published counter. Guest totals at those barriers are unchanged. */
+extern uint32_t g_psx_cyc_batch;
+
 /* Advance guest time. The common production path is inlined: bump the
  * counter and only service devices when the next event deadline is due.
  * Guest-visible timing is unchanged (service_to_now replays exact events).
@@ -59,6 +65,22 @@ extern int g_ls_replay_active;
  * per-instruction charge. MotK VLC issues millions of advances/s; two add+
  * branch pairs there were pure host tax. */
 static inline void psx_advance_cycles(uint32_t cycles) {
+#if !defined(PSX_COSIM)
+    if (g_psx_cyc_batch) {
+        uint32_t b = g_psx_cyc_batch;
+        g_psx_cyc_batch = 0;
+        if (cycles <= UINT32_MAX - b) cycles += b;
+        else {
+            /* Extreme: publish b first, then continue with cycles. */
+            psx_cycle_count += (uint64_t)b;
+            if (!psx_in_device_service &&
+                (psx_next_service_cycle == 0u ||
+                 psx_cycle_count >= psx_next_service_cycle)) {
+                psx_devices_service_to_now();
+            }
+        }
+    }
+#endif
     if (cycles == 0u) return;
 #if defined(PSX_COSIM)
     psx_advance_cycles_slow(cycles);
@@ -84,7 +106,17 @@ static inline void psx_advance_cycles(uint32_t cycles) {
 #endif
 }
 
-/* Read accessor for telemetry. */
+/* Publish deferred charges (IRQ edge / MMIO / savestate). */
+static inline void psx_cyc_batch_flush(void) {
+#if !defined(PSX_COSIM)
+    uint32_t b = g_psx_cyc_batch;
+    if (!b) return;
+    g_psx_cyc_batch = 0;
+    psx_advance_cycles(b);
+#endif
+}
+
+/* Read accessor for telemetry (includes deferred batch). */
 uint64_t psx_get_cycle_count(void);
 
 /* Idle-loop cycle skip (see psx_cycles.c "Idle-loop cycle skip"). */

@@ -38,11 +38,40 @@
 extern "C" {
 #endif
 
+/* Load-charge batching (MotK VLC): under the published deadline, accumulate
+ * into g_psx_cyc_batch instead of storing psx_cycle_count every insn. Flush
+ * at IRQ edges / MMIO (psx_cyc_batch_flush). Absorb/fudge state still updates
+ * per insn — only the host counter publish is deferred. */
+static inline void psx_cyc_charge(uint32_t cycles) {
+    if (cycles == 0u) return;
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(g_ls_replay_active | g_event_step_conservative, 0)) {
+#else
+    if (g_ls_replay_active || g_event_step_conservative) {
+#endif
+        psx_advance_cycles(cycles);
+        return;
+    }
+    if (psx_in_device_service) {
+        psx_cycle_count += (uint64_t)cycles;
+        return;
+    }
+    uint64_t next = psx_cycle_count + (uint64_t)g_psx_cyc_batch + (uint64_t)cycles;
+    if (psx_next_service_cycle != 0u && next < psx_next_service_cycle) {
+        uint32_t sum = g_psx_cyc_batch + cycles;
+        if (sum >= g_psx_cyc_batch) { /* no uint32 wrap */
+            g_psx_cyc_batch = sum;
+            return;
+        }
+    }
+    psx_advance_cycles(cycles); /* publishes any pending batch first */
+}
+
 /* §1 base (Beetle cpu.cpp:795-798). */
 static inline void psx_cyc_base(CPUState* cpu) {
     uint8_t w = cpu->read_absorb_which;
     if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
-    else                     psx_advance_cycles(1u);
+    else                     psx_cyc_charge(1u);
 }
 
 /* GPR_DEPRES (Beetle cpu.cpp:702-705): zero ReadAbsorb[n] for every source/dest
@@ -114,7 +143,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             cpu->read_absorb_which = 0u;
             uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
             cpu->ld_absorb = 5u; /* main-RAM wait 3 + completion 2 */
-            psx_advance_cycles(fudge + 5u);
+            psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t off = phys & 0x1FFFFFu;
@@ -146,7 +175,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             cpu->read_absorb_which = 0u;
             uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
             cpu->ld_absorb = 5u;
-            psx_advance_cycles(fudge + 5u);
+            psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t off = phys & 0x1FFFFFu;

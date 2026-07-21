@@ -162,6 +162,13 @@ static void append_byte(uint8_t value) {
     mdec.output[mdec.output_size++] = value;
 }
 
+/* Reserve `bytes` of output room once (MotK FMV macroblocks write 512/768
+ * bytes each). Avoids ensure_output_capacity per channel byte. */
+static uint8_t *output_reserve(uint32_t bytes) {
+    if (!ensure_output_capacity(mdec.output_size + bytes)) return NULL;
+    return mdec.output + mdec.output_size;
+}
+
 static uint8_t input_byte(uint32_t byte_index) {
     uint16_t hw = mdec.input[byte_index >> 1];
     return (byte_index & 1u) ? (uint8_t)(hw >> 8) : (uint8_t)hw;
@@ -246,21 +253,38 @@ static void idct_block(int16_t *block) {
     }
 
     int16_t tmp[64];
-    /* pass 1 — int16 out, transposed */
+    /* pass 1 — int16 out, transposed. Skip all-zero source columns
+     * (sparse AC after zig-zag); zero column ⇒ zero tmp[*][col]. */
     for (int col = 0; col < 8; col++) {
+        const int16_t *src = block + col * 8;
+        int col_or = (int)src[0] | (int)src[1] | (int)src[2] | (int)src[3]
+                   | (int)src[4] | (int)src[5] | (int)src[6] | (int)src[7];
+        if (!col_or) {
+            for (int x = 0; x < 8; x++) tmp[x * 8 + col] = 0;
+            continue;
+        }
         for (int x = 0; x < 8; x++) {
             int sum = 0;
+            const int16_t *sc = mdec.scale + x * 8;
             for (int u = 0; u < 8; u++)
-                sum += (int)block[col * 8 + u] * (int)mdec.scale[x * 8 + u];
+                sum += (int)src[u] * (int)sc[u];
             tmp[x * 8 + col] = (int16_t)((sum + 0x4000) >> 15);
         }
     }
-    /* pass 2 — int8 out (Mask9ClampS8), no transpose */
+    /* pass 2 — int8 out (Mask9ClampS8), no transpose. Same zero-row skip. */
     for (int col = 0; col < 8; col++) {
+        const int16_t *src = tmp + col * 8;
+        int col_or = (int)src[0] | (int)src[1] | (int)src[2] | (int)src[3]
+                   | (int)src[4] | (int)src[5] | (int)src[6] | (int)src[7];
+        if (!col_or) {
+            for (int x = 0; x < 8; x++) block[col * 8 + x] = 0;
+            continue;
+        }
         for (int x = 0; x < 8; x++) {
             int sum = 0;
+            const int16_t *sc = mdec.scale + x * 8;
             for (int u = 0; u < 8; u++)
-                sum += (int)tmp[col * 8 + u] * (int)mdec.scale[x * 8 + u];
+                sum += (int)src[u] * (int)sc[u];
             block[col * 8 + x] = (int16_t)mask9_clamp_s8((sum + 0x4000) >> 15);
         }
     }
@@ -322,7 +346,9 @@ static int rgb_to_555_chan(uint8_t c) {
     return v;
 }
 
-static void append_rgb_pixel(int y, int cr, int cb) {
+/* Emit one YCbCr pixel into a pre-reserved output cursor (bit-identical to
+ * the former append_byte path). Returns advanced cursor. */
+static uint8_t *emit_rgb_pixel(uint8_t *out, int y, int cr, int cb) {
     /* Beetle YCbCr_to_RGB (mdec.cpp:293-304): /256 coeffs (359,-88/-183,454),
      * +0x80 rounding, the reduced-precision GREEN mask (-88*cb &~0x1F, -183*cr
      * &~0x07) — the hardware quirk our old /1024 path lacked, the main green-hue
@@ -341,34 +367,43 @@ static void append_rgb_pixel(int y, int cr, int cb) {
         uint16_t pixel_xor = (uint16_t)((mdec.output_bit15 ? 0x8000u : 0u)
                                         | (mdec.output_signed ? 0x4210u : 0u));
         packed ^= pixel_xor;
-        append_byte((uint8_t)packed);
-        append_byte((uint8_t)(packed >> 8));
-    } else {
-        /* 24bpp (mdec.cpp:370-393): rgb_xor = signed ? 0x80 : 0x00. */
-        uint8_t rgb_xor = mdec.output_signed ? 0x80u : 0x00u;
-        append_byte((uint8_t)(ru ^ rgb_xor));
-        append_byte((uint8_t)(gu ^ rgb_xor));
-        append_byte((uint8_t)(bu ^ rgb_xor));
+        out[0] = (uint8_t)packed;
+        out[1] = (uint8_t)(packed >> 8);
+        return out + 2;
     }
+    /* 24bpp (mdec.cpp:370-393): rgb_xor = signed ? 0x80 : 0x00. */
+    uint8_t rgb_xor = mdec.output_signed ? 0x80u : 0x00u;
+    out[0] = (uint8_t)(ru ^ rgb_xor);
+    out[1] = (uint8_t)(gu ^ rgb_xor);
+    out[2] = (uint8_t)(bu ^ rgb_xor);
+    return out + 3;
 }
 
 static void append_luma_block(const int16_t *yblk) {
-    for (int i = 0; i < 64; i++) {
-        append_byte(to_output_u8(yblk[i]));
-    }
+    uint8_t *out = output_reserve(64u);
+    if (!out) return;
+    for (int i = 0; i < 64; i++) out[i] = to_output_u8(yblk[i]);
+    mdec.output_size += 64u;
 }
 
 static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                     const int16_t yblk[4][64]) {
+    /* 16×16: 512 bytes @15bpp, 768 @24bpp — reserve once per MB. */
+    uint32_t need = (mdec.output_depth == 3) ? 512u : 768u;
+    uint8_t *out = output_reserve(need);
+    if (!out) return;
+    uint8_t *p = out;
     for (int py = 0; py < 16; py++) {
         for (int px = 0; px < 16; px++) {
             int y_index = (py >= 8 ? 2 : 0) + (px >= 8 ? 1 : 0);
             int lx = px & 7;
             int ly = py & 7;
             int chroma = (px >> 1) + (py >> 1) * 8;
-            append_rgb_pixel(yblk[y_index][lx + ly * 8], crblk[chroma], cbblk[chroma]);
+            p = emit_rgb_pixel(p, yblk[y_index][lx + ly * 8],
+                               crblk[chroma], cbblk[chroma]);
         }
     }
+    mdec.output_size += need;
 }
 
 /* Monotonic count of decode invocations — the frontend FMV detector samples
@@ -566,12 +601,50 @@ void mdec_dma_write_word(uint32_t value) {
     write_data(value);
 }
 
+/* Feed up to `max_words` from a contiguous LE word source (DMA ch0). Stops
+ * early if the FIFO becomes not-ready after a decode completes mid-burst.
+ * Guest bytes + decode triggers match N× mdec_dma_write_word. */
+uint32_t mdec_dma_write_words(const uint32_t *src, uint32_t max_words) {
+    uint32_t moved = 0;
+    while (moved < max_words) {
+        if (!mdec_dma_write_ready()) break;
+        /* Fast fill while a DECODE/QUANT/SCALE command is collecting input —
+         * same halfword packing + single execute_command as write_data. */
+        if (mdec.busy && mdec.input_count < mdec.expected_halfwords) {
+            uint32_t need_hw = mdec.expected_halfwords - mdec.input_count;
+            uint32_t need_words = (need_hw + 1u) / 2u;
+            uint32_t n = max_words - moved;
+            if (n > need_words) n = need_words;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t value = src[moved++];
+                mdec.input[mdec.input_count++] = (uint16_t)value;
+                if (mdec.input_count < mdec.expected_halfwords) {
+                    mdec.input[mdec.input_count++] = (uint16_t)(value >> 16);
+                }
+            }
+            if (mdec.input_count >= mdec.expected_halfwords) {
+                execute_command();
+            }
+            continue;
+        }
+        write_data(src[moved++]);
+    }
+    return moved;
+}
+
 uint32_t mdec_dma_read_word(void) {
     uint32_t value = 0;
     uint32_t start_pos = mdec.output_pos;
-    for (uint32_t i = 0; i < 4u; i++) {
-        if (mdec.output_pos < mdec.output_size) {
-            value |= (uint32_t)mdec.output[mdec.output_pos++] << (i * 8u);
+    uint32_t avail = (start_pos < mdec.output_size)
+                   ? (mdec.output_size - start_pos) : 0u;
+    if (avail >= 4u) {
+        memcpy(&value, mdec.output + start_pos, sizeof(value));
+        mdec.output_pos = start_pos + 4u;
+    } else {
+        for (uint32_t i = 0; i < 4u; i++) {
+            if (mdec.output_pos < mdec.output_size) {
+                value |= (uint32_t)mdec.output[mdec.output_pos++] << (i * 8u);
+            }
         }
     }
     mdec.dma_out_words++;
@@ -586,6 +659,16 @@ uint32_t mdec_dma_read_word(void) {
         clear_output();
     }
     return value;
+}
+
+/* Drain up to `max_words` into a contiguous LE destination (DMA ch1). */
+uint32_t mdec_dma_read_words(uint32_t *dst, uint32_t max_words) {
+    uint32_t moved = 0;
+    while (moved < max_words && mdec.output_pos < mdec.output_size) {
+        dst[moved] = mdec_dma_read_word();
+        moved++;
+    }
+    return moved;
 }
 
 int mdec_dma_write_ready(void) {

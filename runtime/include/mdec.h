@@ -13,6 +13,9 @@ void mdec_write(uint32_t addr, uint32_t value);
 
 void mdec_dma_write_word(uint32_t value);
 uint32_t mdec_dma_read_word(void);
+/* Contiguous LE bursts — bit-identical to N× word helpers; MotK FMV DMA. */
+uint32_t mdec_dma_write_words(const uint32_t *src, uint32_t max_words);
+uint32_t mdec_dma_read_words(uint32_t *dst, uint32_t max_words);
 int mdec_dma_write_ready(void);
 int mdec_dma_read_ready(void);
 

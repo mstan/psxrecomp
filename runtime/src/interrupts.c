@@ -730,6 +730,7 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 }
 
 void psx_check_interrupts(CPUState* cpu) {
+    psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
 #define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
 #ifdef PSX_COSIM
@@ -737,6 +738,24 @@ void psx_check_interrupts(CPUState* cpu) {
 #define COSIM_IRQ_TAKE_PC() (g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc)
 #define COSIM_IRQ_NOTE(kind_) cosim_irq_note(cpu, (kind_), COSIM_IRQ_TAKE_PC(), g_dirty_safe_resume_pc, s_compiled_interrupt_resume_pc, cpu->cop0[COP0_SR])
 #endif
+
+    /* MotK VLC / FMV hot edge: sticky unmasked I_STAT (CD/VBlank) while
+     * IEc or IM2 is clear — no architectural delivery possible. Skip the
+     * mid-path bookkeeping / irq_deliver_eval that used to run every BB.
+     * Guest-visible timing unchanged (same non-delivery). LTO can collapse
+     * this into the VLC call sites. */
+    static uint32_t s_fast_maintenance;
+    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+        uint32_t sr = cpu->cop0[COP0_SR];
+        if (!(sr & 0x01u) || !(sr & (1u << 10))) {
+            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+                extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                debug_server_poll();
+            }
+            return;
+        }
+    }
 
     /* Genuine entry fast paths. Generated resident code calls this at every
      * basic-block edge, which can mean tens of millions of calls inside an FMV
@@ -757,7 +776,6 @@ void psx_check_interrupts(CPUState* cpu) {
      * Poll host maintenance periodically so save/load and the debug socket stay
      * responsive even when the guest spends a long time in this path. At the
      * observed 1M+ block edges/s this is sub-frame latency. */
-    static uint32_t s_fast_maintenance;
     if (g_idle_skip_enabled < 0) (void)psx_idle_skip_is_enabled();
     if (!in_exception && (i_stat & i_mask) == 0 && !s_defer_switch_pending) {
         if (g_idle_skip_enabled > 0) {
@@ -1580,7 +1598,7 @@ irq_deliver_eval:
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     uint32_t prev = s_compiled_interrupt_resume_pc;
     s_compiled_interrupt_resume_pc = resume_pc;
-    psx_check_interrupts(cpu);
+    psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
     s_compiled_interrupt_resume_pc = prev;
 }
 

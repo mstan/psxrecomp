@@ -17,6 +17,7 @@
 #endif
 
 uint64_t psx_cycle_count = 0;
+uint32_t g_psx_cyc_batch = 0;
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
 
@@ -105,8 +106,13 @@ static void advance_devices(uint32_t c) {
 #define PSX_DEADLINE_HARD_CAP 16384u
 
 static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here */
-static uint64_t s_next_service_cycle   = 0;  /* absolute; 0 = dirty, recompute  */
-static int      s_in_device_service    = 0;  /* re-entrancy guard               */
+/* Exported for the inlined psx_advance_cycles / psx_cyc_charge hot path. */
+uint64_t psx_next_service_cycle = 0;         /* absolute; 0 = dirty, recompute  */
+int      psx_in_device_service  = 0;         /* re-entrancy guard               */
+#define s_next_service_cycle psx_next_service_cycle
+#define s_in_device_service  psx_in_device_service
+static uint64_t s_next_watchdog        = 0;
+static uint64_t s_next_pc_sample       = 0;
 
 /* Absolute inclusive limit for dirty_ram_interp.c's exact one-cycle path.
  * Zero means that the next charge must visit psx_advance_cycles(). */
@@ -209,6 +215,7 @@ static void psx_devices_service_to_now(void) {
  * advance through service_to_now even when already synced — MotK FMV pays
  * that on every GPU/CD/MDEC MMIO touch. Recompute here instead. */
 void psx_devices_mmio_sync(void) {
+    psx_cyc_batch_flush();
     if (s_devices_synced_cycle != psx_cycle_count) {
         psx_devices_service_to_now();
     } else {
@@ -297,7 +304,7 @@ void psx_advance_cycles(uint32_t cycles) {
 }
 
 uint64_t psx_get_cycle_count(void) {
-    return psx_cycle_count;
+    return psx_cycle_count + (uint64_t)g_psx_cyc_batch;
 }
 
 /* ===== Idle-loop cycle skip (wait-loop elision, 2026-07-06) ==================
@@ -513,10 +520,22 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
  * would try to replay a bogus gap. Re-anchor devices at the restored cycle and
  * force a fresh deadline on the next charge. */
 void psx_cycles_resync_after_restore(void) {
+    g_psx_cyc_batch        = 0;
     s_devices_synced_cycle = psx_cycle_count;
     s_next_service_cycle   = 0;   /* recompute on next charge */
     s_in_device_service    = 0;
     g_psx_cycle_fast_limit = 0;
+}
+
+void psx_cycles_reset_for_boot(void) {
+    g_psx_cyc_batch        = 0;
+    psx_cycle_count        = 0;
+    s_devices_synced_cycle = 0;
+    s_next_service_cycle   = 0;
+    s_in_device_service    = 0;
+    g_psx_cycle_fast_limit = 0;
+    s_next_watchdog        = 0;
+    s_next_pc_sample       = 0;
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----

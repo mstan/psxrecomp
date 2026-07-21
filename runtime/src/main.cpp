@@ -315,6 +315,8 @@ static std::string s_fps_base_title;
 static FramePacer s_frame_pacer = { 0 };
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
+/* Netplay + depth24: present every other vblank (admit still every tick). */
+static int      s_netplay_depth24_present_skip = 0;
 static uint32_t s_fmv_skip_last_mdec = 0;
 static int      s_fmv_skip_hold = 0;
 
@@ -336,6 +338,7 @@ static void present_session_reset(void) {
     s_frame_pacer = FramePacer{ 0 };
     s_turbo_present_skip = 0;
     s_fmv_skip_present_skip = 0;
+    s_netplay_depth24_present_skip = 0;
     s_fmv_skip_last_mdec = 0;
     s_fmv_skip_hold = 0;
     smooth_60_reset();
@@ -2630,12 +2633,35 @@ static void capture_override_pad(int override_word, PsxNetPad* out) {
     out->connected = 1;
 }
 
+/* Opt-in netplay barrier split: guest quantum vs admit wait (PSX_NETPLAY_TIMING=1).
+ * Printed on the existing [FPS] line — no separate log files. */
+static int      s_np_timing_enabled = -1;
+static uint64_t s_np_admit_ticks = 0;
+static uint64_t s_np_guest_ticks = 0;
+static uint64_t s_np_last_admit_end = 0;
+static uint64_t s_np_timing_frames = 0;
+
+static int netplay_timing_on(void) {
+    if (s_np_timing_enabled < 0) {
+        const char *e = std::getenv("PSX_NETPLAY_TIMING");
+        s_np_timing_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return s_np_timing_enabled;
+}
+
 /* Stage local pad + poll admit until published. Parks the guest fiber when
  * called from the vblank callback (or before scheduler entry). Latches one
  * sample per sim tick; stalls on INPUT_CONFIRM desync. */
 static void netplay_barrier_admit(int override) {
     if (!psx_netplay_active()) return;
     static int desync_logged = 0;
+    const uint64_t admit_t0 =
+        netplay_timing_on() ? SDL_GetPerformanceCounter() : 0;
+    /* Guest quantum = time since previous admit returned (fiber ran). */
+    if (admit_t0 && s_np_last_admit_end && admit_t0 >= s_np_last_admit_end) {
+        s_np_guest_ticks += admit_t0 - s_np_last_admit_end;
+        s_np_timing_frames++;
+    }
     for (;;) {
         uint32_t dt = 0, lh = 0, rh = 0;
         /* Load apply/ready suppresses INPUT (and can sit silent for seconds on
@@ -2677,6 +2703,11 @@ static void netplay_barrier_admit(int override) {
         }
         if (psx_netplay_poll_admit()) {
             desync_logged = 0;
+            if (admit_t0) {
+                const uint64_t t1 = SDL_GetPerformanceCounter();
+                if (t1 >= admit_t0) s_np_admit_ticks += t1 - admit_t0;
+                s_np_last_admit_end = t1;
+            }
             return;
         }
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -2997,8 +3028,24 @@ static void sdl_vblank_present(void) {
                          s_fps_base_title.c_str(), fps, speed);
                 SDL_SetWindowTitle(sdl_window, title);
             }
-            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                         fps, speed, (unsigned long long)s_frame_count);
+            if (netplay_timing_on() && s_np_timing_frames > 0) {
+                const double invf = 1000.0 / (double)frequency;
+                const double admit_ms =
+                    (double)s_np_admit_ticks * invf / (double)s_np_timing_frames;
+                const double guest_ms =
+                    (double)s_np_guest_ticks * invf / (double)s_np_timing_frames;
+                std::fprintf(stderr,
+                    "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
+                    "guest=%.2f ms/f admit=%.2f ms/f (n=%llu)\n",
+                    fps, speed, (unsigned long long)s_frame_count,
+                    guest_ms, admit_ms, (unsigned long long)s_np_timing_frames);
+                s_np_admit_ticks = 0;
+                s_np_guest_ticks = 0;
+                s_np_timing_frames = 0;
+            } else {
+                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                             fps, speed, (unsigned long long)s_frame_count);
+            }
             std::fflush(stderr);
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
@@ -3111,12 +3158,32 @@ static void sdl_vblank_present(void) {
      * (below) for the interactive present path; it still covers the turbo /
      * FMV-skip paths that early-return before pacing.
      *
-     * Delay-sync netplay (pre-rematch order): finish the completed tick, then
-     * admit the next tick's pads (publish → SIO) BEFORE pace/present so both
-     * peers share the same input before host GL work. */
+     * Delay-sync netplay host FPS (MotK FMV): finish → present → admit/pace.
+     * Local Swap overlaps the peer's guest quantum; admit still runs every
+     * tick via the RAII tail (including early returns that skip present).
+     * Offline keeps pace-before-present. Barrier wait stays UDP poll — do
+     * not pair this order with SDL_Delay(0) busy-spin (tick-0 hang). */
+    struct NetplayVblankTail {
+        int  override_ = -1;
+        bool active_ = false;
+        bool skip_pace_ = false;
+        explicit NetplayVblankTail(int ov)
+            : override_(ov), active_(psx_netplay_active() != 0) {}
+        void skip_pace() { skip_pace_ = true; }
+        ~NetplayVblankTail() {
+            if (!active_) return;
+            if (psx_return_to_lobby_requested()) return;
+            netplay_barrier_admit(override_);
+            if (skip_pace_ || psx_return_to_lobby_requested()) return;
+            uint64_t perf_start = runtime_perf_section_begin();
+            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
+            latency_ring_mark(LAT_PACED);
+        }
+    } netplay_tail(override);
+
     if (psx_netplay_active()) {
         psx_netplay_finish_frame();
-        netplay_barrier_admit(override);
     } else if (g_headless) {
         sample_headless_pad_into_sio(override);
     } else {
@@ -3216,13 +3283,19 @@ static void sdl_vblank_present(void) {
                      turbo_loads_active && g_turbo_audio_sink_enabled);
 #endif
 
-    if (g_headless) return;
+    if (g_headless) {
+        netplay_tail.skip_pace();
+        return;
+    }
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
      * simulation advancing and the debug server polling, but removes frontend
      * presentation and wall-clock pacing. */
 #ifndef PSX_NO_DEBUG_TOOLS
-    if (debug_server_turbo_enabled()) return;
+    if (debug_server_turbo_enabled()) {
+        netplay_tail.skip_pace();
+        return;
+    }
 #endif
 
     /* Turbo mode: while TAB is held, skip both VRAM->ARGB conversion and
@@ -3236,7 +3309,10 @@ static void sdl_vblank_present(void) {
         const int TURBO_PRESENT_EVERY = 30;
         if (keys[SDL_SCANCODE_TAB]) {
             turbo_skip = (turbo_skip + 1) % TURBO_PRESENT_EVERY;
-            if (turbo_skip != 0) return;  /* skip render this frame */
+            if (turbo_skip != 0) {
+                netplay_tail.skip_pace();
+                return;  /* skip render this frame */
+            }
         } else {
             turbo_skip = 0;
         }
@@ -3254,7 +3330,10 @@ static void sdl_vblank_present(void) {
         g_turbo_loads_frames++;
         const int TL_PRESENT_EVERY = 30;
         s_turbo_present_skip = (s_turbo_present_skip + 1) % TL_PRESENT_EVERY;
-        if (s_turbo_present_skip != 0) return;
+        if (s_turbo_present_skip != 0) {
+            netplay_tail.skip_pace();
+            return;
+        }
     }
 
     /* FMV auto-skip: run uncapped (no wall-clock pacing) and suppress nearly all
@@ -3263,33 +3342,43 @@ static void sdl_vblank_present(void) {
     if (fmv_skip_active) {
         const int FMV_PRESENT_EVERY = 30;
         s_fmv_skip_present_skip = (s_fmv_skip_present_skip + 1) % FMV_PRESENT_EVERY;
-        if (s_fmv_skip_present_skip != 0) return;
+        if (s_fmv_skip_present_skip != 0) {
+            netplay_tail.skip_pace();
+            return;
+        }
     }
 
-    /* Wall-clock pacing: always runs once fast_boot has ended, even when the
-     * display is still disabled (e.g. game crt0 setup). Skipped only by the
-     * turbo and fast_boot early-returns above. Netplay admits first (above),
-     * then paces here with everyone else, then presents — pre-rematch order.
-     * frame_pacer_wait is the race-free replacement for the old open-coded
-     * loop whose double counter read could underflow into a ~24.7-day
-     * SDL_Delay (Bug B hard freeze). Use the rematch-resettable s_frame_pacer,
-     * not a function-local static. */
-    {
+    /* Netplay FMV: skip present every other depth24 vblank (admit still runs
+     * in the RAII tail). Present-first frame, then alternate. */
+    if (psx_netplay_active() && gpu_display_is_depth24()) {
+        if (s_netplay_depth24_present_skip) {
+            s_netplay_depth24_present_skip = 0;
+            netplay_tail.skip_pace();
+            return;
+        }
+        s_netplay_depth24_present_skip = 1;
+    } else {
+        s_netplay_depth24_present_skip = 0;
+    }
+
+    /* Offline wall-clock pacing before present. Netplay paces in NetplayVblankTail
+     * AFTER present so Swap overlaps the peer's guest quantum. */
+    if (!psx_netplay_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
         frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
-    }
-    latency_ring_mark(LAT_PACED);
+        latency_ring_mark(LAT_PACED);
 
-    /* Low-latency input: the early sample above is now ~one pacer-wait old.
-     * Refresh the device state and re-sample right before present so the next
-     * CPU frame reads near-fresh input (the dominant input->photon cost on a
-     * vsync-light box). Re-stamp the ring's input mark to measure from here. */
-    if (g_low_latency_input && !psx_netplay_active()) {
-        SDL_GameControllerUpdate();  /* refresh pad state after the wait */
-        SDL_PumpEvents();            /* refresh keyboard state */
-        sample_pad_into_sio(override);
-        latency_ring_restamp_input();
+        /* Low-latency input: the early sample above is now ~one pacer-wait old.
+         * Refresh the device state and re-sample right before present so the next
+         * CPU frame reads near-fresh input (the dominant input->photon cost on a
+         * vsync-light box). Re-stamp the ring's input mark to measure from here. */
+        if (g_low_latency_input) {
+            SDL_GameControllerUpdate();  /* refresh pad state after the wait */
+            SDL_PumpEvents();            /* refresh keyboard state */
+            sample_pad_into_sio(override);
+            latency_ring_restamp_input();
+        }
     }
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */

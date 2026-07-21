@@ -547,20 +547,43 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
         g_dma_cur_ch = 1; g_dma_cur_bcr = channels[1].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[1];
     }
-    while (a->remaining_words > 0 && words_budget > 0) {
-        if (ch == 0) {
+    /* Contiguous +4 ch0 (RAM→MDEC): feed via LE burst helper. Guest halfwords
+     * + decode triggers match the per-word loop; wraps / decrementing MADR
+     * and ch1 (needs psx_write_word watchers) stay on the word path. */
+    if (ch == 0 && addr_step == 4) {
+        extern uint8_t *memory_get_ram_ptr(void);
+        uint8_t *ram = memory_get_ram_ptr();
+        while (a->remaining_words > 0 && words_budget > 0) {
             if (!mdec_dma_write_ready()) break;
-            mdec_dma_write_word(psx_read_word(addr));
-        } else {
-            if (!mdec_dma_read_ready()) break;
-            g_dma_cur_madr = addr;
-            psx_write_word(addr, mdec_dma_read_word());
+            uint32_t n = a->remaining_words < words_budget
+                       ? a->remaining_words : words_budget;
+            uint32_t max_by_ram = (0x200000u - addr) / 4u;
+            if (max_by_ram == 0) break;
+            if (n > max_by_ram) n = max_by_ram;
+            uint32_t got =
+                mdec_dma_write_words((const uint32_t *)(ram + addr), n);
+            if (got == 0) break;
+            addr = (addr + got * 4u) & 0x1FFFFCu;
+            a->remaining_words -= got;
+            words_budget -= got;
+            moved += got;
         }
+    } else {
+        while (a->remaining_words > 0 && words_budget > 0) {
+            if (ch == 0) {
+                if (!mdec_dma_write_ready()) break;
+                mdec_dma_write_word(psx_read_word(addr));
+            } else {
+                if (!mdec_dma_read_ready()) break;
+                g_dma_cur_madr = addr;
+                psx_write_word(addr, mdec_dma_read_word());
+            }
 
-        addr = (addr + addr_step) & 0x1FFFFCu;
-        a->remaining_words--;
-        words_budget--;
-        moved++;
+            addr = (addr + addr_step) & 0x1FFFFCu;
+            a->remaining_words--;
+            words_budget--;
+            moved++;
+        }
     }
     if (mdec_writes_ram) { g_dma_cur_ch = -1; g_dma_exec_depth--; }
 
@@ -584,9 +607,22 @@ static void execute_ch0_mdec_in(void) {
 
     if (direction != 0) {
         mdec_debug_dma_in_start(addr, total_words);
-        for (uint32_t i = 0; i < total_words; i++) {
-            mdec_dma_write_word(psx_read_word(addr));
-            addr = (addr + addr_step) & 0x1FFFFCu;
+        if (addr_step == 4 && total_words > 0 &&
+            addr + total_words * 4u <= 0x200000u) {
+            extern uint8_t *memory_get_ram_ptr(void);
+            uint32_t got = mdec_dma_write_words(
+                (const uint32_t *)(memory_get_ram_ptr() + addr), total_words);
+            addr = (addr + got * 4u) & 0x1FFFFCu;
+            /* If the FIFO stalled mid-burst, finish any remainder word-wise. */
+            for (uint32_t i = got; i < total_words; i++) {
+                mdec_dma_write_word(psx_read_word(addr));
+                addr = (addr + 4u) & 0x1FFFFCu;
+            }
+        } else {
+            for (uint32_t i = 0; i < total_words; i++) {
+                mdec_dma_write_word(psx_read_word(addr));
+                addr = (addr + addr_step) & 0x1FFFFCu;
+            }
         }
         mdec_debug_dma_in_end(addr, total_words);
         channels[0].madr = addr;

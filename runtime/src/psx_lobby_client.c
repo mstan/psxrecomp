@@ -128,6 +128,8 @@ static int list_filter_version_strict(void)
     return gv && gv[0] && strcmp(gv, "dev") != 0;
 }
 
+static void queue_send(const char *json);
+
 static void queue_list_request(void)
 {
     char msg[384];
@@ -159,7 +161,6 @@ static int json_extract_object(const char *json, const char *key, char *out, siz
 static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out);
 static void ingest_match_caps_from_json(const char *json);
 static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatchCaps *caps);
-static void queue_send(const char *json);
 
 const char *psx_lobby_default_url(void)
 {

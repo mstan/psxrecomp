@@ -1,6 +1,7 @@
 #include "boot_state.h"
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "gpu_render.h"    /* gr_vram_transfer_in / gr_vram_transfer_out          */
+#include "psx_cycles.h"
 #include "pst_wire.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,6 +197,8 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
         uint8_t cyc[8];
         PstW w;
         pst_w_init(&w, cyc, sizeof cyc);
+        /* Publish deferred load-charge batch before snapshotting the clock. */
+        psx_cyc_batch_flush();
         ok = pst_w_u64(&w, psx_cycle_count) &&
              write_section(f, BS_SEC_CLOCK, cyc, 8);
     }
