@@ -883,6 +883,30 @@ static bool validate_disc_for_launch(const std::filesystem::path& path,
     return true;
 }
 
+static std::filesystem::path normalize_disc_path_for_launch(const std::filesystem::path& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p = fs::absolute(path, ec);
+    if (ec) p = path;
+
+    if (uppercase_ascii(p.extension().string()) == ".CUE") {
+        fs::path bin = p;
+        bin.replace_extension(".bin");
+        if (fs::exists(bin, ec)) {
+            fs::path abs = fs::absolute(bin, ec);
+            return ec ? bin : abs;
+        }
+        ec.clear();
+        bin.replace_extension(".BIN");
+        if (fs::exists(bin, ec)) {
+            fs::path abs = fs::absolute(bin, ec);
+            return ec ? bin : abs;
+        }
+    }
+
+    return p;
+}
+
 static bool validate_bios_for_launch(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) return false;
@@ -954,7 +978,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
                                                       const std::string& game_id,
                                                       const char* argv0) {
     if (disc_override && disc_override[0]) {
-        std::filesystem::path p = std::filesystem::absolute(disc_override);
+        std::filesystem::path p = normalize_disc_path_for_launch(disc_override);
         return validate_disc_for_launch(p, game_id) ? p : std::filesystem::path{};
     }
 
@@ -967,12 +991,16 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
             std::filesystem::path r = resolve_existing_runtime_path(config_disc.string().c_str(), argv0);
             if (!r.empty()) cd = r;
         }
+        cd = normalize_disc_path_for_launch(cd);
         if (std::filesystem::exists(cd) && validate_disc_for_launch(cd, game_id)) {
             return cd;
         }
     }
 
     std::filesystem::path cached = read_cached_path(argv0, "disc.cfg");
+    if (!cached.empty()) {
+        cached = normalize_disc_path_for_launch(cached);
+    }
     if (!cached.empty() && std::filesystem::exists(cached) &&
         validate_disc_for_launch(cached, game_id)) {
         return cached;
@@ -997,6 +1025,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
                 picked)) {
             return {};
         }
+        picked = normalize_disc_path_for_launch(picked);
         if (validate_disc_for_launch(picked, game_id)) {
             write_cached_path(argv0, "disc.cfg", picked);
             return picked;
@@ -4382,7 +4411,8 @@ int main(int argc, char** argv) {
             settings_bios_storage = us.bios_path.string();
             bios_path = settings_bios_storage.c_str();
         }
-        if (us.has_disc_path && !disc_override_path) resolved_disc = us.disc_path;
+        if (us.has_disc_path && !disc_override_path)
+            resolved_disc = normalize_disc_path_for_launch(us.disc_path);
         if (us.has_memcard_dir)                      memcard_dir   = us.memcard_dir;
         if (us.has_memcard1_path)    memcard1_path    = us.memcard1_path;
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
@@ -4870,7 +4900,10 @@ int main(int argc, char** argv) {
                     settings_bios_storage = seed.bios_path.string();
                     bios_path = settings_bios_storage.c_str();
                 }
-                if (seed.has_disc_path) resolved_disc = seed.disc_path;
+                if (seed.has_disc_path) {
+                    seed.disc_path = normalize_disc_path_for_launch(seed.disc_path);
+                    resolved_disc = seed.disc_path;
+                }
                 memcard1_enabled = seed.memcard1_enabled;
                 memcard2_enabled = seed.memcard2_enabled;
                 if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
