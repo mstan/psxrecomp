@@ -302,7 +302,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
 
     uint32_t text_size = image.code_size();
     if (text_size & 0xFFF) text_size = (text_size + 0xFFF) & ~0xFFFu;
-    const uint32_t stack = image.header.stack_base ? image.header.stack_base : 0x801FFFF0u;
+    const uint32_t stack = image.header.stack_base() ? image.header.stack_base() : 0x801FFFF0u;
     const std::string config = fmt::format(
         "[game]\n"
         "name = \"{}\"\n"

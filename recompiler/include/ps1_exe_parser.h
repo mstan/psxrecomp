@@ -9,6 +9,8 @@
 namespace PSXRecomp {
 
 // PS-X EXE header structure (2048 bytes)
+// Layout verified against SCPH1001.BIN, Gex (SLUS-00042), and Digimon World
+// (SLUS-01032) hex dumps, and matches tools/extract_psx_exe.py field offsets.
 #pragma pack(push, 1)
 struct PS1ExeHeader {
     // Offset 0x00-0x0F: Magic + padding
@@ -22,17 +24,22 @@ struct PS1ExeHeader {
     uint32_t load_address;   // RAM load address
     uint32_t file_size;      // Executable size (bytes)
 
-    // Offset 0x20-0x2F: Memfill (BSS section)
-    uint32_t unknown0;
-    uint32_t unknown1;
+    // Offset 0x20-0x2F: Extension fields
+    // Some titles (e.g. Digimon World) store a region marker at 0x28/0x2C
+    // whose start address and byte-size describe a post-code kernel-data
+    // area. Standard EXEs leave these zero.
+    uint32_t field_20;
+    uint32_t field_24;
+    uint32_t field_28;
+    uint32_t field_2C;
+
+    // Offset 0x30-0x37: Stack setup
+    uint32_t initial_sp;     // Stack pointer base (e.g. 0x801FFFF0)
+    uint32_t initial_sp_offset; // Stack pointer offset ($sp = base - offset)
+
+    // Offset 0x38-0x3F: Memfill (BSS section)
     uint32_t memfill_start;
     uint32_t memfill_size;
-
-    // Offset 0x30-0x3F: Stack setup
-    uint32_t initial_sp;     // Stack pointer
-    uint32_t initial_fp;     // Frame pointer
-    uint32_t stack_base;
-    uint32_t stack_offset;
 
     // Offset 0x40-0x7FF: Reserved (2048 - 64 bytes already used = 1984 bytes)
     uint8_t reserved[1984];
@@ -49,6 +56,12 @@ struct PS1ExeHeader {
 
     uint32_t bss_end() const {
         return memfill_start + memfill_size;
+    }
+
+    // Effective stack pointer (sp = initial_sp - initial_sp_offset).
+    // When initial_sp is 0 the runtime falls back to 0x801FFFF0.
+    uint32_t stack_base() const {
+        return initial_sp - initial_sp_offset;
     }
 };
 #pragma pack(pop)

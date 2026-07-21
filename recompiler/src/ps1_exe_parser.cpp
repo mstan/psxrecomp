@@ -243,8 +243,7 @@ std::optional<PS1Executable> PS1ExeParser::parse_buffer(
     to_kseg0(exe.header.load_address);
     to_kseg0(exe.header.memfill_start);
     to_kseg0(exe.header.initial_sp);
-    to_kseg0(exe.header.initial_fp);
-    to_kseg0(exe.header.stack_base);
+    to_kseg0(exe.header.initial_sp_offset);
 
     // Validate header
     if (!validate_header(exe.header, error_msg)) {

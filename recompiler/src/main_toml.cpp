@@ -202,8 +202,8 @@ int main(int argc, char* argv[]) {
     if (text_size & 0xFFF) {
         text_size = (text_size + 0xFFF) & ~0xFFFu;
     }
-    const uint32_t stack_base   = exe.header.stack_base != 0
-                                      ? exe.header.stack_base
+    const uint32_t stack_base   = exe.header.stack_base() != 0
+                                      ? exe.header.stack_base()
                                       : 0x801FFFF0u;
 
     // Generate TOML

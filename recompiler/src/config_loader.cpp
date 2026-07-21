@@ -711,7 +711,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             auto_hdr.load_address = exe->load_address();
             auto_hdr.entry_pc     = exe->entry_point();
             auto_hdr.text_size    = exe->code_size();
-            auto_hdr.stack_base   = exe->header.stack_base;
+            auto_hdr.stack_base   = exe->header.stack_base();
             // Round text_size up to next 4K page if it's not already
             // page-aligned (the runtime's overlay region floor uses this
             // as a guard, and the text segment in RAM is always fully

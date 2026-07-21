@@ -82,6 +82,56 @@ python tools/build_cli.py release
 The ready-to-use CLI archive is written to `dist/`. To package debug binaries
 instead, run `python tools/build_cli.py debug`.
 
+### Quick-start from this repository (Linux / macOS)
+
+This repository is a full development checkout that can recompile the BIOS and
+any game from disc. You can use it to set up and build new game projects.
+
+**One-time environment setup:**
+
+```sh
+# Install system dependencies (Debian/Ubuntu)
+sudo apt install build-essential cmake ninja-build pkg-config libsdl2-dev python3
+
+# Initialize submodules and build the recompiler
+./setup_recompiler.sh
+```
+
+This checks for prerequisites, initializes `lib/RmlUi` and `lib/freetype`,
+builds the `psxrecomp-game` and `psxrecomp-bios` recompiler binaries, and
+regenerates the BIOS C code from your `bios/SCPH1001.BIN`.
+
+**Set up a new game:**
+
+```sh
+./setup_game.sh "Game Name" path/to/disc.bin path/to/disc.cue
+```
+
+This single command:
+1. Extracts the PS-X EXE from the disc image via `tools/extract_psx_exe.py`
+2. Creates per-game function seeds at `seeds/<game>/seeds.txt`
+3. Generates a game-specific config file `game-<game>.toml`
+4. Auto-patches `runtime/CMakeLists.txt` with the game's CMake target
+5. Creates helper scripts: `build_<game>.sh`, `recomp_<game>.sh`, `run_<game>.sh`
+6. Runs the recompiler (whole-image discovery) to produce C code
+
+**Then build and play:**
+
+```sh
+./build_my_game.sh      # compiles the recompiled game into a native binary
+./run_my_game.sh        # launches the game
+```
+
+The game binary embeds a default path to its config file, so `--game` and
+`--disc` flags are only needed on the first run.
+
+**Multi-game layout.** Each game gets its own config (`game-<game>.toml`) and
+CMake target (`psx-<game>`). Running `setup_game.sh` for multiple games adds
+them side-by-side in `runtime/CMakeLists.txt`. Use the `--game` flag to select
+which config to load at runtime.
+
+**See also:** [`docs/BUILDING.md`](docs/BUILDING.md) for build troubleshooting.
+
 > **Where the project is headed.** Development so far has been **breadth-first**:
 > stand up as many games as possible and get them into a playable alpha, proving
 > the framework generalizes. That phase has largely delivered — seven titles now
