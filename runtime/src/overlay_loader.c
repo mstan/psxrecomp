@@ -2164,8 +2164,8 @@ static void init_callbacks(void) {
     s_callbacks.dispatch_call        = overlay_dispatch_call_probed;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
-    { extern void psx_advance_cycles(uint32_t cycles);
-      s_callbacks.advance_cycles     = psx_advance_cycles; }
+    /* Address of the header inline → out-of-line copy in this TU (host side). */
+    s_callbacks.advance_cycles     = psx_advance_cycles;
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;

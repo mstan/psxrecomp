@@ -1620,7 +1620,6 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * stealing the bus; modeling it needs the live steal count threaded out of the DMA
  * controller, and it can't be isolated by a static ruler. It remains an unmodeled
  * dynamic axis; the per-region device waits below are the static, validatable piece. */
-extern void psx_advance_cycles(uint32_t cycles);
 
 /* Runtime-only production cycle charge for data-load timing.  Overlay DLLs
  * flush their local pending-cycle accumulator before entering these host
