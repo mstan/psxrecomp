@@ -23,9 +23,11 @@ void psx_lobby_pump(void) {}
 void psx_lobby_request_list(void) {}
 int  psx_lobby_list_count(void) { return 0; }
 int  psx_lobby_list_get(int index, PsxLobbyRow *out) { (void)index; (void)out; return 0; }
+void psx_lobby_set_game_identity(const char *a, const char *b) { (void)a; (void)b; }
+const char *psx_lobby_game_version(void) { return PSX_GAME_VERSION; }
 int  psx_lobby_create(const char *a, const char *b, const char *c, const char *d,
-                      const PsxLobbyMatchCaps *e)
-{ (void)a; (void)b; (void)c; (void)d; (void)e; return -1; }
+                      const char *e, const PsxLobbyMatchCaps *f)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return -1; }
 int  psx_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
 int  psx_lobby_leave(void) { return -1; }
@@ -88,6 +90,8 @@ typedef struct {
     int in_lobby;
     int is_host;
     char my_bind[PSX_LOBBY_ENDPOINT_LEN];
+    char filter_game_name[PSX_LOBBY_NAME_LEN];
+    char filter_game_version[PSX_LOBBY_VERSION_LEN];
     PsxLobbyJoinInfo join;
     PsxLobbyMember members[PSX_LOBBY_MAX_MEMBERS];
     int member_count;
@@ -99,7 +103,48 @@ typedef struct {
     int pending_n;
 } LobbyClient;
 
-static LobbyClient g_lc = { .fd = -1 };
+static LobbyClient g_lc = {
+    .fd = -1,
+    .filter_game_version = PSX_GAME_VERSION,
+};
+
+static const char *effective_game_version(const char *override_ver)
+{
+    if (override_ver && override_ver[0]) {
+        return override_ver;
+    }
+    if (g_lc.filter_game_version[0]) {
+        return g_lc.filter_game_version;
+    }
+    return PSX_GAME_VERSION;
+}
+
+/* Release builds pin the lobby browser to our exact game_version.
+ * Non-release ("dev") shows all versions of our title so testers can see
+ * unofficial / mismatched hosts; join still requires an exact version match. */
+static int list_filter_version_strict(void)
+{
+    const char *gv = effective_game_version(NULL);
+    return gv && gv[0] && strcmp(gv, "dev") != 0;
+}
+
+static void queue_list_request(void)
+{
+    char msg[384];
+    const char *gn = g_lc.filter_game_name;
+    const char *gv = effective_game_version(NULL);
+    if (list_filter_version_strict() && (gn[0] || (gv && gv[0]))) {
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"list\",\"game_name\":\"%s\",\"game_version\":\"%s\"}",
+                 gn, gv ? gv : "dev");
+        queue_send(msg);
+    } else if (gn[0]) {
+        snprintf(msg, sizeof(msg), "{\"op\":\"list\",\"game_name\":\"%s\"}", gn);
+        queue_send(msg);
+    } else {
+        queue_send("{\"op\":\"list\"}");
+    }
+}
 
 static void match_caps_clear(PsxLobbyMatchCaps *c)
 {
@@ -114,6 +159,7 @@ static int json_extract_object(const char *json, const char *key, char *out, siz
 static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out);
 static void ingest_match_caps_from_json(const char *json);
 static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatchCaps *caps);
+static void queue_send(const char *json);
 
 const char *psx_lobby_default_url(void)
 {
@@ -476,7 +522,7 @@ static void handle_server_json(const char *json)
             snprintf(msg, sizeof(msg), "{\"op\":\"hello\",\"display_name\":\"%s\"}", g_lc.display_name);
             queue_send(msg);
         }
-        queue_send("{\"op\":\"list\"}");
+        queue_list_request();
         return;
     }
     if (strcmp(op, "lobby_list") == 0) {
@@ -526,6 +572,28 @@ static void handle_server_json(const char *json)
                     json_get_str(chunk, "lobby_id", g_lc.list[n].lobby_id, sizeof(g_lc.list[n].lobby_id));
                     json_get_str(chunk, "name", g_lc.list[n].name, sizeof(g_lc.list[n].name));
                     json_get_str(chunk, "game_name", g_lc.list[n].game_name, sizeof(g_lc.list[n].game_name));
+                    json_get_str(chunk, "game_version", g_lc.list[n].game_version,
+                                 sizeof(g_lc.list[n].game_version));
+                    if (!g_lc.list[n].game_version[0]) {
+                        strncpy(g_lc.list[n].game_version, "dev",
+                                sizeof(g_lc.list[n].game_version) - 1);
+                    }
+                    /* Drop lobbies that don't match our title (broadcast list
+                     * is unfiltered). Release builds also pin game_version;
+                     * "dev" keeps other versions visible for testing. */
+                    if (g_lc.filter_game_name[0] &&
+                        strcmp(g_lc.list[n].game_name, g_lc.filter_game_name) != 0) {
+                        p = end;
+                        continue;
+                    }
+                    if (list_filter_version_strict()) {
+                        const char *want_ver = effective_game_version(NULL);
+                        if (want_ver && want_ver[0] &&
+                            strcmp(g_lc.list[n].game_version, want_ver) != 0) {
+                            p = end;
+                            continue;
+                        }
+                    }
                     g_lc.list[n].player_count = json_get_int(chunk, "player_count", 0);
                     g_lc.list[n].max_slots = json_get_int(chunk, "max_slots", 2);
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
@@ -871,9 +939,32 @@ void psx_lobby_pump(void)
     }
 }
 
+void psx_lobby_set_game_identity(const char *game_name, const char *game_version)
+{
+    if (game_name) {
+        strncpy(g_lc.filter_game_name, game_name, sizeof(g_lc.filter_game_name) - 1);
+        g_lc.filter_game_name[sizeof(g_lc.filter_game_name) - 1] = '\0';
+    } else {
+        g_lc.filter_game_name[0] = '\0';
+    }
+    if (game_version && game_version[0]) {
+        strncpy(g_lc.filter_game_version, game_version, sizeof(g_lc.filter_game_version) - 1);
+        g_lc.filter_game_version[sizeof(g_lc.filter_game_version) - 1] = '\0';
+    } else {
+        strncpy(g_lc.filter_game_version, PSX_GAME_VERSION,
+                sizeof(g_lc.filter_game_version) - 1);
+        g_lc.filter_game_version[sizeof(g_lc.filter_game_version) - 1] = '\0';
+    }
+}
+
+const char *psx_lobby_game_version(void)
+{
+    return effective_game_version(NULL);
+}
+
 void psx_lobby_request_list(void)
 {
-    queue_send("{\"op\":\"list\"}");
+    queue_list_request();
     flush_pending();
 }
 
@@ -891,14 +982,23 @@ int psx_lobby_list_get(int index, PsxLobbyRow *out)
     return 1;
 }
 
-int psx_lobby_create(const char *name, const char *game_name, const char *password,
-                     const char *host_bind, const PsxLobbyMatchCaps *match_caps)
+int psx_lobby_create(const char *name, const char *game_name, const char *game_version,
+                     const char *password, const char *host_bind,
+                     const PsxLobbyMatchCaps *match_caps)
 {
     char msg[1536];
     char caps_json[512];
+    const char *gn;
+    const char *gv;
     int n;
     if (!psx_lobby_connected()) {
         return -1;
+    }
+    gn = game_name && game_name[0] ? game_name
+         : (g_lc.filter_game_name[0] ? g_lc.filter_game_name : "Game");
+    gv = effective_game_version(game_version);
+    if (game_name && game_name[0]) {
+        psx_lobby_set_game_identity(game_name, gv);
     }
     strncpy(g_lc.my_bind, host_bind && host_bind[0] ? host_bind : "0.0.0.0:7777",
             sizeof(g_lc.my_bind) - 1);
@@ -909,9 +1009,9 @@ int psx_lobby_create(const char *name, const char *game_name, const char *passwo
         append_match_caps_json(caps_json, sizeof(caps_json), match_caps);
     }
     n = snprintf(msg, sizeof(msg),
-                 "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"password\":\"%s\","
-                 "\"max_slots\":2,\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
-                 name && name[0] ? name : "Lobby", game_name && game_name[0] ? game_name : "Game",
+                 "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\","
+                 "\"password\":\"%s\",\"max_slots\":2,\"host_bind\":\"%s\",\"display_name\":\"%s\"%s}",
+                 name && name[0] ? name : "Lobby", gn, gv,
                  password ? password : "", g_lc.my_bind,
                  g_lc.display_name[0] ? g_lc.display_name : "Host", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
@@ -923,17 +1023,22 @@ int psx_lobby_create(const char *name, const char *game_name, const char *passwo
 int psx_lobby_join(const char *lobby_id, const char *password, const char *guest_bind)
 {
     char msg[1024];
+    const char *gn;
+    const char *gv;
     if (!psx_lobby_connected() || !lobby_id) {
         return -1;
     }
+    gn = g_lc.filter_game_name;
+    gv = effective_game_version(NULL);
     strncpy(g_lc.my_bind, guest_bind && guest_bind[0] ? guest_bind : "0.0.0.0:7778",
             sizeof(g_lc.my_bind) - 1);
     g_lc.join.last_error[0] = '\0';
     snprintf(msg, sizeof(msg),
              "{\"op\":\"join\",\"lobby_id\":\"%s\",\"password\":\"%s\",\"guest_bind\":\"%s\","
-             "\"display_name\":\"%s\"}",
+             "\"display_name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\"}",
              lobby_id, password ? password : "", g_lc.my_bind,
-             g_lc.display_name[0] ? g_lc.display_name : "Guest");
+             g_lc.display_name[0] ? g_lc.display_name : "Guest",
+             gn, gv);
     queue_send(msg);
     flush_pending();
     return 0;

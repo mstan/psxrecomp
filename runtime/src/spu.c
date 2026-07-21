@@ -936,24 +936,78 @@ void spu_event_reset(void) {
     memset(s_events, 0, sizeof(s_events));
 }
 
-/* ---- boot snapshot: complete SPU register + voice state (see boot_state.h) ---- */
-#define SPU_SNAP_FIELDS(X) \
-    X(spu_regs) X(voices) X(transfer_addr) X(key_on_count) \
-    X(endx_latch) X(kon_latch) X(koff_latch)
-uint32_t spu_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void spu_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
+/* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */
+#include "pst_wire.h"
+
+/* SpuVoice host sizeof has padding; wire is packed LE fields (94 bytes). */
+#define SPU_VOICE_WIRE_BYTES ( \
+    4u + 4u + 4u + (28u * 2u) + (3u * 2u) + 4u + 4u + 2u + 2u + 1u + 2u + 4u + 1u)
+
+static int spu_w_voice(PstW *w, const SpuVoice *v) {
+    if (!pst_w_i32(w, (int32_t)v->active) || !pst_w_u32(w, v->cur_addr) ||
+        !pst_w_u32(w, v->repeat_addr))
+        return 0;
+    for (int i = 0; i < SPU_BLOCK_SAMPLES; i++)
+        if (!pst_w_i16(w, v->samples[i])) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!pst_w_i16(w, v->previous_samples[i])) return 0;
+    return pst_w_i32(w, (int32_t)v->sample_idx) && pst_w_u32(w, v->phase) &&
+           pst_w_i16(w, v->hist1) && pst_w_i16(w, v->hist2) && pst_w_u8(w, v->flags) &&
+           pst_w_u16(w, v->env_level) && pst_w_u32(w, v->adsr_divider) &&
+           pst_w_u8(w, v->adsr_phase);
 }
-int spu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=spu_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+static int spu_r_voice(PstR *r, SpuVoice *v) {
+    int32_t active = 0, sample_idx = 0;
+    if (!pst_r_i32(r, &active) || !pst_r_u32(r, &v->cur_addr) ||
+        !pst_r_u32(r, &v->repeat_addr))
+        return 0;
+    v->active = (int)active;
+    for (int i = 0; i < SPU_BLOCK_SAMPLES; i++)
+        if (!pst_r_i16(r, &v->samples[i])) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!pst_r_i16(r, &v->previous_samples[i])) return 0;
+    if (!pst_r_i32(r, &sample_idx) || !pst_r_u32(r, &v->phase) ||
+        !pst_r_i16(r, &v->hist1) || !pst_r_i16(r, &v->hist2) ||
+        !pst_r_u8(r, &v->flags) || !pst_r_u16(r, &v->env_level) ||
+        !pst_r_u32(r, &v->adsr_divider) || !pst_r_u8(r, &v->adsr_phase))
+        return 0;
+    v->sample_idx = (int)sample_idx;
+    return 1;
+}
+
+uint32_t spu_snapshot_bytes(void) {
+    return (uint32_t)(SPU_REG_COUNT * 2u) +
+           (SPU_VOICE_COUNT * SPU_VOICE_WIRE_BYTES) + 20u;
+}
+
+void spu_snapshot_write(uint8_t *p) {
+    PstW w;
+    uint32_t n = spu_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    for (uint32_t i = 0; i < SPU_REG_COUNT; i++)
+        pst_w_u16(&w, spu_regs[i]);
+    for (int i = 0; i < SPU_VOICE_COUNT; i++)
+        spu_w_voice(&w, &voices[i]);
+    pst_w_u32(&w, transfer_addr);
+    pst_w_u32(&w, key_on_count);
+    pst_w_u32(&w, endx_latch);
+    pst_w_u32(&w, kon_latch);
+    pst_w_u32(&w, koff_latch);
+}
+
+int spu_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != spu_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    for (uint32_t i = 0; i < SPU_REG_COUNT; i++)
+        if (!pst_r_u16(&r, &spu_regs[i])) return 0;
+    for (int i = 0; i < SPU_VOICE_COUNT; i++)
+        if (!spu_r_voice(&r, &voices[i])) return 0;
+    if (!pst_r_u32(&r, &transfer_addr) || !pst_r_u32(&r, &key_on_count) ||
+        !pst_r_u32(&r, &endx_latch) || !pst_r_u32(&r, &kon_latch) ||
+        !pst_r_u32(&r, &koff_latch))
+        return 0;
+    return 1;
+}
 uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }
 uint32_t  spu_get_ram_bytes(void){ return (uint32_t)sizeof(spu_ram); }

@@ -2165,71 +2165,158 @@ void sio_get_pace_state(uint64_t out[16]) {
 #endif
 }
 
-/* ---- boot snapshot: complete SIO hardware/FSM state (see boot_state.h) ----
- *
- * Serializes ALL functional SIO state needed to faithfully resume a transfer
- * mid-flight: the six SIO registers, the pad-config FSM (incl. per-slot config
- * latches + pending type requests + the in-flight response buffer), the working
- * memcard FSM vars AND the authoritative per-slot mc_slots[] (the working vars
- * are saved back into mc_slots[] and zeroed whenever the bus switches device or
- * SELECT drops, so a card transfer suspended on a deselected slot lives ONLY in
- * mc_slots[]), the active-device selector, the cycle-paced shifter/buffer/ACK
- * scheduler state, the g_sio_timing_active scheduler gate, and the access-paced
- * pending-IRQ context. Pure diagnostics (trace/txn/irq rings, probe/abort/arm/
- * burst/pace counters, host-resampled pad_buttons/pad_stick) are NOT serialized.
- *
- * The cycle-paced fields and g_sio_timing_active are guarded by
- * SIO_MODEL_CYCLE_PACED so the serialized byte count matches the build that
- * wrote it; a snapshot written by one model can never load into the other
- * because boot_state's integrity key (codegen hash/ABI/ver) rejects it first,
- * and sio_snapshot_read additionally length-checks. */
-#if SIO_MODEL_CYCLE_PACED
-#define SIO_SNAP_PACED_FIELDS(X) \
-    X(g_sio_timing_active) \
-    X(sio_shift_active) X(sio_shift_byte) X(sio_shift_remaining) \
-    X(sio_tx_buffered) X(sio_tx_buffer) \
-    X(sio_shift_ack_irq_en) X(sio_tx_buffer_ack_irq_en) \
-    X(sio_pending_ack) X(sio_ack_remaining) X(sio_pending_ack_irq_en) \
-    X(sio_bus_owner) X(sio_bus_byte_index)
-#else
-#define SIO_SNAP_PACED_FIELDS(X)
-#endif
+/* ---- boot snapshot (LE field wire; McSlotState has host padding) ---- */
+#include "pst_wire.h"
 
-#define SIO_SNAP_FIELDS(X) \
-    /* SIO registers */ \
-    X(sio_tx_data) X(sio_rx_data) X(sio_stat) X(sio_mode) X(sio_ctrl) X(sio_baud) \
-    /* pad-config FSM */ \
-    X(pad_analog) X(pad_connected) X(pad_state) X(selected_slot) \
-    X(pad_response) X(pad_response_len) X(pad_response_idx) X(pad_current_cmd) \
-    X(pad_in_config) X(pad_type_req) \
-    /* memcard working FSM vars */ \
-    X(mc_state) X(mc_slot) X(mc_cmd) X(mc_sector) X(mc_sector_msb) X(mc_sector_lsb) \
-    X(mc_data) X(mc_data_idx) X(mc_checksum) X(mc_flag) \
-    /* memcard authoritative per-slot state */ \
-    X(mc_slots) \
-    /* active device selector */ \
-    X(active_device) \
-    /* cycle-paced shifter/buffer/ACK scheduler (model-gated) */ \
-    SIO_SNAP_PACED_FIELDS(X) \
-    /* access-paced pending-IRQ context */ \
-    X(sio_irq_pending) X(sio_irq_countdown) X(sio_ack_visible_reads) \
-    X(sio_irq_pending_source) X(sio_irq_pending_slot) X(sio_irq_pending_delay) \
-    X(sio_irq_pending_mc_state) X(sio_irq_pending_byte_seq)
-
-uint32_t sio_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    SIO_SNAP_FIELDS(X)
-#undef X
-    return n; }
-
-void sio_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,(const void*)&(f),sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
-    SIO_SNAP_FIELDS(X)
-#undef X
+static int sio_w_mcslot(PstW *w, const McSlotState *s) {
+    return pst_w_u32(w, (uint32_t)s->state) && pst_w_u8(w, s->cmd) &&
+           pst_w_u16(w, s->sector) && pst_w_u8(w, s->sector_msb) &&
+           pst_w_u8(w, s->sector_lsb) && pst_w_bytes(w, s->data, 128) &&
+           pst_w_i32(w, (int32_t)s->data_idx) && pst_w_u8(w, s->checksum) &&
+           pst_w_u8(w, s->flag);
+}
+static int sio_r_mcslot(PstR *r, McSlotState *s) {
+    uint32_t st = 0;
+    int32_t di = 0;
+    if (!pst_r_u32(r, &st) || !pst_r_u8(r, &s->cmd) || !pst_r_u16(r, &s->sector) ||
+        !pst_r_u8(r, &s->sector_msb) || !pst_r_u8(r, &s->sector_lsb) ||
+        !pst_r_bytes(r, s->data, 128) || !pst_r_i32(r, &di) ||
+        !pst_r_u8(r, &s->checksum) || !pst_r_u8(r, &s->flag))
+        return 0;
+    s->state = (McState)st;
+    s->data_idx = (int)di;
+    return 1;
 }
 
-int sio_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=sio_snapshot_bytes()) return 0;
-#define X(f) memcpy((void*)&(f),p,sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
-    SIO_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+static int sio_snap_emit(PstW *w) {
+    if (!pst_w_u8(w, sio_tx_data) || !pst_w_u8(w, sio_rx_data) ||
+        !pst_w_u16(w, sio_stat) || !pst_w_u16(w, sio_mode) ||
+        !pst_w_u16(w, sio_ctrl) || !pst_w_u16(w, sio_baud))
+        return 0;
+    if (!pst_w_bytes(w, pad_analog, 2) || !pst_w_u8(w, pad_connected) ||
+        !pst_w_u32(w, (uint32_t)pad_state) || !pst_w_i32(w, (int32_t)selected_slot) ||
+        !pst_w_bytes(w, pad_response, 8) || !pst_w_u8(w, pad_response_len) ||
+        !pst_w_u8(w, pad_response_idx) || !pst_w_u8(w, pad_current_cmd) ||
+        !pst_w_bytes(w, pad_in_config, 2) ||
+        !pst_w_i16(w, (int16_t)pad_type_req[0]) || !pst_w_i16(w, (int16_t)pad_type_req[1]))
+        return 0;
+    if (!pst_w_u32(w, (uint32_t)mc_state) || !pst_w_i32(w, (int32_t)mc_slot) ||
+        !pst_w_u8(w, mc_cmd) || !pst_w_u16(w, mc_sector) ||
+        !pst_w_u8(w, mc_sector_msb) || !pst_w_u8(w, mc_sector_lsb) ||
+        !pst_w_bytes(w, mc_data, 128) || !pst_w_i32(w, (int32_t)mc_data_idx) ||
+        !pst_w_u8(w, mc_checksum) || !pst_w_u8(w, mc_flag))
+        return 0;
+    if (!sio_w_mcslot(w, &mc_slots[0]) || !sio_w_mcslot(w, &mc_slots[1]))
+        return 0;
+    if (!pst_w_u32(w, (uint32_t)active_device))
+        return 0;
+#if SIO_MODEL_CYCLE_PACED
+    if (!pst_w_i32(w, (int32_t)g_sio_timing_active) ||
+        !pst_w_i32(w, (int32_t)sio_shift_active) || !pst_w_u8(w, sio_shift_byte) ||
+        !pst_w_i32(w, (int32_t)sio_shift_remaining) ||
+        !pst_w_i32(w, (int32_t)sio_tx_buffered) || !pst_w_u8(w, sio_tx_buffer) ||
+        !pst_w_i32(w, (int32_t)sio_shift_ack_irq_en) ||
+        !pst_w_i32(w, (int32_t)sio_tx_buffer_ack_irq_en) ||
+        !pst_w_i32(w, (int32_t)sio_pending_ack) ||
+        !pst_w_i32(w, (int32_t)sio_ack_remaining) ||
+        !pst_w_i32(w, (int32_t)sio_pending_ack_irq_en) ||
+        !pst_w_u32(w, (uint32_t)sio_bus_owner) || !pst_w_u32(w, sio_bus_byte_index))
+        return 0;
+#endif
+    if (!pst_w_i32(w, (int32_t)sio_irq_pending) ||
+        !pst_w_i32(w, (int32_t)sio_irq_countdown) ||
+        !pst_w_i32(w, (int32_t)sio_ack_visible_reads) ||
+        !pst_w_u8(w, sio_irq_pending_source) || !pst_w_u8(w, sio_irq_pending_slot) ||
+        !pst_w_u8(w, sio_irq_pending_delay) || !pst_w_u8(w, sio_irq_pending_mc_state) ||
+        !pst_w_u32(w, sio_irq_pending_byte_seq))
+        return 0;
+    return 1;
+}
+
+static int sio_snap_parse(PstR *r) {
+    uint32_t u;
+    int32_t i;
+    int16_t tr0, tr1;
+    if (!pst_r_u8(r, &sio_tx_data) || !pst_r_u8(r, &sio_rx_data) ||
+        !pst_r_u16(r, &sio_stat) || !pst_r_u16(r, &sio_mode) ||
+        !pst_r_u16(r, &sio_ctrl) || !pst_r_u16(r, &sio_baud))
+        return 0;
+    if (!pst_r_bytes(r, pad_analog, 2) || !pst_r_u8(r, &pad_connected) ||
+        !pst_r_u32(r, &u) || !pst_r_i32(r, &i) ||
+        !pst_r_bytes(r, pad_response, 8) || !pst_r_u8(r, &pad_response_len) ||
+        !pst_r_u8(r, &pad_response_idx) || !pst_r_u8(r, &pad_current_cmd) ||
+        !pst_r_bytes(r, pad_in_config, 2) ||
+        !pst_r_i16(r, &tr0) || !pst_r_i16(r, &tr1))
+        return 0;
+    pad_state = (PadState)u;
+    selected_slot = (int)i;
+    pad_type_req[0] = (int8_t)tr0;
+    pad_type_req[1] = (int8_t)tr1;
+    if (!pst_r_u32(r, &u) || !pst_r_i32(r, &i) || !pst_r_u8(r, &mc_cmd) ||
+        !pst_r_u16(r, &mc_sector) || !pst_r_u8(r, &mc_sector_msb) ||
+        !pst_r_u8(r, &mc_sector_lsb) || !pst_r_bytes(r, mc_data, 128))
+        return 0;
+    mc_state = (McState)u;
+    mc_slot = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &mc_checksum) || !pst_r_u8(r, &mc_flag))
+        return 0;
+    mc_data_idx = (int)i;
+    if (!sio_r_mcslot(r, &mc_slots[0]) || !sio_r_mcslot(r, &mc_slots[1]))
+        return 0;
+    if (!pst_r_u32(r, &u)) return 0;
+    active_device = (ActiveDevice)u;
+#if SIO_MODEL_CYCLE_PACED
+    if (!pst_r_i32(r, &i)) return 0;
+    g_sio_timing_active = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &sio_shift_byte)) return 0;
+    sio_shift_active = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_shift_remaining = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &sio_tx_buffer)) return 0;
+    sio_tx_buffered = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_shift_ack_irq_en = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_tx_buffer_ack_irq_en = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_pending_ack = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_ack_remaining = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_pending_ack_irq_en = (int)i;
+    if (!pst_r_u32(r, &u) || !pst_r_u32(r, &sio_bus_byte_index)) return 0;
+    sio_bus_owner = (SioBusOwner)u;
+#endif
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_irq_pending = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_irq_countdown = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_ack_visible_reads = (int)i;
+    if (!pst_r_u8(r, &sio_irq_pending_source) || !pst_r_u8(r, &sio_irq_pending_slot) ||
+        !pst_r_u8(r, &sio_irq_pending_delay) || !pst_r_u8(r, &sio_irq_pending_mc_state) ||
+        !pst_r_u32(r, &sio_irq_pending_byte_seq))
+        return 0;
+    return 1;
+}
+
+uint32_t sio_snapshot_bytes(void) {
+    PstW w;
+    pst_w_init(&w, NULL, 0);
+    (void)sio_snap_emit(&w);
+    return (uint32_t)w.written;
+}
+
+void sio_snapshot_write(uint8_t *p) {
+    PstW w;
+    uint32_t n = sio_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    (void)sio_snap_emit(&w);
+}
+
+int sio_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != sio_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    return sio_snap_parse(&r);
+}

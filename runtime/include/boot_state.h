@@ -35,11 +35,14 @@ extern "C" {
  */
 
 #define BOOT_STATE_MAGIC   0x50535842u  /* "PSXB" */
-#define BOOT_STATE_VERSION 2u           /* v1 = old incomplete RAM-only snapshot */
+/* v1 = incomplete RAM-only; v2 = full machine but host-struct memcpy (padding);
+ * v3 = little-endian field wire (portable Win/Linux/macOS ARM). */
+#define BOOT_STATE_VERSION 3u
 
 /*
- * On-disk header. Written verbatim at offset 0, followed by the section stream.
- * ALL key fields must match the running build or the snapshot is rejected.
+ * On-disk header (v3): nine little-endian uint32 fields at offset 0 (36 bytes),
+ * followed by the section stream. ALL key fields must match the running build
+ * or the snapshot is rejected. Do not fwrite() this struct — use pst_wire.
  */
 typedef struct {
     uint32_t magic;          /* BOOT_STATE_MAGIC                                  */
@@ -52,15 +55,17 @@ typedef struct {
     uint32_t codegen_ver;    /* PSX_OVERLAY_CODEGEN_VER                           */
     /* ---- layout ---- */
     uint32_t section_count;  /* number of sections that follow                    */
-    uint32_t reserved;       /* 0; keeps the header 8-byte aligned                */
+    uint32_t reserved;       /* 0                                                 */
 } BootStateHeader;
 
+#define BOOT_STATE_HEADER_WIRE_BYTES 36u
+
 /*
- * Section stream: section_count records, each laid out as
- *     uint32_t tag;        (one of BS_SEC_*)
- *     uint32_t pad;        (0)
- *     uint64_t len;        (payload byte count)
- *     uint8_t  payload[len];
+ * Section stream (v3): section_count records, each laid out as
+ *     uint32_t tag;        LE (one of BS_SEC_*)
+ *     uint32_t pad;        LE 0
+ *     uint64_t len;        LE payload byte count
+ *     uint8_t  payload[len];   (module payloads are LE field wires too)
  * An unknown tag, a length mismatch, or a missing required section on load is a
  * hard reject (incomplete restore is never allowed) -> normal boot + recapture.
  */

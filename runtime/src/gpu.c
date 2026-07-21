@@ -4207,26 +4207,84 @@ void gpu_write_gp1(uint32_t val) {
     X(vram_write_col) X(vram_write_row) X(vram_write_remaining) \
     X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
     X(vram_read_col) X(vram_read_row)
-uint32_t gpu_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void gpu_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
+#include "pst_wire.h"
+
+/* GPU snap fields are scalars / u32 arrays — emit as LE u32/i32 (no struct pad). */
+static int gpu_snap_emit(PstW *w) {
+#define WU(f) do { if (!pst_w_u32(w, (uint32_t)(f))) return 0; } while (0)
+#define WI(f) do { if (!pst_w_i32(w, (int32_t)(f))) return 0; } while (0)
+#define WH(f) do { if (!pst_w_u16(w, (uint16_t)(f))) return 0; } while (0)
+    WU(texpage_x); WU(texpage_y); WU(semi_transparency); WU(texpage_colors);
+    WU(dither_enabled); WU(draw_to_display); WU(texture_disable); WU(texture_window_value);
+    WU(set_mask_bit); WU(check_mask_bit);
+    WU(interlace_field); WU(reverse_flag);
+    WU(draw_area_left); WU(draw_area_top); WU(draw_area_right); WU(draw_area_bottom);
+    WI(draw_offset_x); WI(draw_offset_y);
+    WU(hres1); WU(hres2); WU(vres); WU(video_mode); WU(display_depth); WU(vertical_interlace);
+    WU(display_disabled); WU(irq1_flag); WU(dma_direction); WU(lcf);
+    WU(display_area_x); WU(display_area_y);
+    WU(h_display_x1); WU(h_display_x2); WU(v_display_y1); WU(v_display_y2);
+    WU(gpuread_latch);
+    WU((uint32_t)gp0_state);
+    for (int i = 0; i < 16; i++) WU(gp0_cmd_buf[i]);
+    WI(gp0_words_collected); WI(gp0_words_needed);
+    WU(gp0_next_source_addr); WU(gp0_cmd_source_addr);
+    WH(polyline_color); WI(polyline_prev_x); WI(polyline_prev_y); WH(polyline_prev_c);
+    WI(polyline_semi_trans); WI(polyline_has_prev);
+    WH(vram_write_x); WH(vram_write_y); WH(vram_write_w); WH(vram_write_h);
+    WH(vram_write_col); WH(vram_write_row); WU(vram_write_remaining);
+    WI(vram_read_active); WH(vram_read_x); WH(vram_read_y); WH(vram_read_w); WH(vram_read_h);
+    WH(vram_read_col); WH(vram_read_row);
+#undef WU
+#undef WI
+#undef WH
+    return 1;
 }
-uint32_t gpu_cosim_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    GPU_COSIM_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void gpu_cosim_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    GPU_COSIM_SNAP_FIELDS(X)
-#undef X
+static int gpu_snap_parse(PstR *r) {
+    uint32_t u; int32_t i; uint16_t h;
+#define RU(f) do { if (!pst_r_u32(r, &u)) return 0; (f) = u; } while (0)
+#define RI(f) do { if (!pst_r_i32(r, &i)) return 0; (f) = i; } while (0)
+#define RH(f) do { if (!pst_r_u16(r, &h)) return 0; (f) = h; } while (0)
+    RU(texpage_x); RU(texpage_y); RU(semi_transparency); RU(texpage_colors);
+    RU(dither_enabled); RU(draw_to_display); RU(texture_disable); RU(texture_window_value);
+    RU(set_mask_bit); RU(check_mask_bit);
+    RU(interlace_field); RU(reverse_flag);
+    RU(draw_area_left); RU(draw_area_top); RU(draw_area_right); RU(draw_area_bottom);
+    RI(draw_offset_x); RI(draw_offset_y);
+    RU(hres1); RU(hres2); RU(vres); RU(video_mode); RU(display_depth); RU(vertical_interlace);
+    RU(display_disabled); RU(irq1_flag); RU(dma_direction); RU(lcf);
+    RU(display_area_x); RU(display_area_y);
+    RU(h_display_x1); RU(h_display_x2); RU(v_display_y1); RU(v_display_y2);
+    RU(gpuread_latch);
+    if (!pst_r_u32(r, &u)) return 0;
+    gp0_state = (Gp0State)u;
+    for (int k = 0; k < 16; k++) RU(gp0_cmd_buf[k]);
+    RI(gp0_words_collected); RI(gp0_words_needed);
+    RU(gp0_next_source_addr); RU(gp0_cmd_source_addr);
+    RH(polyline_color); RI(polyline_prev_x); RI(polyline_prev_y); RH(polyline_prev_c);
+    RI(polyline_semi_trans); RI(polyline_has_prev);
+    RH(vram_write_x); RH(vram_write_y); RH(vram_write_w); RH(vram_write_h);
+    RH(vram_write_col); RH(vram_write_row); RU(vram_write_remaining);
+    RI(vram_read_active); RH(vram_read_x); RH(vram_read_y); RH(vram_read_w); RH(vram_read_h);
+    RH(vram_read_col); RH(vram_read_row);
+#undef RU
+#undef RI
+#undef RH
+    return 1;
 }
+
+uint32_t gpu_snapshot_bytes(void) {
+    PstW w; pst_w_init(&w, NULL, 0);
+    (void)gpu_snap_emit(&w);
+    return (uint32_t)w.written;
+}
+void gpu_snapshot_write(uint8_t *p) {
+    PstW w; uint32_t n = gpu_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    (void)gpu_snap_emit(&w);
+}
+uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
+void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
 void gpu_cosim_dump(char *out, int cap) {
     if (!out || cap <= 0) return;
     char *p = out;
@@ -4266,15 +4324,17 @@ void gpu_cosim_dump(char *out, int cap) {
     APPEND("%s", "\n");
 #undef APPEND
 }
-int gpu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=gpu_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
+int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != gpu_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    if (!gpu_snap_parse(&r)) return 0;
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
     ws_nw_sync_target();
-    return 1; }
+    return 1;
+}
 uint16_t* gpu_get_vram_ptr(void){ return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }

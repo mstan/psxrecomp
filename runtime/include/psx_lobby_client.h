@@ -9,15 +9,21 @@ extern "C" {
 
 #define PSX_LOBBY_ID_LEN 40
 #define PSX_LOBBY_NAME_LEN 64
+#define PSX_LOBBY_VERSION_LEN 32
 #define PSX_LOBBY_ENDPOINT_LEN 64
 #define PSX_LOBBY_MAX_LIST 32
 #define PSX_LOBBY_MAX_MEMBERS 4
 #define PSX_LOBBY_LANG_LEN 16
 
+#ifndef PSX_GAME_VERSION
+#define PSX_GAME_VERSION "dev"
+#endif
+
 typedef struct PsxLobbyRow {
     char     lobby_id[PSX_LOBBY_ID_LEN];
     char     name[PSX_LOBBY_NAME_LEN];
     char     game_name[PSX_LOBBY_NAME_LEN];
+    char     game_version[PSX_LOBBY_VERSION_LEN];
     int      player_count;
     int      max_slots;
     int      has_password;
@@ -75,17 +81,28 @@ const char *psx_lobby_player_id(void);
 /* Non-blocking pump — call every frame from the launcher. */
 void psx_lobby_pump(void);
 
+/*
+ * Title + release pin used for create/join matching and list filters.
+ * Defaults: game_name empty (no name filter), game_version PSX_GAME_VERSION.
+ * List: Release pins filter by exact game_version; "dev" lists all versions
+ * of the title (join still requires an exact version match).
+ */
+void psx_lobby_set_game_identity(const char *game_name, const char *game_version);
+const char *psx_lobby_game_version(void);
+
 void psx_lobby_request_list(void);
 int  psx_lobby_list_count(void);
 int  psx_lobby_list_get(int index, PsxLobbyRow *out);
 
 /*
  * Create lobby. host_bind e.g. "0.0.0.0:7777". password may be NULL/empty.
+ * game_version NULL/empty → identity / PSX_GAME_VERSION / "dev".
  * match_caps may be NULL (legacy); when non-NULL and valid, sent to the server
  * so guests join with the host's sim settings.
  * Returns 0 if request sent; poll psx_lobby_join_info() / in_lobby().
  */
 int  psx_lobby_create(const char *name, const char *game_name,
+                      const char *game_version,
                       const char *password, const char *host_bind,
                       const PsxLobbyMatchCaps *match_caps);
 

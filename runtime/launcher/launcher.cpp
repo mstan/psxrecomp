@@ -747,7 +747,15 @@ static void refresh_lobby_table(LauncherModel& m) {
         html += std::to_string(i);
         html += ")\">";
         html += "<span class=\"lobby-c-name\">" + rml_escape(row.name) + "</span>";
-        html += "<span class=\"lobby-c-game\">" + rml_escape(row.game_name) + "</span>";
+        {
+            std::string game_label = row.game_name;
+            if (row.game_version[0]) {
+                game_label += " (";
+                game_label += row.game_version;
+                game_label += ")";
+            }
+            html += "<span class=\"lobby-c-game\">" + rml_escape(game_label) + "</span>";
+        }
         html += "<span class=\"lobby-c-players\">";
         html += players;
         html += "</span><span class=\"lobby-c-lock\">";
@@ -1421,8 +1429,9 @@ Result run(SDL_Window* window, void* gl_context,
             handle.DirtyVariable("netplay_mode");
             handle.DirtyVariable("view");
         });
-    auto enter_lobby_browser = [&m, handle]() mutable {
+    auto enter_lobby_browser = [&m, handle, &game_name_s]() mutable {
         m.view = "netplay_lobbies";
+        psx_lobby_set_game_identity(game_name_s.c_str(), PSX_GAME_VERSION);
         if (!psx_lobby_connected()) {
             psx_lobby_set_display_name(m.host_display_name.c_str());
             if (psx_lobby_connect(psx_lobby_default_url()) != 0) {
@@ -1558,7 +1567,9 @@ Result run(SDL_Window* window, void* gl_context,
                 io.has_language = true;
             }
             PsxLobbyMatchCaps caps = match_caps_from_settings(io);
+            psx_lobby_set_game_identity(game_name_s.c_str(), PSX_GAME_VERSION);
             psx_lobby_create(m.host_lobby_name.c_str(), game_name_s.c_str(),
+                             PSX_GAME_VERSION,
                              m.host_lobby_password.c_str(), "0.0.0.0:7777", &caps);
             handle.DirtyVariable("show_host_modal");
             handle.DirtyVariable("room_lobby_title");

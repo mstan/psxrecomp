@@ -2656,56 +2656,106 @@ int cdrom_data_read_active(void) {
  * ring, command/sector history rings, the load-burst ring, response-overwrite
  * counters) and the host-only iso_handle pointer are intentionally excluded.
  * PendingCmd / QueuedCmd are plain pointer-free structs, so raw copy is sound. */
-#define CDROM_SNAP_FIELDS(X) \
-    /* index-banked controller registers + IRQ latch */ \
-    X(index_reg) X(stat_reg) X(request_reg) X(irq_enable) X(irq_flag) \
-    /* CPS single-outstanding INTC latch + presentation delay */ \
-    X(cdrom_intc_request_latched) X(cdrom_irq_generation) \
-    X(cdrom_intc_latched_generation) X(cdrom_irq_present_delay) \
-    /* parameter FIFO */ \
-    X(param_fifo) X(param_count) \
-    /* response FIFO */ \
-    X(response_fifo) X(response_read) X(response_count) \
-    /* current sector buffer */ \
-    X(sector_buffer) X(sector_read_pos) X(sector_available) X(sector_size) \
-    /* last-delivered sector (GetlocL/GetlocP + in-flight re-delivery) */ \
-    X(last_sector_buffer) X(last_sector_lba) X(last_sector_size) \
-    X(last_sector_frame) X(last_sector_mode) X(last_sector_have_raw) \
-    X(last_sector_raw_mode) X(last_sector_xa_file) X(last_sector_xa_channel) \
-    X(last_sector_xa_submode) X(last_sector_xa_coding) \
-    /* seek target */ \
-    X(seek_min) X(seek_sec) X(seek_sect) X(s_setloc_lba) X(setloc_seek_far) \
-    /* read stream state */ \
-    X(reading) X(read_min) X(read_sec) X(read_sect) X(mode_reg) \
-    X(read_cmd) X(read_delay) X(filter_file) X(filter_channel) X(cd_muted) \
-    /* Red Book CD-DA stream */ \
-    X(cdda_playing) X(cdda_track) X(cdda_lba) X(cdda_delay) \
-    X(cdda_data_end_pending) X(cdda_sectors_played) \
-    /* XA ADPCM decode + active-stream identity */ \
-    X(xa_hist_l) X(xa_hist_r) X(xa_stream_file) X(xa_stream_channel) \
-    X(xa_stream_coding) X(xa_stream_active) \
-    /* disc-speed timing model */ \
-    X(g_disc_speed_divisor) X(g_game_divisor) X(g_instant_max_per_frame) \
-    /* pending (delayed second response) + queued command */ \
-    X(pending) X(queued_cmd) \
-    /* one-deep pended data-ready INT1 (Beetle SetAIP analog) */ \
-    X(pending_dataready) X(pending_dataready_stat)
+/* LE field wire — PendingCmd/QueuedCmd have host padding. */
+#include "pst_wire.h"
 
-uint32_t cdrom_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    CDROM_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void cdrom_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    CDROM_SNAP_FIELDS(X)
-#undef X
+static int cdrom_snap_emit(PstW *w) {
+#define W8(f)  do { if (!pst_w_u8(w, (uint8_t)(f))) return 0; } while (0)
+#define WI(f)  do { if (!pst_w_i32(w, (int32_t)(f))) return 0; } while (0)
+#define WU(f)  do { if (!pst_w_u32(w, (uint32_t)(f))) return 0; } while (0)
+#define W64(f) do { if (!pst_w_u64(w, (uint64_t)(f))) return 0; } while (0)
+#define WB(a)  do { if (!pst_w_bytes(w, (a), sizeof(a))) return 0; } while (0)
+    W8(index_reg); W8(stat_reg); W8(request_reg); W8(irq_enable); W8(irq_flag);
+    WI(cdrom_intc_request_latched); WU(cdrom_irq_generation);
+    WU(cdrom_intc_latched_generation); WI(cdrom_irq_present_delay);
+    WB(param_fifo); WI(param_count);
+    WB(response_fifo); WI(response_read); WI(response_count);
+    WB(sector_buffer); WI(sector_read_pos); WI(sector_available); WI(sector_size);
+    WB(last_sector_buffer); WI(last_sector_lba); WI(last_sector_size);
+    WU(last_sector_frame); W8(last_sector_mode); W8(last_sector_have_raw);
+    W8(last_sector_raw_mode); W8(last_sector_xa_file); W8(last_sector_xa_channel);
+    W8(last_sector_xa_submode); W8(last_sector_xa_coding);
+    W8(seek_min); W8(seek_sec); W8(seek_sect); WI(s_setloc_lba); WI(setloc_seek_far);
+    WI(reading); WI(read_min); WI(read_sec); WI(read_sect); W8(mode_reg);
+    W8(read_cmd); WI(read_delay); W8(filter_file); W8(filter_channel); W8(cd_muted);
+    WI(cdda_playing); WI(cdda_track); WU(cdda_lba); WI(cdda_delay);
+    WI(cdda_data_end_pending); W64(cdda_sectors_played);
+    if (!pst_w_i32(w, xa_hist_l[0]) || !pst_w_i32(w, xa_hist_l[1]) ||
+        !pst_w_i32(w, xa_hist_r[0]) || !pst_w_i32(w, xa_hist_r[1]))
+        return 0;
+    W8(xa_stream_file); W8(xa_stream_channel); W8(xa_stream_coding); WI(xa_stream_active);
+    WI(g_disc_speed_divisor); WI(g_game_divisor); WI(g_instant_max_per_frame);
+    /* PendingCmd / QueuedCmd — no host padding on the wire */
+    W8(pending.cmd); WI(pending.pending); WI(pending.delay); WI(pending.phase);
+    W8(queued_cmd.cmd); WB(queued_cmd.params); WI(queued_cmd.param_count); WI(queued_cmd.pending);
+    W8(pending_dataready); W8(pending_dataready_stat);
+#undef W8
+#undef WI
+#undef WU
+#undef W64
+#undef WB
+    return 1;
 }
-int cdrom_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=cdrom_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
-    CDROM_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+
+static int cdrom_snap_parse(PstR *r) {
+    uint8_t b;
+    int32_t i;
+    uint32_t u;
+    uint64_t u64;
+#define R8(f)  do { if (!pst_r_u8(r, &b)) return 0; (f) = b; } while (0)
+#define RI(f)  do { if (!pst_r_i32(r, &i)) return 0; (f) = (int)i; } while (0)
+#define RU(f)  do { if (!pst_r_u32(r, &u)) return 0; (f) = u; } while (0)
+#define R64(f) do { if (!pst_r_u64(r, &u64)) return 0; (f) = u64; } while (0)
+#define RB(a)  do { if (!pst_r_bytes(r, (a), sizeof(a))) return 0; } while (0)
+    R8(index_reg); R8(stat_reg); R8(request_reg); R8(irq_enable); R8(irq_flag);
+    RI(cdrom_intc_request_latched); RU(cdrom_irq_generation);
+    RU(cdrom_intc_latched_generation); RI(cdrom_irq_present_delay);
+    RB(param_fifo); RI(param_count);
+    RB(response_fifo); RI(response_read); RI(response_count);
+    RB(sector_buffer); RI(sector_read_pos); RI(sector_available); RI(sector_size);
+    RB(last_sector_buffer); RI(last_sector_lba); RI(last_sector_size);
+    RU(last_sector_frame); R8(last_sector_mode); R8(last_sector_have_raw);
+    R8(last_sector_raw_mode); R8(last_sector_xa_file); R8(last_sector_xa_channel);
+    R8(last_sector_xa_submode); R8(last_sector_xa_coding);
+    R8(seek_min); R8(seek_sec); R8(seek_sect); RI(s_setloc_lba); RI(setloc_seek_far);
+    RI(reading); RI(read_min); RI(read_sec); RI(read_sect); R8(mode_reg);
+    R8(read_cmd); RI(read_delay); R8(filter_file); R8(filter_channel); R8(cd_muted);
+    RI(cdda_playing); RI(cdda_track); RU(cdda_lba); RI(cdda_delay);
+    RI(cdda_data_end_pending); R64(cdda_sectors_played);
+    if (!pst_r_i32(r, &xa_hist_l[0]) || !pst_r_i32(r, &xa_hist_l[1]) ||
+        !pst_r_i32(r, &xa_hist_r[0]) || !pst_r_i32(r, &xa_hist_r[1]))
+        return 0;
+    R8(xa_stream_file); R8(xa_stream_channel); R8(xa_stream_coding); RI(xa_stream_active);
+    RI(g_disc_speed_divisor); RI(g_game_divisor); RI(g_instant_max_per_frame);
+    R8(pending.cmd); RI(pending.pending); RI(pending.delay); RI(pending.phase);
+    R8(queued_cmd.cmd); RB(queued_cmd.params); RI(queued_cmd.param_count); RI(queued_cmd.pending);
+    R8(pending_dataready); R8(pending_dataready_stat);
+#undef R8
+#undef RI
+#undef RU
+#undef R64
+#undef RB
+    return 1;
+}
+
+uint32_t cdrom_snapshot_bytes(void) {
+    PstW w;
+    pst_w_init(&w, NULL, 0);
+    (void)cdrom_snap_emit(&w);
+    return (uint32_t)w.written;
+}
+void cdrom_snapshot_write(uint8_t *p) {
+    PstW w;
+    uint32_t n = cdrom_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    (void)cdrom_snap_emit(&w);
+}
+int cdrom_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != cdrom_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    return cdrom_snap_parse(&r);
+}
 
 void debug_force_cd_reinsert(void) {
     // Simulamos la apertura de la bandeja borrando los flujos actuales

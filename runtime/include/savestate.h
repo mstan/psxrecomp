@@ -14,8 +14,9 @@ extern "C" {
  *
  * A thin wrapper over boot_state.c's complete full-machine serializer
  * (boot_state_save / boot_state_load — CPU/RAM/scratchpad/VRAM/SPU/CDROM/DMA/SIO/
- * timers/IRQ/clock/dirty-bitmap, with an integrity key so a state can never load
- * into an incompatible build). The only additions here are: per-slot file paths,
+ * timers/IRQ/clock/dirty-bitmap). Format is BOOT_STATE_VERSION 3: little-endian
+ * field wires portable across Win/Linux/macOS ARM (see pst_wire.h). Integrity
+ * key still rejects incompatible builds. The only additions here are: per-slot paths,
  * deferred execution at a safe block-leader boundary (so cpu->pc is a valid
  * resume PC and in_exception == 0), and a restore that unwinds to the scheduler
  * and re-dispatches (psx_scheduler_resume_at).

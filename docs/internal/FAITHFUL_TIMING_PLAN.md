@@ -213,6 +213,20 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-21 (lobby game_version + release pins):**
+  WS lobby now carries `game_version` alongside `game_name` (create/list/join).
+  Server rejects `version_mismatch` / `game_mismatch`; list can filter by either.
+  MotK/MW bake release pins from repo `VERSION` (Release → e.g. `0.1.0`, else
+  `dev`) via `PSX_GAME_VERSION` / `SNESRECOMP_BUILD_VERSION`. Clients send the
+  pin on create/join and filter the lobby browser. Redeploy lobby server for
+  remote matchmaking. Docs: `recomp-net-server/docs/WS_LOBBY.md`.
+- **2026-07-21 (portable .pst / boot_state v3 LE wire):**
+  Savestate / boot_state version → 3: header + section framing and all
+  module snapshots emit little-endian field wires (`pst_wire.h`) — no
+  host-struct padding (TimerRegs, DMA async/delayed, SpuVoice, McSlotState,
+  CDROM Pending/Queued). Netplay host→guest blob transfer is identical on
+  Win/Linux x86_64 and macOS ARM. Old v2 `.pst` files are rejected (recapture).
+
 - **2026-07-20 (netplay match_caps — host settings enforce):**
   Lobby `create` / `set_match_caps` / `start` carry host sim caps
   (aspect, turbo_loads, bios_hle, fast_boot, auto_skip_fmv, input_delay,

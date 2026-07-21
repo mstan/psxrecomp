@@ -219,6 +219,7 @@ option(PSX_NETPLAY "Link recomp-net delay-sync when available" ON)
 set(RECOMP_NET_ROOT "" CACHE PATH "Path to recomp-net; empty = auto-discover")
 if(PSX_NETPLAY AND NOT RECOMP_NET_ROOT)
     foreach(_cand
+            "${PSXRECOMP_ROOT}/lib/recomp-net"
             "${CMAKE_SOURCE_DIR}/../recomp-net"
             "${PSXRECOMP_ROOT}/../recomp-net"
             "${CMAKE_SOURCE_DIR}/recomp-net")
@@ -323,6 +324,7 @@ function(psxrecomp_add_runtime_target target)
         DEFAULT_BIOS_PATH
         DEFAULT_GAME_CONFIG_PATH
         EXE_NAME
+        GAME_VERSION
     )
     # GAME_GENERATED_FULL_C is a list (not a single value): the split-TU build
     # writes the recompiled game as N full_NN.c shards instead of one
@@ -497,12 +499,23 @@ function(psxrecomp_add_runtime_target target)
         set(PSX_GIT_REV "unknown")
     endif()
 
+    # Release pin for lobby matching (create/join/list). Override via
+    # GAME_VERSION arg or -DPSX_GAME_VERSION=...; default "dev".
+    if(NOT PSXRT_GAME_VERSION)
+        if(DEFINED PSX_GAME_VERSION AND NOT PSX_GAME_VERSION STREQUAL "")
+            set(PSXRT_GAME_VERSION "${PSX_GAME_VERSION}")
+        else()
+            set(PSXRT_GAME_VERSION "dev")
+        endif()
+    endif()
+
     target_compile_definitions(${target} PRIVATE
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
         PSX_DEFAULT_BIOS_PATH="${PSXRT_DEFAULT_BIOS_PATH}"
         PSX_DEFAULT_GAME_CONFIG_PATH="${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
         PSX_BUILD_REV="${PSX_GIT_REV}"
+        PSX_GAME_VERSION="${PSXRT_GAME_VERSION}"
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
