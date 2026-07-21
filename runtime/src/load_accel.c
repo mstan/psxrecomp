@@ -29,6 +29,7 @@ extern int g_precise_mode;
 static int s_enabled = 1;
 static int s_horizon_enabled = 1;
 static int s_extra_horizon_enabled = 1;
+static int s_horizon_any = 0;
 static uint64_t s_calls;
 static uint64_t s_handled;
 static uint64_t s_fallback_mode;
@@ -36,18 +37,41 @@ static uint64_t s_fallback_diagnostic;
 static uint64_t s_fallback_layout;
 static uint64_t s_horizon_hits;
 static uint64_t s_horizon_cycles;
-static uint32_t s_horizon_sites[16];
+static uint32_t s_horizon_sites[48];
 static uint32_t s_horizon_site_count;
 static uint64_t s_extra_horizon_hits;
 static uint64_t s_extra_horizon_cycles;
-static uint32_t s_extra_horizon_sites[16];
+static uint32_t s_extra_horizon_sites[48];
 static uint32_t s_extra_horizon_site_count;
+static uint32_t s_cfg_func;
+static uint32_t s_cfg_counter;
+static uint32_t s_cfg_gpustat_ptr;
+static uint32_t s_cfg_timer1_ptr;
+static uint32_t s_cfg_timer1_cache;
 
 #ifdef PSX_ENABLE_BLOCK_CYCLES
 #define VQ_STEP(cpu_, mask_) psx_cyc_step((cpu_), (mask_))
 #else
 #define VQ_STEP(cpu_, mask_) do { (void)(cpu_); (void)(mask_); } while (0)
 #endif
+
+void psx_vsync_query_hle_configure(uint32_t func, uint32_t counter_addr,
+                                   uint32_t gpustat_ptr_addr,
+                                   uint32_t timer1_ptr_addr,
+                                   uint32_t timer1_cache_addr) {
+    s_cfg_func = func;
+    s_cfg_counter = counter_addr;
+    s_cfg_gpustat_ptr = gpustat_ptr_addr;
+    s_cfg_timer1_ptr = timer1_ptr_addr;
+    s_cfg_timer1_cache = timer1_cache_addr;
+}
+
+int psx_vsync_query_hle_try(CPUState* cpu, uint32_t dispatch_addr) {
+    if (!s_cfg_func || dispatch_addr != s_cfg_func) return 0;
+    return psx_vsync_query_hle_enter(cpu, s_cfg_func, s_cfg_counter,
+                                     s_cfg_gpustat_ptr, s_cfg_timer1_ptr,
+                                     s_cfg_timer1_cache);
+}
 
 void psx_vsync_query_hle_set_enabled(int on) { s_enabled = on ? 1 : 0; }
 void psx_vsync_query_hle_set_horizon_enabled(int on) {
@@ -56,6 +80,7 @@ void psx_vsync_query_hle_set_horizon_enabled(int on) {
 void psx_vsync_query_hle_set_extra_horizon_enabled(int on) {
     s_extra_horizon_enabled = on ? 1 : 0;
 }
+void psx_vsync_query_hle_set_horizon_any(int on) { s_horizon_any = on ? 1 : 0; }
 
 void psx_vsync_query_hle_add_event_horizon_site(uint32_t return_pc) {
     if (return_pc == 0u) return;
@@ -112,19 +137,28 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
 
     s_handled++;
 
-    /* These sites were statically verified as the clock sample inside a CD
-     * wait loop.  While a sustained read is active, nothing useful happens
-     * between samples until a deliverable device event.  Advance the same
-     * guest clock/device model to that boundary in one host operation; the
-     * original VSync path below then reaches its normal interrupt checkpoint
-     * and returns the post-event VBlank counter.  A defensive one-VBlank-ish
-     * cap prevents a malformed per-game site list from making a large jump. */
+    /* Event horizon: verified CD wait-loop return PCs only, and only while
+     * cdrom_load_in_progress() (excludes XA/STR). Advancing on every VSync(-1)
+     * during MotK mode=0xA2 reads (horizon_any + drive_reading) raced guest
+     * time past the movie — mdec_decode_count stayed 0 / display disabled. */
     int horizon_kind = is_event_horizon_site(cpu->gpr[31]);
-    if (s_horizon_enabled &&
-        (horizon_kind == 1 ||
-         (horizon_kind == 2 && s_extra_horizon_enabled)) &&
-        cdrom_load_in_progress()) {
+    int horizon_ok = 0;
+    if (s_horizon_enabled && cdrom_load_in_progress()) {
+        if (s_horizon_any)
+            horizon_ok = 1;
+        else if (horizon_kind == 1)
+            horizon_ok = 1;
+        else if (horizon_kind == 2 && s_extra_horizon_enabled)
+            horizon_ok = 1;
+    }
+    if (horizon_ok) {
         uint32_t dist = cycles_to_next_event();
+        /* Pending VBlank in I_STAT makes cycles_to_next_event()==0 even when the
+         * CD wait's next sector is far out. Prefer the CD schedule then. */
+        if (dist <= 64u) {
+            uint32_t cd = cdrom_cycles_to_irq(0xFFFFFFFFu);
+            if (cd > 64u && cd != 0xFFFFFFFFu) dist = cd;
+        }
         if (dist > 64u && dist != 0xFFFFFFFFu && dist <= 1200000u) {
             psx_advance_cycles(dist);
             if (horizon_kind == 2) {
@@ -207,14 +241,14 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
 void psx_vsync_query_hle_stats_json(char* buf, int cap) {
     snprintf(buf, (size_t)cap,
              "\"enabled\":%d,\"horizon_enabled\":%d,"
-             "\"extra_horizon_enabled\":%d,"
+             "\"extra_horizon_enabled\":%d,\"horizon_any\":%d,"
              "\"calls\":%llu,\"handled\":%llu,"
              "\"fallback_mode\":%llu,\"fallback_diagnostic\":%llu,"
              "\"fallback_layout\":%llu,\"horizon_sites\":%u,"
              "\"horizon_hits\":%llu,\"horizon_cycles\":%llu,"
              "\"extra_horizon_sites\":%u,\"extra_horizon_hits\":%llu,"
              "\"extra_horizon_cycles\":%llu",
-             s_enabled, s_horizon_enabled, s_extra_horizon_enabled,
+             s_enabled, s_horizon_enabled, s_extra_horizon_enabled, s_horizon_any,
              (unsigned long long)s_calls,
              (unsigned long long)s_handled,
              (unsigned long long)s_fallback_mode,

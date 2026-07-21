@@ -38,17 +38,31 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
 /* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
  * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic.
  * force_4_3 = pillarbox at native 4:3 even on a wide display aspect (FMVs
- * are authored 4:3 and get no GTE squash to compensate the stretch). */
+ * are authored 4:3 and get no GTE squash to compensate the stretch).
+ * content_w: if 0 < content_w < src_w, only columns [0, content_w) are shown
+ * (left-aligned in the letterbox; the rest stays cleared black). Used to hide
+ * a trailing depth24 margin without changing CRTC width / stretching. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
-                         int force_4_3);
+                         int force_4_3, int content_w);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
 /* Sync the authoritative FBO down to CPU VRAM if the GPU side is ahead (else
- * a no-op). The 24-bit (FMV) present path, screenshots, and the debug server
- * call this before reading CPU VRAM. */
+ * a no-op). Screenshots and the debug server call this before reading CPU
+ * VRAM. Do NOT use before 24-bit (FMV) scanout — a full readback can clobber
+ * packed RGB888 MDEC bytes in the CPU mirror (use flush_cpu_uploads instead). */
 void gl_renderer_sync_cpu(void);
+
+/* Land pending CPU→VRAM uploads into the FBO without reading the FBO back.
+ * Safe before 24-bit (FMV) CPU scanout of the mirror. */
+void gl_renderer_flush_cpu_uploads(void);
+
+/* Mark the whole display dirty, drop present-path latches, reset frame-
+ * interpolation history, and force the next several SwapWindow calls even if
+ * VRAM tiles match the last present. Call after savestate restore so a
+ * reloaded identical frame still reaches the window (double/triple buffer). */
+void gl_renderer_invalidate_present(void);
 
 /* THE present path for 15-bit frames: blit the display region straight from
  * the authoritative VRAM FBO into a letterboxed rect (no readback).

@@ -61,6 +61,10 @@ struct CodeGenConfig {
     // See docs/DATA_SHARDS.md. Empty = no hooks (default).
     std::set<uint32_t> data_shard_funcs;
 
+    // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
+    // addresses (MotK VLC leaves, etc.). Host locality hint only.
+    std::set<uint32_t> hot_funcs;
+
     // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
     // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
     // guest RAM VBlank counter returned by that query path.  Empty = inert.

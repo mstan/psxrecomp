@@ -461,6 +461,10 @@ struct GameConfig {
     // out to be impure only costs a poisoned capture, never a wrong replay.
     std::vector<uint32_t> data_shard_funcs;
 
+    // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
+    // on their generated C bodies (profile/host locality; no guest semantics).
+    std::vector<uint32_t> hot_funcs;
+
     // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
     // implementation.  mode=-1 returns vsync_counter_addr while bypassing two
     // unused MMIO reads; every other mode executes the original function.
@@ -476,6 +480,9 @@ struct GameConfig {
     // Separately togglable second tier for additional verified loops, allowing
     // per-feature A/B without disabling the accepted base site set.
     std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    // When true, any VSync(-1) may event-horizon while CD load/read is busy
+    // (not only listed return PCs). For titles whose FMV polls many sites.
+    bool                  vsync_event_horizon_any = false;
 
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
@@ -746,6 +753,9 @@ struct UserSettings {
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
     bool has_skip_launcher  = false; bool skip_launcher  = false;
+    // [netplay] — display name for lobby browser / room. Prompted once on first
+    // Netplay Lobbies visit; Change Player Name updates it.
+    bool has_netplay_player_name = false; std::string netplay_player_name;
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
     // [audio]

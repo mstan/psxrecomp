@@ -122,6 +122,7 @@ int main(int argc, char** argv) {
     bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+    std::set<uint32_t>    hot_funcs;            // [recompiler] hot_funcs
     std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
@@ -157,6 +158,7 @@ int main(int argc, char** argv) {
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
+        hot_funcs.insert(cfg.hot_funcs.begin(), cfg.hot_funcs.end());
         if (cfg.vsync_query_func)
             vsync_query_hle_funcs[cfg.vsync_query_func] = {
                 cfg.vsync_counter_addr, cfg.vsync_gpustat_ptr_addr,
@@ -826,6 +828,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
     codegen_config.data_shard_funcs = ds_funcs;
+    codegen_config.hot_funcs = hot_funcs;
     codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
@@ -1180,6 +1183,11 @@ int main(int argc, char** argv) {
         ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
         if (codegen.cps_enabled())
             ds << "    cpu->pc = entry->resume_pc;\n";
+        ds << "    /* load_accel: cycle-faithful VSync(-1) query (config-gated). */\n";
+        ds << "    {\n";
+        ds << "        extern int psx_vsync_query_hle_try(CPUState* cpu, uint32_t addr);\n";
+        ds << "        if (psx_vsync_query_hle_try(cpu, addr)) return 1;\n";
+        ds << "    }\n";
         ds << "    entry->fn(cpu);\n";
         ds << "    return 1;\n";
         ds << "}\n";

@@ -323,6 +323,10 @@ void psx_bios_hle_configure(int call_hle, int boot_skip)
 {
     s_call_hle_on  = call_hle ? 1 : 0;
     s_boot_skip_on = boot_skip ? 1 : 0;
+    /* Rematch / session_reboot re-enters bring-up without process exit; the
+     * shell-skip latch must arm again or peers run the interactive shell and
+     * appear hung after netplay lockstep. */
+    s_shell_skipped = 0;
     g_psx_bios_hle_hook =
         (s_call_hle_on || s_boot_skip_on) ? &bios_hle_dispatch : NULL;
 }

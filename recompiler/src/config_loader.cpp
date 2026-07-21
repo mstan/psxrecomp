@@ -877,6 +877,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 data_shard_funcs.push_back(parse_hex(a, "data_shards.funcs"));
         }
     }
+    // Optional [recompiler] hot_funcs — __attribute__((hot)) on emitted C.
+    std::vector<uint32_t> hot_funcs;
+    if (recomp.contains("hot_funcs")) {
+        const auto& arr = toml::find<std::vector<std::string>>(recomp, "hot_funcs");
+        for (const auto& a : arr)
+            hot_funcs.push_back(parse_hex(a, "recompiler.hot_funcs"));
+    }
     uint32_t vsync_query_func = 0;
     uint32_t vsync_counter_addr = 0;
     uint32_t vsync_gpustat_ptr_addr = 0;
@@ -884,6 +891,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t vsync_timer1_cache_addr = 0;
     std::vector<uint32_t> vsync_event_horizon_sites;
     std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    bool vsync_event_horizon_any = false;
     if (cfg.contains("load_accel")) {
         const toml::value& lav = toml::find(cfg, "load_accel");
         if (lav.contains("vsync_query")) {
@@ -930,6 +938,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                         vsync_event_horizon_extra_sites.push_back(parse_hex(
                             a, "load_accel.vsync_query.event_horizon_extra_sites"));
                 }
+                if (vq.contains("event_horizon_any"))
+                    vsync_event_horizon_any = toml::find<bool>(vq, "event_horizon_any");
             }
         }
     }
@@ -1188,6 +1198,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
         /*data_shard_funcs*/      data_shard_funcs,
+        /*hot_funcs*/             hot_funcs,
         /*vsync_query_func*/      vsync_query_func,
         /*vsync_counter_addr*/    vsync_counter_addr,
         /*vsync_gpustat_ptr_addr*/ vsync_gpustat_ptr_addr,
@@ -1195,6 +1206,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*vsync_timer1_cache_addr*/ vsync_timer1_cache_addr,
         /*vsync_event_horizon_sites*/ vsync_event_horizon_sites,
         /*vsync_event_horizon_extra_sites*/ vsync_event_horizon_extra_sites,
+        /*vsync_event_horizon_any*/   vsync_event_horizon_any,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
@@ -1386,6 +1398,13 @@ UserSettings load_user_settings(const fs::path& path) {
             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
         });
     }
+    if (doc.contains("netplay")) {
+        const toml::value& n = toml::find(doc, "netplay");
+        if (n.contains("player_name")) try_get([&]{
+            const auto v = toml::find<std::string>(n, "player_name");
+            if (!v.empty()) { s.netplay_player_name = v; s.has_netplay_player_name = true; }
+        });
+    }
     if (doc.contains("bios")) {
         const toml::value& b = toml::find(doc, "bios");
         if (b.contains("path")) try_get([&]{
@@ -1529,6 +1548,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
     if (s.has_skip_launcher)
         f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
+    if (s.has_netplay_player_name && !s.netplay_player_name.empty())
+        f << "\n[netplay]\nplayer_name = \"" << s.netplay_player_name << "\"\n";
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)

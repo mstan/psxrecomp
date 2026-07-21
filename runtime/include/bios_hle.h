@@ -53,12 +53,14 @@ struct CPUState;
  * bios_hle.c, emitted-extern by full_function_emitter.cpp). NULL = pure LLE. */
 extern int (*g_psx_bios_hle_hook)(struct CPUState* cpu, uint32_t phys);
 
-/* Select the BIOS backend. Call once at bring-up, after config + env
- * resolution, before psx_scheduler_run. Two independent axes:
+/* Select the BIOS backend. Call at bring-up (and again on netplay rematch
+ * session_reboot), after config + env resolution, before psx_scheduler_run.
+ * Two independent axes:
  *   call_hle  — service implemented kernel calls in HLE ([runtime] bios_hle)
  *   boot_skip — one-shot shell intercept ((bios_hle && !keep_intro) OR the
  *               deprecated fast_boot alias, which skips boot only)
- * The hook is installed when either axis is on; both off = NULL = pure LLE. */
+ * Clears the shell-skip latch so rematch can skip again. The hook is installed
+ * when either axis is on; both off = NULL = pure LLE. */
 void psx_bios_hle_configure(int call_hle, int boot_skip);
 
 int         psx_bios_hle_enabled(void);

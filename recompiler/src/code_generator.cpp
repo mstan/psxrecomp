@@ -1906,6 +1906,11 @@ std::string CodeGenerator::translate_basic_block(
                         // continuation; the callee's jr $ra publishes cpu->pc =
                         // $ra and the flat trampoline dispatches back into this
                         // function's entry-switch. No host nesting.
+                        // Only register a LOCAL switch case when the return PC
+                        // lives in this piece (has a block label). When the
+                        // delay/return was split out, successors is empty — the
+                        // mid-function pre-pass promotes addr+8 to its own
+                        // dispatch entry (do not emit goto block_<foreign>).
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
@@ -1950,8 +1955,8 @@ std::string CodeGenerator::translate_basic_block(
 
                     if (cps_enabled_) {
                         // The target and link were committed before the delay
-                        // slot above. Register the continuation and tail-transfer
-                        // using the latched target.
+                        // slot above. Register a local continuation only when
+                        // the return PC is in this piece (see jal).
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
@@ -2096,7 +2101,16 @@ GeneratedFunction CodeGenerator::generate_function(
 
     GeneratedFunction result;
     result.function_name = func.name;
-    result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+    {
+        std::string sig;
+        if (config_.hot_funcs.count(func.start_addr)) {
+            sig += "#if defined(__GNUC__) || defined(__clang__)\n"
+                   "__attribute__((hot))\n"
+                   "#endif\n";
+        }
+        sig += fmt::format("void {}(CPUState* cpu)", func.name);
+        result.signature = std::move(sig);
+    }
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
     // translate_instruction widens this function's width compares. Cleared for
@@ -2661,8 +2675,10 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
 }
 
 void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
-    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    /* Release inlines debug_server_log_call_entry via debug_server.h
+     * (included from psx_runtime.h). Debug builds need the extern. */
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     ss << "#endif\n";
     ss << "#ifdef PSX_COSIM\n";
@@ -2863,6 +2879,13 @@ std::string CodeGenerator::generate_file(
                         check_target(block.exit_instr.address + 8);
                     } else if (block.exit_instr.type == ControlFlowType::Jump) {
                         check_target(block.exit_instr.target);
+                    } else if (block.exit_instr.type == ControlFlowType::JumpLink ||
+                               block.exit_instr.type == ControlFlowType::JumpLinkReg) {
+                        // CPS jal/jalr publishes $ra = addr+8. When the delay slot
+                        // was split into another piece, that return PC is often a
+                        // mid-block address (not a function start / block leader) and
+                        // was never registered — MotK 0x8001E7F0 fell to dirty_ram.
+                        check_target(block.exit_instr.address + 8);
                     }
                 }
             };

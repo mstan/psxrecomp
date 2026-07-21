@@ -17,6 +17,7 @@
  * via psx_fatal_halt rather than silently no-op (no stubs).
  */
 
+#include "gpu.h"
 #include "gpu_render.h"
 #include "gpu_vk_renderer.h"
 #include "gpu_sw_renderer.h"
@@ -1557,6 +1558,15 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
 
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height, 4, 3, dst);
+    /* Short GP1(07h) bands: letterbox inside the 4:3 rect (see GL present). */
+    if (src_h > 0 && src_h < 240) {
+        int box_h = dst[1].y - dst[0].y;
+        int content_h = (box_h * src_h) / 240;
+        if (content_h < 1) content_h = 1;
+        int y0 = dst[0].y + (box_h - content_h) / 2;
+        dst[0].y = y0;
+        dst[1].y = y0 + content_h;
+    }
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; blit.srcSubresource.layerCount = 1;
     blit.srcOffsets[1].x = src_w; blit.srcOffsets[1].y = src_h; blit.srcOffsets[1].z = 1;
@@ -2070,9 +2080,54 @@ static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
     up_add(x, y, x + w - 1, y + h - 1);
 }
 
+/* Same policy as GL: skip framebuffer-sized depth24 (RGB888) transfers only;
+ * still stage smaller texture A0s. On leave clear skipped FB union — never
+ * restage packed RGB888 as 1555. */
+static int s_depth24_skip_up = 0;
+static DirtyRect s_d24_skip_fb;
+
+static int depth24_is_fb_transfer(int w, int h) {
+    if (!gpu_display_is_depth24() || w <= 0 || h <= 0) return 0;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    int fb_w = (int)((di.width * 3u + 1u) / 2u);
+    int fb_h = (int)di.height;
+    if (fb_w < 8) fb_w = 8;
+    if (fb_h < 1) fb_h = 1;
+    if (h >= fb_h - 8 && h <= fb_h + 16 && w >= (fb_w * 3) / 4) return 1;
+    if ((int64_t)w * (int64_t)h >= ((int64_t)fb_w * fb_h) / 2) return 1;
+    return 0;
+}
+
+static void depth24_clear_skipped_fb(void) {
+    /* GL scissor-clears the skipped FB union. VK keeps texture uploads that
+     * landed during depth24; the FB bands are overwritten by the next 15-bit
+     * draws. (A full-image ClearColorImage would wipe those textures.) */
+    rect_clear(&s_d24_skip_fb);
+}
+
+static void depth24_upload_policy(void) {
+    int d24 = gpu_display_is_depth24();
+    if (d24 && !s_depth24_skip_up) {
+        s_up_nrects = 0;
+        rect_clear(&s_d24_skip_fb);
+    } else if (!d24 && s_depth24_skip_up) {
+        s_up_nrects = 0;
+        depth24_clear_skipped_fb();
+        gpu_depth24_upload_span_reset();
+    }
+    s_depth24_skip_up = d24;
+}
+
 static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
     sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
+    depth24_upload_policy();
+    if (s_depth24_skip_up && depth24_is_fb_transfer(w, h)) {
+        int x0 = x & (VRAM_W - 1), y0 = y & (VRAM_H - 1);
+        rect_add(&s_d24_skip_fb, x0, y0, x0 + w - 1, y0 + h - 1);
+        return;
+    }
     up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
@@ -2084,6 +2139,7 @@ static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
 static void vkb_vram_write(int x, int y, uint16_t pixel) {
     sw_vram_write(x, y, pixel);
     if (!s_ctx_ok) return;
+    depth24_upload_policy();
     up_add(x & (VRAM_W - 1), y & (VRAM_H - 1),
            x & (VRAM_W - 1), y & (VRAM_H - 1));
 }

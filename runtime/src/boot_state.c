@@ -195,7 +195,12 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         if (len != sizeof(CpuRegs)) return 0;
         const CpuRegs* c = (const CpuRegs*)p;
         memcpy(cpu->gpr,      c->gpr,      sizeof cpu->gpr);
-        cpu->pc = entry_pc;   /* always enter at the game entry, never a mid-PC */
+        /* Restore the saved PC. Boot-skip captures are taken at game entry, so
+         * c->pc is entry there. User savestates (F1–F12) must resume mid-game —
+         * forcing entry_pc here left MotK title/char-select loads at 0x80065A44
+         * with menu RAM/GPU, display stuck off, and ~fake host FPS. */
+        (void)entry_pc;
+        cpu->pc = c->pc;
         cpu->hi = c->hi; cpu->lo = c->lo;
         memcpy(cpu->cop0,     c->cop0,     sizeof cpu->cop0);
         memcpy(cpu->gte_data, c->gte_data, sizeof cpu->gte_data);

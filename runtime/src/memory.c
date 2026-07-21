@@ -34,6 +34,11 @@ static uint8_t ram[RAM_SIZE];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
+/* Exposed for inlined main-RAM load helpers in psx_cyc.h (VLC/decode hot path). */
+uint8_t *g_psx_ram = ram;
+/* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
+int g_psx_load_delay = -1;
+
 /* Physical address translation for guest accesses. The 2 MB main RAM is
  * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
  * register, default 0x0B88) and games rely on it — Kula World's crt0
@@ -762,6 +767,12 @@ uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 void memory_init(const char* bios_path) {
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
+    /* Rematch re-enters without process exit — wipe sticky I/O regs that
+     * live outside device *_init (I_STAT/I_MASK cleared in interrupts_init). */
+    memset(mem_ctrl, 0, sizeof(mem_ctrl));
+    ram_size_reg = 0;
+    i_stat = 0;
+    i_mask = 0;
 
     FILE* f = fopen(bios_path, "rb");
     if (!f) {
@@ -1246,10 +1257,10 @@ static uint32_t psx_read_word_raw(uint32_t addr) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
-        uint32_t v = (uint32_t)ram[phys]
-             | ((uint32_t)ram[phys + 1] << 8)
-             | ((uint32_t)ram[phys + 2] << 16)
-             | ((uint32_t)ram[phys + 3] << 24);
+        /* Host LE load — same bytes as the shift-or form; VLC/decode hot paths
+         * issue millions of aligned main-RAM LWs per second. */
+        uint32_t v;
+        memcpy(&v, &ram[phys], sizeof(v));
         /* Targeted main-RAM read watch (debug). Flag is 0 in normal runs, so the
          * hot read path pays only a predictable branch. */
         if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
@@ -1587,8 +1598,6 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * stealing the bus; modeling it needs the live steal count threaded out of the DMA
  * controller, and it can't be isolated by a static ruler. It remains an unmodeled
  * dynamic axis; the per-region device waits below are the static, validatable piece. */
-extern void psx_advance_cycles(uint32_t cycles);
-
 /* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-dependent
  * part of a load's access cost (added to the timestamp before the +completion). `size`
  * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
@@ -1638,12 +1647,14 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
         cpu->ld_which_t = (uint8_t)arm_rt;
         return;
     }
-    /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20). */
-    psx_advance_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
+    /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20).
+     * Combined with region+completion into one advance — deadline catch-up
+     * replays exact event boundaries, so splitting the charge is only host cost. */
     uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
     uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
+    uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
     cpu->ld_absorb = cost;
-    psx_advance_cycles(cost);
+    psx_advance_cycles(fudge + cost);
     cpu->ld_which_t = (uint8_t)arm_rt;
     /* PROOF GATE (PSX_POLL_PROOF=N, default 0/off): a FLAT, non-absorbed extra N
      * cycles per main-RAM data read — replicates the historical "+6 cyc/main-RAM
@@ -1660,6 +1671,15 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
     }
 }
 
+/* Resolve PSX_LOAD_DELAY once (shared with inlined psx_cyc.h helpers). */
+int psx_load_delay_enabled(void) {
+    if (g_psx_load_delay < 0) {
+        const char* e = getenv("PSX_LOAD_DELAY");
+        g_psx_load_delay = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_psx_load_delay;
+}
+
 /* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on
  * PSX_ENABLE_BLOCK_CYCLES so the Beetle-oracle build (cycles off) does a plain read. */
 static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t size,
@@ -1668,9 +1688,10 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
     /* Bisect gate (PSX_LOAD_DELAY=0): disable the R3000A load-delay interlock
      * timing (the d8c4a8e/fade560/d597797 feature) to test whether it moves the
      * MMX6 cutscene ordering. Read once; default on. */
-    static int s_ld = -1;
-    if (s_ld < 0) { const char* e = getenv("PSX_LOAD_DELAY"); s_ld = (e && e[0] == '0') ? 0 : 1; }
-    if (!s_ld) { (void)addr; (void)size; (void)rt; (void)reg_mask; return; }
+    if (!psx_load_delay_enabled()) {
+        (void)addr; (void)size; (void)rt; (void)reg_mask;
+        return;
+    }
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
@@ -1681,17 +1702,23 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
 #endif
 }
 
-uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+/* Slow path for non-main-RAM / lockstep / data-shard loads (inlined helper falls here). */
+uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
+    if (g_ls_mode == 0 && !g_ds_recording) return psx_read_word_raw(addr);
     return psx_read_word(addr);
+}
+uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
+    if (g_ls_mode == 0 && !g_ds_recording) {
+        /* mirror psx_read_half_raw path for production */
+        return psx_read_half(addr);
+    }
+    return psx_read_half(addr);
 }
 void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
                                    uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
-}
-uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
-    return psx_read_half(addr);
 }
 uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);

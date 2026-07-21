@@ -733,9 +733,35 @@ static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
     return psx_change_thread_fiber(cpu, target_tcb);
 }
 
+static int g_in_scheduler_run = 0;
+static int g_return_to_lobby_req = 0;
+
+void psx_clear_return_to_lobby(void)
+{
+    g_return_to_lobby_req = 0;
+}
+
+int psx_return_to_lobby_requested(void)
+{
+    return g_return_to_lobby_req;
+}
+
+void psx_request_return_to_lobby(void)
+{
+    g_return_to_lobby_req = 1;
+    if (!g_in_scheduler_run) {
+        return;
+    }
+    g_sched_escape.target_tcb = 0;
+    g_sched_escape.resume_pc = 0;
+    g_sched_escape.reason = PSX_RUN_RETURN_TO_LOBBY;
+    longjmp(g_scheduler_jmpbuf, 1);
+}
+
 void psx_scheduler_run(CPUState* cpu)
 {
     extern int g_psx_dispatch_depth;
+    g_in_scheduler_run = 1;
     g_sched_escape.reason = PSX_RUN_CONTINUE;
     for (;;) {
         if (setjmp(g_scheduler_jmpbuf) != 0) {
@@ -745,6 +771,10 @@ void psx_scheduler_run(CPUState* cpu)
              * with in_exception==0), so interrupt state needs no fixup here. */
             g_psx_dispatch_depth = 0;
             g_psx_call_bail      = 0;
+            /* Soft-exit / yield longjmps out of vblank inside
+             * psx_devices_service_to_now; without this the re-entrancy guard
+             * stays set and every later advance skips device service forever. */
+            { extern int psx_in_device_service; psx_in_device_service = 0; }
             /* A longjmp-out through a nested call unit (overlay_loader_call_native
              * or dispatch_nonlocal_call) would skip its depth restore; clear the
              * nested-unit gate so IRQ checks are not wedged-off after the escape
@@ -754,10 +784,15 @@ void psx_scheduler_run(CPUState* cpu)
 
         switch (g_sched_escape.reason) {
             case PSX_RUN_FATAL:
+                g_in_scheduler_run = 0;
                 trap_crash("scheduler: structured FATAL escape");
                 return;
             case PSX_RUN_GUEST_EXIT:
+                g_in_scheduler_run = 0;
                 return; /* abnormal top-level exit — main.cpp dumps diagnostics */
+            case PSX_RUN_RETURN_TO_LOBBY:
+                g_in_scheduler_run = 0;
+                return; /* netplay soft-exit — main.cpp reopens lobby UI */
             default:
                 break;  /* CONTINUE / YIELD_TO_TCB / RESUME_CURRENT */
         }
@@ -804,6 +839,7 @@ void psx_scheduler_run(CPUState* cpu)
             continue;
         }
         g_sched_escape.reason = PSX_RUN_GUEST_EXIT;
+        g_in_scheduler_run = 0;
         return;
     }
 }

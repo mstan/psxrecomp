@@ -240,20 +240,26 @@ double rab_fill_ms(const rab_bridge *b) {
 
 void rab_push(rab_bridge *b, const int16_t *in, int frames) {
     int ch = b->cfg.channels;
+    /* Track fill incrementally — the old per-frame (in_count - out_pos)
+     * recompute sat under SDL_LockAudioDevice for every SPU sample and
+     * correlated with MotK's post-XA FPS cliff. */
+    double fill = (double)b->in_count - b->out_pos;
+    const double cap_lim = (double)(b->cap - 1);
     for (int f = 0; f < frames; ++f) {
-        double fill = (double)b->in_count - b->out_pos;
-        if (fill >= (double)(b->cap - 1)) {
+        if (fill >= cap_lim) {
             /* Overflow emergency: producer outran consumer past the ring. Drop the
              * oldest source frame by nudging the read cursor forward. Rare under
              * DRC; the resampler's continuous history limits the audible seam. */
             b->out_pos += 1.0;
             b->stats.overflow_drops++;
+            fill -= 1.0;
         }
         int64_t w = (int64_t)(b->in_count % (uint64_t)b->cap);
         float *slot = b->ring + w * ch;
         for (int c = 0; c < ch; ++c)
             slot[c] = (float)in[f * ch + c] * (1.0f / 32768.0f);
         b->in_count++;
+        fill += 1.0;
     }
     b->stats.pushed_frames += (uint64_t)frames;
 }

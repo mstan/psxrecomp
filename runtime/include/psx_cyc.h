@@ -32,12 +32,11 @@
 #include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
 #endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
+#include "psx_cycles.h"  /* inline psx_advance_cycles */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-extern void psx_advance_cycles(uint32_t cycles);
 
 /* §1 base (Beetle cpu.cpp:795-798). */
 static inline void psx_cyc_base(CPUState* cpu) {
@@ -88,14 +87,81 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */
 
-/* CPU data load value+timing (memory.c). Does the full Beetle per-instruction
- * sequence: §1 base + GPR_DEPRES(reg_mask) + (LDWhich==rt cancel) + DO_LDS +
- * ReadMemory timing (clear give-back, fudge, region+completion, arm LDAbsorb +
- * LDWhich=rt), and returns the raw value (caller applies the same width/sign as the
- * prior cpu->read_* call). For LWL/LWR pass the WORD-ALIGNED address. */
-extern uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
-extern uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
-extern uint8_t  psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+/* Main-RAM base + load-delay gate (memory.c). Inlined load helpers use these
+ * so MotK VLC / decode hot paths avoid an out-of-line call per LW/LH. */
+extern uint8_t *g_psx_ram;
+extern int      g_psx_load_delay;
+extern int      g_ls_mode;
+extern volatile int g_ds_recording;
+int psx_load_delay_enabled(void);
+uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+
+/* CPU data load value+timing. Full Beetle sequence for main RAM is inlined;
+ * MMIO / lockstep / data-shard fall through to *_slow in memory.c. */
+static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+                                          uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+        if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+        if (g_psx_load_delay) {
+            psx_cyc_base(cpu);
+            psx_cyc_deps(cpu, reg_mask);
+            if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+            psx_cyc_lds(cpu);
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
+            cpu->ld_absorb = 5u; /* main-RAM wait 3 + completion 2 */
+            psx_advance_cycles(fudge + 5u);
+            cpu->ld_which_t = (uint8_t)rt;
+        }
+        uint32_t off = phys & 0x1FFFFFu;
+        return (uint32_t)g_psx_ram[off]
+             | ((uint32_t)g_psx_ram[off + 1] << 8)
+             | ((uint32_t)g_psx_ram[off + 2] << 16)
+             | ((uint32_t)g_psx_ram[off + 3] << 24);
+    }
+    return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
+#else
+    (void)cpu; (void)rt; (void)reg_mask;
+    extern uint32_t psx_read_word(uint32_t a);
+    return psx_read_word(addr);
+#endif
+}
+
+static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+                                          uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+        if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+        if (g_psx_load_delay) {
+            psx_cyc_base(cpu);
+            psx_cyc_deps(cpu, reg_mask);
+            if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+            psx_cyc_lds(cpu);
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
+            cpu->ld_absorb = 5u;
+            psx_advance_cycles(fudge + 5u);
+            cpu->ld_which_t = (uint8_t)rt;
+        }
+        uint32_t off = phys & 0x1FFFFFu;
+        return (uint16_t)((uint32_t)g_psx_ram[off]
+                        | ((uint32_t)g_psx_ram[off + 1] << 8));
+    }
+    return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
+#else
+    (void)cpu; (void)rt; (void)reg_mask;
+    extern uint16_t psx_read_half(uint32_t a);
+    return psx_read_half(addr);
+#endif
+}
+
+extern uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
 /* Charge the exact timing/pipeline effects of a 32-bit CPU load without
  * invoking the memory handler.  Enhancement HLE may use this only when static

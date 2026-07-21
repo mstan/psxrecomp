@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "psx_netplay.h"
+
 struct SDL_Window;
 
 namespace PSXRecompV4 { struct UserSettings; }
@@ -27,6 +29,12 @@ enum class Result {
     Launch,  // user pressed LAUNCH — proceed to boot with `io`
     Quit,    // user closed the window — caller should exit
     Unavailable, // launcher could not initialise (assets/GL); caller boots as if skipped
+};
+
+/* Optional behaviour for run(). */
+struct RunOptions {
+    /* Open directly on the lobby room (lobby WS already connected). */
+    bool resume_netplay_room = false;
 };
 
 // Static facts about the game the launcher is configuring. Drives the title and
@@ -51,13 +59,25 @@ struct GameInfo {
     std::vector<Language> languages;
 };
 
+/* Filled on Launch when the user started from the Netplay lobby path. */
+struct NetplayLaunch {
+    bool enabled = false;
+    PsxNetplayConfig cfg{};
+    std::string display_name;
+};
+
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*
 // to avoid leaking SDL types into this header) already created and current on
 // `window`. `io` is seeded with the effective settings (game.toml ∪ settings.toml)
 // and, on Result::Launch, updated in place with the user's choices. `assets_dir`
 // is the directory holding launcher.rml / .rcss / fonts.
+// When `out_net` is non-null, a successful netplay lobby launch sets it.
+// Lobby WebSocket stays connected across a netplay Launch so the match can
+// return to the same room; offline Launch / Quit still disconnect.
 Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
-           const GameInfo& game, const char* assets_dir);
+           const GameInfo& game, const char* assets_dir,
+           NetplayLaunch* out_net = nullptr,
+           const RunOptions& opts = {});
 
 } // namespace psx_launcher

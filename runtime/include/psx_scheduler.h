@@ -46,6 +46,7 @@ typedef enum {
     PSX_RUN_YIELD_TO_TCB,    /* ChangeThread / cross-thread RFE: switch to g_sched_escape.target_tcb */
     PSX_RUN_RESUME_CURRENT,  /* same-thread RFE: re-dispatch the current thread at resume_pc */
     PSX_RUN_GUEST_EXIT,      /* a guest thread legitimately ended */
+    PSX_RUN_RETURN_TO_LOBBY, /* netplay soft-exit: tear down match, keep lobby WS */
     PSX_RUN_FATAL,           /* invariant violation — fail closed, never silently continue */
 } psx_run_reason_t;
 
@@ -86,6 +87,15 @@ int psx_is_dispatchable(uint32_t pc);
  * exit-diagnostic dump then runs. Forward-declared for main.cpp (C++). */
 struct CPUState;
 void psx_scheduler_run(struct CPUState* cpu);
+
+/*
+ * Soft-exit netplay back to the lobby UI. Sets PSX_RUN_RETURN_TO_LOBBY and
+ * longjmps out of the scheduler when inside psx_scheduler_run; otherwise just
+ * latches the flag for the caller to observe. Safe from the netplay barrier.
+ */
+void psx_request_return_to_lobby(void);
+int  psx_return_to_lobby_requested(void);
+void psx_clear_return_to_lobby(void);
 
 /* Save-state restore: unwind to psx_scheduler_run and re-dispatch resume_pc
  * (the restored CPUState's PC). Call on the scheduler fiber at a block-leader

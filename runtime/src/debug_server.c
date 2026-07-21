@@ -2007,13 +2007,24 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined be
  * actually ran. Entry-stamp attribution is leaf-biased but honest. */
 volatile uint32_t g_psx_last_fn_entry = 0;
 
+/* Addressable entry for overlay CPS callbacks (header inlines the Release path). */
+void debug_server_log_call_entry_fn(uint32_t func_addr) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    g_psx_last_fn_entry = func_addr;
+#else
+    debug_server_log_call_entry(func_addr);
+#endif
+}
+
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release: inlined in cpu_state.h for every generated TU. */
+#else
 void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_last_fn_entry = func_addr;
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
-#ifndef PSX_NO_DEBUG_TOOLS
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
@@ -2022,14 +2033,6 @@ void debug_server_log_call_entry(uint32_t func_addr) {
      * Beetle side (PC==anchor, before execute). Covers the game-dispatch path
      * that debug_server_trace_dispatch misses. */
     cyc_watch_observe(func_addr & 0x1FFFFFFFu);
-#endif
-#ifdef PSX_NO_DEBUG_TOOLS
-    /* Hottest call site in the binary — called at the top of every
-     * recompiled function. Early-return makes it a 1-instruction
-     * function-call cost; the compiler will likely PLT it through. */
-    (void)func_addr;
-    return;
-#endif
     s_fn_direct_seen++;
     if (!debug_cpu_ptr) {
         s_fn_direct_no_cpu++;
@@ -2061,6 +2064,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     s_fn_entry_seq++;
     ls_suppress_end();
 }
+#endif /* !PSX_NO_DEBUG_TOOLS */
 
 /* Always-on A0/B0/C0 BIOS-call ring (ported from ape-fw for good-vs-bad
  * event-delivery comparison). Recorded at the central dispatch chokepoint. */
@@ -4629,6 +4633,8 @@ static void handle_gpu_state(int id, const char *json)
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     uint32_t gpustat = gpu_read_gpustat();
+    uint32_t hx1 = 0, hx2 = 0, hy1 = 0, hy2 = 0, hr1 = 0, hr2 = 0;
+    gpu_get_crtc_debug(&hx1, &hx2, &hy1, &hy2, &hr1, &hr2);
 
     GpuDrawArea da;
     gpu_get_draw_area(&da);
@@ -4641,6 +4647,8 @@ static void handle_gpu_state(int id, const char *json)
              "\"width\":%d,\"height\":%d,"
              "\"depth\":%d,\"depth24\":%d,"
              "\"disabled\":%d,"
+             "\"h_display\":[%u,%u],\"v_display\":[%u,%u],"
+             "\"hres1\":%u,\"hres2\":%u,"
              "\"gpustat\":\"0x%08X\","
              "\"gp0_writes\":%llu,"
              "\"gp0_nop\":%llu,\"gp0_fill\":%llu,\"gp0_draw\":%llu,\"gp0_env\":%llu,\"gp0_copy\":%llu,"
@@ -4656,6 +4664,7 @@ static void handle_gpu_state(int id, const char *json)
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
              di.disabled,
+             hx1, hx2, hy1, hy2, hr1, hr2,
              gpustat,
              (unsigned long long)gpu_get_gp0_count(),
              (unsigned long long)nop, (unsigned long long)fill,
@@ -7184,20 +7193,35 @@ static void handle_savestate(int id, const char *json)
 {
     extern int savestate_request_save(int slot);
     extern int savestate_request_load(int slot);
+    extern int psx_netplay_active(void);
+    extern int psx_netplay_is_host(void);
+    extern int psx_netplay_request_save(int slot);
+    extern int psx_netplay_request_load(int slot);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
     int staged;
-    if      (!strcmp(op, "save")) staged = savestate_request_save(slot);
-    else if (!strcmp(op, "load")) staged = savestate_request_load(slot);
-    else { send_err(id, "op must be save|load"); return; }
+    if (strcmp(op, "save") && strcmp(op, "load")) {
+        send_err(id, "op must be save|load");
+        return;
+    }
+    if (psx_netplay_active()) {
+        if (!psx_netplay_is_host()) {
+            send_err(id, "savestate refused (netplay guest; host-only)");
+            return;
+        }
+        staged = !strcmp(op, "save") ? psx_netplay_request_save(slot)
+                                     : psx_netplay_request_load(slot);
+    } else if (!strcmp(op, "save")) {
+        staged = savestate_request_save(slot);
+    } else {
+        staged = savestate_request_load(slot);
+    }
     if (!staged) {
-        /* Refused: bad slot, not configured, or load on an LLE host-fiber run
-         * (cross-fiber unwind is unsafe there — see savestate_request_load).
-         * The old handler ack'd ok:true anyway, which read as a silent no-op. */
+        /* Refused: bad slot, not configured, load on LLE, or netplay busy. */
         send_err(id, "savestate request refused (LLE run cannot load states; "
-                     "check slot / configuration)");
+                     "check slot / configuration / netplay host)");
         return;
     }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
@@ -7756,22 +7780,20 @@ static void handle_display_ring_get(int id, const char *json)
 
 static void handle_screenshot_file(int id, const char *json)
 {
-    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
-     * the freshest frame and is presented without a readback). Sync it down so
-     * the capture reflects what's on screen. No-op for the software backend or
-     * when no GPU frame is pending. Safe here: the debug server is pumped on
-     * the main (GL-context) thread. */
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();
-    /* Same staleness class for the Vulkan backend (GPU-authoritative VRAM
-     * image + lazy CPU mirror): sync it down too. No-op when inactive. */
-    extern void vk_renderer_sync_cpu(void);
-    vk_renderer_sync_cpu();
-
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) {
         send_err(id, "display disabled"); return;
+    }
+    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
+     * the freshest frame and is presented without a readback). Sync it down so
+     * the capture reflects what's on screen. NEVER sync on depth24: FBO
+     * readback clobbers packed RGB888 MDEC bytes in the CPU mirror. */
+    if (!di.depth24) {
+        extern void gl_renderer_sync_cpu(void);
+        gl_renderer_sync_cpu();
+        extern void vk_renderer_sync_cpu(void);
+        vk_renderer_sync_cpu();
     }
 
     uint32_t w = di.width;  if (w > 640) w = 640;

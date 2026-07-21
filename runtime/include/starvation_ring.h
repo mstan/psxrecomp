@@ -98,6 +98,10 @@ void starvation_watchdog_check(void);
 /* Manual dump-to-file (for testing / TCP probe). Filename can be NULL. */
 void starvation_ring_dump(const char *path);
 
+/* Rematch / session_reboot: clear ring + watchdog so a prior match cannot
+ * poison the next dump or leave s_dump_done set. */
+void starvation_ring_reset(void);
+
 /* Periodic PC sample. Caller responsible for throttling. */
 void starvation_ring_pc_sample(void);
 

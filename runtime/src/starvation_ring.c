@@ -71,6 +71,13 @@ void starvation_watchdog_heartbeat(void) {
     s_last_heartbeat_us = host_us_now();
 }
 
+void starvation_ring_reset(void) {
+    memset(s_ring, 0, sizeof(s_ring));
+    s_seq = 0;
+    s_last_heartbeat_us = 0;
+    s_dump_done = 0;
+}
+
 void starvation_ring_record(uint8_t kind, uint8_t tx, uint8_t rx,
                             uint16_t ctrl, uint16_t stat,
                             int shift_active, int shift_remaining,
@@ -264,6 +271,7 @@ void starvation_ring_record(uint8_t kind, uint8_t tx, uint8_t rx,
 void starvation_watchdog_heartbeat(void) {}
 void starvation_watchdog_check(void) {}
 void starvation_ring_dump(const char *path) { (void)path; }
+void starvation_ring_reset(void) {}
 void starvation_ring_pc_sample(void) {}
 uint64_t starvation_ring_total(void) { return 0; }
 int starvation_ring_get(uint64_t seq, StarvationEntry *out) { (void)seq; (void)out; return 0; }

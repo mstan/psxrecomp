@@ -9,6 +9,7 @@
 
 #include "config_loader.h"
 #include "disc_identity.h"
+#include "psx_lobby_client.h"
 
 extern "C" {
 #include "memcard.h"
@@ -145,8 +146,43 @@ struct LauncherModel {
     Rml::String verdict_detail; // sub line
     Rml::String verdict_state;  // "ok" | "warn" | "bad" | "none" — drives colour
 
-    // View toggle: "dashboard" (default) | "settings" | "controls".
-    Rml::String view = "dashboard";
+    // View: "home" | "dashboard" | "settings" | "controls" |
+    //       "netplay_lobbies" | "netplay_room".
+    Rml::String view = "home";
+    bool netplay_mode = false;
+    /* True when the binary was linked with recomp-net (PSX_HAS_RECOMP_NET). */
+    bool netplay_available =
+#if defined(PSX_HAS_RECOMP_NET)
+        true
+#else
+        false
+#endif
+        ;
+
+    // Lobby browser / room state
+    Rml::String lobby_status = "Not connected";
+    Rml::String lobby_table_html;
+    Rml::String room_table_html;
+    Rml::String room_lobby_title = "Lobby";
+    int  lobby_selected = -1;
+    bool lobby_join_enabled = false;
+    bool lobby_can_launch = false;   /* host: all peers ready */
+    bool lobby_is_host = false;
+    bool lobby_local_ready = false;
+    bool show_host_modal = false;
+    bool show_join_pw_modal = false;
+    bool show_name_modal = false;
+    bool name_modal_is_change = false; /* false = first-time prompt */
+    Rml::String name_modal_hint =
+        "Saved locally for next time. Shown to other players in lobbies.";
+    Rml::String host_display_name;
+    Rml::String name_draft;
+    Rml::String host_lobby_name = "My Lobby";
+    Rml::String host_lobby_password;
+    Rml::String join_lobby_password;
+    Rml::String selected_lobby_id;
+    bool selected_has_password = false;
+    bool netplay_launch_ready = false; /* set when server sends launch */
 
     // Controls page: which player's keyboard binds are being edited (0=P1,1=P2).
     int         cfg_player = 0;
@@ -170,6 +206,11 @@ struct LauncherModel {
     Rml::String p1_dot, p2_dot;              // "" (on) | "off"
     Rml::String p1_options, p2_options;      // data-rml option-list markup
     Rml::String dd_open;                     // "" | "p1" | "p2" (which device list is open)
+    /* Shared Refresh-button feedback (both player cards). */
+    Rml::String dev_refresh_label = "Refresh";
+    bool        dev_refresh_busy  = false;
+    bool        dev_refresh_done  = false;
+    Uint32      dev_refresh_until = 0;       /* SDL ticks; clear pulse after */
 
     // Localization (only shown when the game declares languages). Settings-view
     // cycle button, like Renderer / Screen model.
@@ -634,6 +675,8 @@ std::string win_pick_save_file(SDL_Window*, const char* title, const char*,
 
 // Load at least one font face so RmlUi can render text. Tries bundled fonts in
 // assets_dir, then a couple of platform fallbacks. Returns true if any loaded.
+// Symbols/emoji faces are loaded with fallback_face=true so missing glyphs in
+// LatoLatin (e.g. the lobby 🔒) resolve from Noto Sans Symbols 2 / Segoe UI Symbol.
 bool load_fonts(const fs::path& assets_dir) {
     const char* bundled[] = {
         "fonts/LatoLatin-Regular.ttf",
@@ -646,24 +689,245 @@ bool load_fonts(const fs::path& assets_dir) {
         std::error_code ec;
         if (fs::exists(p, ec) && Rml::LoadFontFace(p.generic_string())) any = true;
     }
-    if (any) return true;
 #if defined(_WIN32)
-    const char* sys[] = { "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf" };
-    for (const char* p : sys)
-        if (Rml::LoadFontFace(p)) any = true;
+    if (!any) {
+        const char* sys[] = { "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf" };
+        for (const char* p : sys)
+            if (Rml::LoadFontFace(p)) any = true;
+    }
 #endif
+    /* Outline symbol fonts (not color-emoji CBDT) — FreeType/RmlUi can glyph these. */
+    const char* symbol_bundled[] = {
+        "fonts/NotoSansSymbols2-Regular.ttf",
+        "NotoSansSymbols2-Regular.ttf",
+    };
+    bool symbols = false;
+    for (const char* rel : symbol_bundled) {
+        const fs::path p = assets_dir / rel;
+        std::error_code ec;
+        if (fs::exists(p, ec) && Rml::LoadFontFace(p.generic_string(), /*fallback_face=*/true)) {
+            symbols = true;
+            break;
+        }
+    }
+    if (!symbols) {
+        const char* symbol_sys[] = {
+#if defined(_WIN32)
+            "C:/Windows/Fonts/seguisym.ttf", /* Segoe UI Symbol */
+            "C:/Windows/Fonts/seguiemj.ttf",
+#else
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/NotoSansSymbols2-Regular.ttf",
+#endif
+        };
+        for (const char* p : symbol_sys) {
+            std::error_code ec;
+            if (fs::exists(p, ec) && Rml::LoadFontFace(p, /*fallback_face=*/true)) {
+                symbols = true;
+                break;
+            }
+        }
+    }
+    (void)symbols;
     return any;
+}
+
+static void refresh_lobby_table(LauncherModel& m) {
+    std::string html;
+    const int n = psx_lobby_list_count();
+    for (int i = 0; i < n; ++i) {
+        PsxLobbyRow row{};
+        if (!psx_lobby_list_get(i, &row)) continue;
+        const bool sel = (i == m.lobby_selected);
+        char players[32];
+        std::snprintf(players, sizeof(players), "%d/%d", row.player_count, row.max_slots);
+        html += "<div class=\"lobby-row";
+        if (sel) html += " sel";
+        html += "\" data-event-click=\"lobby_select(";
+        html += std::to_string(i);
+        html += ")\">";
+        html += "<span class=\"lobby-c-name\">" + rml_escape(row.name) + "</span>";
+        html += "<span class=\"lobby-c-game\">" + rml_escape(row.game_name) + "</span>";
+        html += "<span class=\"lobby-c-players\">";
+        html += players;
+        html += "</span><span class=\"lobby-c-lock\">";
+        if (row.has_password) html += "&#128274;"; /* lock emoji */
+        html += "</span></div>";
+    }
+    if (html.empty()) {
+        html = "<div class=\"lobby-row\"><span class=\"lobby-c-name\">No lobbies yet — host one.</span></div>";
+    }
+    m.lobby_table_html = html;
+    m.lobby_join_enabled = (m.lobby_selected >= 0 && m.lobby_selected < n);
+    if (psx_lobby_connected()) {
+        m.lobby_status = "Connected — select a lobby or host";
+    } else {
+        m.lobby_status = "Disconnected — is the lobby server running?";
+    }
+}
+
+static void refresh_room_table(LauncherModel& m) {
+    std::string html;
+    const int n = psx_lobby_member_count();
+    for (int i = 0; i < n; ++i) {
+        PsxLobbyMember mem{};
+        if (!psx_lobby_member_get(i, &mem)) continue;
+        html += "<div class=\"lobby-row\">";
+        html += "<span class=\"lobby-c-name\">" + rml_escape(mem.display_name) + "</span>";
+        html += "<span class=\"room-c-slot\">P";
+        html += std::to_string(mem.slot + 1);
+        html += "</span><span class=\"room-c-ready";
+        if (mem.ready) html += " on";
+        html += "\">";
+        html += mem.ready ? "Ready" : "Not ready";
+        html += "</span></div>";
+    }
+    if (html.empty()) {
+        html = "<div class=\"lobby-row\"><span class=\"lobby-c-name\">Waiting for players…</span></div>";
+    }
+    m.room_table_html = html;
+    m.lobby_is_host = psx_lobby_is_host() != 0;
+    m.lobby_local_ready = psx_lobby_local_ready() != 0;
+    m.lobby_can_launch = m.lobby_is_host && psx_lobby_all_ready() != 0;
+    if (psx_lobby_in_lobby()) {
+        char st[160];
+        std::snprintf(st, sizeof(st), "%d / %d players%s",
+                      psx_lobby_join_info()->player_count,
+                      psx_lobby_join_info()->max_slots,
+                      m.lobby_can_launch ? " — all ready" : "");
+        m.lobby_status = st;
+        if (m.host_lobby_name.size() > 0)
+            m.room_lobby_title = m.host_lobby_name;
+    }
+}
+
+static void persist_player_name(PSXRecompV4::UserSettings& io, const fs::path& settings_path,
+                                const Rml::String& name) {
+    std::string cleaned;
+    cleaned.reserve(name.size());
+    for (char ch : std::string(name.c_str())) {
+        if (ch == '"' || ch == '\\' || ch == '\n' || ch == '\r') continue;
+        cleaned.push_back(ch);
+    }
+    if (cleaned.empty()) return;
+    io.netplay_player_name = cleaned;
+    io.has_netplay_player_name = true;
+    PSXRecompV4::save_user_settings(settings_path, io);
+}
+
+/* Write controller device/mode/deadzone immediately (not only on Launch), so
+ * Refresh / Quit / soft-return dashboard keep the user's pad selection. */
+static void persist_controller_settings(PSXRecompV4::UserSettings& io,
+                                        const fs::path& settings_path,
+                                        const LauncherModel& m,
+                                        const std::vector<DeviceOption>& dev_opts) {
+    const int i1 = (m.p1_dev_index >= 0 && m.p1_dev_index < (int)dev_opts.size())
+                       ? m.p1_dev_index : 0;
+    const int i2 = (m.p2_dev_index >= 0 && m.p2_dev_index < (int)dev_opts.size())
+                       ? m.p2_dev_index : 0;
+    io.p1_device = device_string(dev_opts[i1]);
+    io.has_p1_device = true;
+    io.p2_device = device_string(dev_opts[i2]);
+    io.has_p2_device = true;
+    io.p1_mode = m.p1_mode;
+    io.has_p1_mode = true;
+    io.p2_mode = m.p2_mode;
+    io.has_p2_mode = true;
+    io.deadzone = m.deadzone_pct * 32767 / 100;
+    io.has_deadzone = true;
+    PSXRecompV4::save_user_settings(settings_path, io);
 }
 
 } // namespace
 
 namespace psx_launcher {
 
+/* Host sim settings snapshot for lobby match_caps negotiation. */
+static PsxLobbyMatchCaps match_caps_from_settings(const PSXRecompV4::UserSettings& io) {
+    PsxLobbyMatchCaps c{};
+    c.valid = 1;
+    c.aspect_num = io.has_aspect_ratio ? io.aspect_num : 4;
+    c.aspect_den = io.has_aspect_ratio ? io.aspect_den : 3;
+    if (c.aspect_num <= 0) c.aspect_num = 4;
+    if (c.aspect_den <= 0) c.aspect_den = 3;
+    c.turbo_loads = io.has_turbo_loads ? (io.turbo_loads ? 1 : 0) : 0;
+    c.bios_hle = io.has_bios_hle ? (io.bios_hle ? 1 : 0) : 1;
+    c.fast_boot = io.has_fast_boot ? (io.fast_boot ? 1 : 0) : 0;
+    c.auto_skip_fmv = io.has_auto_skip_fmv ? (io.auto_skip_fmv ? 1 : 0) : 0;
+    c.input_delay = 2;
+    if (const char* e = std::getenv("PSX_NET_INPUT_DELAY")) {
+        int d = std::atoi(e);
+        if (d < 0) d = 0;
+        if (d > 16) d = 16;
+        c.input_delay = d;
+    }
+    if (io.has_language && !io.language.empty()) {
+        std::snprintf(c.language, sizeof(c.language), "%s", io.language.c_str());
+    } else {
+        std::snprintf(c.language, sizeof(c.language), "en");
+    }
+    return c;
+}
+
+static void apply_match_caps_to_settings(PSXRecompV4::UserSettings& io,
+                                         const PsxLobbyMatchCaps& c) {
+    if (!c.valid) return;
+    io.aspect_num = c.aspect_num > 0 ? c.aspect_num : 4;
+    io.aspect_den = c.aspect_den > 0 ? c.aspect_den : 3;
+    io.has_aspect_ratio = true;
+    io.turbo_loads = c.turbo_loads != 0;
+    io.has_turbo_loads = true;
+    io.bios_hle = c.bios_hle != 0;
+    io.has_bios_hle = true;
+    io.fast_boot = c.fast_boot != 0;
+    io.has_fast_boot = true;
+    io.auto_skip_fmv = c.auto_skip_fmv != 0;
+    io.has_auto_skip_fmv = true;
+    if (c.language[0]) {
+        io.language = c.language;
+        io.has_language = true;
+    }
+}
+
+/* Returns false if endpoints are incomplete — caller must not boot netplay. */
+static bool fill_netplay_launch(NetplayLaunch* out, PSXRecompV4::UserSettings& io) {
+    if (!out) return false;
+    *out = NetplayLaunch{};
+    const PsxLobbyJoinInfo *ji = psx_lobby_join_info();
+    const char *bind = ji->bind_hostport[0] ? ji->bind_hostport :
+                       (ji->local_slot == 0 ? "0.0.0.0:7777" : "0.0.0.0:7778");
+    if (!ji->peer_hostport[0] || !ji->host_endpoint[0] ||
+        (ji->local_slot == 0 && !ji->guest_endpoint[0])) {
+        return false;
+    }
+    const PsxLobbyMatchCaps *mc = psx_lobby_match_caps();
+    if (mc && mc->valid)
+        apply_match_caps_to_settings(io, *mc);
+    out->enabled = true;
+    psx_netplay_config_defaults(&out->cfg);
+    out->cfg.enabled = 1;
+    out->cfg.local_slot = ji->local_slot;
+    /* -1 = auto in main.cpp (prefer g_players[local_slot] on same-PC). */
+    out->cfg.input_player = -1;
+    out->cfg.session_id = ji->session_id ? ji->session_id : 1u;
+    if (mc && mc->valid)
+        out->cfg.input_delay = mc->input_delay;
+    std::snprintf(out->cfg.bind_hostport, sizeof(out->cfg.bind_hostport), "%s", bind);
+    std::snprintf(out->cfg.peer_hostport, sizeof(out->cfg.peer_hostport), "%s",
+                  ji->peer_hostport);
+    const char *dn = psx_lobby_display_name();
+    out->display_name = (dn && dn[0]) ? dn : psx_lobby_player_id();
+    return true;
+}
+
 Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
-           const GameInfo& game, const char* assets_dir)
+           const GameInfo& game, const char* assets_dir,
+           NetplayLaunch* out_net,
+           const RunOptions& opts)
 {
     (void)gl_context;  // already created + current; we only need the window.
+    if (out_net) *out_net = NetplayLaunch{};
 
     // Keyboard keybinds live in keybinds.ini next to the exe (assets_dir == the
     // exe dir). Load them so the Controls page edits the real, persisted map;
@@ -792,6 +1056,25 @@ Result run(SDL_Window* window, void* gl_context,
         refresh_language(m, game.languages);
     }
 
+    const fs::path settings_path = assets / "settings.toml";
+    if (io.has_netplay_player_name && !io.netplay_player_name.empty())
+        m.host_display_name = io.netplay_player_name;
+    m.name_draft = m.host_display_name;
+
+    /* Builds without recomp-net skip the Offline/Netplay home chooser. */
+    if (!m.netplay_available) {
+        m.netplay_mode = false;
+        m.view = "dashboard";
+    }
+
+    if (opts.resume_netplay_room && m.netplay_available && psx_lobby_in_lobby()) {
+        m.netplay_mode = true;
+        m.view = "netplay_room";
+        m.netplay_launch_ready = false;
+        psx_lobby_set_ready(0);
+        refresh_room_table(m);
+    }
+
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
@@ -834,6 +1117,26 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("verdict_detail", &m.verdict_detail);
     c.Bind("verdict_state",  &m.verdict_state);
     c.Bind("view",           &m.view);
+    c.Bind("netplay_mode",   &m.netplay_mode);
+    c.Bind("netplay_available", &m.netplay_available);
+    c.Bind("lobby_status",   &m.lobby_status);
+    c.Bind("lobby_table_html",&m.lobby_table_html);
+    c.Bind("room_table_html", &m.room_table_html);
+    c.Bind("room_lobby_title", &m.room_lobby_title);
+    c.Bind("lobby_join_enabled", &m.lobby_join_enabled);
+    c.Bind("lobby_can_launch", &m.lobby_can_launch);
+    c.Bind("lobby_is_host", &m.lobby_is_host);
+    c.Bind("lobby_local_ready", &m.lobby_local_ready);
+    c.Bind("show_host_modal", &m.show_host_modal);
+    c.Bind("show_join_pw_modal", &m.show_join_pw_modal);
+    c.Bind("show_name_modal", &m.show_name_modal);
+    c.Bind("name_modal_is_change", &m.name_modal_is_change);
+    c.Bind("name_modal_hint", &m.name_modal_hint);
+    c.Bind("host_display_name", &m.host_display_name);
+    c.Bind("name_draft", &m.name_draft);
+    c.Bind("host_lobby_name", &m.host_lobby_name);
+    c.Bind("host_lobby_password", &m.host_lobby_password);
+    c.Bind("join_lobby_password", &m.join_lobby_password);
     c.Bind("cfg_player",     &m.cfg_player);
     c.Bind("cfg_player_label", &m.cfg_player_label);
     c.Bind("p1_mode",        &m.p1_mode);
@@ -851,6 +1154,9 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p1_options",     &m.p1_options);
     c.Bind("p2_options",     &m.p2_options);
     c.Bind("dd_open",        &m.dd_open);
+    c.Bind("dev_refresh_label", &m.dev_refresh_label);
+    c.Bind("dev_refresh_busy",  &m.dev_refresh_busy);
+    c.Bind("dev_refresh_done",  &m.dev_refresh_done);
     c.Bind("lang_menu",      &m.lang_menu);
     c.Bind("lang_label",     &m.lang_label);
     c.Bind("mc1_enabled",    &m.mc1_enabled);
@@ -1100,14 +1406,213 @@ Result run(SDL_Window* window, void* gl_context,
             end_scan();
             m.view = "dashboard"; handle.DirtyVariable("view");
         });
+    c.BindEventCallback("mode_offline",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.netplay_mode = false;
+            m.view = "dashboard";
+            handle.DirtyVariable("netplay_mode");
+            handle.DirtyVariable("view");
+        });
+    c.BindEventCallback("mode_netplay",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (!m.netplay_available) return;
+            m.netplay_mode = true;
+            m.view = "dashboard";
+            handle.DirtyVariable("netplay_mode");
+            handle.DirtyVariable("view");
+        });
+    auto enter_lobby_browser = [&m, handle]() mutable {
+        m.view = "netplay_lobbies";
+        if (!psx_lobby_connected()) {
+            psx_lobby_set_display_name(m.host_display_name.c_str());
+            if (psx_lobby_connect(psx_lobby_default_url()) != 0) {
+                m.lobby_status = "Failed to connect — start the lobby server";
+            }
+        }
+        psx_lobby_request_list();
+        refresh_lobby_table(m);
+        handle.DirtyVariable("view");
+        handle.DirtyVariable("lobby_status");
+        handle.DirtyVariable("lobby_table_html");
+        handle.DirtyVariable("lobby_join_enabled");
+    };
+    c.BindEventCallback("show_netplay_lobbies",
+        [&m, handle, enter_lobby_browser](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (m.host_display_name.empty()) {
+                m.name_draft = "";
+                m.name_modal_is_change = false;
+                m.name_modal_hint =
+                    "Saved locally for next time. Shown to other players in lobbies.";
+                m.show_name_modal = true;
+                handle.DirtyVariable("name_draft");
+                handle.DirtyVariable("name_modal_is_change");
+                handle.DirtyVariable("name_modal_hint");
+                handle.DirtyVariable("show_name_modal");
+                return;
+            }
+            enter_lobby_browser();
+        });
+    c.BindEventCallback("lobby_change_name",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.name_draft = m.host_display_name;
+            m.name_modal_is_change = true;
+            m.name_modal_hint =
+                "Saved locally for next time. Shown to other players in lobbies.";
+            m.show_name_modal = true;
+            handle.DirtyVariable("name_draft");
+            handle.DirtyVariable("name_modal_is_change");
+            handle.DirtyVariable("name_modal_hint");
+            handle.DirtyVariable("show_name_modal");
+        });
+    c.BindEventCallback("lobby_name_cancel",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_name_modal = false;
+            handle.DirtyVariable("show_name_modal");
+        });
+    c.BindEventCallback("lobby_name_confirm",
+        [&m, handle, &io, settings_path, enter_lobby_browser](Rml::DataModelHandle, Rml::Event&,
+                                                             const Rml::VariantList&) mutable {
+            Rml::String name = m.name_draft;
+            /* trim */
+            while (!name.empty() && (name.front() == ' ' || name.front() == '\t'))
+                name.erase(name.begin());
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
+                name.pop_back();
+            if (name.empty()) {
+                m.name_modal_hint = "Enter a player name, then press Save.";
+                handle.DirtyVariable("name_modal_hint");
+                return;
+            }
+            m.host_display_name = name;
+            m.show_name_modal = false;
+            persist_player_name(io, settings_path, name);
+            psx_lobby_set_display_name(name.c_str());
+            handle.DirtyVariable("host_display_name");
+            handle.DirtyVariable("show_name_modal");
+            if (!m.name_modal_is_change) {
+                enter_lobby_browser();
+            }
+        });
+    auto try_join_selected_lobby = [&m, handle]() mutable {
+        if (!m.lobby_join_enabled) return;
+        psx_lobby_set_display_name(m.host_display_name.c_str());
+        if (m.selected_has_password) {
+            m.show_join_pw_modal = true;
+            handle.DirtyVariable("show_join_pw_modal");
+            return;
+        }
+        psx_lobby_join(m.selected_lobby_id.c_str(), "", "0.0.0.0:7778");
+    };
+    c.BindEventCallback("lobby_select",
+        [&m, handle, try_join_selected_lobby](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            if (args.empty()) return;
+            const int idx = (int)args[0].Get<int>();
+            /* Double-click same row → join (RmlUi may not forward dblclick on
+             * data-rml rows; detect via click timing instead). */
+            static int s_last_idx = -1;
+            static Uint32 s_last_ms = 0;
+            const Uint32 now = SDL_GetTicks();
+            const bool dbl = (idx == s_last_idx && (now - s_last_ms) < 400u);
+            s_last_idx = idx;
+            s_last_ms = now;
+
+            m.lobby_selected = idx;
+            PsxLobbyRow row{};
+            if (psx_lobby_list_get(m.lobby_selected, &row)) {
+                m.selected_lobby_id = row.lobby_id;
+                m.selected_has_password = row.has_password != 0;
+            }
+            refresh_lobby_table(m);
+            handle.DirtyVariable("lobby_table_html");
+            handle.DirtyVariable("lobby_join_enabled");
+            if (dbl)
+                try_join_selected_lobby();
+        });
+    c.BindEventCallback("lobby_host_open",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_host_modal = true;
+            handle.DirtyVariable("show_host_modal");
+        });
+    c.BindEventCallback("lobby_host_cancel",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_host_modal = false;
+            handle.DirtyVariable("show_host_modal");
+        });
+    c.BindEventCallback("lobby_host_confirm",
+        [&m, handle, &game_name_s, &io, &game](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_host_modal = false;
+            m.room_lobby_title = m.host_lobby_name;
+            psx_lobby_set_display_name(m.host_display_name.c_str());
+            if (!psx_lobby_connected()) {
+                psx_lobby_connect(psx_lobby_default_url());
+            }
+            /* Sync live UI toggles into io before snapshotting match_caps. */
+            io.aspect_num = kAspects[m.aspect_index][0];
+            io.aspect_den = kAspects[m.aspect_index][1];
+            io.has_aspect_ratio = true;
+            io.turbo_loads = m.turbo_loads != 0; io.has_turbo_loads = true;
+            io.auto_skip_fmv = m.auto_skip_fmv != 0; io.has_auto_skip_fmv = true;
+            if (m.lang_menu && m.lang_index >= 0 &&
+                m.lang_index < (int)game.languages.size()) {
+                io.language = game.languages[m.lang_index].code;
+                io.has_language = true;
+            }
+            PsxLobbyMatchCaps caps = match_caps_from_settings(io);
+            psx_lobby_create(m.host_lobby_name.c_str(), game_name_s.c_str(),
+                             m.host_lobby_password.c_str(), "0.0.0.0:7777", &caps);
+            handle.DirtyVariable("show_host_modal");
+            handle.DirtyVariable("room_lobby_title");
+        });
+    c.BindEventCallback("lobby_join",
+        [try_join_selected_lobby](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            try_join_selected_lobby();
+        });
+    c.BindEventCallback("lobby_join_pw_cancel",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_join_pw_modal = false;
+            handle.DirtyVariable("show_join_pw_modal");
+        });
+    c.BindEventCallback("lobby_join_pw_confirm",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_join_pw_modal = false;
+            psx_lobby_set_display_name(m.host_display_name.c_str());
+            psx_lobby_join(m.selected_lobby_id.c_str(), m.join_lobby_password.c_str(), "0.0.0.0:7778");
+            handle.DirtyVariable("show_join_pw_modal");
+        });
+    c.BindEventCallback("lobby_exit_room",
+        [&m, handle, enter_lobby_browser](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            psx_lobby_leave();
+            enter_lobby_browser();
+        });
+    c.BindEventCallback("lobby_toggle_ready",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            const int next = psx_lobby_local_ready() ? 0 : 1;
+            psx_lobby_set_ready(next);
+            m.lobby_local_ready = next != 0;
+            handle.DirtyVariable("lobby_local_ready");
+        });
+    c.BindEventCallback("lobby_launch",
+        [&m, &io, &game](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (!psx_lobby_is_host() || !psx_lobby_all_ready()) return;
+            io.aspect_num = kAspects[m.aspect_index][0];
+            io.aspect_den = kAspects[m.aspect_index][1];
+            io.has_aspect_ratio = true;
+            io.turbo_loads = m.turbo_loads != 0; io.has_turbo_loads = true;
+            io.auto_skip_fmv = m.auto_skip_fmv != 0; io.has_auto_skip_fmv = true;
+            if (m.lang_menu && m.lang_index >= 0 &&
+                m.lang_index < (int)game.languages.size()) {
+                io.language = game.languages[m.lang_index].code;
+                io.has_language = true;
+            }
+            PsxLobbyMatchCaps caps = match_caps_from_settings(io);
+            psx_lobby_request_start(&caps);
+        });
     // ---- controller: device dropdown + pad-mode segmented selector ----
     auto dirty_player = [handle](int player) mutable {
         const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_mode"};
         const char* v1[] = {"p2_dev_label","p2_status","p2_dot","p2_options","p2_mode"};
         for (const char* v : (player == 0 ? v0 : v1)) handle.DirtyVariable(v);
     };
-    // dev_opts is captured by value: the device list is fixed for the launcher
-    // session (a hot-plug here would require a re-enumerate, deferred).
     c.BindEventCallback("open_dd",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
             const int player = args.empty() ? 0 : (int)args[0].Get<int>();
@@ -1120,7 +1625,8 @@ Result run(SDL_Window* window, void* gl_context,
             m.dd_open = Rml::String(); handle.DirtyVariable("dd_open");
         });
     c.BindEventCallback("pick_device",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+        [&m, handle, &dev_opts, &io, settings_path, dirty_player](
+            Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
             if (args.size() < 2) return;
             const int player = (int)args[0].Get<int>();
             const int idx    = (int)args[1].Get<int>();
@@ -1129,6 +1635,65 @@ Result run(SDL_Window* window, void* gl_context,
             m.dd_open = Rml::String();
             dirty_player(player);
             handle.DirtyVariable("dd_open");
+            persist_controller_settings(io, settings_path, m, dev_opts);
+        });
+    /* Re-scan SDL joysticks for EVERY controller slot (P1 + P2). Preserves
+     * each port's selection by device string/GUID. Both Refresh buttons share
+     * the same busy/done pulse so the click feedback is obvious. */
+    c.BindEventCallback("refresh_devices",
+        [&m, handle, &dev_opts, &io, settings_path, dirty_player](
+            Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.dev_refresh_busy = true;
+            m.dev_refresh_done = false;
+            m.dev_refresh_label = "Scanning…";
+            handle.DirtyVariable("dev_refresh_busy");
+            handle.DirtyVariable("dev_refresh_done");
+            handle.DirtyVariable("dev_refresh_label");
+
+            /* Keep the visible selection; if the index is stale/OOB, fall back
+             * to the last persisted GUID in io (survives a bad rescan). */
+            const auto cur = [&](int idx, const std::string& saved, bool has_saved) -> std::string {
+                if (idx >= 0 && idx < (int)dev_opts.size())
+                    return device_string(dev_opts[idx]);
+                if (has_saved && !saved.empty()) return saved;
+                return "none";
+            };
+            const std::string p1 = cur(m.p1_dev_index, io.p1_device, io.has_p1_device);
+            const std::string p2 = cur(m.p2_dev_index, io.p2_device, io.has_p2_device);
+
+            /* Pump so SDL notices hotplug; then re-enumerate NumJoysticks. */
+            SDL_PumpEvents();
+            SDL_JoystickUpdate();
+            SDL_GameControllerUpdate();
+
+            dev_opts = enumerate_devices();
+            m.p1_dev_index = find_or_add_device_index(dev_opts, p1);
+            m.p2_dev_index = find_or_add_device_index(dev_opts, p2);
+            /* Force data-rml option lists to rebuild (close any open dropdown). */
+            m.dd_open = Rml::String();
+            m.p1_options.clear();
+            m.p2_options.clear();
+            handle.DirtyVariable("dd_open");
+            handle.DirtyVariable("p1_options");
+            handle.DirtyVariable("p2_options");
+            refresh_player(m, 0, dev_opts);
+            refresh_player(m, 1, dev_opts);
+            dirty_player(0);
+            dirty_player(1);
+            persist_controller_settings(io, settings_path, m, dev_opts);
+
+            int pads = 0;
+            for (const auto& o : dev_opts)
+                if (o.kind == 2) pads++;
+            char done[48];
+            std::snprintf(done, sizeof(done), "Updated · %d pad%s", pads, pads == 1 ? "" : "s");
+            m.dev_refresh_busy = false;
+            m.dev_refresh_done = true;
+            m.dev_refresh_label = done;
+            m.dev_refresh_until = SDL_GetTicks() + 1400u;
+            handle.DirtyVariable("dev_refresh_busy");
+            handle.DirtyVariable("dev_refresh_done");
+            handle.DirtyVariable("dev_refresh_label");
         });
     // ---- localization: Language cycle button (Settings > LOCALIZATION) ----
     // Matches the Settings-view idiom (Renderer / Screen model cycle toggles):
@@ -1143,22 +1708,32 @@ Result run(SDL_Window* window, void* gl_context,
     // Pad-mode segmented selector: each segment passes its mode (0=hybrid,
     // 1=analog, 2=digital) so any mode is one click away.
     c.BindEventCallback("set_mode_p1",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+        [&m, handle, &dev_opts, &io, settings_path, dirty_player](
+            Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
             if (args.empty()) return;
-            m.p1_mode = (int)args[0].Get<int>(); refresh_player(m, 0, dev_opts); dirty_player(0);
+            m.p1_mode = (int)args[0].Get<int>();
+            refresh_player(m, 0, dev_opts);
+            dirty_player(0);
+            persist_controller_settings(io, settings_path, m, dev_opts);
         });
     c.BindEventCallback("set_mode_p2",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+        [&m, handle, &dev_opts, &io, settings_path, dirty_player](
+            Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
             if (args.empty()) return;
-            m.p2_mode = (int)args[0].Get<int>(); refresh_player(m, 1, dev_opts); dirty_player(1);
+            m.p2_mode = (int)args[0].Get<int>();
+            refresh_player(m, 1, dev_opts);
+            dirty_player(1);
+            persist_controller_settings(io, settings_path, m, dev_opts);
         });
-    /* Analog-stick deadzone, stepped 0..50% (wraps). Applies to both the
-     * stick->d-pad threshold and the analog centre dead-band. */
+    /* Analog-stick deadzone, stepped 0..50% (wraps). Radial gate for both the
+     * stick->d-pad fold (Digital) and the DualShock centre dead-band. */
     c.BindEventCallback("cycle_deadzone",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+        [&m, handle, &io, &dev_opts, settings_path](
+            Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.deadzone_pct += 5;
             if (m.deadzone_pct > 50) m.deadzone_pct = 0;
             handle.DirtyVariable("deadzone_pct");
+            persist_controller_settings(io, settings_path, m, dev_opts);
         });
     c.BindEventCallback("toggle_mc1",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1290,6 +1865,74 @@ Result run(SDL_Window* window, void* gl_context,
             }
         }
 
+        /* Lobby client pump + live browser / room views. */
+        psx_lobby_pump();
+        if (m.view == "netplay_lobbies" || m.view == "netplay_room") {
+            if (psx_lobby_in_lobby() && m.view != "netplay_room") {
+                m.view = "netplay_room";
+                refresh_room_table(m);
+                handle.DirtyVariable("view");
+                handle.DirtyVariable("room_table_html");
+                handle.DirtyVariable("lobby_status");
+                handle.DirtyVariable("lobby_is_host");
+                handle.DirtyVariable("lobby_local_ready");
+                handle.DirtyVariable("lobby_can_launch");
+            }
+            if (!psx_lobby_in_lobby() && m.view == "netplay_room") {
+                m.view = "netplay_lobbies";
+                handle.DirtyVariable("view");
+            }
+            if (psx_lobby_launch_pending() && !m.netplay_launch_ready) {
+                psx_lobby_clear_launch_pending();
+                if (out_net && fill_netplay_launch(out_net, io)) {
+                    m.netplay_launch_ready = true;
+                    m.launch_requested = true;
+                } else {
+                    m.lobby_status =
+                        "Launch aborted: missing peer LAN endpoint "
+                        "(rejoin lobby)";
+                    handle.DirtyVariable("lobby_status");
+                }
+            }
+            if (psx_lobby_join_info()->last_error[0]) {
+                char st[128];
+                std::snprintf(st, sizeof(st), "Error: %s", psx_lobby_join_info()->last_error);
+                m.lobby_status = st;
+                handle.DirtyVariable("lobby_status");
+            }
+        }
+        /* Clear Refresh-button pulse after a short hold. */
+        if (m.dev_refresh_until != 0 && SDL_GetTicks() >= m.dev_refresh_until) {
+            m.dev_refresh_until = 0;
+            m.dev_refresh_busy = false;
+            m.dev_refresh_done = false;
+            m.dev_refresh_label = "Refresh";
+            handle.DirtyVariable("dev_refresh_busy");
+            handle.DirtyVariable("dev_refresh_done");
+            handle.DirtyVariable("dev_refresh_label");
+        }
+
+        if (m.view == "netplay_lobbies") {
+            static Uint32 last_list_req = 0;
+            const Uint32 now = SDL_GetTicks();
+            if (now - last_list_req > 1000) {
+                last_list_req = now;
+                if (psx_lobby_connected()) psx_lobby_request_list();
+            }
+            refresh_lobby_table(m);
+            handle.DirtyVariable("lobby_status");
+            handle.DirtyVariable("lobby_table_html");
+            handle.DirtyVariable("lobby_join_enabled");
+        }
+        if (m.view == "netplay_room") {
+            refresh_room_table(m);
+            handle.DirtyVariable("lobby_status");
+            handle.DirtyVariable("room_table_html");
+            handle.DirtyVariable("lobby_is_host");
+            handle.DirtyVariable("lobby_local_ready");
+            handle.DirtyVariable("lobby_can_launch");
+        }
+
         if (m.launch_requested) { result = Result::Launch; running = false; }
         if (m.quit_requested)   { result = Result::Quit;   running = false; }
 
@@ -1305,6 +1948,14 @@ Result run(SDL_Window* window, void* gl_context,
         context->Render();
         render_interface.EndFrame();
         SDL_GL_SwapWindow(window);
+    }
+
+    /* Keep the lobby WebSocket across a netplay Launch so both peers can return
+     * to the same room after the match. Offline launch / quit still disconnect. */
+    const bool keep_lobby =
+        (result == Result::Launch && out_net && out_net->enabled && psx_lobby_in_lobby());
+    if (!keep_lobby) {
+        psx_lobby_disconnect();
     }
 
     // ---- Commit choices on launch ----
@@ -1349,6 +2000,10 @@ Result run(SDL_Window* window, void* gl_context,
             m.lang_index < (int)game.languages.size()) {
             io.language = game.languages[m.lang_index].code;
             io.has_language = true;
+        }
+        if (!m.host_display_name.empty()) {
+            io.netplay_player_name = std::string(m.host_display_name.c_str());
+            io.has_netplay_player_name = true;
         }
     }
 

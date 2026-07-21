@@ -118,12 +118,9 @@ extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
  * deadline first. Every COP2 register access calls psx_gte_stall, which advances
  * guest cycles to the deadline if the op is still in flight. Faithful only with
  * per-instruction cycle charging. */
-/* R3000A I-cache instruction-FETCH cost (psx_icache.c). Faithful direct-mapped
- * model: HIT +0, KSEG1/uncached +4, cached miss +3 + refill. Shared by interp
- * (per-instruction) and the compiled emitters (per-cache-line leader). */
-extern void     psx_icache_fetch(CPUState* cpu, uint32_t addr);
-extern void     psx_icache_reset(void);
-extern int      psx_icache_enabled(void);   /* opt-in (PSX_ICACHE=1) until both backends charge it */
+/* R3000A I-cache instruction-FETCH cost (psx_icache.h). HIT is inlined;
+ * MISS lives in psx_icache.c. Shared by interp + compiled emitters. */
+#include "psx_icache.h"
 
 extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
 extern void     psx_gte_stall(CPUState* cpu);
@@ -149,8 +146,18 @@ extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t retu
  * through the per-instruction interpreter (interrupt taken at the exact
  * architectural instruction) and cpu->pc holds a dispatchable resume point, so
  * the caller must `return` without executing its compiled body. See
- * PRECISE_IRQ_SLICE.md. */
-extern int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+ * PRECISE_IRQ_SLICE.md.
+ *
+ * PARKED default OFF (g_psx_precise_slice=0). The hot inline returns 0 with no
+ * call; PSX_PRECISE_SLICE=1 enables the impl for A/B. Every compiled block
+ * leader hits this — MotK VLC alone issues millions of calls/s. */
+extern int g_psx_precise_slice;
+extern int psx_slice_block_impl(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+void psx_precise_slice_init_from_env(void);
+static inline int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    if (!g_psx_precise_slice) return 0;
+    return psx_slice_block_impl(cpu, block_addr, bcyc, side_effects);
+}
 
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
@@ -263,5 +270,21 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
  * This makes the per-instruction timing API visible to EVERY generated file and
  * runtime TU that includes cpu_state.h. */
 #include "psx_cyc.h"
+
+/* Release call-entry stamp — inlined into every generated BIOS/game TU that
+ * includes this header (MotK VLC entry tax). Debug builds use the out-of-line
+ * ring path in debug_server.c. */
+#ifdef PSX_NO_DEBUG_TOOLS
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern volatile uint32_t g_psx_last_fn_entry;
+static inline void debug_server_log_call_entry(uint32_t func_addr) {
+    g_psx_last_fn_entry = func_addr;
+}
+#ifdef __cplusplus
+}
+#endif
+#endif
 
 #endif /* PSXRECOMP_CPU_STATE_H */

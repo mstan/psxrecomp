@@ -201,6 +201,20 @@ bool FullFunctionEmitter::emit_function(
         local_continuations.push_back({cross, cross_norm, norm});
     }
 
+    // FAITHFUL_TIMING_PLAN P5 / game code_generator.cpp parity: every basic-block
+    // leader must be a dispatchable CPS continuation. psx_check_interrupts_at
+    // publishes ANY leader as an async-RFE resume PC; without a dispatch key the
+    // trampoline falls into dirty_ram_interp. MotK measured ~1300 dirty blocks/frame
+    // dominated by kernel poll-loop leaders 0x45FC/0x4614 inside func_00004498 —
+    // both had labels/gotos but no dispatch entries (only jal+8 conts were registered).
+    // Entry block is already a function dispatch key; skip it. Dedup later.
+    for (uint32_t leader : block_leaders) {
+        if (!addr_to_raw.count(leader)) continue;
+        uint32_t leader_norm = normalize_address(leader);
+        if (all_function_entries_norm.count(leader_norm)) continue;
+        local_continuations.push_back({leader, leader_norm, norm});
+    }
+
     // Helper: find which function (in all_function_entries_norm) contains a
     // given ROM target address.  Returns the largest function-entry norm that
     // is <= target_norm.  Returns 0 if no containing function found.
@@ -1734,13 +1748,13 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
-    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
     full_c += "#ifdef PSX_COSIM\n";
     full_c += "extern void cosim_block(uint32_t block_leader_phys);\n";
     full_c += "extern void cosim_instr(uint32_t pc);\n";
     full_c += "#endif\n";
     full_c += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     full_c += "#endif\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";

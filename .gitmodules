@@ -4,3 +4,6 @@
 [submodule "lib/freetype"]
 	path = lib/freetype
 	url = https://github.com/freetype/freetype.git
+[submodule "lib/recomp-net"]
+	path = lib/recomp-net
+	url = https://github.com/TechnicallyComputers/recomp-net.git

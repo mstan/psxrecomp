@@ -1,6 +1,7 @@
 #ifndef PSX_SAVESTATE_H
 #define PSX_SAVESTATE_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "cpu_state.h"
 
@@ -23,17 +24,47 @@ extern "C" {
 #define SAVESTATE_SLOTS 12
 
 /* Configure the slot directory + integrity key (from main, after config load).
- * dir = the per-game memcard/save dir; files land at <dir>/state_slotNN.pst. */
+ * dir = the per-game memcard/save dir; files land at
+ * <dir>/state_<entry_pc>_slotNN.pst. */
 void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry_pc);
+
+/* Current slot directory (empty if not configured). */
+const char* savestate_dir(void);
+
+/* Integrity key last passed to savestate_configure (for sandbox rebind). */
+void savestate_get_integrity(uint32_t* bios_checksum, uint32_t* entry_pc);
+
+/* Build the on-disk path for slot [0..SAVESTATE_SLOTS-1]. Returns 1 on success. */
+int savestate_slot_path(int slot, char* out, size_t cap);
+
+/* Read/write a slot file (malloc'd buffer for read). Returns 1 on success. */
+int savestate_read_slot(int slot, uint8_t** data_out, size_t* size_out);
+int savestate_write_slot(int slot, const void* data, size_t size);
+
+/* 1 if the slot file exists and is non-empty. */
+int savestate_slot_exists(int slot);
 
 /* Stage a save/load of slot [0..SAVESTATE_SLOTS-1]. Executed at the next safe
  * boundary by savestate_poll (called every block from psx_check_interrupts).
- * Safe to call from the SDL key handler or a debug-server command. */
-/* Stage a save/load for the next block boundary. Returns 1 if staged, 0 if
- * the request cannot be honored (not configured, bad slot, or — for load —
- * an LLE host-fiber run, where the cross-fiber unwind is unsafe). */
+ * Safe to call from the SDL key handler or a debug-server command.
+ * Returns 1 if staged, 0 if refused (not configured, bad slot, LLE load, or
+ * netplay guest — only the match host may initiate user save/load). */
 int savestate_request_save(int slot);
 int savestate_request_load(int slot);
+
+/* Netplay follow-host sync only. Bypasses the guest user-initiation guard so
+ * the guest can write/apply the host-authoritative slot during probe/transfer. */
+int savestate_request_save_protocol(int slot);
+int savestate_request_load_protocol(int slot);
+
+/* 1 while a staged save/load has not yet been consumed by savestate_poll. */
+int savestate_pending(void);
+
+/* 1 once after a successful load restore (before scheduler longjmp). Clears. */
+int savestate_take_load_completed(void);
+
+/* Frontend hook (main.cpp): restage VRAM present path after a successful load. */
+void psx_frontend_on_savestate_loaded(void);
 
 /* Called every block from psx_check_interrupts (in_exception == 0). If a save is
  * pending, serialize with cpu->pc = resume_pc; if a load is pending, restore and

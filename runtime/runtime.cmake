@@ -204,11 +204,61 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_keybinds.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_netplay.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_lobby_client.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
     ${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp
     # (sljit Tier-2 in-process JIT backend removed 2026-07-15 — was disabled by
     # default since 2026-06-25; gaps fall to the interpreter, gcc/tcc unaffected.)
 )
+
+# Optional delay-sync netplay (recomp-net). Auto-discovers a sibling checkout
+# (…/recomp-net next to the game repo or next to psxrecomp). Override with
+# -DRECOMP_NET_ROOT=… or -DPSX_NETPLAY=OFF.
+option(PSX_NETPLAY "Link recomp-net delay-sync when available" ON)
+set(RECOMP_NET_ROOT "" CACHE PATH "Path to recomp-net; empty = auto-discover")
+if(PSX_NETPLAY AND NOT RECOMP_NET_ROOT)
+    foreach(_cand
+            "${CMAKE_SOURCE_DIR}/../recomp-net"
+            "${PSXRECOMP_ROOT}/../recomp-net"
+            "${CMAKE_SOURCE_DIR}/recomp-net")
+        get_filename_component(_abs "${_cand}" ABSOLUTE)
+        if(EXISTS "${_abs}/CMakeLists.txt")
+            set(RECOMP_NET_ROOT "${_abs}" CACHE PATH "Path to recomp-net; empty = auto-discover" FORCE)
+            break()
+        endif()
+    endforeach()
+endif()
+if(PSX_NETPLAY AND RECOMP_NET_ROOT AND EXISTS "${RECOMP_NET_ROOT}/CMakeLists.txt")
+    if(NOT TARGET recomp_net)
+        set(RNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(RNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        add_subdirectory("${RECOMP_NET_ROOT}" "${CMAKE_BINARY_DIR}/recomp-net")
+    endif()
+    set(PSXRECOMP_HAS_RECOMP_NET TRUE)
+    message(STATUS "psxrecomp: recomp-net netplay enabled (${RECOMP_NET_ROOT})")
+else()
+    set(PSXRECOMP_HAS_RECOMP_NET FALSE)
+    if(PSX_NETPLAY)
+        message(STATUS "psxrecomp: recomp-net not found — netplay stubs only "
+                       "(set RECOMP_NET_ROOT or place checkout at ../recomp-net)")
+    endif()
+endif()
+
+# Lobby WebSocket client helpers are vendored under runtime/src/lobby_ws/
+# (protocol talks to the proprietary recomp-net-server, not recomp-net).
+set(PSXRECOMP_LOBBY_WS_DIR "${PSXRECOMP_ROOT}/runtime/src/lobby_ws")
+if(EXISTS "${PSXRECOMP_LOBBY_WS_DIR}/rnet_ws.c" AND EXISTS "${PSXRECOMP_LOBBY_WS_DIR}/rnet_sha1.c")
+    set(PSXRECOMP_HAS_LOBBY_CLIENT TRUE)
+    list(APPEND PSXRECOMP_RUNTIME_SOURCES
+        ${PSXRECOMP_LOBBY_WS_DIR}/rnet_ws.c
+        ${PSXRECOMP_LOBBY_WS_DIR}/rnet_sha1.c)
+    set(PSXRECOMP_LOBBY_INCLUDE_DIR "${PSXRECOMP_LOBBY_WS_DIR}")
+    message(STATUS "psxrecomp: lobby client enabled (${PSXRECOMP_LOBBY_WS_DIR})")
+else()
+    set(PSXRECOMP_HAS_LOBBY_CLIENT FALSE)
+    set(PSXRECOMP_LOBBY_INCLUDE_DIR "")
+endif()
 
 set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_ROOT}/runtime/include
@@ -217,6 +267,9 @@ set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_ROOT}/recompiler/lib/fmt/include
     ${PSXRECOMP_ROOT}/recompiler/lib/toml11
 )
+if(PSXRECOMP_LOBBY_INCLUDE_DIR)
+    list(APPEND PSXRECOMP_RUNTIME_INCLUDE_DIRS ${PSXRECOMP_LOBBY_INCLUDE_DIR})
+endif()
 
 set(PSXRECOMP_BIOS_GENERATED
     ${PSXRECOMP_ROOT}/generated/SCPH1001_full.c
@@ -483,6 +536,14 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    if(PSXRECOMP_HAS_RECOMP_NET)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_NET=1)
+        target_link_libraries(${target} PRIVATE recomp_net)
+    endif()
+    if(PSXRECOMP_HAS_LOBBY_CLIENT)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_LOBBY_CLIENT=1)
     endif()
 
     # First-divergence co-sim oracle (COSIM_ORACLE.md): the clean, deterministic build.

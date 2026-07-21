@@ -1255,7 +1255,7 @@ extern int psx_interrupt_delivery_needed(const CPUState *cpu);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
 extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
-extern void debug_server_log_call_entry(uint32_t func_addr);
+extern void debug_server_log_call_entry_fn(uint32_t func_addr);
 
 static OverlayCallbacks s_callbacks;
 
@@ -1473,7 +1473,7 @@ static void init_callbacks(void) {
      * at every guest function entry when the callee would immediately no-op. */
     s_callbacks.log_call_entry       = NULL;
 #else
-    s_callbacks.log_call_entry       = debug_server_log_call_entry;
+    s_callbacks.log_call_entry       = debug_server_log_call_entry_fn;
 #endif
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
     /* Return-from-exception mark (ABI v12): overlay `rfe` ops forward here. */
@@ -1503,26 +1503,26 @@ static void init_callbacks(void) {
         extern uint16_t psx_cyc_load_half(CPUState*, uint32_t, uint32_t, uint32_t);
         extern uint8_t  psx_cyc_load_byte(CPUState*, uint32_t, uint32_t, uint32_t);
         extern uint32_t psx_cyc_lwc2_read(CPUState*, uint32_t);
-        extern void     psx_icache_fetch(CPUState*, uint32_t);
+        extern void     psx_icache_fetch_fn(CPUState*, uint32_t);
         extern void     psx_muldiv_set(CPUState*, uint32_t);
         extern void     psx_muldiv_stall(CPUState*);
         extern uint32_t psx_mult_latency_s(uint32_t);
         extern uint32_t psx_mult_latency_u(uint32_t);
         extern void     psx_gte_stall(CPUState*);
         extern void     psx_gte_read(CPUState*, uint32_t);
-        extern int      psx_slice_block(CPUState*, uint32_t, uint32_t, int);
+        extern int      psx_slice_block_impl(CPUState*, uint32_t, uint32_t, int);
         s_callbacks.cyc_load_word  = psx_cyc_load_word;
         s_callbacks.cyc_load_half  = psx_cyc_load_half;
         s_callbacks.cyc_load_byte  = psx_cyc_load_byte;
         s_callbacks.cyc_lwc2_read  = psx_cyc_lwc2_read;
-        s_callbacks.icache_fetch   = psx_icache_fetch;
+        s_callbacks.icache_fetch   = psx_icache_fetch_fn;
         s_callbacks.muldiv_set     = psx_muldiv_set;
         s_callbacks.muldiv_stall   = psx_muldiv_stall;
         s_callbacks.mult_latency_s = psx_mult_latency_s;
         s_callbacks.mult_latency_u = psx_mult_latency_u;
         s_callbacks.gte_stall      = psx_gte_stall;
         s_callbacks.gte_read       = psx_gte_read;
-        s_callbacks.slice_block    = psx_slice_block;
+        s_callbacks.slice_block    = psx_slice_block_impl;
         /* ABI v10: GTE special-register accessors — the emitter emits direct
          * calls for flag/IR/derived GTE regs (mfc2/cfc2/mtc2/ctc2); a GTE-heavy
          * overlay DLL cannot link without these forwarded. */

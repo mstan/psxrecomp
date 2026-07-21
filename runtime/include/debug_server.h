@@ -132,12 +132,15 @@ void debug_server_trace_dispatch(uint32_t func_addr);
 void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu);
 
 /* Direct-call entry hook — emitted by the recompiler at the top of every
- * generated function so we can see direct-jal targets that never go through
- * psx_dispatch.  Logs into the fn_entry ring (subject to fn_filter) without
- * touching the shadow stack — the native C call/return discipline already
- * handles unwinding for direct calls. */
+ * generated function. Release (PSX_NO_DEBUG_TOOLS): inlined in cpu_state.h
+ * (stamp g_psx_last_fn_entry). Debug builds use the out-of-line ring path. */
+extern volatile uint32_t g_psx_last_fn_entry;
+#ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_call_entry(uint32_t func_addr);
+#endif
 void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);
+/* Addressable stub for overlay CPS callbacks (always out-of-line). */
+void debug_server_log_call_entry_fn(uint32_t func_addr);
 
 /* Last store instruction PC — set by the recompiler before every memory
  * store (sb/sh/sw/swl/swr/swc2).  Read by SIO/MMIO write handlers to

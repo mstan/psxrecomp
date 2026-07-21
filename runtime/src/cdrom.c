@@ -2236,6 +2236,9 @@ void cdrom_init(const char* cue_path) {
     memset(sector_buffer, 0, sizeof(sector_buffer));
     memset(last_sector_buffer, 0, sizeof(last_sector_buffer));
 
+    /* Rematch re-calls cdrom_init; boot must see 1x until game entry again. */
+    g_disc_speed_divisor = 1;
+
     index_reg = 0;
     request_reg = 0;
     irq_enable = 0x1F;
@@ -2291,6 +2294,11 @@ void cdrom_init(const char* cue_path) {
     cdrom_debug_clear_sector_history();
 
     if (cue_path) {
+        /* Rematch re-opens the same disc; close the prior handle first. */
+        if (iso_handle) {
+            iso_close(iso_handle);
+            iso_handle = NULL;
+        }
         iso_handle = iso_open(cue_path);
     }
 

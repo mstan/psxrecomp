@@ -223,6 +223,28 @@ static int mask9_clamp_s8(int v) {
  * bias differed from hardware → the washed/wrong-contrast FMV). The block buffer
  * holds int8-range samples on return. */
 static void idct_block(int16_t *block) {
+    /* DC-only fast path: bit-identical to the loops below when AC is zero
+     * (common in dark/flat FMV macroblocks). Pass1 only fills tmp[*][0];
+     * pass2 only multiplies by scale[*][0]. */
+    int ac = 0;
+    for (int i = 1; i < 64; i++) ac |= block[i];
+    if (!ac) {
+        int16_t tmp0[8];
+        int dc = block[0];
+        for (int x = 0; x < 8; x++) {
+            int sum = dc * (int)mdec.scale[x * 8];
+            tmp0[x] = (int16_t)((sum + 0x4000) >> 15);
+        }
+        for (int col = 0; col < 8; col++) {
+            for (int x = 0; x < 8; x++) {
+                int sum = (int)tmp0[col] * (int)mdec.scale[x * 8];
+                block[col * 8 + x] =
+                    (int16_t)mask9_clamp_s8((sum + 0x4000) >> 15);
+            }
+        }
+        return;
+    }
+
     int16_t tmp[64];
     /* pass 1 — int16 out, transposed */
     for (int col = 0; col < 8; col++) {
@@ -487,6 +509,9 @@ void mdec_init(void) {
     memset(mdec_trace, 0, sizeof(mdec_trace));
     mdec_trace_seq = 0;
     mdec_trace_head = 0;
+    /* Rematch resets s_frame_count; a stale stamp makes mdec_recently_active
+     * wrap and lie for the whole next session. */
+    mdec_last_color_decode_frame = (uint64_t)0 - 1000u;
     for (int i = 0; i < 64; i++) {
         mdec.y_quant[i] = 1;
         mdec.uv_quant[i] = 1;

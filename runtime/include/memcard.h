@@ -70,6 +70,21 @@ int memcard_debug_info(int card, const char **path_out,
 int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
                               uint8_t *dst);
 
+/* Export / import a full 128KB card image (present cards only for export).
+ * import marks dirty and flushes to the bound filepath. Returns 0 on success. */
+int memcard_export_raw(int card, uint8_t *dst);
+int memcard_import_raw(int card, const uint8_t *src);
+
+/* Redirect on-disk paths for both slots (e.g. guest netplay sandbox) without
+ * reloading RAM. Subsequent flushes write to the new paths. Returns 0. */
+int memcard_rebind_dir(const char *dir);
+
+/* Restore explicit per-slot filepaths (from a prior snapshot). NULL path skips. */
+int memcard_rebind_paths(const char *path0, const char *path1);
+
+/* Reload in-memory images from the currently bound filepaths (0 = ok). */
+int memcard_reload_bound(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -128,6 +128,23 @@ button:hover { background-color: #232d3c; }
 .pad-art.analog  { decorator: image(img/pad_analog.png contain); }
 .card-col { display: block; flex: 1 1 auto; }
 .field-lbl { display: block; color: #8b949e; font-size: 12dp; margin-bottom: 5dp; }
+.field-lbl-row {
+	display: flex; flex-direction: row; align-items: center; margin-bottom: 5dp;
+}
+.field-lbl-row .field-lbl { flex: 1 1 auto; margin-bottom: 0dp; }
+.dev-refresh {
+	background-color: #1b2330; border: 1dp #2b3543; border-radius: 5dp;
+	color: #adbac7; font-size: 11dp; padding: 3dp 10dp; font-weight: bold;
+	min-width: 88dp; text-align: center;
+}
+.dev-refresh:hover { border-color: #3b82f6; color: #e6e9ef; }
+.dev-refresh:active { background-color: #2563eb; border-color: #3b82f6; color: #ffffff; }
+.dev-refresh.busy {
+	background-color: #1e3a5f; border-color: #3b82f6; color: #93c5fd;
+}
+.dev-refresh.done {
+	background-color: #14532d; border-color: #22c55e; color: #bbf7d0;
+}
 .dropdown-wrap { display: block; position: relative; margin-bottom: 12dp; }
 .dropdown {
 	display: flex; flex-direction: row; align-items: center;
@@ -206,6 +223,13 @@ button:hover { background-color: #232d3c; }
 	font-size: 16dp; padding: 12dp 34dp;
 }
 #launch:hover { background-color: #3b82f6; }
+#switch-netplay, #switch-offline {
+	background-color: #1b2330; border: 1dp #2b3543; color: #e6e9ef; font-weight: bold;
+	font-size: 15dp; padding: 12dp 22dp; margin-right: 12dp;
+}
+#switch-netplay:hover, #switch-offline:hover {
+	background-color: #232d3c; border-color: #3b82f6;
+}
 .back-btn { margin-right: 14dp; }
 
 /* ---- confirmation modal ---- */
@@ -220,27 +244,112 @@ button:hover { background-color: #232d3c; }
 .modal-btns button { margin-left: 10dp; }
 .modal-confirm { background-color: #2563eb; border-color: #3b82f6; color: #ffffff; font-weight: bold; }
 .modal-confirm:hover { background-color: #3b82f6; }
+
+/* ---- mode select (home) ---- */
+.home-wrap { display: block; padding: 48dp 40dp 20dp 40dp; }
+.home-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff; margin-bottom: 8dp; }
+.home-sub { display: block; color: #7d8590; font-size: 15dp; margin-bottom: 28dp; }
+.home-btn {
+	display: block; width: 100%; margin-bottom: 14dp; padding: 22dp 24dp;
+	background-color: #11161f; border: 1dp #1e2733; border-radius: 12dp;
+	color: #e6e9ef; font-size: 20dp; font-weight: bold; text-align: left;
+}
+.home-btn:hover { border-color: #3b82f6; background-color: #161c28; }
+.home-btn.net { border-color: #0d9488; background-color: #0f1f1c; }
+.home-btn.net:hover { border-color: #2dd4bf; background-color: #132824; }
+.home-btn.exit { color: #9aa3af; font-size: 17dp; padding: 16dp 24dp; }
+.home-btn-desc { display: block; color: #7d8590; font-size: 13dp; font-weight: normal; margin-top: 4dp; }
+
+/* ---- netplay skin ---- */
+body.netplay-skin { background-color: #0a1210; }
+body.netplay-skin .panel { background-color: #0f1a17; border-color: #1a2e28; }
+body.netplay-skin .card { background-color: #0f1a17; border-color: #1a2e28; }
+body.netplay-skin #launch-netlobbies {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+body.netplay-skin #launch-netlobbies:hover { background-color: #14b8a6; }
+body.netplay-skin #switch-offline {
+	background-color: #132824; border-color: #1a2e28; color: #e6e9ef;
+}
+body.netplay-skin #switch-offline:hover {
+	background-color: #1a3530; border-color: #14b8a6;
+}
+
+/* ---- lobby browser ---- */
+.lobby-toolbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 12dp; }
+.lobby-toolbar button { margin-right: 10dp; }
+.lobby-status { display: block; color: #7d8590; font-size: 13dp; flex: 1 1 auto; }
+.lobby-table {
+	display: block; background-color: #0f1a17; border: 1dp #1a2e28; border-radius: 10dp;
+	padding: 8dp; margin-bottom: 12dp; min-height: 220dp;
+}
+.lobby-head, .lobby-row {
+	display: flex; flex-direction: row; align-items: center; padding: 10dp 12dp;
+}
+.lobby-head { color: #7d8590; font-size: 12dp; font-weight: bold; border-bottom: 1dp #1a2e28; }
+.lobby-row { border-bottom: 1dp #15241f; }
+.lobby-row:hover { background-color: #132824; }
+.lobby-row.sel { background-color: #134e4a; border-radius: 6dp; }
+.lobby-c-name { flex: 1 1 auto; }
+.lobby-c-game { flex: 1 1 auto; color: #9aa3af; font-size: 13dp; }
+.lobby-c-players { width: 70dp; text-align: center; }
+.lobby-c-lock { width: 40dp; text-align: center; font-size: 16dp; }
+.lobby-actions { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; }
+.lobby-actions button { margin-right: 10dp; margin-bottom: 6dp; padding: 12dp 18dp; font-weight: bold;
+	background-color: #1b2330; border: 1dp #2b3543; border-radius: 8dp; color: #e6e9ef; }
+.lobby-actions button:hover { border-color: #2dd4bf; }
+.lobby-actions button.primary { background-color: #0d9488; border-color: #14b8a6; color: #042f2e; }
+.lobby-actions button.disabled { opacity: 0.35; }
+.lobby-actions button.ready-on {
+	background-color: #0d9488; border-color: #14b8a6; color: #042f2e;
+}
+.room-c-slot { width: 48dp; text-align: center; color: #9aa3af; }
+.room-c-ready { width: 100dp; text-align: center; color: #7d8590; font-weight: bold; }
+.room-c-ready.on { color: #2dd4bf; }
+.field-row { display: flex; flex-direction: row; align-items: center; margin-bottom: 10dp; }
+.field-row .field-lbl { width: 140dp; color: #9aa3af; }
+.field-row input {
+	flex: 1 1 auto; background-color: #0b1210; border: 1dp #1a2e28; border-radius: 6dp;
+	color: #e6e9ef; padding: 8dp 10dp;
+}
 </style>
 </head>
 
-<body id="root" data-model="settings">
+<body id="root" data-model="settings" data-class-netplay-skin="netplay_mode">
 <div id="frame">
 
-	<div class="topbar">
+	<div class="topbar" data-if="view != 'home'">
 		<div class="logo"></div>
 		<div class="title-block">
 			<h1>{{game_name}} Recomp</h1>
-			<div class="subtitle">{{game_name}} launcher</div>
+			<div class="subtitle" data-if="netplay_mode == false">{{game_name}} launcher</div>
+			<div class="subtitle" data-if="netplay_mode">{{game_name}} netplay</div>
 		</div>
 		<div class="topbar-actions">
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_controls">Controls</button>
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
 			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 			<button class="top-btn primary" data-if="view == 'controls'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+			<button class="top-btn primary" data-if="view == 'netplay_lobbies'" data-event-click="show_dashboard">‹ Back</button>
 		</div>
 	</div>
 
-	<!-- ================= DASHBOARD VIEW ================= -->
+	<!-- ================= HOME (mode select) ================= -->
+	<div data-if="view == 'home'">
+		<div class="home-wrap">
+			<span class="home-title">{{game_name}} Recomp</span>
+			<span class="home-sub">Choose how you want to play</span>
+			<button class="home-btn" data-event-click="mode_offline">Offline Mode
+				<span class="home-btn-desc">Classic launcher — local play, full controller setup</span>
+			</button>
+			<button class="home-btn net" data-if="netplay_available" data-event-click="mode_netplay">Netplay
+				<span class="home-btn-desc">Online lobbies — host or join a delay-sync session</span>
+			</button>
+			<button class="home-btn exit" data-event-click="quit">Exit</button>
+		</div>
+	</div>
+
+	<!-- ================= DASHBOARD VIEW (offline + netplay share layout) ================= -->
 	<div data-if="view == 'dashboard'">
 
 		<div class="panel disc-panel">
@@ -279,7 +388,10 @@ button:hover { background-color: #232d3c; }
 				<div class="card-body player">
 					<div class="pad-art" data-class-analog="p1_mode != 2" data-class-digital="p1_mode == 2"></div>
 					<div class="card-col">
-						<div class="field-lbl">Device</div>
+						<div class="field-lbl-row">
+							<div class="field-lbl">Device</div>
+							<button class="dev-refresh" data-class-busy="dev_refresh_busy" data-class-done="dev_refresh_done" data-event-click="refresh_devices">{{dev_refresh_label}}</button>
+						</div>
 						<div class="dropdown-wrap">
 							<div class="dropdown" data-event-click="open_dd(0)">
 								<span class="dd-label">{{p1_dev_label}}</span><span class="caret"></span>
@@ -291,7 +403,7 @@ button:hover { background-color: #232d3c; }
 					</div>
 				</div>
 			</div>
-			<div class="card right">
+			<div class="card right" data-if="netplay_mode == false">
 				<div class="card-head">
 					<span class="card-name">PLAYER 2</span>
 					<div class="seg" data-if="mode_selectable">
@@ -303,7 +415,10 @@ button:hover { background-color: #232d3c; }
 				<div class="card-body player">
 					<div class="pad-art" data-class-analog="p2_mode != 2" data-class-digital="p2_mode == 2"></div>
 					<div class="card-col">
-						<div class="field-lbl">Device</div>
+						<div class="field-lbl-row">
+							<div class="field-lbl">Device</div>
+							<button class="dev-refresh" data-class-busy="dev_refresh_busy" data-class-done="dev_refresh_done" data-event-click="refresh_devices">{{dev_refresh_label}}</button>
+						</div>
 						<div class="dropdown-wrap">
 							<div class="dropdown" data-event-click="open_dd(1)">
 								<span class="dd-label">{{p2_dev_label}}</span><span class="caret"></span>
@@ -447,12 +562,128 @@ button:hover { background-color: #232d3c; }
 		</div>
 	</div>
 
+	<!-- ================= NETPLAY LOBBIES ================= -->
+	<div data-if="view == 'netplay_lobbies'">
+		<div class="panel">
+			<div class="eyebrow">NETPLAY LOBBIES</div>
+			<div class="lobby-toolbar">
+				<span class="lobby-status">{{lobby_status}}</span>
+			</div>
+			<div class="lobby-table">
+				<div class="lobby-head">
+					<span class="lobby-c-name">LOBBY</span>
+					<span class="lobby-c-game">GAME</span>
+					<span class="lobby-c-players">PLAYERS</span>
+					<span class="lobby-c-lock"></span>
+				</div>
+				<div data-rml="lobby_table_html"></div>
+			</div>
+			<div class="lobby-actions">
+				<button data-event-click="show_dashboard">Return to Launcher</button>
+				<button data-event-click="lobby_change_name">Change Player Name</button>
+				<button class="primary" data-event-click="lobby_host_open">Host Game</button>
+				<button id="join-lobby-btn" data-class-disabled="lobby_join_enabled == false" data-event-click="lobby_join">Join Lobby</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- ================= NETPLAY LOBBY ROOM ================= -->
+	<div data-if="view == 'netplay_room'">
+		<div class="panel">
+			<div class="eyebrow">LOBBY ROOM</div>
+			<div class="lobby-toolbar">
+				<span class="lobby-status">{{room_lobby_title}} — {{lobby_status}}</span>
+			</div>
+			<div class="lobby-table">
+				<div class="lobby-head">
+					<span class="lobby-c-name">PLAYER</span>
+					<span class="room-c-slot">SLOT</span>
+					<span class="room-c-ready">STATUS</span>
+				</div>
+				<div data-rml="room_table_html"></div>
+			</div>
+			<div class="lobby-actions">
+				<button data-event-click="lobby_exit_room">Exit Lobby</button>
+				<button data-class-ready-on="lobby_local_ready" data-event-click="lobby_toggle_ready">Ready</button>
+				<button class="primary" data-if="lobby_is_host" data-class-disabled="lobby_can_launch == false" data-event-click="lobby_launch">Launch Game</button>
+			</div>
+		</div>
+	</div>
+
 	<!-- ================= FOOTER ================= -->
-	<div class="footer">
+	<div class="footer" data-if="view == 'dashboard'">
 		<span class="switch" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
 		<span class="skip-lbl">Skip Launcher on Boot</span>
 		<span class="foot-status"><span class="dot"></span><span class="status-txt">Recompiler ready</span></span>
-		<button id="launch" data-event-click="launch">LAUNCH GAME</button>
+		<button id="switch-netplay" data-if="netplay_mode == false && netplay_available" data-event-click="mode_netplay">Switch to Netplay</button>
+		<button id="launch" data-if="netplay_mode == false" data-event-click="launch">LAUNCH GAME</button>
+		<button id="switch-offline" data-if="netplay_mode" data-event-click="mode_offline">Switch to Offline</button>
+		<button id="launch-netlobbies" data-if="netplay_mode" data-event-click="show_netplay_lobbies">NETPLAY LOBBIES</button>
+	</div>
+	<div class="footer" data-if="view == 'settings'">
+		<span class="switch" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
+		<span class="skip-lbl">Skip Launcher on Boot</span>
+		<span class="foot-status"><span class="dot"></span><span class="status-txt">Recompiler ready</span></span>
+		<button id="switch-netplay" data-if="netplay_mode == false && netplay_available" data-event-click="mode_netplay">Switch to Netplay</button>
+		<button id="launch" data-if="netplay_mode == false" data-event-click="launch">LAUNCH GAME</button>
+		<button id="switch-offline" data-if="netplay_mode" data-event-click="mode_offline">Switch to Offline</button>
+		<button id="launch-netlobbies" data-if="netplay_mode" data-event-click="show_netplay_lobbies">NETPLAY LOBBIES</button>
+	</div>
+	<div class="footer" data-if="view == 'controls'">
+		<span class="switch" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
+		<span class="skip-lbl">Skip Launcher on Boot</span>
+		<span class="foot-status"><span class="dot"></span><span class="status-txt">Recompiler ready</span></span>
+		<button id="switch-netplay" data-if="netplay_mode == false && netplay_available" data-event-click="mode_netplay">Switch to Netplay</button>
+		<button id="launch" data-if="netplay_mode == false" data-event-click="launch">LAUNCH GAME</button>
+		<button id="switch-offline" data-if="netplay_mode" data-event-click="mode_offline">Switch to Offline</button>
+		<button id="launch-netlobbies" data-if="netplay_mode" data-event-click="show_netplay_lobbies">NETPLAY LOBBIES</button>
+	</div>
+
+	<!-- Player name modal (first visit or Change Player Name) -->
+	<div class="modal-backdrop" data-if="show_name_modal">
+		<div class="modal-box">
+			<span class="modal-title" data-if="name_modal_is_change == false">Choose a player name</span>
+			<span class="modal-title" data-if="name_modal_is_change">Change player name</span>
+			<div class="field-row"><span class="field-lbl">Player name</span>
+				<input type="text" data-value="name_draft"/></div>
+			<span class="modal-text">{{name_modal_hint}}</span>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-if="name_modal_is_change" data-event-click="lobby_name_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_name_confirm">Save</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Host lobby modal -->
+	<div class="modal-backdrop" data-if="show_host_modal">
+		<div class="modal-box">
+			<span class="modal-title">Host a lobby</span>
+			<div class="field-row"><span class="field-lbl">Lobby name</span>
+				<input type="text" data-value="host_lobby_name"/></div>
+			<div class="field-row"><span class="field-lbl">Password</span>
+				<input type="text" data-value="host_lobby_password"/></div>
+			<span class="modal-text">Leave password empty for an open lobby. Opponent joins over the lobby server; LAN UDP uses ports 7777/7778.</span>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-event-click="lobby_host_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_host_confirm">Create</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Join password modal -->
+	<div class="modal-backdrop" data-if="show_join_pw_modal">
+		<div class="modal-box">
+			<span class="modal-title">Lobby password</span>
+			<div class="field-row"><span class="field-lbl">Password</span>
+				<input type="text" data-value="join_lobby_password"/></div>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-event-click="lobby_join_pw_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="lobby_join_pw_confirm">Join</button>
+			</div>
+		</div>
 	</div>
 
 	<!-- ================= SKIP-LAUNCHER CONFIRM MODAL ================= -->
