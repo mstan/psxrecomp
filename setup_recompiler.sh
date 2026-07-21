@@ -109,8 +109,10 @@ else
     echo "  You need a Sony SCPH-1001 BIOS file. Place it at:"
     echo "    bios/SCPH1001.BIN"
     echo ""
-    echo "  Without it, the runtime will prompt for a BIOS file at launch."
-    echo "  The BIOS C code cannot be regenerated until the file is present."
+    echo "  The BIOS must be present before setup can continue — without it"
+    echo "  the recompiled BIOS C code (generated/SCPH1001_full.c) cannot be"
+    echo "  generated and the runtime targets won't build."
+    exit 1
 fi
 echo ""
 
@@ -142,6 +144,6 @@ echo "    Place a game disc (.bin/.cue) in a folder, then run:"
 echo "      ./setup_game.sh \"Game Name\" path/to/game.bin path/to/game.cue"
 echo ""
 echo "  Or build and run an already-configured game:"
-echo "    ./build_digimon.sh"
-echo "    ./run_digimon.sh"
+echo "    ./build_<game>.sh"
+echo "    ./run_<game>.sh"
 echo ""

@@ -1108,7 +1108,7 @@ int main(int argc, char** argv) {
     // Generate full C file and save to the generated directory
     // Use argv[2] as output path if provided, otherwise derive from input filename
     // Use filename() not stem() because ".36" in SCUS_942.36 is part of the serial, not an extension
-    std::string exe_stem = exe_path.filename().string();
+    std::string exe_stem = exe_path.stem().string();
     std::filesystem::create_directories(out_dir);
     std::filesystem::path output_filename = out_dir / (exe_stem + "_full.c");
     fmt::print("Generating complete C file: {}\n", output_filename.string());
