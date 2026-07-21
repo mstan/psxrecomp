@@ -649,7 +649,7 @@ static uint64_t g_legacy_underruns = 0;
 int g_audio_unmute_resync = 0;
 /* Actual device rate the host opened at (bridge mode may differ from 44100;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
-int g_audio_host_rate = 44100;
+extern "C" int g_audio_host_rate = 44100;
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
@@ -1307,7 +1307,6 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
                                    uint64_t *overflow_drops, double *correction,
                                    int *legacy, int *host_rate)
 {
-    extern int g_audio_host_rate;   /* set at device open */
     *legacy = audio_legacy_mode() ? 1 : 0;
     *host_rate = g_audio_host_rate;
     if (*legacy || !s_drc_ready) {

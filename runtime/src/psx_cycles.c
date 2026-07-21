@@ -159,7 +159,7 @@ static void psx_devices_recompute_deadline(void) {
     g_psx_cycle_fast_limit = s_next_service_cycle - 1u;
 }
 
-static void psx_devices_service_to_now(void) {
+void psx_devices_service_to_now(void) {
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
     g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
@@ -262,7 +262,8 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
     g_psx_cycle_fast_limit = 0;
 }
 
-void psx_advance_cycles(uint32_t cycles) {
+/* Slow path for the inlined psx_advance_cycles (COSIM / lockstep / conservative). */
+void psx_advance_cycles_slow(uint32_t cycles) {
     { extern int g_ls_replay_active;
       if (g_ls_replay_active) {
           /* Replay owns a private-in-time view of the global clock. Advance it
@@ -288,18 +289,16 @@ void psx_advance_cycles(uint32_t cycles) {
     }
 #endif
 #if STARVATION_RING_ENABLED
-    s_watchdog_throttle += charged_cycles;
+    s_watchdog_throttle += cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;
         starvation_watchdog_check();
     }
-    psx_pc_sample_throttle += cycles;
-    if (psx_pc_sample_throttle >= 1048576u) {
-        psx_pc_sample_throttle = 0;
+    s_pc_sample_throttle += cycles;
+    if (s_pc_sample_throttle >= 1048576u) {
+        s_pc_sample_throttle = 0;
         psx_cycles_pc_sample_fire();
     }
-#else
-    (void)charged_cycles;
 #endif
 }
 
