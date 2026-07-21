@@ -10,6 +10,8 @@ extern "C" {
 extern uint32_t g_psx_icache_tv[1024];
 extern int g_psx_icache_active;
 extern int g_ls_replay_active;
+void psx_icache_reset(void);
+void psx_icache_fetch(CPUState *cpu, uint32_t addr);
 void psx_icache_fetch_miss(CPUState *cpu, uint32_t addr);
 
 /* Keep the interpreter's steady-state tag hit inside its translation unit.

@@ -2201,8 +2201,10 @@ static void init_callbacks(void) {
      * PSX_ENABLE_BLOCK_CYCLES emits these; forward to the runtime's real impls so
      * native overlays charge cycles on the SAME timeline as the interp/BIOS. */
     {
-        extern uint32_t psx_cyc_load_word(CPUState*, uint32_t, uint32_t, uint32_t);
-        extern uint16_t psx_cyc_load_half(CPUState*, uint32_t, uint32_t, uint32_t);
+        /* Word/half fast paths are static inline in psx_cyc.h; overlays get the
+         * out-of-line slow entry points (same guest timing, MMIO-safe). */
+        extern uint32_t psx_cyc_load_word_slow(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint16_t psx_cyc_load_half_slow(CPUState*, uint32_t, uint32_t, uint32_t);
         extern uint8_t  psx_cyc_load_byte(CPUState*, uint32_t, uint32_t, uint32_t);
         extern uint32_t psx_cyc_lwc2_read(CPUState*, uint32_t);
         extern void     psx_icache_fetch_fn(CPUState*, uint32_t);
@@ -2213,8 +2215,8 @@ static void init_callbacks(void) {
         extern void     psx_gte_stall(CPUState*);
         extern void     psx_gte_read(CPUState*, uint32_t);
         extern int      psx_slice_block_impl(CPUState*, uint32_t, uint32_t, int);
-        s_callbacks.cyc_load_word  = psx_cyc_load_word;
-        s_callbacks.cyc_load_half  = psx_cyc_load_half;
+        s_callbacks.cyc_load_word  = psx_cyc_load_word_slow;
+        s_callbacks.cyc_load_half  = psx_cyc_load_half_slow;
         s_callbacks.cyc_load_byte  = psx_cyc_load_byte;
         s_callbacks.cyc_lwc2_read  = psx_cyc_lwc2_read;
         s_callbacks.icache_fetch   = psx_icache_fetch_fn;

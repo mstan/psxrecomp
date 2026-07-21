@@ -1778,39 +1778,18 @@ static inline int psx_cyc_main_ram_fast_addr(uint32_t addr, uint32_t width,
 }
 #endif
 
-uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+/* Slow paths for the inlined helpers in psx_cyc.h (MMIO / lockstep / shards). */
+uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
-#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
-    uint32_t phys;
-    if (psx_cyc_main_ram_fast_addr(addr, 4u, &phys)) {
-        return (uint32_t)ram[phys]
-             | ((uint32_t)ram[phys + 1] << 8)
-             | ((uint32_t)ram[phys + 2] << 16)
-             | ((uint32_t)ram[phys + 3] << 24);
-    }
-#endif
     return psx_read_word(addr);
 }
 uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
-    if (g_ls_mode == 0 && !g_ds_recording) {
-        /* mirror psx_read_half_raw path for production */
-        return psx_read_half(addr);
-    }
     return psx_read_half(addr);
 }
 void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
                                    uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
-}
-uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
-#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
-    uint32_t phys;
-    if (psx_cyc_main_ram_fast_addr(addr, 2u, &phys))
-        return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
-#endif
-    return psx_read_half(addr);
 }
 uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);
