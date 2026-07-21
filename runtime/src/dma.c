@@ -881,6 +881,53 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
     return best;
 }
 
+uint32_t dma_cycles_to_internal_event(void) {
+    uint32_t best = 0xFFFFFFFFu;
+
+    /* Async MDEC channels move one word whenever their cycle accumulator
+     * reaches the channel cost. Completion-only scheduling batches many RAM
+     * writes at a later service boundary, which is observably different when
+     * the CPU polls the destination buffer. */
+    for (int ch = 0; ch < 2; ch++) {
+        const DMAAsyncChannel *a = &mdec_async[ch];
+        if (!a->active || a->remaining_words == 0 ||
+            !((channels[ch].chcr >> 24) & 1u) || !channel_enabled(ch))
+            continue;
+        uint32_t direction = channels[ch].chcr & 1u;
+        if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0))
+            return 1u; /* invalid route is completed on the next DMA tick */
+        if ((ch == 0 && !mdec_dma_write_ready()) ||
+            (ch == 1 && !mdec_dma_read_ready()))
+            continue;
+        uint32_t cpw = ch == 0 ? DMA_MDEC_IN_CYCLES_PER_WORD
+                               : DMA_MDEC_OUT_CYCLES_PER_WORD;
+        uint32_t d = a->cycles_accum < cpw ? cpw - a->cycles_accum : 1u;
+        if (d < best) best = d;
+    }
+
+    /* CD-ROM DMA writes guest RAM incrementally. Expose each word on time;
+     * waiting only for the channel-complete IRQ can delay hundreds of writes. */
+    if (cdrom_async.active && cdrom_async.remaining_words != 0 &&
+        ((channels[3].chcr >> 24) & 1u) && channel_enabled(3)) {
+        if ((channels[3].chcr & 1u) != 0) {
+            return 1u; /* unsupported RAM->CD direction cancels next tick */
+        }
+        if (cdrom_dma_ready()) {
+            uint32_t d = cdrom_async.cycles_accum < DMA_CDROM_CYCLES_PER_WORD
+                       ? DMA_CDROM_CYCLES_PER_WORD - cdrom_async.cycles_accum
+                       : 1u;
+            if (d < best) best = d;
+        }
+    }
+
+    for (int ch = 0; ch < 7; ch++) {
+        if (delayed_complete[ch].active &&
+            delayed_complete[ch].cycles_remaining < best)
+            best = delayed_complete[ch].cycles_remaining;
+    }
+    return best;
+}
+
 uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask) {
     if (!(i_mask & (1u << 3))) return 0xFFFFFFFFu;
     uint32_t best = 0xFFFFFFFFu;
@@ -931,6 +978,16 @@ void dma_advance(uint32_t cycles) {
             uint32_t moved = 0;
             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
             g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
+            /* Snapshot outgoing executed code at the last possible coherent
+             * moment: after the async wait, immediately before the first RAM
+             * word. Scheduling-time capture was too early because guest code
+             * can continue executing while the CD device is not ready. */
+            if (a->remaining_words == a->total_words && words_budget > 0 &&
+                addr < 0x1C0000u) {
+                uint32_t bytes = a->total_words * 4u;
+                if (bytes > 0x200000u - addr) bytes = 0x200000u - addr;
+                overlay_capture_before_dma(addr, bytes);
+            }
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
                 uint32_t word = cdrom_dma_read();
                 g_dma_cur_madr = addr;

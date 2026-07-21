@@ -113,7 +113,7 @@ struct LauncherModel {
     bool ws_eligible     = true;  // toggle shown only when renderer==software (native-wide is SW-only)
     bool ultrawide       = false; // separate EXPERIMENTAL 21:9 choice
     bool uw_eligible     = false; // per-game offer_ultrawide gate
-    bool fullscreen      = false; // launch the game window in desktop fullscreen
+    int  fullscreen      = 0;     // tri-state: 0 windowed, 1 borderless (desktop), 2 exclusive
     bool frame_interpolation = false;
     int  frame_interpolation_fps = 0; // 0 = current display refresh
     bool opengl_renderer = false;
@@ -134,6 +134,7 @@ struct LauncherModel {
     Rml::String aspect_label;
     Rml::String winsize_label;
     Rml::String interpolation_fps_label;
+    Rml::String fullscreen_label;
 
     // Disc verification (recomputed whenever disc_path changes).
     Rml::String disc_file;      // file name only, e.g. "tomba.cue"
@@ -433,6 +434,17 @@ const char* crt_name(int v) {
     }
 }
 
+// Tri-state fullscreen: 0 off / 1 borderless (desktop) fullscreen / 2 exclusive
+// fullscreen (real display-mode change) — same semantics as recomp-ui's
+// universal Fullscreen control on every other console.
+const char* fullscreen_name(int v) {
+    switch (v) {
+        case 1:  return "Borderless";
+        case 2:  return "Exclusive";
+        default: return "Off";
+    }
+}
+
 // Offered display aspects. 4:3 is the native presentation every game ships
 // with; wider aspects enable the runtime widescreen hack (GTE X-squash +
 // stretched present — see [video] aspect_ratio in config_loader.h).
@@ -493,6 +505,7 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.interpolation_fps_label = interp_fps_label(m.frame_interpolation_fps);
+    m.fullscreen_label = fullscreen_name(m.fullscreen);
     m.opengl_renderer = (m.renderer == 1);
     m.interpolation_target_visible = m.opengl_renderer && m.frame_interpolation;
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
@@ -1097,6 +1110,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
     c.Bind("turbo_loads",    &m.turbo_loads);
     c.Bind("fullscreen",     &m.fullscreen);
+    c.Bind("fullscreen_label", &m.fullscreen_label);
     c.Bind("frame_interpolation", &m.frame_interpolation);
     c.Bind("interpolation_fps_label", &m.interpolation_fps_label);
     c.Bind("opengl_renderer", &m.opengl_renderer);
@@ -1343,10 +1357,11 @@ Result run(SDL_Window* window, void* gl_context,
             m.turbo_loads = !m.turbo_loads;
             handle.DirtyVariable("turbo_loads");
         });
-    c.BindEventCallback("toggle_fullscreen",
+    c.BindEventCallback("cycle_fullscreen",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.fullscreen = !m.fullscreen;
+            m.fullscreen = (m.fullscreen + 1) % 3; refresh_labels(m);
             handle.DirtyVariable("fullscreen");
+            handle.DirtyVariable("fullscreen_label");
         });
     c.BindEventCallback("toggle_frame_interpolation",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {

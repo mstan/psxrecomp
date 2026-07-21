@@ -17,9 +17,24 @@ extern uint64_t psx_next_service_cycle; /* absolute; 0 = dirty / recompute */
 extern int      psx_in_device_service;  /* re-entrancy guard */
 extern int      g_event_step_conservative;
 
-/* Event-deadline device model: catch every device up to the charged
- * guest-cycle position and force a deadline recompute. memory.c calls
- * this at the top of every device-MMIO read/write. */
+/* Diagnostic replay clock: advance the CPU-visible guest clock without
+ * servicing devices, then restore the authoritative live clock afterward.
+ * Used only while g_ls_replay_active is set. */
+int      psx_cycle_replay_begin(uint64_t start_cycle);
+uint64_t psx_cycle_replay_end(void);
+
+/* Transactional I-cache view for the overlay differential harness. The
+ * interpreter keeps the authoritative post-call cache; native replay starts
+ * from the saved entry tags, mutates a temporary view, then restores live. */
+int      psx_icache_shadow_record_begin(void);
+int      psx_icache_shadow_replay_begin(void);
+void     psx_icache_shadow_replay_end(void);
+void     psx_icache_shadow_abort(void);
+
+/* Event-deadline device model (psx_cycles.c): catch every device up to the
+ * charged guest-cycle position and force a deadline recompute. memory.c calls
+ * this at the top of every device-MMIO read/write so handlers always see
+ * current device state and re-arming writes shorten the next service. */
 void psx_devices_mmio_sync(void);
 void psx_devices_service_to_now(void);
 

@@ -7,11 +7,12 @@
 extern "C" {
 #endif
 
-/* Parsed <addr8>_<crc8>.{dll,so} cache filename. The parser is shared by the
+/* Parsed legacy <addr8>_<logical8> or immutable
+ * <addr8>_<logical8>_<artifact8>.{dll,so} cache filename. The parser is shared by the
  * Windows and POSIX directory walkers so both platforms reject partial hex
  * fields and lookalike suffixes identically. */
 typedef struct PsxOverlayCacheFile {
-    char name[22];
+    char name[40];
     char path[768];
     uint32_t region_start;
     uint32_t content_crc;

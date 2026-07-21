@@ -69,45 +69,89 @@ static inline uint32_t psx_instr_base_cycles(uint32_t insn) {
  * target (armed via LDWhich), not a GPR_RES. Pure (insn-only) so the static emitters
  * fold it to a literal at gen-time and the interpreter calls it at runtime. */
 static inline uint32_t psx_cyc_dep_res_mask(uint32_t insn) {
+    enum {
+        PSX_CYC_ROLE_RS  = 1u,
+        PSX_CYC_ROLE_RT  = 2u,
+        PSX_CYC_ROLE_RD  = 4u,
+        PSX_CYC_ROLE_R31 = 8u
+    };
+    /* The interpreter already dispatches on opcode/funct to execute the
+     * instruction.  Repeating that work here with nested switches made the
+     * load-delay interlock a second decoder in every non-load hot path.  These
+     * tables encode the same register roles in O(1); static emitters still call
+     * this single shared helper and therefore retain the same generated masks. */
+    static const uint8_t op_roles[64] = {
+        0, PSX_CYC_ROLE_RS, 0, PSX_CYC_ROLE_R31,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS, PSX_CYC_ROLE_RS,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RT,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        PSX_CYC_ROLE_RS, PSX_CYC_ROLE_RS, PSX_CYC_ROLE_RS,
+        PSX_CYC_ROLE_RS, PSX_CYC_ROLE_RS, PSX_CYC_ROLE_RS,
+        PSX_CYC_ROLE_RS, 0,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        0, 0, PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0
+    };
+    static const uint8_t special_roles[64] = {
+        PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD, 0,
+        PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD, 0,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RD,
+        0, 0, 0, 0, 0, 0,
+        PSX_CYC_ROLE_RD, PSX_CYC_ROLE_RS,
+        PSX_CYC_ROLE_RD, PSX_CYC_ROLE_RS,
+        0, 0, 0, 0,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT,
+        0, 0, 0, 0,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        0, 0,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        PSX_CYC_ROLE_RS | PSX_CYC_ROLE_RT | PSX_CYC_ROLE_RD,
+        0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0
+    };
     uint32_t op = insn >> 26;
     uint32_t rs = (insn >> 21) & 0x1Fu;
     uint32_t rt = (insn >> 16) & 0x1Fu;
     uint32_t rd = (insn >> 11) & 0x1Fu;
-    uint32_t M_rs = 1u << rs, M_rt = 1u << rt, M_rd = 1u << rd;
-    switch (op) {
-    case 0x00: { /* SPECIAL */
-        uint32_t fn = insn & 0x3Fu;
-        switch (fn) {
-        case 0x00: case 0x02: case 0x03:                 return M_rt | M_rd;        /* SLL/SRL/SRA */
-        case 0x04: case 0x06: case 0x07:                 return M_rs | M_rt | M_rd; /* SLLV/SRLV/SRAV */
-        case 0x08: case 0x09:                            return M_rs | M_rd;        /* JR/JALR */
-        case 0x10: case 0x12:                            return M_rd;               /* MFHI/MFLO */
-        case 0x11: case 0x13:                            return M_rs;               /* MTHI/MTLO */
-        case 0x18: case 0x19: case 0x1A: case 0x1B:      return M_rs | M_rt;        /* MULT/MULTU/DIV/DIVU */
-        case 0x20: case 0x21: case 0x22: case 0x23:
-        case 0x24: case 0x25: case 0x26: case 0x27:
-        case 0x2A: case 0x2B:                            return M_rs | M_rt | M_rd; /* ADD..NOR/SLT/SLTU */
-        default:                                         return 0u;                 /* SYSCALL/BREAK/... */
-        }
-    }
-    case 0x01: { /* REGIMM/BCOND: DEP rs, RES link(31 for *AL variants) */
-        uint32_t link = ((rt & 0x1Eu) == 0x10u) ? (1u << 31) : 0u;
-        return M_rs | link;
-    }
-    case 0x02:                                           return 0u;                 /* J */
-    case 0x03:                                           return 1u << 31;           /* JAL (RES 31) */
-    case 0x04: case 0x05:                                return M_rs | M_rt;        /* BEQ/BNE */
-    case 0x06: case 0x07:                                return M_rs;               /* BLEZ/BGTZ */
-    case 0x08: case 0x09: case 0x0A: case 0x0B:
-    case 0x0C: case 0x0D: case 0x0E:                     return M_rs | M_rt;        /* ADDI..XORI */
-    case 0x0F:                                           return M_rt;               /* LUI (RES rt) */
-    case 0x20: case 0x21: case 0x22: case 0x23:
-    case 0x24: case 0x25: case 0x26:                     return M_rs;               /* LB..LWR (load: rs only) */
-    case 0x28: case 0x29: case 0x2A: case 0x2B:
-    case 0x2E:                                           return M_rs | M_rt;        /* SB/SH/SWL/SW/SWR */
-    /* COP0/1/2/3 (0x10-0x13), LWC* (0x30-0x33), SWC* (0x38-0x3B): no GPR_DEP/RES */
-    default:                                             return 0u;
-    }
+    uint32_t roles = op_roles[op];
+    if (op == 0u)
+        roles = special_roles[insn & 0x3Fu];
+    else if (op == 1u && (rt & 0x1Eu) == 0x10u)
+        roles |= PSX_CYC_ROLE_R31;
+    return ((0u - ((roles & PSX_CYC_ROLE_RS) != 0u)) & (1u << rs)) |
+           ((0u - ((roles & PSX_CYC_ROLE_RT) != 0u)) & (1u << rt)) |
+           ((0u - ((roles & PSX_CYC_ROLE_RD) != 0u)) & (1u << rd)) |
+           ((0u - ((roles & PSX_CYC_ROLE_R31) != 0u)) & (1u << 31));
 }
 
 #ifdef __cplusplus

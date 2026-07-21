@@ -31,6 +31,10 @@ void     dma_advance(uint32_t cycles);
 /* Cycle-budgeted precise event slicing: guest CPU cycles until a DELIVERABLE
  * DMA IRQ (bit3 unmasked in i_mask). UINT32_MAX if none. */
 uint32_t dma_cycles_to_irq(uint32_t i_mask);
+/* Mask-blind scheduler boundary: next DMA word movement or delayed completion,
+ * not merely the final IRQ. RAM-producing DMA must become visible at its
+ * per-word due cycle even when guest code polls ordinary RAM instead of DICR. */
+uint32_t dma_cycles_to_internal_event(void);
 /* Strict deliverability form for wait-loop elision: unlike the conservative
  * scheduler bound, ignores channel completions whose DICR IRQ is disabled. */
 uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask);

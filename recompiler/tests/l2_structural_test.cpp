@@ -25,6 +25,7 @@
 
 #include "mips_decoder.h"
 #include "strict_translator.h"
+#include "gte_register_classification.h"
 #include "fmt/format.h"
 
 using PSXRecomp::MipsDecoder;
@@ -82,6 +83,23 @@ static auto check_code(std::function<std::string(const std::string&)> fn) {
             return fmt::format("unsupported: {}", r.fail_reason);
         return fn(r.c_code);
     };
+}
+
+// Check that host-visible operations occur in a specific source order.  This
+// matters for overlay stores: the DLL-local cycle batch must be published
+// before an MMIO write or SWL/SWR's read-modify-write begins.
+static auto must_contain_in_order(std::initializer_list<const char*> needles) {
+    std::vector<std::string> v(needles.begin(), needles.end());
+    return check_code([v](const std::string& c) -> std::string {
+        std::string::size_type pos = 0;
+        for (const auto& n : v) {
+            const auto found = c.find(n, pos);
+            if (found == std::string::npos)
+                return fmt::format("missing/out-of-order '{}' in: {}", n, c);
+            pos = found + n.size();
+        }
+        return "";
+    });
 }
 
 // ── Form table ──────────────────────────────────────────────────────────
@@ -242,7 +260,7 @@ static const Form kForms[] = {
 
     // SW $a0, 0($v1)
     { I_TYPE(0x2B, V1, A0, 0), "sw_a0_0_v1",
-      must_contain({"gpr[4]", "gpr[3]", "write_word"}) },
+      must_contain_in_order({"psx_store_cycle_barrier()", "write_word"}) },
 
     // LB $v0, 0($v1)
     { I_TYPE(0x20, V1, V0, 0), "lb_v0_0_v1",
@@ -262,11 +280,24 @@ static const Form kForms[] = {
 
     // SB $a0, 0($v1)
     { I_TYPE(0x28, V1, A0, 0), "sb_a0_0_v1",
-      must_contain({"gpr[4]", "gpr[3]", "write_byte"}) },
+      must_contain_in_order({"psx_store_cycle_barrier()", "write_byte"}) },
 
     // SH $a0, 0($v1)
     { I_TYPE(0x29, V1, A0, 0), "sh_a0_0_v1",
-      must_contain({"gpr[4]", "gpr[3]", "write_half"}) },
+      must_contain_in_order({"psx_store_cycle_barrier()", "write_half"}) },
+
+    // SWL/SWR are read-modify-write stores.  Publishing after the raw read is
+    // too late because the read itself may be MMIO and host-visible.
+    { I_TYPE(0x2A, V1, A0, 1), "swl_a0_1_v1",
+      must_contain_in_order({"psx_store_cycle_barrier()", "read_word", "write_word"}) },
+    { I_TYPE(0x2E, V1, A0, 2), "swr_a0_2_v1",
+      must_contain_in_order({"psx_store_cycle_barrier()", "read_word", "write_word"}) },
+
+    // SWC2 must include the GTE stall in the published timestamp, then expose
+    // that timestamp before the memory and precision-shadow side effects.
+    { I_TYPE(0x3A, V1, A0, 0), "swc2_a0_0_v1",
+      must_contain_in_order({"psx_gte_stall", "psx_store_cycle_barrier()", "write_word",
+                             "gte_precision_store_word"}) },
 
     // === COP0 ===
     // MFC0 $v0, $12  (read SR)
@@ -333,6 +364,46 @@ int main(int argc, char** argv) {
             if (verbose)
                 fmt::print("        c_code: {}\n", r.c_code);
         }
+    }
+
+    // Exhaustively lock the helper/raw classification for every COP2 register
+    // and transfer form.  This prevents native BIOS/overlay code from drifting
+    // away from the interpreter's canonical register semantics.
+    const auto check_gte_helper = [&](uint32_t word, const std::string& call,
+                                      bool expected, const char *kind,
+                                      uint8_t reg) {
+        ++total;
+        const TranslateResult r = StrictTranslator::translate(
+            MipsDecoder::decode(word, 0));
+        const bool actual = r.supported && contains(r.c_code, call);
+        if (actual == expected) {
+            ++pass;
+        } else {
+            ++fail;
+            fmt::print("  FAIL  strict GTE {} reg {} helper={} expected={} code={}\n",
+                       kind, reg, actual, expected, r.c_code);
+        }
+    };
+    for (uint8_t reg = 0; reg < 32; ++reg) {
+        const uint32_t cop2 = 0x12u << 26;
+        check_gte_helper(cop2 | (0x00u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_read_data(cpu, {})", reg),
+                         PSXRecompGTERegisters::data_read_needs_helper(reg), "MFC2", reg);
+        check_gte_helper(cop2 | (0x02u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_read_ctrl(cpu, {})", reg),
+                         PSXRecompGTERegisters::ctrl_read_needs_helper(reg), "CFC2", reg);
+        check_gte_helper(cop2 | (0x04u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_write_data(cpu, {}", reg),
+                         PSXRecompGTERegisters::data_write_needs_helper(reg), "MTC2", reg);
+        check_gte_helper(cop2 | (0x06u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_write_ctrl(cpu, {}", reg),
+                         PSXRecompGTERegisters::ctrl_write_needs_helper(reg), "CTC2", reg);
+        check_gte_helper(I_TYPE(0x32, V1, reg, 0),
+                         fmt::format("gte_write_data(cpu, {}", reg),
+                         PSXRecompGTERegisters::data_write_needs_helper(reg), "LWC2", reg);
+        check_gte_helper(I_TYPE(0x3A, V1, reg, 0),
+                         fmt::format("gte_read_data(cpu, {})", reg),
+                         PSXRecompGTERegisters::data_read_needs_helper(reg), "SWC2", reg);
     }
 
     fmt::print("\nL2 structural: {}/{} ok", pass, total);

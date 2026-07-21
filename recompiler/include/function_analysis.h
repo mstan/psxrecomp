@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
+#include <utility>
 #include <vector>
 #include <string>
 #include "ps1_exe_parser.h"
@@ -27,6 +29,18 @@ struct Function {
     // emitter generate ONE shared body per host with an entry switch instead
     // of duplicating the host's blocks per alias.
     std::vector<uint32_t> alias_group_entries;
+    // Exact-entry composites retain the source producer that owns this code.
+    // Zero means an ordinary single-image function.
+    uint32_t producer_lo = 0;
+    uint32_t producer_hi = 0;
+};
+
+struct AbsorbedEntry {
+    uint32_t addr;
+    uint32_t host_start;
+    uint32_t host_end;
+    uint32_t source_addr;
+    bool resolved_indirect;
 };
 
 struct FunctionAnalysisResult {
@@ -39,7 +53,46 @@ struct FunctionAnalysisResult {
     int bios_thunk_count = 0; // Packed A0/B0/C0 BIOS dispatch thunks
     int state_continuation_count = 0; // Split entries after calls to SaveState-style helpers
     int pointer_table_entry_count = 0; // Function entries found from executable pointer tables
+    // Statically proven direct/constant-register transfer targets that the
+    // FINAL exact-entry partition reaches inside another function. These are
+    // safe overlapping aliases: the source edge and host reachability were
+    // both observed by the analyzer (not inferred from a raw byte envelope).
+    std::vector<AbsorbedEntry> absorbed_entries;
+    // Instruction PCs reached by the FINAL exact-entry partition. Consumers
+    // use this to reject hostless `interior` seeds that merely fall inside a
+    // function's coarse [start,end) envelope or an unreachable data hole.
+    std::set<uint32_t> exact_reachable_pcs;
 };
+
+// A canonical, bounds-checked MIPS jump table recovered from a jr $rN site.
+// `table_base` and each pair's first value are the runtime addresses stored by
+// the guest; the pair's second value is the corresponding address in the
+// active executable image (normally identical, except for BIOS shell remaps).
+struct ExactJumpTable {
+    uint32_t table_base = 0;
+    uint32_t table_count = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> targets;
+};
+
+using ExactAddressMapper = uint32_t (*)(uint32_t, const PS1Executable&);
+
+// Recognize only the canonical bounded-switch dependency chain:
+// sltiu/beq guard -> sll index,2 -> addu table address -> lw target -> jr.
+// The table constant may use either same-register or cross-register
+// `lui source; addiu base,source,lo`. `producer_lo/producer_hi` bound both
+// table storage and case code for composite images; zero/zero means the full
+// executable. Every dependency, table word, and target must pass the hard
+// safety checks; otherwise the whole table is rejected.
+bool resolve_exact_bounded_jump_table(
+    const PS1Executable& exe,
+    uint32_t entry,
+    uint32_t hard_cap,
+    uint32_t jr_pc,
+    uint32_t jr_rs,
+    ExactJumpTable& table,
+    ExactAddressMapper runtime_to_image = nullptr,
+    uint32_t producer_lo = 0,
+    uint32_t producer_hi = 0);
 
 class FunctionAnalyzer {
 public:
@@ -52,7 +105,10 @@ public:
     // reachable from them. Used by runtime-loaded overlays and opt-in main-EXE
     // reachable discovery. Unresolved jalr/indirect targets do not mint
     // functions; evidence-backed entries must be supplied explicitly.
-    FunctionAnalysisResult analyze_exact_entries(const std::vector<uint32_t>& entries);
+    FunctionAnalysisResult analyze_exact_entries(
+        const std::vector<uint32_t>& entries,
+        const std::vector<std::pair<uint32_t, uint32_t>>& producer_ranges = {},
+        const std::set<uint32_t>& cross_call_allow = {});
 
     // Add a forced entry point address that is treated as a function start
     // even if it has no standard ADDIU $sp prologue. The function will be

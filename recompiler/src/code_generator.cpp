@@ -1,5 +1,6 @@
 #include "code_generator.h"
 #include "control_flow.h"
+#include "gte_register_classification.h"
 // Shared widescreen backdrop-window detector (single source of truth across the
 // recompiler and the interpreter). Self-contained C header;
 // included via relative path to avoid an include-dir collision (recompiler and
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 namespace PSXRecomp {
@@ -179,9 +181,9 @@ std::string CodeGenerator::translate_sw(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_word({}, {});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_word({}, {});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_word({} + {}, {});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_word({} + {}, {});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -457,9 +459,9 @@ std::string CodeGenerator::translate_sb(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_byte({}, (uint8_t){});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_byte({}, (uint8_t){});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_byte({} + {}, (uint8_t){});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_byte({} + {}, (uint8_t){});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -470,9 +472,9 @@ std::string CodeGenerator::translate_sh(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_half({}, (uint16_t){});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_half({}, (uint16_t){});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_half({} + {}, (uint16_t){});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_half({} + {}, (uint16_t){});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -705,21 +707,23 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
 
-    // REGIMM branches (bltz, bgez, bltzal, bgezal)
+    // REGIMM branches. R3000A hardware decodes EVERY rt value here, not just
+    // the four assembler mnemonics: the branch sense is rt bit 0 (0 = bltz,
+    // 1 = bgez) and the link register is written iff (rt & 0x1E) == 0x10 —
+    // Beetle cpu.cpp op_BCOND: result = (int32)(rs ^ (rt<<31)) < 0,
+    // link = ((rt & 0x1E) == 0x10). Undefined rt values appear when discovery
+    // sweeps data-as-code into a function; emitting the hardware decode keeps
+    // the regen alive AND matches the oracle if the word is ever executed.
     if (opcode == 0x01) {
         uint32_t regimm_op = (instr >> 16) & 0x1F;
-        if (regimm_op == 0x00) { // bltz
+        if ((regimm_op & 0x01u) == 0x00u) { // bltz family (incl. bltzal + undefined mirrors)
             // Classified LEFT-edge funnel bltz (auto_screen_x, signed idioms):
             // reject only past the revealed margin. Identity at 4:3 (margin 0).
-            if (ws_cull_bltz_pcs_.count(addr))
+            if (regimm_op == 0x00 && ws_cull_bltz_pcs_.count(addr))
                 return fmt::format("psx_ws_cull_bltz({}) /* ws auto screen-x cull (left edge) */",
                                    reg_name(rs));
             return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x01) { // bgez
-            return fmt::format("(int32_t){} >= 0", reg_name(rs));
-        } else if (regimm_op == 0x10) { // bltzal
-            return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x11) { // bgezal
+        } else {                            // bgez family (incl. bgezal + undefined mirrors)
             return fmt::format("(int32_t){} >= 0", reg_name(rs));
         }
     }
@@ -834,6 +838,42 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // overlay variant: addr is different code here — fall through to vanilla.
     }
+    if (config_.ws_cull_vxrange_sites.count(addr)) {
+        if (opcode == 0x0B) {  // sltiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            return fmt::format("{} = psx_ws_cull_vxrange({}, {});"
+                               "  /* ws cull masked-u16 X window */{}",
+                               reg_name(rt), reg_name(rs), (unsigned)imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] vxrange site 0x{:08X} is not "
+                       "sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
+    if (config_.ws_cull_depth_sites.count(addr)) {
+        if (opcode == 0x0A) {  // slti
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((int32_t){} < psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth */{}",
+                               reg_name(rt), reg_name(rs), (int)imm, comment);
+        }
+        if (opcode == 0x0B) {  // sltiu: MIPS sign-extends its immediate
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((uint32_t){} < (uint32_t)psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth unsigned */{}",
+                               reg_name(rt), reg_name(rs), (int)imm, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] depth site 0x{:08X} is not "
+                       "slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     if (config_.ws_cull_range_sites.count(addr)) {
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -936,6 +976,22 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // overlay variant: addr is different code here — fall through to vanilla.
     }
+    // Explicit horizontal low-edge widen for negate-form classifiers:
+    // `subu rd, zero, rt` computes -bound; subtracting the horizontal margin
+    // moves that bound left. Identity at 4:3.
+    if (config_.ws_cull_negsub_sites.count(addr)) {
+        if (opcode == 0x00 && funct == 0x23 && get_rs(instr) == 0) {
+            uint32_t rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
+                               "  /* ws cull negsub */{}",
+                               reg_name(rd), reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] negsub site 0x{:08X} is not "
+                       "subu rD,zero,rT (0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
     // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
     // final screen-X; squash the stored value around the screen centre so the
@@ -947,9 +1003,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             int16_t offset = get_imm16(instr);
             std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
             if (offset == 0)
-                return store_pc + fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                    reg_name(rs), reg_name(rt), comment);
-            return store_pc + fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                reg_name(rs), offset, reg_name(rt), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.backdrop] x site 0x{:08X} is not "
@@ -1086,10 +1142,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             : std::string(reg_name(rs));
         std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
         if (opcode == 0x28)  // sb
-            return store_pc + fmt::format("cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         if (opcode == 0x29)  // sh
-            return store_pc + fmt::format("cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         fmt::print(stderr, "ERROR: [persist_options] init site 0x{:08X} is not sb/sh "
                    "(opcode 0x{:02X})\n", addr, opcode);
@@ -1205,25 +1261,25 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     const std::string gte_read = fmt::format(
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", rt);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
-                        if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
+                        if (PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_read + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
                         } else {
                             code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
                         }
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
-                        if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                        if (PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_read + fmt::format("{} = gte_read_ctrl(cpu, {});  /* cfc2 */", reg_name(rt), rd);
                         } else {
                             code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
                         }
                     } else if (cop_op == 0x04) { // MTC2 - move to COP2 data
-                        if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
+                        if (PSXRecompGTERegisters::data_write_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_stall + fmt::format("gte_write_data(cpu, {}, {});  /* mtc2 */", rd, reg_name(rt));
                         } else {
                             code = gte_stall + fmt::format("cpu->gte_data[{}] = {};  /* mtc2 */", rd, reg_name(rt));
                         }
                     } else if (cop_op == 0x06) { // CTC2 - move to COP2 control
-                        if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                        if (PSXRecompGTERegisters::ctrl_write_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_stall + fmt::format("gte_write_ctrl(cpu, {}, {});  /* ctc2 */", rd, reg_name(rt));
                         } else {
                             code = gte_stall + fmt::format("cpu->gte_ctrl[{}] = {};  /* ctc2 */", rd, reg_name(rt));
@@ -1272,7 +1328,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     std::string addr = (offset == 0)
                         ? reg_name(rs)
                         : fmt::format("{} + {}", reg_name(rs), offset);
-                    bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
+                    bool special = PSXRecompGTERegisters::data_write_needs_helper(static_cast<uint8_t>(rt));
                     if (special) {
                         code = gte_stall + fmt::format("gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));  /* lwc2 gte[{}] */",
                                            rt, addr, rt);
@@ -1290,17 +1346,17 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     // Faithful GTE: COP2 reg read stalls to the command deadline.
                     const char* gte_stall =
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
-                    std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
+                    std::string value = PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rt))
                         ? fmt::format("gte_read_data(cpu, {})", rt)
                         : fmt::format("cpu->gte_data[{}]", rt);
                     std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
                     if (offset == 0) {
                         code = gte_stall + swc2_store_pc + fmt::format(
-                            "cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
+                            "psx_store_cycle_barrier(); cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
                             reg_name(rs), value, reg_name(rs), rt, rt, reg_name(rs));
                     } else {
                         code = gte_stall + swc2_store_pc + fmt::format(
-                            "cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                            "psx_store_cycle_barrier(); cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
                             reg_name(rs), offset, value, reg_name(rs), offset, rt,
                             rt, offset, reg_name(rs));
                     }
@@ -1517,6 +1573,42 @@ std::string CodeGenerator::translate_basic_block(
                 std::string delay_saved_cond;    // branch condition captured before delay
                 std::string delay_saved_target;  // JR/JALR target captured before delay
 
+                const uint32_t branch_opcode =
+                    (block.exit_instr.instruction >> 26) & 0x3Fu;
+                if (branch_opcode >= 0x14u && branch_opcode <= 0x17u) {
+                    /* Opcodes 0x14-0x17 (the MIPS-II branch-likely family) are
+                     * RESERVED on the R3000A: real hardware raises the Reserved
+                     * Instruction exception at this PC (Beetle cpu.cpp opcode
+                     * table row 0x10: op_ILL). Discovery can sweep data-as-code
+                     * into a function body; aborting the WHOLE regen here (the
+                     * old throw) broke "every title regenerates at tip" over one
+                     * bogus word, and emitting the word as a real branch would
+                     * be unfaithful. Emit the architectural RI raise inline —
+                     * ABI-neutral: the dispatch trampoline (and the CPS exit
+                     * contract in overlay mode) re-dispatches cpu->pc after the
+                     * return, exactly like any other guest control transfer. If
+                     * the word is data (never executed) nothing happens; if the
+                     * guest really reaches it, the kernel handler sees the same
+                     * exception hardware would deliver. */
+                    fmt::print("  WARNING: reserved opcode 0x{:08X} at 0x{:08X} "
+                               "— emitting guest RI exception raise\n",
+                               block.exit_instr.instruction, addr);
+                    ss << config_.indent
+                       << fmt::format("{{ /* reserved opcode 0x{:08X}: architectural RI exception */\n",
+                                      block.exit_instr.instruction);
+                    ss << config_.indent << "  uint32_t psx_ri_sr = cpu->cop0[12];\n";
+                    ss << config_.indent
+                       << fmt::format("  cpu->cop0[14] = 0x{:08X}u;  /* EPC = faulting PC, BD=0 */\n", addr);
+                    ss << config_.indent
+                       << "  cpu->cop0[13] = (cpu->cop0[13] & ~0x8000007Cu) | (10u << 2);  /* Cause: RI */\n";
+                    ss << config_.indent
+                       << "  cpu->cop0[12] = (psx_ri_sr & ~0x3Fu) | ((psx_ri_sr & 0x0Fu) << 2);  /* SR push */\n";
+                    ss << config_.indent
+                       << "  cpu->pc = (psx_ri_sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;\n";
+                    ss << config_.indent << "  return; }\n";
+                    break;  /* block ends at the raise; nothing after is reachable */
+                }
+
                 // Per-instruction interlock ORDER (Beetle): the branch's §1+deps+DO_LDS
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
@@ -1566,7 +1658,22 @@ std::string CodeGenerator::translate_basic_block(
                     uint32_t delay_slot_addr = addr + 4;
                     auto delay_instr_opt = exe_.read_word(delay_slot_addr);
 
-                    if (delay_instr_opt.has_value()) {
+                    /* A native control transfer without its architectural delay
+                     * slot is never a legal partial shard.  In particular, a
+                     * page-scoped overlay capture can end with the branch at
+                     * ...FFC while the slot lives at ...000 in the next page.
+                     * The old code silently skipped the unavailable word and
+                     * still emitted the transfer, corrupting guest state while
+                     * looking like a successful native call.  Fail generation
+                     * closed; the runtime interpreter remains authoritative
+                     * until a capture containing the guard word is available. */
+                    if (!delay_instr_opt.has_value()) {
+                        throw std::runtime_error(fmt::format(
+                            "cannot emit control flow at 0x{:08X}: mandatory "
+                            "delay slot 0x{:08X} is outside the input image",
+                            addr, delay_slot_addr));
+                    }
+                    {
                         uint32_t delay_instr = *delay_instr_opt;
 
                         // For branch-likely variants, delay slot is conditional
@@ -1749,89 +1856,15 @@ std::string CodeGenerator::translate_basic_block(
                     //   P1: lui $R,hi; addiu $R,$R,lo; addu $D,$idx,$R; lw $D,0($D)
                     //   P2: lui $R,hi;                 addu $D,$R,$idx; lw $D,off($D)
                     // table_base = lui_val + addiu_val + lw_offset
-                    uint32_t table_base  = 0;
-                    uint32_t table_count = 0;
-                    {
-                        uint32_t lw_base_reg   = 0xFF;   // base reg in the LW
-                        int32_t  lw_offset     = 0;      // offset in the LW instruction
-                        uint32_t addu_cand[2]  = {0xFF, 0xFF}; // rs, rt of ADDU
-                        uint32_t table_reg     = 0xFF;   // candidate for table base reg
-                        uint32_t lui_val       = 0;
-                        int16_t  addiu_val[2]  = {0, 0}; // per-candidate ADDIU
-                        bool     found_addiu[2]= {false, false};
-                        bool     found_lui     = false;
-
-                        for (int back = 1; back <= 40; back++) {
-                            uint32_t sa = block.exit_instr.address - (uint32_t)(back * 4);
-                            if (sa < cfg.function_start) break;
-                            auto sopt = exe_.read_word(sa);
-                            if (!sopt) break;
-                            uint32_t si   = *sopt;
-                            uint32_t s_op = (si >> 26) & 0x3F;
-                            uint32_t s_rs = (si >> 21) & 0x1F;
-                            uint32_t s_rt = (si >> 16) & 0x1F;
-                            uint32_t s_rd = (si >> 11) & 0x1F;
-                            uint32_t s_fn = si & 0x3F;
-
-                            // LW $jr_reg, offset($base)
-                            if (s_op == 0x23 && s_rt == jr_rs && lw_base_reg == 0xFF) {
-                                lw_base_reg = s_rs;
-                                lw_offset   = (int32_t)(int16_t)(si & 0xFFFF);
-                                continue;
-                            }
-                            // ADDU $lw_base, $a, $b  — save both operands as candidates
-                            if (s_op == 0x00 && s_fn == 0x21 &&
-                                s_rd == lw_base_reg && lw_base_reg != 0xFF &&
-                                addu_cand[0] == 0xFF) {
-                                addu_cand[0] = s_rs;
-                                addu_cand[1] = s_rt;
-                                table_reg    = s_rt;  // initial guess; may flip on LUI match
-                                continue;
-                            }
-                            // ADDIU $cand, $cand, imm  (scanning back → before LUI)
-                            if (s_op == 0x09 && addu_cand[0] != 0xFF) {
-                                for (int c = 0; c < 2; c++) {
-                                    if (!found_addiu[c] && addu_cand[c] != 0xFF &&
-                                        s_rs == addu_cand[c] && s_rt == addu_cand[c]) {
-                                        addiu_val[c]   = (int16_t)(si & 0xFFFF);
-                                        found_addiu[c] = true;
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            // LUI $cand, hi  — determines which candidate is the table base
-                            if (s_op == 0x0F && addu_cand[0] != 0xFF && !found_lui) {
-                                for (int c = 0; c < 2; c++) {
-                                    if (addu_cand[c] != 0xFF && s_rt == addu_cand[c]) {
-                                        lui_val   = ((uint32_t)(si & 0xFFFF)) << 16;
-                                        table_reg = addu_cand[c];
-                                        // carry over the ADDIU for this candidate
-                                        if (!found_addiu[c]) { addiu_val[c] = 0; }
-                                        // store addiu in slot 0 for convenience
-                                        addiu_val[0]   = addiu_val[c];
-                                        found_addiu[0] = found_addiu[c];
-                                        found_lui      = true;
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            // SLTIU — table entry count
-                            if (s_op == 0x0B && table_count == 0) {
-                                table_count = si & 0xFFFF;
-                                continue;
-                            }
-                            if (found_lui && table_count != 0) break;
-                        }
-
-                        if (found_lui && table_count > 0 && table_count < 512) {
-                            uint32_t base = lui_val +
-                                (found_addiu[0] ? (uint32_t)(int32_t)addiu_val[0] : 0u);
-                            table_base = base + (uint32_t)lw_offset;
-                        }
-                    }
-
+                    ExactJumpTable exact_table;
+                    bool have_exact_table = resolve_exact_bounded_jump_table(
+                        exe_, cfg.function_start, cfg.function_end,
+                        block.exit_instr.address, jr_rs, exact_table,
+                        ram_to_rom, cfg.producer_lo, cfg.producer_hi);
+                    uint32_t table_base = have_exact_table
+                        ? exact_table.table_base : 0u;
+                    uint32_t table_count = have_exact_table
+                        ? exact_table.table_count : 0u;
                     // If we found a valid table, read entries and emit switch.
                     // table_base may be a RAM address (BIOS shell code copies
                     // ROM 0xBFC18000+ to RAM 0x80030000+).  Translate to ROM
@@ -1842,11 +1875,8 @@ std::string CodeGenerator::translate_basic_block(
                         uint32_t rom_table_base = ram_to_rom(table_base, exe_);
                         std::set<uint32_t>    seen;
                         std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime_addr, rom_addr}
-                        for (uint32_t i = 0; i < table_count; i++) {
-                            auto eopt = exe_.read_word(rom_table_base + i * 4);
-                            if (!eopt) continue;
-                            uint32_t runtime_addr = *eopt;
-                            uint32_t rom_addr = ram_to_rom(runtime_addr, exe_);
+                        for (const auto& [runtime_addr, rom_addr] :
+                             exact_table.targets) {
                             if (seen.insert(rom_addr).second &&
                                 (cfg.blocks.count(rom_addr) || extra_labels_.count(rom_addr))) {
                                 targets.push_back({runtime_addr, rom_addr});
@@ -2178,7 +2208,12 @@ GeneratedFunction CodeGenerator::generate_function(
     // into the owning block. Emitted BEFORE the entry hooks so a continuation
     // re-entry bypasses debug_server_log_call_entry / widescreen entry hooks
     // (those must run only on a true function entry, cpu->pc == 0).
-    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+    // Overlay mode must emit the cpu->pc guard even when the continuation set
+    // is EMPTY: a range re-entry can still request an interior PC of a
+    // single-block function, and without the guard the body runs from its top
+    // regardless of the requested PC — the same corrupting-fall-through this
+    // switch's fail-closed default exists to prevent.
+    if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
         body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
         body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
@@ -2337,33 +2372,18 @@ void CodeGenerator::scan_jr_tables(
     for (const auto& [baddr, blk] : cfg.blocks) {
         if (blk.exit_instr.type != ControlFlowType::JumpRegister) continue;
         uint32_t jr_r = get_rs(blk.exit_instr.instruction);
-        // Run same backward scan as translate_basic_block to find table_base/count
-        uint32_t tb = 0, tc = 0;
-        {
-            uint32_t lw_base = 0xFF; int32_t lw_off = 0;
-            uint32_t ac[2] = {0xFF,0xFF}; uint32_t lui_v = 0;
-            int16_t av[2] = {0,0}; bool fa[2] = {false,false}, fl = false;
-            for (int b = 1; b <= 40; b++) {
-                uint32_t sa = blk.exit_instr.address - (uint32_t)(b*4);
-                if (sa < cfg.function_start) break;
-                auto so = exe_.read_word(sa); if (!so) break;
-                uint32_t si=*so, s_op=(si>>26)&0x3F, s_rs=(si>>21)&0x1F,
-                         s_rt=(si>>16)&0x1F, s_rd=(si>>11)&0x1F, s_fn=si&0x3F;
-                if (s_op==0x23 && s_rt==jr_r && lw_base==0xFF) { lw_base=s_rs; lw_off=(int32_t)(int16_t)(si&0xFFFF); continue; }
-                if (s_op==0x00 && s_fn==0x21 && s_rd==lw_base && lw_base!=0xFF && ac[0]==0xFF) { ac[0]=s_rs; ac[1]=s_rt; continue; }
-                if (s_op==0x09 && ac[0]!=0xFF) { for(int c=0;c<2;c++){if(!fa[c]&&ac[c]!=0xFF&&s_rs==ac[c]&&s_rt==ac[c]){av[c]=(int16_t)(si&0xFFFF);fa[c]=true;break;}} continue; }
-                if (s_op==0x0F && ac[0]!=0xFF && !fl) { for(int c=0;c<2;c++){if(ac[c]!=0xFF&&s_rt==ac[c]){lui_v=((uint32_t)(si&0xFFFF))<<16;if(!fa[c]){av[c]=0;}av[0]=av[c];fa[0]=fa[c];fl=true;break;}} continue; }
-                if (s_op==0x0B && tc==0) { tc=si&0xFFFF; continue; }
-                if (fl && tc!=0) break;
-            }
-            if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
+        ExactJumpTable exact_table;
+        if (!resolve_exact_bounded_jump_table(
+                exe_, cfg.function_start, cfg.function_end,
+                blk.exit_instr.address, jr_r, exact_table, ram_to_rom,
+                cfg.producer_lo, cfg.producer_hi)) {
+            continue;
         }
+        uint32_t tb = exact_table.table_base;
+        uint32_t tc = exact_table.table_count;
         if (tb==0 || tc==0) continue;
-        uint32_t rom_tb = ram_to_rom(tb, exe_);
-        for (uint32_t i = 0; i < tc; i++) {
-            auto eopt = exe_.read_word(rom_tb + i*4);
-            if (!eopt) continue;
-            uint32_t t = ram_to_rom(*eopt, exe_);
+        for (const auto& target_pair : exact_table.targets) {
+            uint32_t t = target_pair.second;
             if (t >= cfg.function_start && t < cfg.function_end) {
                 out_edges[baddr].push_back(t);
                 if (!cfg.blocks.count(t))
@@ -2478,7 +2498,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // the `entry` arg. The dispatch routes a continuation by calling the first
     // alias wrapper with cpu->pc set (entry is then ignored). Owner =
     // aliases[0]->start_addr.
-    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+    if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
         body << config_.indent << "if (cpu->pc != 0u) {\n";
         body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
@@ -2489,7 +2509,34 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
                  << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
             cps_continuation_owner_[c] = aliases[0]->start_addr;
         }
-        body << config_.indent << "        default: break;\n";
+        if (config_.overlay_mode) {
+            // Alias entry PCs are excluded from cps_cur_continuations_ (they
+            // dispatch as function entries with cpu->pc == 0), but a RANGE
+            // re-entry can still request one with cpu->pc set — route it to
+            // its block, exactly as the entry switch below would.
+            for (const Function* a : aliases) {
+                if (!seen.insert(a->start_addr).second) continue;
+                body << config_.indent
+                     << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n",
+                                    a->start_addr, a->start_addr);
+            }
+            // FAIL CLOSED on any other interior PC (same contract as
+            // generate_function's overlay entry switch, PR #46). The old
+            // `default: break` fell through to `switch (entry)` and ran the
+            // ALIAS'S OWN block for a PC it does not own — the Tomba 2
+            // splash→title reload death: dispatch(0x80089788) resolved to the
+            // alias func_80089770, which re-ran the crt0 shim tail (reload
+            // $ra, call main-init) in an infinite loop, leaking 0x40 of guest
+            // stack per iteration until the frames overwrote the freshly
+            // loaded module code itself. Restore the requested PC and signal
+            // the overlay dispatch to route it to the dirty-RAM interpreter.
+            body << config_.indent
+                 << fmt::format("        default: cpu->pc = _cont; "
+                                "psx_native_bad_entry(cpu, 0x{:08X}u, _cont); return;\n",
+                                aliases[0]->start_addr);
+        } else {
+            body << config_.indent << "        default: break;\n";
+        }
         body << config_.indent << "    }\n";
         body << config_.indent << "}\n";
     }
@@ -2499,7 +2546,16 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
              << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n",
                             a->start_addr, a->start_addr);
     }
-    body << config_.indent << "    default: return;\n";
+    if (config_.overlay_mode) {
+        // A dispatched entry outside the alias set must not silently no-op:
+        // the loader would count it as executed. Fail closed to the interp.
+        body << config_.indent
+             << fmt::format("    default: cpu->pc = entry; "
+                            "psx_native_bad_entry(cpu, 0x{:08X}u, entry); return;\n",
+                            aliases[0]->start_addr);
+    } else {
+        body << config_.indent << "    default: return;\n";
+    }
     body << config_.indent << "}\n";
 
     body << blocks_buf.str();
@@ -2695,6 +2751,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
+    ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";
@@ -2757,6 +2815,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
     ss << kw << "void psx_swl(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "    psx_store_cycle_barrier();\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";
@@ -2773,6 +2832,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
     ss << kw << "void psx_swr(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "    psx_store_cycle_barrier();\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";
@@ -3073,6 +3133,17 @@ std::string CodeGenerator::generate_ranges_manifest(
             (void)baddr;
             uint32_t lo = blk.start_addr;
             uint32_t hi = blk.end_addr + 4u;
+            /* translate_basic_block clones an out-of-block delay slot when the
+             * control-flow instruction itself is the block's last word.  That
+             * cloned instruction is compiled code too: include it in the exact
+             * validity range so its bytes participate in the candidate CRC and
+             * page-generation watch.  Otherwise a later write to the slot could
+             * leave stale native semantics callable. */
+            if (blk.exit_instr.has_delay_slot &&
+                blk.exit_instr.type != ControlFlowType::None &&
+                blk.exit_instr.address == blk.end_addr && hi <= UINT32_MAX - 4u) {
+                hi += 4u;
+            }
             if (hi > lo) iv.emplace_back(lo, hi);
         }
         if (iv.empty()) continue;

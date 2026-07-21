@@ -6,6 +6,7 @@ Usage: python test_reachable_discovery_codegen.py \
 """
 import argparse
 import os
+import pathlib
 import struct
 import subprocess
 import sys
@@ -94,11 +95,17 @@ def main():
         if result.returncode != 0:
             failures.append(f"reachable recompile failed:\n{output}")
         else:
-            full_path = os.path.join(tmp, "generated", "test.exe_full.c")
+            full_paths = sorted(path for path in
+                                pathlib.Path(tmp, "generated").glob("test.exe_full*.c")
+                                if "_dispatch" not in path.name)
             dispatch_path = os.path.join(
                 tmp, "generated", "test.exe_dispatch.c")
-            with open(full_path, encoding="utf-8") as f:
-                full = f.read()
+            if not full_paths:
+                failures.append("reachable recompile emitted no _full*.c shards")
+                full = ""
+            else:
+                full = "\n".join(path.read_text(encoding="utf-8")
+                                   for path in full_paths)
             with open(dispatch_path, encoding="utf-8") as f:
                 dispatch = f.read()
 

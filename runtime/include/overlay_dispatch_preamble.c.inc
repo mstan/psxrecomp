@@ -143,17 +143,17 @@ int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_
     overlay_flush_cycles();
     return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
 }
-/* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/mtc2/
- * ctc2 on flag/IR/derived GTE regs through these as DIRECT calls, so any
+/* GTE special-register accessors (ABI v10). The emitter routes masked,
+ * sign-extended, aliased/FIFO, read-only, precision-sensitive, flag/IR, and
+ * derived registers through these as DIRECT calls, so any
  * GTE-heavy overlay (Tomba2 lava / Trolley attract demos) fails to link
  * without them — undefined gte_read_ctrl was the signature that silently
  * blocked all new overlay coverage. GTE state is SHARED runtime state; a
- * local fallback would fork the flag/IR timeline, so these forward
+ * local fallback would fork that timeline, so these forward
  * unconditionally (ABI v10 hosts always supply them; the v10 gate rejects
  * DLL/host mixes that don't).
- * NOTE the plain-data fast paths (cpu->gte_data[i] / cpu->gte_ctrl[i]) stay
- * direct CPUState accesses in emitted code — only the derived/flag registers
- * come through here, matching code_generator.cpp's COP2 case. */
+ * Proven bit-transparent registers retain direct CPUState-array fast paths;
+ * the shared emitter classification header is the source of truth. */
 uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
     overlay_flush_cycles();
     return g_cbs.gte_read_data(cpu, reg);
@@ -205,6 +205,12 @@ int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
 int psx_ws_cull_bltz(uint32_t v) {
     return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
 }
+int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
+    int32_t margin = psx_ws_x_margin();
+    uint32_t bound = (uint32_t)(int32_t)(int16_t)(uint16_t)imm;
+    return (((x + (uint32_t)margin) & 0xFFFFu) <
+            (bound + 2u * (uint32_t)margin)) ? 1 : 0;
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
@@ -223,5 +229,17 @@ uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
 int32_t psx_ws_player_x_bound(int32_t vanilla) {
     return g_cbs.ws_player_x_bound ? g_cbs.ws_player_x_bound(vanilla) : vanilla;
 }
+int32_t psx_ws_depth_bound(int32_t imm) {
+    return g_cbs.ws_depth_bound ? g_cbs.ws_depth_bound(imm) : imm;
+}
+/* Sub-pixel GTE precision-store tracker (ABI v14). The emitter emits a direct
+ * gte_precision_store_word() call for every swc2 (GTE store-word), including in
+ * overlay-resident code, so the DLL must define it or the shard fails to link
+ * (undefined reference — the rfe/gte_read_ctrl class). Forwards to the host's
+ * stateful tracker (gte.cpp); no-op if the host predates the callback
+ * (precision tracking is a widescreen enhancement, off by default — 4:3
+ * behavior is unaffected). */
+void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
+}
 /* ----------------------------------------------------------------------- */
-

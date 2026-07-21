@@ -21,4 +21,20 @@ int psx_game_text_native_ok(uint32_t addr)
     return psx_game_address_in_text(addr) && dirty_ram_text_native_ok(phys);
 }
 
+#elif !defined(PSX_HAS_GAME_DISPATCH)
+
+/* The BIOS-only runtime still links shared dispatch observability. There is no
+ * game image to classify, so both predicates are necessarily false. */
+int psx_game_address_in_text(uint32_t addr)
+{
+    (void)addr;
+    return 0;
+}
+
+int psx_game_text_native_ok(uint32_t addr)
+{
+    (void)addr;
+    return 0;
+}
+
 #endif /* PSX_HAS_GAME_DISPATCH */

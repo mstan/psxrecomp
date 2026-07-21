@@ -520,17 +520,25 @@ extern void psx_exception_longjmp(void);
  * no-op and the real EPC is dispatched directly — that is how a suspended thread
  * resumes at its own PC. */
 void psx_rfe_mark_escape(void) {
-    if (in_exception && g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
-        g_rfe_escape_pending = 1;
-        g_exc_escape_reason  = PSX_EXC_ESCAPE_RFE_RETURN;
-    }
+    if (!in_exception) return;
+    /* Arm on EVERY handler-window RFE, including LEGACY_SENTINEL deliveries.
+     * The old blanket decline assumed a sentinel delivery always resumes AT
+     * the sentinel — but a handler that switches threads (the guest's own
+     * cooperative scheduler moving PCB[0] in its VBlank callback) RFEs to the
+     * NEW thread's real EPC instead; with nothing armed, no exit path ever
+     * fires and in_exception wedges the VBlank authority forever (Tomba 2
+     * splash livelock). The take site keeps the legacy contract intact: a
+     * resume that DOES land on the sentinel still declines there and exits
+     * through the sentinel detector's saved-GPR restore. */
+    g_rfe_escape_pending = 1;
+    if (g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL)
+        g_exc_escape_reason = PSX_EXC_ESCAPE_RFE_RETURN;
 }
 
 /* Called in the dispatch trampoline after a function returns (cpu->pc holds the
  * real resume EPC). If an RFE armed the escape inside the synchronous handler,
  * longjmp back to psx_check_interrupts (cpu->pc preserved across the longjmp). */
 void psx_rfe_escape_check(CPUState* cpu) {
-    (void)cpu;
     /* Escape ONLY when this RFE is the synchronous handler completing on the SAME
      * fiber that set up the exception (the owner of exception_jmpbuf). in_exception
      * is a single global, so a thread RESUMED on a different fiber (its own real EPC
@@ -540,8 +548,20 @@ void psx_rfe_escape_check(CPUState* cpu) {
      * exactly how a suspended thread continues at its own PC. */
     extern void* psx_fiber_current(void); /* psx_fiber.h is included further down */
     if (g_rfe_escape_pending && in_exception &&
+        cpu->pc != PSX_EXC_SENTINEL_PC &&
         psx_fiber_current() == g_exception_owner_fiber) {
         g_rfe_escape_pending = 0;
+        /* A LEGACY_SENTINEL delivery escaping to a NON-sentinel PC means the
+         * handler switched threads and RFE'd to the new thread's real EPC.
+         * Record the completion truthfully as an RFE return so the epilogue's
+         * restore discriminator does NOT overwrite the kernel's freshly
+         * restored TCB registers with the ENTERING thread's saved_gpr (the
+         * cross-thread corruption Fix B exists to prevent). A resume that
+         * lands ON the sentinel never reaches this longjmp (declined above):
+         * it exits through the legacy sentinel detector, whose saved-GPR
+         * restore contract stays keyed on the untouched LEGACY reason. */
+        if (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL)
+            g_exc_escape_reason = PSX_EXC_ESCAPE_RFE_RETURN;
         /* Same shadow-frame hardening as deferred_exception_longjmp. */
         extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
         overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
@@ -858,6 +878,9 @@ void psx_check_interrupts(CPUState* cpu) {
                 /* Materialized clean boundary: re-save the deferred thread cleanly
                  * (this OVERWRITES any poisoned/sentinel EPC the guest handler wrote
                  * for it while nested), re-point PCB[0], and honor the switch. */
+                extern int overlay_loader_shadow_native_thread_switch_bail(void);
+                if (overlay_loader_shadow_native_thread_switch_bail())
+                    PSX_CHECK_INTERRUPTS_RETURN();
                 s_defer_switch_pending = 0;
                 s_defer_switch_target  = 0;
                 s_defer_switch_from    = 0;
@@ -1345,6 +1368,26 @@ irq_deliver_eval:
             same_guest_pc(cpu->pc, g_exception_real_epc) &&
             entry_tcb != 0u && entry_tcb == exit_tcb;
     }
+    /* Same-thread completion of a SENTINEL (legacy) delivery via an explicit
+     * guest RFE / ReturnFromException. The guest TCB never holds the host
+     * sentinel (psx_assert_no_sentinel_pc), so the kernel's restore resumed
+     * cpu->pc at an APPROXIMATE saved PC (typically a stale earlier dirty
+     * boundary) — but with PCB[0] unmoved the TRUE continuation of the
+     * interrupted code is the LIVE host chain below this frame. Exit exactly
+     * like the legacy sentinel detector: restore the interrupted GPRs and
+     * return pc=0 so the interrupted compiled leader continues natively.
+     * Without this the approximate PC surfaces up the trampoline, severs the
+     * live chain, and one hop later lands on an un-re-enterable mid-function
+     * PC — the top-level "execution completed, PC=0" abnormal exit (Tomba 2
+     * splash, frame 1385). A GENUINE in-handler switch (PCB[0] moved) skips
+     * this and is honored/deferred by the scheduler block below. */
+    if (g_exception_real_epc == (uint32_t)PSX_EXC_SENTINEL_PC &&
+        entry_tcb != 0u && entry_tcb == exit_tcb &&
+        (g_exc_escape_reason == PSX_EXC_ESCAPE_RFE_RETURN ||
+         g_exc_escape_reason == PSX_EXC_ESCAPE_SYSCALL_RETURN)) {
+        same_thread_resume = 1;
+        cpu->pc = 0;   /* continue the interrupted live chain */
+    }
     int do_restore =
         (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL || same_thread_resume);
     /* Ring exit-half: every delivery records which escape path it took and
@@ -1438,6 +1481,12 @@ irq_deliver_eval:
         extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
         uint32_t new_state = psx_read_word(exit_tcb & 0x1FFFFFFFu);
         if (new_state == 0x4000u) {   /* the new current thread must be runnable */
+            /* A native-only shadow pass must never commit the handler's TCB/RAM
+             * changes or escape past the authoritative restore. Bail before
+             * configuring either immediate or deferred scheduler state. */
+            extern int overlay_loader_shadow_native_thread_switch_bail(void);
+            if (overlay_loader_shadow_native_thread_switch_bail())
+                PSX_CHECK_INTERRUPTS_RETURN();
             /* Fix #2: honor the switch ONLY at the outermost dispatch boundary,
              * where the outgoing thread's guest state is fully materialized in
              * CPUState. Nested inside a host call unit / dirty pump, the outgoing

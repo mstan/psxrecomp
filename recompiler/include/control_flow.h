@@ -53,6 +53,8 @@ struct BasicBlock {
 struct ControlFlowGraph {
     uint32_t function_start;
     uint32_t function_end;
+    uint32_t producer_lo = 0;
+    uint32_t producer_hi = 0;
     std::map<uint32_t, BasicBlock> blocks; // Map: block start address -> block
     std::vector<uint32_t> block_order;     // Blocks in address order
 

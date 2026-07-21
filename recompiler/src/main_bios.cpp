@@ -912,6 +912,18 @@ int run_discover(const fs::path& bios_path, const fs::path& out_dir,
 
 int main(int argc, char** argv) {
     try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "-h" || a == "--help") {
+                std::fprintf(stdout,
+                    "usage: psxrecomp-bios --config <path.toml>\n"
+                    "       psxrecomp-bios <bios.bin> <out_dir> [--cc <c-compiler>]\n"
+                    "       psxrecomp-bios <bios.bin> <out_dir> --discover <seeds.json>\n"
+                    "       psxrecomp-bios <bios.bin> <out_dir> --emit-full <seeds.json>\n");
+                return 0;
+            }
+        }
+
         // ── --config <path.toml> short-form ────────────────────────────
         // If --config is the first (or only) flag, all paths come from the
         // TOML. This is the going-forward invocation; the positional form

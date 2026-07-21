@@ -27,9 +27,18 @@ static void check_name_parser(void) {
     assert(addr == 0 && crc == 0);
     assert(psx_overlay_cache_name_parse("89abcdef_ABCDEF01.so", &addr, &crc));
     assert(addr == 0x89ABCDEFu && crc == 0xABCDEF01u);
+    assert(psx_overlay_cache_name_parse(
+        "89abcdef_ABCDEF01_13579BDF.so", &addr, &crc));
+    assert(addr == 0x89ABCDEFu && crc == 0xABCDEF01u);
 
+    assert(!psx_overlay_cache_name_parse("", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse(".so", &addr, &crc));
     assert(!psx_overlay_cache_name_parse("G0010000_DEADBEEF.so", &addr, &crc));
     assert(!psx_overlay_cache_name_parse("80010000_DEADBEG0.so", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse(
+        "80010000_DEADBEEF_DEADBEG0.so", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse(
+        "80010000_DEADBEEFDEADBEEF.so", &addr, &crc));
     assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.dll", &addr, &crc));
     assert(!psx_overlay_cache_name_parse("80010000-DEADBEEF.so", &addr, &crc));
     assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.so.extra", &addr, &crc));
@@ -40,8 +49,8 @@ int main(int argc, char **argv) {
     check_name_parser();
 
     ScanResult result = {0};
-    assert(psx_overlay_posix_scan_cache_dir(argv[1], record_cache_file, &result) == 2);
-    assert(result.count == 2);
+    assert(psx_overlay_posix_scan_cache_dir(argv[1], record_cache_file, &result) == 3);
+    assert(result.count == 3);
     assert(result.addr == 0x80010000u);
     assert(result.crc == 0xDEADBEEFu);
 

@@ -66,6 +66,13 @@ void card_data_writes_arm(uint8_t value, uint16_t mc_state,
                           uint8_t mc_data_idx, uint8_t slot) {
     (void)value; (void)mc_state; (void)mc_data_idx; (void)slot;
 }
+void event_ring_record_aux(uint16_t kind, uint8_t detail, uint32_t aux) {
+    (void)kind; (void)detail; (void)aux;
+}
+void psx_irq_raise(uint32_t bit, uint32_t detail) {
+    (void)detail;
+    i_stat |= 1u << bit;
+}
 
 /* ---- Test harness ---- */
 
@@ -356,8 +363,53 @@ static void test_directory_frame_layout(void) {
      * Just check that read succeeded. */
 }
 
-int main(void) {
+/* Exact scheduler deadlines must fire on the call that reaches the boundary.
+ * The old strict-inequality loops subtracted the countdown to zero without
+ * processing the event, after which sio_cycles_to_irq() no longer advertised
+ * it and the event could be delayed until an unrelated scheduler wake. */
+static void test_cycle_paced_exact_boundaries(void) {
+    const uint32_t irq_sio0 = 1u << 7;
+    const uint16_t ctrl = CTRL_TX_EN | CTRL_SELECT | CTRL_ACK_IRQ_EN;
+
+    sio_init();
+    memcard_init("test_dir");
+    i_stat = 0;
+    sio_write(SIO_CTRL, ctrl);
+    sio_write(SIO_TX_DATA, 0x81);
+
+    EXPECT_EQ("paced.shift.initial", 1088, sio_cycles_to_irq(irq_sio0));
+    sio_advance(1087);
+    EXPECT_EQ("paced.shift.remaining", 1, sio_cycles_to_irq(irq_sio0));
+    EXPECT_EQ("paced.shift.no_irq", 0, i_stat & irq_sio0);
+    sio_advance(1);
+    EXPECT_EQ("paced.ack.initial", 170, sio_cycles_to_irq(irq_sio0));
+    EXPECT_EQ("paced.ack.no_irq", 0, i_stat & irq_sio0);
+    sio_advance(169);
+    EXPECT_EQ("paced.ack.remaining", 1, sio_cycles_to_irq(irq_sio0));
+    sio_advance(1);
+    EXPECT_EQ("paced.ack.irq", irq_sio0, i_stat & irq_sio0);
+
+    /* sio_tick() retains the same event walker for access-paced callers. */
+    sio_init();
+    memcard_init("test_dir");
+    i_stat = 0;
+    sio_write(SIO_CTRL, ctrl);
+    sio_write(SIO_TX_DATA, 0x81);
+    sio_tick(1088);
+    EXPECT_EQ("paced.tick.ack", 170, sio_cycles_to_irq(irq_sio0));
+    sio_tick(170);
+    EXPECT_EQ("paced.tick.irq", irq_sio0, i_stat & irq_sio0);
+}
+
+int main(int argc, char **argv) {
     fprintf(stderr, "=== sio card protocol tests ===\n");
+
+    if (argc == 2 && strcmp(argv[1], "exact-boundaries") == 0) {
+        test_cycle_paced_exact_boundaries();
+        fprintf(stderr, "test_cycle_paced_exact_boundaries:  %d/%d ok\n",
+                g_checks - g_failures, g_checks);
+        return g_failures > 0 ? 1 : 0;
+    }
 
     test_no_card_present();
     fprintf(stderr, "test_no_card_present:               %d/%d ok\n",
@@ -396,6 +448,12 @@ int main(void) {
     prev_checks = g_checks; prev_fails = g_failures;
     test_directory_frame_layout();
     fprintf(stderr, "test_directory_frame_layout:        %d/%d ok\n",
+            (g_checks - prev_checks) - (g_failures - prev_fails),
+            g_checks - prev_checks);
+
+    prev_checks = g_checks; prev_fails = g_failures;
+    test_cycle_paced_exact_boundaries();
+    fprintf(stderr, "test_cycle_paced_exact_boundaries:  %d/%d ok\n",
             (g_checks - prev_checks) - (g_failures - prev_fails),
             g_checks - prev_checks);
 

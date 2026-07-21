@@ -95,6 +95,7 @@ extern void     psx_write_byte(uint32_t addr, uint8_t val);
 static sock_t s_listen  = SOCK_INVALID;
 static sock_t s_client  = SOCK_INVALID;
 static int    s_port    = DEFAULT_DEBUG_PORT;
+static int    s_listen_err = 0;   /* platform socket error captured by init */
 
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];
@@ -2020,6 +2021,10 @@ void debug_server_log_call_entry_fn(uint32_t func_addr) {
 /* Release: inlined in cpu_state.h for every generated TU. */
 #else
 void debug_server_log_call_entry(uint32_t func_addr) {
+    /* Whole-call native replay is diagnostic and must not double-consume or
+     * overwrite live trace/stack-watch state. Architectural CPU state is
+     * compared by the caller; these observers are intentionally inert. */
+    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }
     g_psx_last_fn_entry = func_addr;
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
@@ -8789,6 +8794,69 @@ static void handle_irqctx_ring(int id, const char *json)
     free(buf);
 }
 
+/* sp_ring — dump the always-on stack-domain transition ring (fntrace.c).
+ * One entry per dispatch whose guest SP crossed a 64 KB domain: the
+ * provenance record for "who installed this stack pointer". */
+static void handle_sp_ring(int id, const char *json)
+{
+    extern SpDomainEntry g_spdom_ring[]; extern uint64_t g_spdom_seq;
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > (int)SPDOM_RING_CAP) count = (int)SPDOM_RING_CAP;
+    uint64_t total = g_spdom_seq;
+    uint32_t avail = total < SPDOM_RING_CAP ? (uint32_t)total : SPDOM_RING_CAP;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 256u + (size_t)n * 200u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 256; i++) {
+        uint64_t idx = total - n + i;
+        SpDomainEntry *e = &g_spdom_ring[idx % SPDOM_RING_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,"
+            "\"prev_sp\":\"0x%08X\",\"new_sp\":\"0x%08X\","
+            "\"target\":\"0x%08X\",\"ra\":\"0x%08X\",\"tcb\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            e->frame, e->prev_sp, e->new_sp, e->target, e->ra, e->tcb);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+/* disp_ring — dump the always-on dispatch tail ring (fntrace.c). */
+static void handle_disp_ring(int id, const char *json)
+{
+    extern DispTailEntry g_disp_tail[]; extern uint64_t g_disp_tail_seq;
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > (int)DISP_TAIL_CAP) count = (int)DISP_TAIL_CAP;
+    uint64_t total = g_disp_tail_seq;
+    uint32_t avail = total < DISP_TAIL_CAP ? (uint32_t)total : DISP_TAIL_CAP;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 256u + (size_t)n * 130u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 200; i++) {
+        uint64_t idx = total - n + i;
+        DispTailEntry *e = &g_disp_tail[idx % DISP_TAIL_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"target\":\"0x%08X\","
+            "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)idx, (unsigned long long)e->cycle,
+            e->target, e->ra, e->sp);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_freeze_check(int id, const char *json)
 {
     int window = json_get_int(json, "window", 256);
@@ -10764,13 +10832,16 @@ static void handle_overlay_loader_status(int id, const char *json)
             "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
             "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\","
             "\"gen_fastpath\":%llu,\"range_links\":%d,\"range_index_overflow\":%d,"
-            "\"lazy_manifests\":%d,\"lazy_manifest_overflow\":%d",
+            "\"lazy_manifests\":%d,\"lazy_manifest_overflow\":%d,"
+            "\"candidate_overflow\":%llu,\"pair_aliases\":%llu",
             r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast,
             (unsigned long long)overlay_loader_gen_fastpath(),
             overlay_loader_range_link_count(),
             overlay_loader_range_index_overflow(),
             overlay_loader_lazy_manifest_count(),
-            overlay_loader_lazy_manifest_overflow());
+            overlay_loader_lazy_manifest_overflow(),
+            (unsigned long long)overlay_loader_candidate_overflow(),
+            (unsigned long long)overlay_loader_pair_aliases());
         uint64_t nd=0, ni=0, sn=0, ss=0, sc=0, sx=0;
         psx_interrupt_delivery_diag(&nd, &ni, &sn, &ss, &sc, &sx);
         n += snprintf(buf + n, sizeof(buf) - n,
@@ -12213,6 +12284,8 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "d44_ring",          handle_d44_ring },
     { "irqctx_ring",       handle_irqctx_ring },
+    { "sp_ring",           handle_sp_ring },
+    { "disp_ring",         handle_disp_ring },
     { "cyc_watch",         handle_cyc_watch },
     { "cyc_watch_dump",    handle_cyc_watch_dump },
     { "cyc_watch_clear",   handle_cyc_watch_clear },
@@ -12415,7 +12488,11 @@ void debug_server_init(int port)
 #endif
 
     s_listen = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_listen == SOCK_INVALID) return;
+    if (s_listen == SOCK_INVALID) {
+        s_listen_err = sock_error();
+        fprintf(stdout, "psxrecomp: debug server socket() FAILED\n");
+        return;
+    }
 
     int yes = 1;
     setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
@@ -12427,6 +12504,8 @@ void debug_server_init(int port)
     addr.sin_port = htons((uint16_t)s_port);
 
     if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        s_listen_err = sock_error();
+        fprintf(stdout, "psxrecomp: debug server bind(%d) FAILED\n", s_port);
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
         return;
@@ -12438,6 +12517,8 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
+    fprintf(stdout, "psxrecomp: debug server LISTENING on 127.0.0.1:%d\n",
+            s_port);
 
     /* Always-on wall-time phase sampler (phase_profile). Own thread: the
      * server pumps on the main thread, so sampling must not live there. */
@@ -12845,6 +12926,13 @@ static int io_thread_main(void *arg)
         sock_close(c);
     }
     return 0;
+}
+
+void debug_server_get_status(int *listening, int *port, int *error)
+{
+    if (listening) *listening = (s_listen != SOCK_INVALID);
+    if (port)      *port      = s_port;
+    if (error)     *error     = s_listen_err;
 }
 
 void debug_server_poll(void)

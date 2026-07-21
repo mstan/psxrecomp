@@ -25,6 +25,20 @@ extern int g_ls_mode;
  * perturbs real global timing state. */
 extern int g_ls_replay_active;
 
+/* Side-effect-free whole-call trace used by the overlay differential gate.
+ * RECORD executes the interpreter authoritatively and records every memory
+ * operation. REPLAY feeds the recorded reads to native code and verifies
+ * writes without touching RAM, scratchpad, or MMIO a second time. These calls
+ * are deliberately single-owner/non-nestable; a false return fails the
+ * comparison closed. */
+int      ls_shadow_record_begin(void);
+int      ls_shadow_record_end(uint32_t *ops, int *saw_exception);
+int      ls_shadow_replay_begin(void);
+int      ls_shadow_replay_end(uint32_t *ops, int *mismatch_kind,
+                              uint32_t *pc, uint32_t *addr,
+                              uint32_t *expected, uint32_t *actual);
+void     ls_shadow_abort(void);
+
 /* Memory chokepoint hooks, called from the psx_read_ and psx_write_ funcs. */
 uint32_t ls_read_hook(uint32_t addr, int size, uint32_t real_val);
 void     ls_write_hook(uint32_t addr, int size, uint32_t val);

@@ -87,8 +87,10 @@ target_include_directories(psxrecomp-game PRIVATE
     lib/ELFIO
 )
 target_link_libraries(psxrecomp-game PRIVATE fmt rabbitizer)
-if(MINGW OR WIN32)
+if(MINGW)
     target_link_options(psxrecomp-game PRIVATE -Wl,--stack,16777216)
+elseif(MSVC)
+    target_link_options(psxrecomp-game PRIVATE /STACK:16777216)
 endif()
 
 # psxrecomp-toml — PS-X EXE → game.toml generator.
@@ -104,6 +106,24 @@ target_include_directories(psxrecomp-toml PRIVATE
     lib/fmt/include
 )
 target_link_libraries(psxrecomp-toml PRIVATE fmt)
+
+# psxrecomp — user-facing media-to-source project generator.
+add_executable(psxrecomp
+    src/main_cli.cpp
+    src/ps1_exe_parser.cpp
+    ../runtime/src/iso_reader.cpp
+)
+target_include_directories(psxrecomp PRIVATE
+    include
+    ../runtime/include
+    lib/fmt/include
+)
+target_link_libraries(psxrecomp PRIVATE fmt)
+if(MINGW)
+    target_link_options(psxrecomp PRIVATE -Wl,--stack,16777216)
+elseif(MSVC)
+    target_link_options(psxrecomp PRIVATE /STACK:16777216)
+endif()
 
 # ---- baked codegen hash (stale-binary guard) --------------------------------
 # Bake the SAME emitter-source hash the runtime folds into its overlay cache
@@ -145,8 +165,10 @@ target_include_directories(PSXRecomp PRIVATE
 target_link_libraries(PSXRecomp PRIVATE fmt rabbitizer)
 
 # Increase stack size for large binaries (1447+ functions)
-if(MINGW OR WIN32)
+if(MINGW)
     target_link_options(PSXRecomp PRIVATE -Wl,--stack,16777216)
+elseif(MSVC)
+    target_link_options(PSXRecomp PRIVATE /STACK:16777216)
 endif()
 
 # psxrecomp-bios — Phase 1a BIOS boot slice recompiler.
@@ -174,8 +196,20 @@ target_include_directories(psxrecomp-bios PRIVATE
     lib/toml11
 )
 target_link_libraries(psxrecomp-bios PRIVATE fmt rabbitizer)
-if(MINGW OR WIN32)
+if(MINGW)
     target_link_options(psxrecomp-bios PRIVATE -Wl,--stack,16777216)
+elseif(MSVC)
+    target_link_options(psxrecomp-bios PRIVATE /STACK:16777216)
+endif()
+
+# Released Windows CLI archives must run without a separate MinGW install.
+# Keep this opt-in so ordinary developer/debug builds retain their normal
+# linker behavior on every platform.
+option(PSXRECOMP_STATIC_CLI "Statically link MinGW runtime libraries into CLI tools" OFF)
+if(PSXRECOMP_STATIC_CLI AND MINGW)
+    foreach(_cli_target psxrecomp psxrecomp-game psxrecomp-toml psxrecomp-bios)
+        target_link_options(${_cli_target} PRIVATE -static -static-libgcc -static-libstdc++)
+    endforeach()
 endif()
 
 # L1 decoder conformance test — compares MipsDecoder against Rabbitizer
@@ -244,6 +278,15 @@ if(BUILD_TESTING)
     )
     add_test(NAME recompiler_patch_cxx17_header_test
              COMMAND recompiler_patch_cxx17_header_test)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME overlay_cross_page_delay_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_cross_page_delay_codegen.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>)
+    endif()
 endif()
 
 # Reachable main-EXE discovery test: parser-bound validation plus exact-entry

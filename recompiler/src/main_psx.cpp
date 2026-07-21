@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -48,6 +49,15 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
         by_host[ae.host_start].push_back(&ae);
     }
     for (const auto& [host_start, group] : by_host) {
+        uint32_t producer_lo = 0;
+        uint32_t producer_hi = 0;
+        for (const auto& function : result.functions) {
+            if (function.start_addr == host_start) {
+                producer_lo = function.producer_lo;
+                producer_hi = function.producer_hi;
+                break;
+            }
+        }
         std::vector<uint32_t> entries;
         for (const AliasEntry* ae : group) entries.push_back(ae->addr);
         for (const AliasEntry* ae : group) {
@@ -62,6 +72,8 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
             af.is_data_section = false;
             af.alias_walk_lo = ae->host_start;
             af.alias_group_entries = entries;
+            af.producer_lo = producer_lo;
+            af.producer_hi = producer_hi;
             result.functions.push_back(af);
         }
     }
@@ -70,6 +82,23 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    const auto print_usage = [&]() {
+        fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
+        fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
+    };
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        }
+    }
+    if (argc < 2) {
+        print_usage();
+        return 0;
+    }
+
     /* --codegen-hash: print the baked emitter-source hash and exit. Handled
      * before the banner so the output is machine-parseable (one hex line).
      * compile_overlays.py compares this to the hash from --runtime-include and
@@ -127,6 +156,9 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
+    std::set<uint32_t>    ws_cull_negsub;       // [widescreen.cull] negsub_sites
+    std::set<uint32_t>    ws_cull_vxrange;      // [widescreen.cull] vxrange_sites
+    std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
@@ -168,6 +200,9 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(cfg.ws_cull_screen_x_sites.begin(), cfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(cfg.ws_cull_slti_sites.begin(), cfg.ws_cull_slti_sites.end());
+        ws_cull_negsub.insert(cfg.ws_cull_negsub_sites.begin(), cfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(cfg.ws_cull_vxrange_sites.begin(), cfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -204,13 +239,6 @@ int main(int argc, char** argv) {
             fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
         fmt::print("\n");
     } else {
-        if (argc < 2) {
-            fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
-            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
-            fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
-            return 0;
-        }
-
         exe_path = argv[1];
         for (int i = 2; i < argc; i++) {
             std::string arg = argv[i];
@@ -248,6 +276,9 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(wscfg.ws_cull_screen_x_sites.begin(), wscfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(wscfg.ws_cull_slti_sites.begin(), wscfg.ws_cull_slti_sites.end());
+        ws_cull_negsub.insert(wscfg.ws_cull_negsub_sites.begin(), wscfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(wscfg.ws_cull_vxrange_sites.begin(), wscfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -416,13 +447,20 @@ int main(int argc, char** argv) {
 
     /* Load extra function addresses from a file (one hex address per line).
      * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
-     * addresses: alias candidates, never walk roots. Lines of the form
+     * addresses: alias candidates, never walk roots. `hosted_interior TARGET
+     * HOST` is a narrow cross-variant identity assertion: TARGET may alias only
+     * the explicitly rooted HOST, and only when TARGET is a syntactic block
+     * leader in HOST's current-byte range. The shard publisher additionally
+     * requires both emitted identities to match a previously CRC-validated host
+     * exactly before the result can reach the runtime. Lines of the form
      * `dispatch_root 0xXXXXXXXX` mark classifier-proven dispatch roots
      * WITHOUT a callable boundary (the kernel install-slot class, e.g. RAM
      * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
      * exactly these PCs, so they are real execution roots even though no
      * prologue / preceding jr $ra exists. They are trusted walk roots and
-     * exempt from the overlay-mode boundary re-check below.
+         * exempt from the overlay-mode boundary re-check below.  Lines of the
+         * form `call_root 0xXXXXXXXX` carry the same mechanical trust for a
+         * statically proven direct or constant-register call/tail-call target.
      *
      * Seeds are accepted within the loaded image's own bounds — overlay mode
      * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
@@ -430,7 +468,14 @@ int main(int argc, char** argv) {
      * valid seeds. */
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
+    std::map<uint32_t, uint32_t> hosted_interior_seeds;
+    std::set<uint32_t> hosted_interior_hosts;
+    constexpr size_t kHostedInteriorTargetCap = 4096;
+    constexpr size_t kHostedInteriorHostCap = 512;
     std::set<uint32_t>    trusted_root_seeds;
+    std::set<uint32_t>    trusted_call_root_seeds;
+    std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
+    std::set<uint32_t> cross_call_allow;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
@@ -439,8 +484,90 @@ int main(int argc, char** argv) {
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
+                if (line.rfind("producer_range", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, lo_text, hi_text;
+                    in >> tag >> lo_text >> hi_text;
+                    uint32_t lo = static_cast<uint32_t>(
+                        std::strtoul(lo_text.c_str(), nullptr, 16));
+                    uint32_t hi = static_cast<uint32_t>(
+                        std::strtoul(hi_text.c_str(), nullptr, 16));
+                    if (lo_text.empty() || hi_text.empty() ||
+                        lo < seed_lo || lo >= hi || hi > seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid producer_range: {}\n", line);
+                        return 1;
+                    }
+                    producer_ranges.emplace_back(lo, hi);
+                    continue;
+                }
+                if (line.rfind("cross_call_allow", 0) == 0) {
+                    const char* p = line.c_str() + 16;
+                    uint32_t addr = static_cast<uint32_t>(
+                        std::strtoul(p, nullptr, 16));
+                    if (addr < seed_lo || addr >= seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid cross_call_allow: {}\n", line);
+                        return 1;
+                    }
+                    cross_call_allow.insert(addr);
+                    continue;
+                }
+                if (line.rfind("retained_alias", 0) == 0) {
+                    fmt::print("  ignoring legacy retained_alias; old host "
+                               "ranges are never reused: {}\n", line);
+                    continue;
+                }
+                if (line.rfind("hosted_interior", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, target_text, host_text, trailing;
+                    in >> tag >> target_text >> host_text >> trailing;
+                    auto parse_hex_u32 = [](const std::string& text,
+                                            uint32_t& value) -> bool {
+                        if (text.empty()) return false;
+                        char* end = nullptr;
+                        errno = 0;
+                        unsigned long long parsed =
+                            std::strtoull(text.c_str(), &end, 16);
+                        if (errno != 0 || end == text.c_str() || *end != '\0' ||
+                            parsed > 0xFFFFFFFFull) return false;
+                        value = static_cast<uint32_t>(parsed);
+                        return true;
+                    };
+                    uint32_t target = 0, host = 0;
+                    if (tag != "hosted_interior" || !trailing.empty() ||
+                        !parse_hex_u32(target_text, target) ||
+                        !parse_hex_u32(host_text, host) ||
+                        (target & 3u) != 0u || (host & 3u) != 0u ||
+                        target < seed_lo || target >= seed_hi ||
+                        host < seed_lo || host >= seed_hi || target == host) {
+                        fmt::print(stderr, "ERROR: invalid hosted_interior: {}\n", line);
+                        return 1;
+                    }
+                    auto prior = hosted_interior_seeds.find(target);
+                    if (prior != hosted_interior_seeds.end() &&
+                        prior->second != host) {
+                        fmt::print(stderr, "ERROR: conflicting hosted_interior "
+                                   "hosts for 0x{:08X}\n", target);
+                        return 1;
+                    }
+                    hosted_interior_seeds.emplace(target, host);
+                    hosted_interior_hosts.insert(host);
+                    if (hosted_interior_seeds.size() >
+                            kHostedInteriorTargetCap ||
+                        hosted_interior_hosts.size() >
+                            kHostedInteriorHostCap) {
+                        fmt::print(stderr, "ERROR: hosted_interior capacity "
+                                   "exceeded (targets {} / {}, hosts {} / {})\n",
+                                   hosted_interior_seeds.size(),
+                                   kHostedInteriorTargetCap,
+                                   hosted_interior_hosts.size(),
+                                   kHostedInteriorHostCap);
+                        return 1;
+                    }
+                    continue;
+                }
                 bool interior = false;
                 bool trusted_root = false;
+                bool trusted_call_root = false;
                 const char* p = line.c_str();
                 if (line.rfind("interior", 0) == 0) {
                     interior = true;
@@ -448,6 +575,9 @@ int main(int argc, char** argv) {
                 } else if (line.rfind("dispatch_root", 0) == 0) {
                     trusted_root = true;
                     p += 13;
+                } else if (line.rfind("call_root", 0) == 0) {
+                    trusted_call_root = true;
+                    p += 9;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
                 if (addr >= seed_lo && addr < seed_hi) {
@@ -455,15 +585,43 @@ int main(int argc, char** argv) {
                         interior_seeds.push_back(addr);
                     } else {
                         if (trusted_root) trusted_root_seeds.insert(addr);
+                        if (trusted_call_root) trusted_call_root_seeds.insert(addr);
                         file_seeds.push_back(addr);
                         exact_entries.push_back(addr);
                     }
                 }
             }
+            std::sort(producer_ranges.begin(), producer_ranges.end());
+            for (size_t i = 1; i < producer_ranges.size(); i++) {
+                if (producer_ranges[i - 1].second > producer_ranges[i].first) {
+                    fmt::print(stderr, "ERROR: overlapping producer_range entries\n");
+                    return 1;
+                }
+            }
+            for (uint32_t addr : cross_call_allow) {
+                bool contained = false;
+                for (const auto& range : producer_ranges) {
+                    if (addr >= range.first && addr < range.second) {
+                        contained = true;
+                        break;
+                    }
+                }
+                if (!contained) {
+                    fmt::print(stderr,
+                               "ERROR: cross_call_allow 0x{:08X} is outside "
+                               "producer ranges\n", addr);
+                    return 1;
+                }
+            }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root) from {}\n",
-                       file_seeds.size() + interior_seeds.size(),
-                       interior_seeds.size(), trusted_root_seeds.size(),
+                       "{} hosted-interior, {} dispatch-root, {} call-root, {} producer ranges, "
+                       "{} cross-call allows) from {}\n",
+                       file_seeds.size() + interior_seeds.size() +
+                           hosted_interior_seeds.size(),
+                       interior_seeds.size(), hosted_interior_seeds.size(),
+                       trusted_root_seeds.size(),
+                       trusted_call_root_seeds.size(),
+                       producer_ranges.size(), cross_call_allow.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -484,11 +642,35 @@ int main(int argc, char** argv) {
             auto w = exe->read_word(a);
             return w.has_value() ? *w : 0u;
         };
+        auto dense_local_pointer_table = [&](uint32_t a) -> bool {
+            for (uint32_t i = 0; i < 3u; i++) {
+                auto value = exe->read_word(a + i * 4u);
+                if (!value.has_value() || (*value & 3u) != 0u ||
+                    *value < exe_lo || *value >= exe->end_address()) {
+                    return false;
+                }
+            }
+            return true;
+        };
         auto callable_boundary = [&](uint32_t a) -> bool {
             uint32_t w = read_w(a);
             if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
             if (a == exe_lo) return true;
             if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            // Normal-mode discovery already skips alignment padding after a
+            // return when it infers a frameless function start. Preserve that
+            // evidence here. Requiring the next entry to be exactly jr-ra+8
+            // demoted legitimate Psy-Q leaf routines separated by one to six
+            // padding NOPs to orphan interiors, so exact-entry analysis emitted
+            // no function at all. The delay slot (jr+4) may be non-NOP; only
+            // words after it and before the proposed entry must be padding.
+            bool padding_only = true;
+            for (uint32_t back = 12; back <= 32 && a >= exe_lo + back;
+                 back += 4) {
+                if (read_w(a - back + 8) != 0u) padding_only = false;
+                if (!padding_only) break;
+                if (read_w(a - back) == 0x03E00008u) return true;
+            }
             int32_t frame = 0;
             return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
                    !(a >= exe_lo + 4 &&
@@ -497,8 +679,15 @@ int main(int argc, char** argv) {
 
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
+        std::set<uint32_t> hosted_targets;
+        for (const auto& seed : hosted_interior_seeds)
+            hosted_targets.insert(seed.first);
         for (uint32_t a : exact_entries) {
-            if (reachable_discovery && a == exe->header.initial_pc) {
+            if (hosted_targets.count(a)) {
+                // A fragment PS-X header needs one initial PC, but a trusted
+                // hosted interior must never become a walk root through it.
+                continue;
+            } else if (reachable_discovery && a == exe->header.initial_pc) {
                 // The PS-X EXE header is direct execution evidence for the
                 // main entry even when it uses a nonstandard prologue.
                 roots.insert(a);
@@ -508,6 +697,11 @@ int main(int argc, char** argv) {
                  * execution root despite having no callable boundary. */
                 fmt::print("  seed 0x{:08X} accepted as dispatch root "
                            "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (trusted_call_root_seeds.count(a) &&
+                       !dense_local_pointer_table(a)) {
+                fmt::print("  seed 0x{:08X} accepted as static call root "
+                           "(direct/constant-register target)\n", a);
                 roots.insert(a);
             } else if (callable_boundary(a)) {
                 roots.insert(a);
@@ -535,7 +729,8 @@ int main(int argc, char** argv) {
         {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
-            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+            analysis_result = analyzer.analyze_exact_entries(
+                roots_vec, producer_ranges, cross_call_allow);
         }
 
         std::vector<AliasEntry> alias_entries;
@@ -543,7 +738,7 @@ int main(int argc, char** argv) {
         for (uint32_t a : interior) {
             const PSXRecomp::Function* host = containing(a);
             if (host && a == host->start_addr) continue;  // became a real entry
-            if (host) {
+            if (host && analysis_result.exact_reachable_pcs.count(a)) {
                 if (alias_seen.insert(a).second)
                     alias_entries.push_back({a, host->start_addr, host->end_addr});
             } else {
@@ -552,47 +747,63 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Range-ownership completeness (B): a DIRECT CALL (jal) whose target
-        // lands strictly INSIDE an already-discovered function is a separate
-        // routine the host's discovered range absorbed (e.g. via a break/trap
-        // fall-through in discovery — the crt0 `jal main; break` that swallowed
-        // the next function, the Tomba 2 FMV-freeze root cause). Register every
-        // such target as an ALIAS entry so the host's entry-switch routes a
-        // dispatch of that PC to the correct interior block (running the absorbed
-        // routine natively) instead of failing closed to the interpreter. This is
-        // derived purely from static jal evidence in the discovered code, so it
-        // does not depend on the PC having been captured/executed. jal encodes a
-        // code target, so this never mints code from data.
-        size_t jal_alias_added = 0;
-        {
-            std::set<uint32_t> known_starts;
-            for (const auto& f : analysis_result.functions)
-                known_starts.insert(f.start_addr);
-            std::set<uint32_t> jal_targets;
-            for (const auto& f : analysis_result.functions) {
-                for (uint32_t a = f.start_addr; a + 4 <= f.end_addr; a += 4) {
-                    uint32_t w = read_w(a);
-                    if ((w >> 26) == 0x03u) {  // jal
-                        uint32_t tgt = (a & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
-                        jal_targets.insert(tgt);
-                    }
+        // Cross-variant propagation never guesses a new walk. The caller names
+        // a current-byte host that was already CRC-valid in the cache, and the
+        // recompiler requires that exact root plus a syntactic block boundary
+        // in the host's current-byte range. This block test alone is NOT proof
+        // of reachability: the publisher must compare the emitted host+alias
+        // CRC/range identities with the preselected cached owner before use.
+        PSXRecomp::ControlFlowAnalyzer hosted_cfg_analyzer(*exe);
+        std::map<uint32_t, PSXRecomp::ControlFlowGraph> hosted_cfgs;
+        for (const auto& seed : hosted_interior_seeds) {
+            uint32_t target = seed.first;
+            uint32_t requested_host = seed.second;
+            const PSXRecomp::Function* host = nullptr;
+            for (const auto& function : analysis_result.functions) {
+                if (function.start_addr == requested_host) {
+                    host = &function;
+                    break;
                 }
             }
-            for (uint32_t t : jal_targets) {
-                if (known_starts.count(t)) continue;          // already a real entry
-                if (!alias_seen.count(t)) {
-                    const PSXRecomp::Function* host = containing(t);
-                    if (host && t != host->start_addr) {
-                        alias_seen.insert(t);
-                        alias_entries.push_back({t, host->start_addr, host->end_addr});
-                        jal_alias_added++;
-                    }
-                }
+            bool explicitly_rooted = roots.count(requested_host) != 0;
+            bool producer_ok = host &&
+                (host->producer_lo == 0 ||
+                 (target >= host->producer_lo && target < host->producer_hi));
+            bool block_ok = false;
+            if (host && producer_ok && target > host->start_addr &&
+                target < host->end_addr) {
+                auto inserted = hosted_cfgs.emplace(
+                    host->start_addr, PSXRecomp::ControlFlowGraph{});
+                if (inserted.second)
+                    inserted.first->second = hosted_cfg_analyzer.analyze_function(*host);
+                block_ok = inserted.first->second.blocks.count(target) != 0;
+            }
+            if (host && explicitly_rooted && producer_ok && block_ok) {
+                if (alias_seen.insert(target).second)
+                    alias_entries.push_back(
+                        {target, host->start_addr, host->end_addr});
+            } else {
+                fmt::print("  WARNING: hosted interior 0x{:08X} rejected for "
+                           "host 0x{:08X} (host={}, rooted={}, producer={}, block={})\n",
+                           target, requested_host, host ? "yes" : "no",
+                           explicitly_rooted ? "yes" : "no",
+                           producer_ok ? "yes" : "no", block_ok ? "yes" : "no");
             }
         }
-        if (jal_alias_added)
-            fmt::print("  +{} in-function jal-target alias entries "
-                       "(range-ownership completeness)\n", jal_alias_added);
+
+        // Range-ownership completeness uses only analyzer-proven transfers from
+        // reachable instructions. The analyzer also revalidates each target's
+        // host against the final root partition and producer boundaries.
+        size_t proven_alias_added = 0;
+        for (const auto& absorbed : analysis_result.absorbed_entries) {
+            if (!alias_seen.insert(absorbed.addr).second) continue;
+            alias_entries.push_back(
+                {absorbed.addr, absorbed.host_start, absorbed.host_end});
+            proven_alias_added++;
+        }
+        if (proven_alias_added)
+            fmt::print("  +{} analyzer-proven absorbed alias entries "
+                       "(final range ownership)\n", proven_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
@@ -836,6 +1047,9 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_cull_screen_x_sites = ws_cull_screen_x;
     codegen_config.ws_cull_slti_sites  = ws_cull_slti;
+    codegen_config.ws_cull_negsub_sites = ws_cull_negsub;
+    codegen_config.ws_cull_vxrange_sites = ws_cull_vxrange;
+    codegen_config.ws_cull_depth_sites = ws_cull_depth;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
@@ -930,7 +1144,22 @@ int main(int argc, char** argv) {
     // the on-disk representation changes. Function bodies are byte-identical
     // to what full_c_code would have contained; see
     // CodeGenerator::last_gen_funcs() / build_shared_decls_header().
-    {
+    if (overlay_mode) {
+        // Overlays are single small TUs consumed by compile_overlays.py, which
+        // reads <stem>_full.c directly. Emit the monolith; the split path below
+        // would delete _full.c and leave only shards, breaking overlay compile
+        // (no_output). Splitting a small overlay TU has no parallel-compile
+        // benefit anyway.
+        std::ofstream full_file(output_filename);
+        if (full_file.is_open()) {
+            full_file << full_c_code;
+            full_file.close();
+            fmt::print("✓ Saved overlay monolith to {}\n", output_filename.string());
+        } else {
+            fmt::print(stderr, "⚠ Failed to write overlay monolith {}\n\n",
+                       output_filename.string());
+        }
+    } else {
         // 1. Remove stale outputs: the old monolith and any previously
         //    written shards (a shard count shrink must not leave orphans).
         std::error_code rm_ec;

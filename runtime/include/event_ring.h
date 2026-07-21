@@ -28,16 +28,15 @@
 extern "C" {
 #endif
 
-/* The event ring is a dev diagnostic: it is only readable over the TCP
- * debug server, which production builds strip (PSX_NO_DEBUG_TOOLS). It is
- * not part of the freeze dump, so recording in production is pure
- * hot-path cost — disable it there. */
+/* ALWAYS-ON in every build, production included. The ring records EDGES
+ * (IRQ decisions, I_STAT raises, DMA/CD/timer schedule+fire), not per-poll
+ * samples, so the hot-path cost is a handful of stores per device event.
+ * The TCP debug server is compiled into every build too (production runs
+ * opt the listener in via PSX_DEBUG_SERVER=1), so the ring is readable on
+ * the exact production binary that exhibits a bug — the Tomba 2 lost
+ * CD-completion race was only attributable because of this. */
 #ifndef EVENT_RING_ENABLED
-#ifdef PSX_NO_DEBUG_TOOLS
-#define EVENT_RING_ENABLED 0
-#else
 #define EVENT_RING_ENABLED 1
-#endif
 #endif
 
 /* 64K entries * 48 bytes ~= 3 MB. Covers many frames of transition activity. */

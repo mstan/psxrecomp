@@ -23,18 +23,27 @@ static int parse_hex8(const char *text, uint32_t *value) {
 
 int psx_overlay_cache_name_parse(const char *name, uint32_t *region_start,
                                  uint32_t *content_crc) {
-    uint32_t addr = 0, crc = 0;
+    uint32_t addr = 0, crc = 0, artifact = 0;
 #ifdef _WIN32
     static const char extension[] = ".dll";
 #else
     static const char extension[] = ".so";
 #endif
-    if (!name || strlen(name) != 17 + sizeof(extension) - 1 || name[8] != '_' ||
-        strcmp(name + 17, extension) != 0 ||
-        !parse_hex8(name, &addr) || !parse_hex8(name + 9, &crc))
+    if (!name) return 0;
+    size_t name_len = strlen(name);
+    size_t ext_len = sizeof(extension) - 1u;
+    if (name_len < ext_len) return 0;
+    size_t stem_len = name_len - ext_len;
+    if (
+        (stem_len != 17u && stem_len != 26u) || name[8] != '_' ||
+        strcmp(name + stem_len, extension) != 0 ||
+        !parse_hex8(name, &addr) || !parse_hex8(name + 9, &crc) ||
+        (stem_len == 26u &&
+         (name[17] != '_' || !parse_hex8(name + 18, &artifact))))
         return 0;
     if (region_start) *region_start = addr;
     if (content_crc) *content_crc = crc;
+    (void)artifact;
     return 1;
 }
 

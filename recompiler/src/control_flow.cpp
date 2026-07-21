@@ -359,6 +359,8 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     uint32_t walk_lo = func.alias_walk_lo ? func.alias_walk_lo : func.start_addr;
     cfg.function_start = walk_lo;
     cfg.function_end = func.end_addr;
+    cfg.producer_lo = func.producer_lo;
+    cfg.producer_hi = func.producer_hi;
 
     // Simplified single-pass analysis: scan instructions to find block boundaries
     // without building full CFG. This avoids the crash in build_basic_blocks.

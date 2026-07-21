@@ -1,0 +1,35 @@
+{
+  "schema": "psxrecomp bios resident code v1",
+  "images": [
+    {
+      "name": "SCPH-1001 boot-installed device helper",
+      "bios_sha256": "71af94d1e47a68c11e8fdb9f8368040601514a42a5a399cda48c7d3bff1e99d3",
+      "region_start": "0x8000DF80",
+      "region_size": "0x70",
+      "evidence": {
+        "verified_snapshots": 415,
+        "verified_sessions": 10,
+        "distinct_code_images": 1,
+        "code_window_crc32": "0x4EE6AC69"
+      },
+      "code_fragments": [
+        {
+          "address": "0x8000DF80",
+          "words": [
+            "0x946F000A", "0x3C080000", "0x01E2C025", "0x37190012",
+            "0xA479000A", "0x24080028", "0x2508FFFF", "0x1500FFFE",
+            "0x00000000", "0x03E00008", "0x00000000", "0x8C621074",
+            "0x00000000", "0x30420080", "0x1040000B", "0x00000000",
+            "0x8C621044", "0x00000000", "0x30420080", "0x1440FFFC",
+            "0x00000000", "0x3C020001", "0x8C42DFFC", "0x00000000",
+            "0x00400008", "0x00000000", "0x03E00008", "0x00000000"
+          ]
+        }
+      ],
+      "dispatch_entry_pcs": [
+        "0x8000DF80", "0x8000DF98", "0x8000DFA4",
+        "0x8000DFAC", "0x8000DFC0", "0x8000DFD4"
+      ]
+    }
+  ]
+}

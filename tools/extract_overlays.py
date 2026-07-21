@@ -65,10 +65,12 @@ class DiscReader:
     def read_file_bytes(self, lba, size):
         """Read exactly `size` bytes starting at `lba`."""
         sectors_needed = (size + SECTOR_DATA - 1) // SECTOR_DATA
-        data = b''
-        for i in range(sectors_needed):
-            data += self.read_sector_data(lba + i)
-        return data[:size]
+        # Do not repeatedly append to an immutable bytes object: large archive
+        # files (MMX6's ROCK_X6.DAT is ~51 MB / ~25k sectors) turn that into an
+        # O(n^2) copy loop.  Accumulate references and copy the payload once.
+        chunks = [self.read_sector_data(lba + i)
+                  for i in range(sectors_needed)]
+        return b''.join(chunks)[:size]
 
 # ---------------------------------------------------------------------------
 # CUE parser — extracts BIN path and track mode

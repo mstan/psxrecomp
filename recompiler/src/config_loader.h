@@ -39,6 +39,15 @@ namespace PSXRecompV4 {
 //   digital — always present a digital pad (id 0x41); sticks disabled.
 enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
+// Renderer IDs shared by game.toml/settings parsing and runtime startup.
+// OpenGL is the default because the Windows software/SDL_Renderer path is slow
+// enough to mask interpreter/AOT performance work and can present as a false
+// 30 FPS regression. Software remains an explicit opt-in fallback.
+inline constexpr int VIDEO_RENDERER_SOFTWARE = 0;
+inline constexpr int VIDEO_RENDERER_OPENGL = 1;
+inline constexpr int VIDEO_RENDERER_VULKAN = 2;
+inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
@@ -138,6 +147,19 @@ struct RuntimeConfig {
     // overlay bytes to overlay_captures.json for offline compilation.
     bool                  overlay_cache = false;
 
+    // overlay_capture_history: opt-in durable capture history. The runtime
+    // keeps overlay_captures.json as an atomic latest snapshot for the live
+    // compiler and additionally appends every changed coherent snapshot to
+    // overlay_captures.addendum.jsonl beside the executable. A malformed tail
+    // from a hard kill cannot destroy earlier records.
+    bool                  overlay_capture_history = false;
+
+    // overlay_capture_persist_dir: optional DEV-only, project-relative safe
+    // directory for one immutable JSON file per changed snapshot. Absolute
+    // paths and `..` components are rejected. Production normally leaves this
+    // unset and retains only the addendum beside the executable.
+    std::string           overlay_capture_persist_dir;
+
     // turbo_loads: OPT-IN per game. While the game is loading (CD data
     // stream active, XA/FMV excluded, post-BIOS-handoff only) the frontend
     // skips wall-clock pacing so the guest runs at host speed — compressing
@@ -208,10 +230,11 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
-    // renderer: "software" (default) | "opengl". Selects the rasterizer/present
+    // renderer: "software" | "opengl" (default). Selects the rasterizer/present
     // backend. The OpenGL backend is a hardware-accelerated alternative; the
-    // software rasterizer remains the fallback. Stored as 0=software, 1=opengl.
-    int                   video_renderer = 0;
+    // software rasterizer remains the explicit fallback. Stored as
+    // VIDEO_RENDERER_*.
+    int                   video_renderer = DEFAULT_VIDEO_RENDERER;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of
@@ -507,6 +530,15 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Horizontal low-edge form `subu rd,zero,rs` -> `-rs-x_margin`.
+    // Empty by default; configured sites require regenerated native code.
+    std::vector<uint32_t> ws_cull_negsub_sites;
+    // `sltiu rt,rs,imm` where rs is an ANDI-masked 16-bit screen X.
+    // Widens both edges in 16-bit space; empty by default; regen required.
+    std::vector<uint32_t> ws_cull_vxrange_sites;
+    // Aspect-scaled slti/sltiu far-bound sites. Empty by default; use only for
+    // pure visibility gates. Configured sites require regenerated native code.
+    std::vector<uint32_t> ws_cull_depth_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 
@@ -736,10 +768,12 @@ struct UserSettings {
     bool has_fast_boot      = false; bool fast_boot      = false;
     // HLE BIOS tier toggle (see RuntimeConfig::bios_hle). Overrides game.toml.
     bool has_bios_hle       = false; bool bios_hle       = false;
-    // [video] fullscreen: launch the game window in desktop fullscreen (the
-    // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
-    // hotkey still toggles it live). false => windowed (default).
-    bool has_fullscreen     = false; bool fullscreen     = false;
+    // [video] fullscreen: universal tri-state (matches every recomp-ui console's
+    // launcher control). 0 = windowed (default), 1 = borderless desktop
+    // fullscreen, 2 = exclusive fullscreen (real display-mode change). The
+    // in-game Alt+Enter / Cmd+Ctrl+F hotkey toggles live between windowed and
+    // whichever of these is configured.
+    bool has_fullscreen     = false; int  fullscreen     = 0;
     // Low-latency present knobs. low_latency_input re-samples the pad after the
     // wall-clock pacer (just before present) so the next CPU frame reads fresh
     // input instead of input ~one frame stale (the dominant input->photon cost

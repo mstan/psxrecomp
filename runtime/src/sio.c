@@ -2006,16 +2006,20 @@ void sio_advance(uint32_t cycles) {
     int remaining = (int)cycles;
     int transitions = 0;
     const int MAX_TRANSITIONS = 8;
-    while (remaining > 0 && transitions < MAX_TRANSITIONS) {
+    while (transitions < MAX_TRANSITIONS &&
+           (remaining > 0 ||
+            (sio_shift_active && sio_shift_remaining <= 0) ||
+            (sio_pending_ack && sio_ack_remaining <= 0))) {
         int dt = remaining;
         int next_event = -1;
         if (sio_shift_active && sio_shift_remaining > 0
-            && sio_shift_remaining < dt) {
+            && sio_shift_remaining <= dt) {
             dt = sio_shift_remaining;
             next_event = 0;
         }
         if (sio_pending_ack && sio_ack_remaining > 0
-            && sio_ack_remaining < dt) {
+            && (sio_ack_remaining < dt ||
+                (sio_ack_remaining == dt && next_event < 0))) {
             dt = sio_ack_remaining;
             next_event = 1;
         }
@@ -2057,16 +2061,20 @@ void sio_tick(int cycles) {
         int remaining = cycles;
         int transitions = 0;
         const int MAX_TRANSITIONS = 8;
-        while (remaining > 0 && transitions < MAX_TRANSITIONS) {
+        while (transitions < MAX_TRANSITIONS &&
+               (remaining > 0 ||
+                (sio_shift_active && sio_shift_remaining <= 0) ||
+                (sio_pending_ack && sio_ack_remaining <= 0))) {
             int dt = remaining;
             int next_event = -1;
             if (sio_shift_active && sio_shift_remaining > 0
-                && sio_shift_remaining < dt) {
+                && sio_shift_remaining <= dt) {
                 dt = sio_shift_remaining;
                 next_event = 0;
             }
             if (sio_pending_ack && sio_ack_remaining > 0
-                && sio_ack_remaining < dt) {
+                && (sio_ack_remaining < dt ||
+                    (sio_ack_remaining == dt && next_event < 0))) {
                 dt = sio_ack_remaining;
                 next_event = 1;
             }

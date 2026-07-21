@@ -266,6 +266,10 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &cpu->gte_data[i])) return 0;
         for (int i = 0; i < 32; i++)
             if (!pst_r_u32(&r, &cpu->gte_ctrl[i])) return 0;
+        /* Older generated shards could leave masked/read-only COP2 backing
+         * words noncanonical.  Repair once at the raw restore boundary so
+         * native direct reads and interpreter helpers remain tier-identical. */
+        gte_canonicalize_cpu_state(cpu);
         return 1;
     }
     case BS_SEC_RAM:

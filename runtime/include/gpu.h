@@ -154,9 +154,18 @@ int  gpu_ws_present_native_43(void);
 int  psx_ws_x_margin(void);
 void gpu_ws_set_cull_guard_pixels(int pixels);
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
-                                    const uint32_t *slti, int nslti);
+                                    const uint32_t *slti, int nslti,
+                                    const uint32_t *range, int nrange);
+void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
+int  psx_ws_is_cull_negsub_site(uint32_t pc);
+int  psx_ws_is_cull_vxrange_site(uint32_t pc);
+int  psx_ws_is_cull_depth_site(uint32_t pc);
+int32_t psx_ws_depth_bound(int32_t imm);
+int  psx_ws_is_cull_range_site(uint32_t pc);
 /* Scale a signed Q16 horizontal gameplay limit into the active native-wide
  * game field. Identity at 4:3 / menus / FMV. */
 int32_t psx_ws_player_x_bound(int32_t vanilla);
@@ -174,6 +183,7 @@ int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
 int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_bltz(uint32_t v);
+int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 /* True if a run of instruction words carries the screen-extent reject signature
  * (a width compare AND a height compare from the configured immediate sets).
  * Used by the interp to gate the widening to real render funnels. */

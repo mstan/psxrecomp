@@ -550,6 +550,14 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
         return 1;
     }
 
+    /* Never let a speculative native shadow pass switch host/guest threads.
+     * The authoritative interpreter pass would already have escaped if this
+     * switch were real; reaching it only in native code proves divergence. */
+    {
+        extern int overlay_loader_shadow_native_thread_switch_bail(void);
+        if (overlay_loader_shadow_native_thread_switch_bail()) return -1;
+    }
+
     HostThreadFiber* current = psx_bind_current_host_thread(cpu, current_tcb);
     int saved_current_context = 0;
     if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
@@ -652,6 +660,12 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
     if (psx_tcb_state(cpu, target_tcb) != 0x4000u) {
         debug_server_log_thread_event(7, cpu, current_tcb, target_tcb, 0);
         return 0;
+    }
+    /* Contain a native-only shadow divergence before it mutates TCB/RAM,
+     * scheduler targets, or crosses run_shadow_diff with a longjmp. */
+    {
+        extern int overlay_loader_shadow_native_thread_switch_bail(void);
+        if (overlay_loader_shadow_native_thread_switch_bail()) return -1;
     }
     /* Commit the yielding thread's context so it can be re-dispatched later.
      * resume PC = its return address (resume right after the ChangeThread call).
@@ -769,6 +783,8 @@ void psx_scheduler_run(CPUState* cpu)
              * invariants the skipped psx_dispatch_impl frames would otherwise
              * own. No exception_jmpbuf frame is ever skipped (switch fires only
              * with in_exception==0), so interrupt state needs no fixup here. */
+            extern void overlay_loader_shadow_scheduler_escape_fixup(void);
+            overlay_loader_shadow_scheduler_escape_fixup();
             g_psx_dispatch_depth = 0;
             g_psx_call_bail      = 0;
             /* Soft-exit / yield longjmps out of vblank inside
@@ -894,7 +910,16 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
              * diverts it (Case B). */
             debug_server_log_thread_event(psx_get_in_exception() ? 24u : 20u, cpu,
                                           psx_current_tcb_ptr(cpu), target_tcb, cpu->pc);
-            if (!psx_get_in_exception() && psx_change_thread(cpu, target_tcb)) {
+            int switch_result = 0;
+            if (!psx_get_in_exception())
+                switch_result = psx_change_thread(cpu, target_tcb);
+            if (switch_result < 0) {
+                /* Native shadow validation requested an impossible thread
+                 * switch. Its bail flag unwinds the speculative call; return
+                 * true so CPS syscall wrappers stop this block immediately. */
+                return 1;
+            }
+            if (switch_result > 0) {
                 /* Thread switched (and this thread has since been resumed): the
                  * fiber scheduler leaves cpu->pc == 0. Under CPS that must NOT
                  * be a transfer — return 0 so the syscall wrapper falls through

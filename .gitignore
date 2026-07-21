@@ -19,6 +19,7 @@ recompiler/build/
 recompiler/build-asan/
 recompiler/build-asan2/
 recompiler/build-checked/
+recompiler/build-cli/
 recompiler/build-t2/
 runtime/build/
 runtime/build-msvc/
@@ -41,6 +42,12 @@ sdl2-msvc/
 # Diagnostic dumps & smoke logs (transient)
 *.log
 *.jsonl
+/.aot_capture_history/
+
+# Local additive overlay-capture store configuration and game-derived data.
+.psxrecomp.env
+.env
+.local/
 
 # Build-generated codegen-hash header (hash_codegen.cmake): folds an emitter
 # content hash into the overlay cache path; regenerated each build, never committed.

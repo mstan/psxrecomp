@@ -1435,6 +1435,51 @@ void FullFunctionEmitter::emit_dispatch(
         out += fmt::format("const uint32_t psx_bios_kernel_body_count = {}u;\n\n", kb_count);
     }
 
+    // --- Runtime-installed BIOS call-vector stubs ---
+    // Every retail PSX BIOS installs the A0/B0/C0 ABI gates as the same
+    // four-instruction shape: lui/addiu $t0,target; jr $t0; nop. The target is
+    // BIOS-specific, so decode it from live RAM and require the complete shape
+    // before taking the native tail transfer. A game/BIOS patch that changes
+    // even one word fails closed to dirty_ram_interp below.
+    out += "typedef struct {\n";
+    out += "    uint32_t key;\n";
+    out += "    uint32_t body_lo;\n";
+    out += "    uint32_t body_hi;\n";
+    out += "} PsxNativeStub;\n\n";
+    out += "const PsxNativeStub psx_bios_native_stubs[3] = {\n";
+    out += "    { 0x000000A0u, 0x000000A0u, 0x000000B0u },\n";
+    out += "    { 0x000000B0u, 0x000000B0u, 0x000000C0u },\n";
+    out += "    { 0x000000C0u, 0x000000C0u, 0x000000D0u },\n";
+    out += "};\n";
+    out += "const uint32_t psx_bios_native_stub_count = 3u;\n\n";
+    out += "static int psx_bios_try_native_call_stub(CPUState* cpu, "
+           "uint32_t addr) {\n";
+    out += "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
+    out += "    if (phys != 0xA0u && phys != 0xB0u && phys != 0xC0u) return 0;\n";
+    out += "    uint32_t w0 = cpu->read_word(phys + 0u);\n";
+    out += "    uint32_t w1 = cpu->read_word(phys + 4u);\n";
+    out += "    uint32_t w2 = cpu->read_word(phys + 8u);\n";
+    out += "    uint32_t w3 = cpu->read_word(phys + 12u);\n";
+    out += "    if ((w0 & 0xFFFF0000u) != 0x3C080000u ||\n";
+    out += "        (w1 & 0xFFFF0000u) != 0x25080000u ||\n";
+    out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
+    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+    out += "    psx_icache_fetch(cpu, addr);\n";
+    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
+                       psx_cyc_dep_res_mask(0x3C080000u));
+    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
+                       psx_cyc_dep_res_mask(0x25080000u));
+    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
+                       psx_cyc_dep_res_mask(0x01000008u));
+    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
+                       psx_cyc_dep_res_mask(0x00000000u));
+    out += "#endif\n";
+    out += "    cpu->gpr[8] = ((w0 & 0xFFFFu) << 16) +\n";
+    out += "                  (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
+    out += "    cpu->pc = cpu->gpr[8];\n";
+    out += "    return 1;\n";
+    out += "}\n\n";
+
     // Dispatch function with binary search.
     out += "static uint32_t normalize(uint32_t addr) {\n";
     out += "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
@@ -1489,11 +1534,14 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * backends. Handled (rc 1) \xE2\x87\x92 the service completed against guest\n";
     out += "         * state and the guest resumes at $ra via the trampoline's normal\n";
     out += "         * return/tail contract below. rc 0 \xE2\x87\x92 pure LLE fall-through. */\n";
-    out += "        if (g_psx_bios_hle_hook &&\n";
-    out += "            g_psx_bios_hle_hook(cpu, addr & 0x1FFFFFFFu)) {\n";
-    out += "            cpu->pc = cpu->gpr[31];\n";
-    out += "            found = 1;\n";
-    out += "        }\n";
+        out += "        if (g_psx_bios_hle_hook &&\n";
+        out += "            g_psx_bios_hle_hook(cpu, addr & 0x1FFFFFFFu)) {\n";
+        out += "            cpu->pc = cpu->gpr[31];\n";
+        out += "            found = 1;\n";
+        out += "        }\n";
+        out += "        /* Byte-guarded A0/B0/C0 call-vector tail stubs. */\n";
+        out += "        if (!found && psx_bios_try_native_call_stub(cpu, addr))\n";
+        out += "            found = 1;\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
     out += "        /* Game EXEs can overlap the BIOS shell copy window at\n";
     out += "         * physical 0x30000-0x5AFFF. If the target belongs to the\n";

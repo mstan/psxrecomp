@@ -44,6 +44,13 @@ int  autocompile_request(void);
  * Must be called from the same thread that owns the overlay loader. */
 void autocompile_poll_main(void);
 
+/* Process-shutdown teardown, emu thread only: stops the publication pipeline,
+ * kills the compiler process tree (job object), and JOINS the watcher and
+ * preparer threads — waiting out any in-flight LoadLibrary rather than
+ * abandoning a thread inside the Windows loader lock (which can deadlock
+ * ExitProcess). Safe to call in any state, including mid-run; idempotent. */
+void autocompile_shutdown(void);
+
 /* JSON status blob for the debug server: state, run/fail counters, last
  * exit code, and the output tail. Returns bytes written. */
 int  autocompile_status_json(char *out, int cap);

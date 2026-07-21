@@ -61,7 +61,7 @@ def main() -> int:
     require_before(
         candidate,
         r"if\s*\(\s*!s_active\s*\)\s*return\s+0\s*;",
-        r"idx_head\s*\(",
+        r"(?:idx_head|exact_entry_has)\s*\(",
         "overlay_loader_is_candidate",
     )
 

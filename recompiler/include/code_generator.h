@@ -99,6 +99,21 @@ struct CodeGenConfig {
     // the auto-detector cannot qualify (X-only test, no height compare).
     std::set<uint32_t> ws_cull_slti_sites;
 
+    // Explicit horizontal low-edge widen sites ([widescreen.cull]
+    // negsub_sites): `subu rd, zero, rs` becomes `-rs - x_margin`.
+    // Identity at 4:3; empty by default.
+    std::set<uint32_t> ws_cull_negsub_sites;
+
+    // Explicit masked-16-bit screen-X window sites ([widescreen.cull]
+    // vxrange_sites). The configured sltiu is routed through the shared
+    // runtime helper so native and interpreted overlays use identical math.
+    std::set<uint32_t> ws_cull_vxrange_sites;
+
+    // Explicit aspect-scaled far-bound sites ([widescreen.cull]
+    // depth_sites). Configured slti/sltiu instructions route through the
+    // runtime helper; empty by default.
+    std::set<uint32_t> ws_cull_depth_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).

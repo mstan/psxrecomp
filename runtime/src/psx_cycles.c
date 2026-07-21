@@ -17,10 +17,34 @@
 #endif
 
 uint64_t psx_cycle_count = 0;
+static int      s_cycle_replay_active = 0;
+static uint64_t s_cycle_replay_live = 0;
 
-/* Throttle watchdog check to once per ~64K cycles (header hot path). */
-uint32_t psx_watchdog_throttle = 0;
-uint32_t psx_pc_sample_throttle = 0;
+int psx_cycle_replay_begin(uint64_t start_cycle) {
+    extern int g_ls_replay_active;
+    if (!g_ls_replay_active || s_cycle_replay_active) return 0;
+    s_cycle_replay_live = psx_cycle_count;
+    psx_cycle_count = start_cycle;
+    s_cycle_replay_active = 1;
+    return 1;
+}
+
+uint64_t psx_cycle_replay_end(void) {
+    uint64_t replay_cycle = psx_cycle_count;
+    if (s_cycle_replay_active) {
+        psx_cycle_count = s_cycle_replay_live;
+        s_cycle_replay_active = 0;
+    }
+    return replay_cycle;
+}
+
+/* Throttle diagnostic checks in debug-tool builds.  Production defines
+ * STARVATION_RING_ENABLED=0, so interpreted instructions do not pay two
+ * diagnostic global read/modify/writes on every cycle charge. */
+#if STARVATION_RING_ENABLED
+static uint32_t s_watchdog_throttle = 0;
+static uint32_t s_pc_sample_throttle = 0;
+#endif
 
 /* Conservative event-granularity diagnostic (set via debug cmd
  * overlay_native_event_granularity). Normally psx_advance_cycles charges a
@@ -35,6 +59,15 @@ uint32_t psx_pc_sample_throttle = 0;
  * clears with this on, the root cause is per-block event-ordering, and the
  * real fix is a due-cycle event scheduler (run-to-next-event), not this. */
 int g_event_step_conservative = 0;
+
+/* Env opt-in (PSX_EVENT_STEP_CONSERVATIVE=1) so the diagnostic is reachable in
+ * production builds too, where the TCP setter doesn't exist — the determinism
+ * A/B ("do the fast-limit and conservative paths present the same guest event
+ * timeline?") needs the production binary to run BOTH ways. */
+void psx_event_step_conservative_env_init(void) {
+    const char *e = getenv("PSX_EVENT_STEP_CONSERVATIVE");
+    if (e && e[0] == '1') g_event_step_conservative = 1;
+}
 
 static void advance_devices(uint32_t c) {
     psx_cycle_count += (uint64_t)c;
@@ -72,10 +105,12 @@ static void advance_devices(uint32_t c) {
 #define PSX_DEADLINE_HARD_CAP 16384u
 
 static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here */
-uint64_t psx_next_service_cycle = 0;         /* absolute; 0 = dirty, recompute  */
-int      psx_in_device_service  = 0;         /* re-entrancy guard (header hot path) */
-static uint64_t s_next_watchdog  = 0;        /* sparse throttle anchors in service_to_now */
-static uint64_t s_next_pc_sample = 0;
+static uint64_t s_next_service_cycle   = 0;  /* absolute; 0 = dirty, recompute  */
+static int      s_in_device_service    = 0;  /* re-entrancy guard               */
+
+/* Absolute inclusive limit for dirty_ram_interp.c's exact one-cycle path.
+ * Zero means that the next charge must visit psx_advance_cycles(). */
+uint64_t g_psx_cycle_fast_limit = 0;
 
 /* Distance to the nearest INTERNAL device event, mask-blind (i_mask =
  * all-unmasked). This is the chunking bound for catch-up: the sio/cdrom/dma
@@ -88,7 +123,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t best = interrupts_cycles_to_vblank();   /* frame pacing always */
     uint32_t t = timers_cycles_to_irq(0xFFFFFFFFu);  if (t < best) best = t;
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
-    uint32_t d = dma_cycles_to_irq(0xFFFFFFFFu);     if (d < best) best = d;
+    uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
@@ -114,12 +149,14 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
 static void psx_devices_recompute_deadline(void) {
     uint32_t next = devices_cycles_to_next_internal_event();
     if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
-    psx_next_service_cycle = psx_cycle_count + (uint64_t)next;
+    s_next_service_cycle = psx_cycle_count + (uint64_t)next;
+    g_psx_cycle_fast_limit = s_next_service_cycle - 1u;
 }
 
-void psx_devices_service_to_now(void) {
-    if (psx_in_device_service) return;                 /* device code charged cycles: absorb */
-    psx_in_device_service = 1;
+static void psx_devices_service_to_now(void) {
+    if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    g_psx_cycle_fast_limit = 0;
+    s_in_device_service = 1;
     uint64_t target = psx_cycle_count;
     if (s_devices_synced_cycle < target) {
         /* Rewind and re-play the gap in event-bounded chunks so device
@@ -133,6 +170,18 @@ void psx_devices_service_to_now(void) {
             uint32_t to_ev = devices_cycles_to_next_internal_event();
             if (to_ev > 0 && to_ev < step) step = to_ev;
             if (step == 0) step = 1;
+            /* Preserve interval causality at an advertised event boundary.
+             * Devices are advanced in a fixed dependency order (CD before DMA,
+             * MDEC input before output). Passing the whole D-cycle interval to
+             * each device lets a state created by an earlier device at cycle D
+             * be treated by a later device as though it existed for all D
+             * cycles. Advance the quiet prefix first, then the boundary cycle:
+             * this is exactly the conservative timeline with O(events), not
+             * O(cycles), host calls. */
+            if (step > 1u && to_ev == step) {
+                advance_devices(step - 1u);
+                step = 1u;
+            }
             advance_devices(step);
             interrupts_service_scheduled_events();
         }
@@ -165,6 +214,10 @@ void psx_devices_mmio_sync(void) {
     } else {
         psx_devices_recompute_deadline();
     }
+    s_next_service_cycle = 0;   /* recompute on the next charge */
+    /* Service-to-now republishes its old deadline.  Clear the inline limit
+     * after it returns because the MMIO operation can re-arm an earlier event. */
+    g_psx_cycle_fast_limit = 0;
 }
 
 /* Exact per-charge path (legacy semantics). Used by PSX_COSIM builds and the
@@ -198,20 +251,20 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
 #endif
     }
     s_devices_synced_cycle = psx_cycle_count;
-    psx_next_service_cycle = 0;
+    s_next_service_cycle   = 0;
+    g_psx_cycle_fast_limit = 0;
 }
 
-void psx_cycles_watchdog_fire(void) {
-    starvation_watchdog_check();
-}
-
-void psx_cycles_pc_sample_fire(void) {
-    starvation_ring_pc_sample();
-}
-
-/* COSIM / conservative / lockstep path — not on the MotK FMV hot path. */
-void psx_advance_cycles_slow(uint32_t cycles) {
-    if (g_ls_replay_active) return;
+void psx_advance_cycles(uint32_t cycles) {
+    { extern int g_ls_replay_active;
+      if (g_ls_replay_active) {
+          /* Replay owns a private-in-time view of the global clock. Advance it
+           * so GTE/muldiv deadlines and memory wait states see the same time as
+           * the authoritative pass, but never service devices or observers. */
+          if (s_cycle_replay_active) psx_cycle_count += (uint64_t)cycles;
+          return;
+      }
+    }
     if (cycles == 0) return;
 #ifdef PSX_COSIM
     psx_advance_cycles_exact(cycles);
@@ -227,16 +280,20 @@ void psx_advance_cycles_slow(uint32_t cycles) {
         }
     }
 #endif
-    psx_watchdog_throttle += cycles;
-    if (psx_watchdog_throttle >= 65536u) {
-        psx_watchdog_throttle = 0;
-        psx_cycles_watchdog_fire();
+#if STARVATION_RING_ENABLED
+    s_watchdog_throttle += charged_cycles;
+    if (s_watchdog_throttle >= 65536u) {
+        s_watchdog_throttle = 0;
+        starvation_watchdog_check();
     }
     psx_pc_sample_throttle += cycles;
     if (psx_pc_sample_throttle >= 1048576u) {
         psx_pc_sample_throttle = 0;
         psx_cycles_pc_sample_fire();
     }
+#else
+    (void)charged_cycles;
+#endif
 }
 
 uint64_t psx_get_cycle_count(void) {
@@ -339,9 +396,12 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     extern int psx_get_in_exception(void);
     extern uint64_t g_guest_store_count, g_mmio_access_count;
 
+    /* A speculative replay must not clear or train the authoritative live idle
+     * detector. Its clock/device view is transactional and cannot be skipped. */
+    if (g_ls_replay_active) return;
     if (!idle_skip_on() || g_idle_note_suppress) return;
     if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
-        g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
+        g_precise_mode || g_ls_mode != 0) {
         s_idle_pc = 0;
         s_idle_streak = 0;
         s_idle_have_snap = 0;
@@ -454,17 +514,9 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
  * force a fresh deadline on the next charge. */
 void psx_cycles_resync_after_restore(void) {
     s_devices_synced_cycle = psx_cycle_count;
-    psx_next_service_cycle = 0;   /* recompute on next charge */
-    psx_in_device_service  = 0;
-}
-
-void psx_cycles_reset_for_boot(void) {
-    psx_cycle_count        = 0;
-    s_devices_synced_cycle = 0;
-    psx_next_service_cycle = 0;
-    psx_in_device_service  = 0;
-    s_next_watchdog        = 0;
-    s_next_pc_sample       = 0;
+    s_next_service_cycle   = 0;   /* recompute on next charge */
+    s_in_device_service    = 0;
+    g_psx_cycle_fast_limit = 0;
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----

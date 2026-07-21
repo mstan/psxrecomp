@@ -12,20 +12,117 @@ Background on the original prototype:
 
 [![PSXRecomp demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
 
+## How to use PSXRecomp
+
+PSXRecomp takes a PlayStation disc image and BIOS and creates a recompilation
+project containing C source and build scripts.
+
+### Generate a project with the released CLI
+
+1. Download `psxrecomp-cli-windows-x86_64.zip` from
+   [Releases](https://github.com/mstan/psxrecomp/releases).
+2. Extract the whole zip to a folder. Keep its contents together.
+3. Open PowerShell in that folder and run:
+
+```powershell
+.\psxrecomp.exe build `
+  --disc "C:\Games\My Game\game.cue" `
+  --bios "C:\BIOS\SCPH1001.BIN" `
+  --output "C:\Projects\MyGameRecomp"
+```
+
+Use the `.cue` file when a game has one, and keep its `.bin` track files beside
+it. Single-file `.bin` and `.iso` images are also accepted.
+
+The output folder contains:
+
+- generated C source for the game and BIOS;
+- `game.toml`, which you can edit for game-specific settings;
+- `CMakeLists.txt` and build scripts; and
+- a local copy of the PSXRecomp runtime source needed by the project.
+
+The downloaded CLI is self-contained. You do not need to install Python or
+build this repository to generate a project.
+
+### Build the generated project
+
+Install CMake, Ninja, a C/C++ compiler, and SDL2 development files. Then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Projects\MyGameRecomp\build.ps1"
+```
+
+The generated project also includes a shell build script for macOS and Linux:
+
+```sh
+sh /path/to/MyGameRecomp/build.sh
+```
+
+The ready-made CLI release is currently for 64-bit Windows. You can build the
+CLI from source on another operating system using the instructions below.
+
+The generated project is a practical starting point, not a promise that every
+game works without game-specific fixes. PSX games can load extra code and use
+hardware in ways that require additional configuration or development.
+
+Use only disc and BIOS files you obtained legally. PSXRecomp does not include
+them. Generated game and BIOS source is derived from those files, so do not
+redistribute it.
+
+### Build the CLI from source
+
+You need Git, Python 3, CMake, Ninja, and a C++20 compiler.
+
+```sh
+git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
+cd psxrecomp
+python tools/build_cli.py release
+```
+
+The ready-to-use CLI archive is written to `dist/`. To package debug binaries
+instead, run `python tools/build_cli.py debug`.
+
+> **Where the project is headed.** Development so far has been **breadth-first**:
+> stand up as many games as possible and get them into a playable alpha, proving
+> the framework generalizes. That phase has largely delivered — seven titles now
+> run and ship public builds (see [Games](#games)). The project is now pivoting to
+> a **depth / optimization** phase: pushing each game toward 100% static coverage,
+> tightening timing accuracy, driving load times toward zero, and hardening the
+> renderer and audio paths. Expect the fleet to get *faster and more accurate*
+> rather than *wider* from here.
+
 ## What It Is
 
 PSXRecomp translates PS1 MIPS binaries into C, then compiles that C as a
 native executable linked against a PS1 hardware runtime. The v4 architecture
-recompiles the real SCPH1001 BIOS and runs it as the kernel. There is no HLE
-BIOS layer, no stubs, and no general-purpose interpreter fallback for static
-code.
+recompiles the real `SCPH1001.BIN` BIOS and runs it as the kernel — that
+**low-level (LLE) recompiled BIOS is the foundation and the correctness oracle.**
+Everything is architected LLE-first: accuracy comes first, and convenience is
+layered on top, opt-in, never underneath.
 
-PSXRecomp is a framework. Game-specific projects live in their own
+Three things sit on that foundation:
+
+- **An optional HLE tier.** A high-level BIOS layer can be laid over the
+  recompiled kernel to skip the boot sequence and service a few BIOS calls
+  directly — a player-facing convenience and optimization, enabled by default
+  but fully opt-out (`[runtime] bios_hle = false`). Anything it doesn't
+  implement falls straight through to the recompiled BIOS, so the LLE path stays
+  load-bearing and remains the oracle every accuracy check runs against.
+- **Capture-and-compile for overlays.** PS1 games stream code off the disc at
+  runtime (*overlays*) that no ahead-of-time recompiler can see. PSXRecomp
+  captures each overlay the moment it loads and recompiles it to native code,
+  cached and reused forever after (`static → gcc → tcc` backend).
+- **A general-purpose interpreter — as a transient safety net, not a fixture.**
+  Anything not yet native (a freshly streamed overlay, RAM-installed code) runs
+  in a small MIPS interpreter so the machine is always *correct*. But the
+  interpreter is explicitly meant to be **compiled away**: the same capture
+  feeds the TCC-backed sharding pipeline, which turns interpreted code into
+  cached native shards in the background. The more a game runs, the less the
+  interpreter is doing — the goal state is an idle interpreter and 100% native
+  execution.
+
+PSXRecomp is a **framework**. Game-specific projects live in their own
 repositories and link this one in as a **git submodule** to build a game binary.
-The active end-to-end targets are:
-
-- [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
-- [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
 
 **New here?** The fastest way in:
 [`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) (how a game actually
@@ -33,6 +130,26 @@ runs — static / native-overlay / interpreter), then
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/BUILDING.md`](docs/BUILDING.md), and
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Games
+
+Each game is its own repository that pins a framework commit as a submodule and
+ships its own release with an in-app launcher. All are **alpha** — playable, not
+yet fully validated end to end.
+
+| Game | Repository | Latest build | Notes |
+|---|---|---|---|
+| *Tomba!* | [TombaRecomp](https://github.com/mstan/TombaRecomp) | [releases](https://github.com/mstan/TombaRecomp/releases/latest) | Most mature target; widescreen, supersampling, save/load. |
+| *Tomba! 2* | [Tomba2Recomp](https://github.com/mstan/Tomba2Recomp) | [releases](https://github.com/mstan/Tomba2Recomp/releases/latest) | Multi-track disc support, selectable 21:9. |
+| *Ape Escape* | [ApeEscapeRecomp](https://github.com/mstan/ApeEscapeRecomp) | [releases](https://github.com/mstan/ApeEscapeRecomp/releases/latest) | New launcher, widescreen, memory-card save/load. |
+| *Mega Man X4* | [MegaManX4Recomp](https://github.com/mstan/MegaManX4Recomp) | [releases](https://github.com/mstan/MegaManX4Recomp/releases/latest) | Playable; widescreen. |
+| *Mega Man X5* | [MegaManX5Recomp](https://github.com/mstan/MegaManX5Recomp) | [releases](https://github.com/mstan/MegaManX5Recomp/releases/latest) | Early bring-up. |
+| *Mega Man X6* | [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) | [releases](https://github.com/mstan/MegaManX6Recomp/releases/latest) | Playable; stages, controller, save/load. |
+| *Tsumu Light* | [TsumuLightRecomp](https://github.com/mstan/TsumuLightRecomp) | [releases](https://github.com/mstan/TsumuLightRecomp/releases/latest) | Japanese title (SLPS-02253); early bring-up. |
+
+Each game repo carries its own build/run instructions, keyboard/controller
+mappings, and per-game settings. **This repository builds the framework and a
+BIOS-only runtime** — see [Release Package](#release-package) below.
 
 ## Philosophy — toward 100% static recompilation
 
@@ -90,47 +207,44 @@ a game is played; this branch is where that machinery is being built.
 
 ## Status
 
-Current milestone as of 2026-05-18:
+The framework is at **alpha**: the LLE recompiled BIOS boots and hands off to
+the game across all seven targets, and each runs as majority-native code with
+the capture-and-compile pipeline filling overlays as they're reached. The
+breadth-first push is essentially done; work now is depth and optimization.
+
+Core subsystems, framework-wide:
 
 | Subsystem | State |
 |---|---|
-| BIOS recompilation (`SCPH1001.BIN`) | Boots and hands off to Tomba |
-| Game EXE recompilation | Tomba title, OPTIONS, NEW GAME, save/load, and gameplay reached |
-| CD-ROM / MDEC / XA | Tomba FMVs stream and play at the game's 15 fps cadence |
-| Memory cards | Tomba save and load verified |
-| SIO0 controllers | Digital pad polling plus DualShock config replies used by Tomba |
-| GPU | Functional for BIOS boot, FMVs, menus, and first gameplay area |
-| Interrupts, COP0, timers | Working for current Tomba path |
-| Dirty-RAM support | BIOS/game RAM-installed dispatch paths handled |
-| Controller input | Keyboard plus SDL/XInput-style controller mapping via `input.ini` |
+| BIOS recompilation (`SCPH1001.BIN`) | Boots to shell and hands off to game; also the correctness oracle |
+| HLE BIOS tier | Optional boot-skip + service layer over the recompiled BIOS; default on, opt-out |
+| Game EXE recompilation | Title/menus/save-load/gameplay reached across the fleet |
+| Overlay capture → compile → cache | `static → gcc → tcc`; coverage grows as a game is played |
+| Interpreter failover | Correctness net for not-yet-native code; being compiled away by sharding |
+| CD-ROM / MDEC / XA | FMVs stream and play; XA/CDDA timing stays authentic |
+| Memory cards | Save and load verified on multiple titles |
+| SIO0 controllers | Digital pad + DualShock config; per-game analog/digital selection |
+| GPU | Software + OpenGL + Vulkan backends; widescreen FOV/HUD work per game |
+| SPU | Working; reverb/noise/sweep and exact SPU-IRQ accuracy still being tightened |
+| Interrupts, COP0, timers, GTE | Working; cycle-accuracy foundation is an active depth-phase focus |
 
-Known follow-up work:
+Per-game maturity varies — see the [Games](#games) table. None of the titles is
+declared fully validated end to end; users perform the final playthrough
+validation on each release.
 
-- The recent Tomba visual burn-down fixed the BIOS PS logo, title/menu glyph
-  seams, dialog/pause panel seams, terrain shading, and shaded textured branch
-  rendering observed in the first area.
-- SPU coverage is partial; reverb, noise, sweep, and accurate SPU IRQ behavior
-  are not complete.
-- The historical Windows "Not Responding" hang is mitigated but should stay on
-  the watch list until longer in-game soak tests are clean.
-- Neither game is fully validated end to end yet. Tomba has considerably more
-  coverage; Mega Man X6 is playable (stages, controller, and memory-card
-  save/load all work). Full playthroughs of both are still unverified.
+Open depth-phase fronts: cycle/IRQ-phase timing accuracy, load-time-toward-zero
+(data sharding), renderer parity between the software/GL/Vulkan backends, and
+driving overlay coverage the last mile to 100% static.
 
-For the current game milestone, build and run the sibling TombaRecomp project:
-
-```sh
-cd ../TombaRecomp
-cmake --build build -j16
-./build/psx-runtime.exe --game game.toml
-```
-
-Running this repository's runtime without `--game` is still useful for
-BIOS-only memory card management.
+Running this repository's runtime without a game is useful for **BIOS-only
+memory-card management**; to build and play a title, use its game repo from the
+[Games](#games) table.
 
 ## Release Package
 
-The framework release package is BIOS-only:
+**This repository's release is BIOS-only** — it is the framework runtime, not a
+game. Use it for BIOS boot and memory-card management; to play a title, grab its
+release from the [Games](#games) table.
 
 1. Download `PSXRecomp-v*-windows-x64.zip` from Releases.
 2. Extract it and run `PSXRecomp.exe`.
@@ -140,8 +254,11 @@ The package does not include a PS1 BIOS, game disc image, generated game code,
 or save data. The selected BIOS path is saved next to the executable as
 `bios.cfg`; delete that file to pick a different BIOS later.
 
-Game-specific recomp projects, including TombaRecomp, use the same runtime
-picker contract but also prompt for a legally obtained game disc image.
+The game recomp projects use the same runtime picker contract but ship a
+**Dear ImGui launcher**: on first run it prompts for your legally obtained BIOS
+and game disc image, then lets you configure video, controls, and per-game
+settings before launching. Keyboard/controller mappings live in each game's repo
+and launcher, not here.
 
 ## Setup
 
@@ -176,42 +293,13 @@ generated C is optimized. Game projects generate their own
 `generated/<serial>_*.c` files and link this runtime through CMake — see
 [`docs/BUILDING.md`](docs/BUILDING.md#build-and-run-a-game).
 
-## Keyboard Map
+## Input
 
-| PSX button | Keyboard |
-|---|---|
-| D-Pad Up / Down / Left / Right | Arrow keys |
-| Cross | X |
-| Square | Z |
-| Circle | S |
-| Triangle | A |
-| L1 / R1 | Q / W |
-| L2 / R2 | E / R |
-| L3 / R3 (stick clicks) | T / Y |
-| Start | Enter |
-| Select | Right Shift |
-| Turbo | Tab (hold) |
-| Fullscreen | F11 / Alt+Enter / Cmd+F |
-
-## Controller Map
-
-Xbox-style controller defaults are enabled when a controller is connected:
-
-| PSX button | Xbox controller |
-|---|---|
-| D-Pad Up / Down / Left / Right | D-pad or left stick |
-| Cross | A |
-| Circle | B |
-| Square | X |
-| Triangle | Y |
-| L1 / R1 | LB / RB |
-| L2 / R2 | LT / RT |
-| L3 / R3 | Left / right stick click |
-| Start | Menu |
-| Select | View / Back |
-
-Release builds create/use `input.ini` next to the executable. Edit that file to
-change controller device index, deadzone, or button mapping.
+Keyboard and Xbox-style controller input work out of the box; the default
+fullscreen toggle is F11 / Alt+Enter / Cmd+F. **Full button maps, controller
+configuration, and rebinding live in each game's repo and in-app launcher** —
+they're game-facing, not part of the framework. The BIOS-only framework runtime
+accepts keyboard input for navigating the BIOS shell and memory-card tools.
 
 ## Architecture
 
@@ -233,20 +321,25 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md) for the
 development rules, and [`docs/internal/`](docs/internal/) for the phased plans
 and deep design notes (`PLAN.md`, `FAITHFUL_TIMING_PLAN.md`, …).
 
-## Disc Speed
+## Load Times
 
-Per-game `disc_speed` in `game.toml [runtime]` compresses CD-ROM timing:
+The runtime models **authentic 1× CD-ROM timing by default** — the same read and
+seek delays as real hardware. On top of that faithful baseline, load-time
+acceleration is **opt-in**, per game, so the accurate path is never compromised:
 
-| Value | Effect |
-|---|---|
-| `"1x"` | Authentic PSX timing. Default for all games. |
-| `"2x"` / `"4x"` | 2× / 4× faster reads and seeks. |
-| `"instant"` | Minimum-floor delays. **Known to hang some games** during early initialization; root cause not yet identified. Use `"4x"` instead until resolved. |
+- **Turbo** — a hold-to-fast-forward key that compresses loads on demand.
+- **`[runtime] turbo_loads` / `idle_skip`** — automatic acceleration during load
+  waits, with `turbo_audio_sink` keeping the SPU timeline coherent through the
+  burst.
+- **Warm CD routes (`[[runtime.warm_cd_routes]]`)** — narrowly-scoped fast
+  read cadence armed on a specific `SetLoc`, restoring authentic timing the
+  moment the read pattern diverges.
 
-FMV playback is always protected: the CD-ROM layer reverts to 1× whenever XA
-audio streaming is active, regardless of `disc_speed`. The speed switch fires
-only after the BIOS has handed off to the game EXE — boot and the license
-screen always run at authentic 1×.
+FMV/XA and CDDA streaming, seek, and motor timing always stay authentic
+regardless of the accelerators. Driving load times toward zero (via data
+sharding) is an active depth-phase effort — see
+[`docs/LOAD_TIME_ZERO.md`](docs/LOAD_TIME_ZERO.md) and
+[`docs/disc-speed.md`](docs/disc-speed.md).
 
 ## Help make your game faster — just by playing it
 

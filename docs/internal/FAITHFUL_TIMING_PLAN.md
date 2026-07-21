@@ -34,12 +34,13 @@ take IRQs at the exact instruction. Games that read timers / poll IRQ-driven
 flags in tight loops fork between backends.
 
 Tomba 2 (SCUS-94454) logo→FMV stall is the canonical case. The cascade:
+
 1. Timer1 debounce value-fork @ pc 0x8008592C (frame 1823) — fixed by exact block
    cycle costs ("Fix A", already in tree).
 2. **CURRENT BLOCKER:** measured **−8 cycle drift** (native BEHIND interp),
    entering in the BIOS→overlay init transition (func 0x80050B0C subtree). The
    frame-1824 logo-delay wait loop (caller 0x8008AE48 → RCnt reader 0x80085900;
-   exits when *0x80102748[=960] < elapsed Timer1) loops ~1557× in interp (reaches
+   exits when \*0x80102748[=960] < elapsed Timer1) loops ~1557× in interp (reaches
    FMV) vs ~42× native (stuck on logo).
    **Mechanism (located in code_generator.cpp):** when a branch's delay slot is
    ALSO a block leader (`exit_has_delay && !delay_slot_in_block`, ~line 1243), the
@@ -54,8 +55,9 @@ Tomba 2 (SCUS-94454) logo→FMV stall is the canonical case. The cascade:
 ## 2. The target architecture (what "faithful core" means)
 
 Per ChatGPT (validated) + standard practice:
+
 - ONE shared **per-instruction cycle-cost function** `psx_instr_base_cycles(pc,
-  insn)` used by BOTH the dirty-interp and the recompiler. No two approximate
+insn)` used by BOTH the dirty-interp and the recompiler. No two approximate
   models.
 - Recompiler emits **exact** accumulated cycle charges (collapses to a constant
   per pure-compute block); every dynamically executed instruction charged exactly
@@ -67,8 +69,8 @@ Per ChatGPT (validated) + standard practice:
 - **Timers derived on-demand** from a global guest-cycle counter at read time;
   DMA/CD/GPU/IRQ on **scheduled event deadlines** (not per-cycle ticking) so
   compiled stays fast.
-- Invariant: *every execution backend may differ in host implementation, but not
-  in guest-visible time.* At same-PC convergence points, native cycle total ==
+- Invariant: _every execution backend may differ in host implementation, but not
+  in guest-visible time._ At same-PC convergence points, native cycle total ==
   interp cycle total.
 - pc=0 means ONLY a real guest pc=0 / explicit termination — NEVER "dispatcher
   couldn't re-enter." Fail closed + log on undispatchable PCs.
@@ -108,6 +110,7 @@ function, then VERIFY each against Beetle at runtime. Do NOT paste Beetle code
 (architecture differs + GPLv2 hygiene); write our own informed by the facts.
 
 Extraction map — `psxrecomp/beetle-psx/mednafen/psx/` (main checkout):
+
 - **CPU base / instruction fetch:** cpu.cpp `ReadInstruction()` (~L534) — icache
   model: `timestamp += 4` cache-disabled (0xA000_0000+), `+3` on cache miss/fill,
   `+1` per fill word, near-0 on hit. For a static recompiler this becomes a
@@ -130,15 +133,16 @@ Extraction map — `psxrecomp/beetle-psx/mednafen/psx/` (main checkout):
   (T1 hblank ÷2146 etc.); move to on-demand counter = f(global cycles) at read.
 
 Build order for the model (P3 → Stage-2):
+
 1. Shared header (single source of truth) consumed by interp (runtime) AND
-   recompiler (it already includes ../../runtime/include/*.h): identity first
+   recompiler (it already includes ../../runtime/include/\*.h): identity first
    (cost=1) → regen → prove byte-identical generated cycle charges (zero behaviour
    change) → seam established.
 2. Fill real costs from the extraction map, ONE component at a time, each verified
    against Beetle at runtime (native cumulative cycles == Beetle at convergence).
 3. Memory wait-states in the psx_read/write path (region table).
-DO each transcription with the Beetle source open + a runtime cross-check; a wrong
-cycle number CREATES divergence, so verify, don't rush.
+   DO each transcription with the Beetle source open + a runtime cross-check; a wrong
+   cycle number CREATES divergence, so verify, don't rush.
 
 ## 3c. STAGE 2 — full hardware cycle accuracy (the goal; -8 is DONE/past)
 
@@ -147,27 +151,29 @@ makes the cycle model match REAL R3000A timing, validated against Beetle. We are
 hardware-cycle-accurate yet: model is ~1 cycle/instruction; Beetle charges ~2x.
 
 ### The validation breakthrough: DELTA comparison (offset-independent)
+
 Absolute-cycle comparison through boot is meaningless (native is ~121M cycles off
 Beetle due to turbo-loads/overlay load-model differences). BUT the cyc_watch
 comparator's per-hit DELTAS cancel that offset: between two consecutive hits of the
 same anchor (one iteration of identical code), native charged 46 cycles vs Beetle 91
 (@0x80017FC4). That ~2x gap IS the cycle-model inaccuracy, measured cleanly. So:
-  VALIDATE STAGE 2 BY MATCHING native Δcycles == Beetle Δcycles over identical
-  regions (consecutive same-anchor hits, or entry/exit anchor pairs), NOT absolute.
+VALIDATE STAGE 2 BY MATCHING native Δcycles == Beetle Δcycles over identical
+regions (consecutive same-anchor hits, or entry/exit anchor pairs), NOT absolute.
 First concrete target: make the 0x80017FC4 inter-hit Δ 46 -> 91 (== Beetle).
 
 ### Stage-2 progress log
+
 - #1a data-load cost DONE (2ef47bd): psx_instr_base_cycles +2 per CPU load (LWC2 +1).
   Δ gate @0x80017FC4: native per-iter 46 -> 56 (Beetle 91). FMV still streams (no
   regression). Closed ~10/45. Approximation: no scratchpad-free / region / load-delay
   ABSORB yet — those are refinements (absorb would LOWER native, so it's not the
   remaining 35; the remaining gap is other components below).
 - REMAINING ~35 cyc: DISASSEMBLED func_80017FC4 — it is only loads/stores/ALU/branches
-  + a countdown delay loop; NO mult/div/GTE/MMIO. So the gap is NOT those, for this fn.
-  BUT func_80017FC4 exits via a CPS TAIL-CALL to 0x8001EFFC (no normal return), so the
-  single-anchor entry-to-next-entry window SPANS MULTIPLE functions (80017FC4 ->
-  8001EFFC -> ... -> re-call). => single-anchor Δ is TOO COARSE for per-component
-  attribution; the 56/91 covers code we haven't disassembled.
+  - a countdown delay loop; NO mult/div/GTE/MMIO. So the gap is NOT those, for this fn.
+    BUT func_80017FC4 exits via a CPS TAIL-CALL to 0x8001EFFC (no normal return), so the
+    single-anchor entry-to-next-entry window SPANS MULTIPLE functions (80017FC4 ->
+    8001EFFC -> ... -> re-call). => single-anchor Δ is TOO COARSE for per-component
+    attribution; the 56/91 covers code we haven't disassembled.
 - TOOLING NEXT (before more cost components): add a TWO-ANCHOR region mode to cyc_watch
   (capture cycles at region START anchor A and END anchor B; report Δ(B−A) per pass) on
   BOTH backends. Then validate the cost model on a KNOWN, fully-disassembled single
@@ -176,7 +182,9 @@ First concrete target: make the 0x80017FC4 inter-hit Δ 46 -> 91 (== Beetle).
   Only then resume adding components (fetch / mult-div-stall / GTE / load-absorb).
 
 ### Components to transcribe (from in-tree Beetle + psx-spx; verify each by Δ)
+
 The ~2x gap is dominated by what 1/insn ignores. Implement one at a time, re-measure Δ:
+
 1. **Memory access wait-states (biggest lever).** Real loads/stores cost >1 cycle by
    region (RAM/BIOS-ROM/scratchpad/MMIO). Beetle: cpu.cpp ReadMemory `lts` delta +
    LDAbsorb (load-delay). Charge in the load/store path: interp exec_one's mem ops AND
@@ -187,12 +195,13 @@ The ~2x gap is dominated by what 1/insn ignores. Implement one at a time, re-mea
    HI/LO read. Encode in psx_instr_base_cycles (+ optional stall-on-read).
 4. **GTE/COP2 per-command.** Beetle gte.cpp GTE_Instruction table (RTPS=15, NCDS=19,
    NCDT=44, ...). Encode in psx_instr_base_cycles for COP2 ops.
-All land in the single-source psx_instr_base_cycles (opcode costs) + a memory-path
-wait-state charger (address-dependent). Both backends consume the same model (seam
-already in place). Each component: transcribe -> regen/build -> Δ-compare vs Beetle
-on a fixed region -> next.
+   All land in the single-source psx_instr_base_cycles (opcode costs) + a memory-path
+   wait-state charger (address-dependent). Both backends consume the same model (seam
+   already in place). Each component: transcribe -> regen/build -> Δ-compare vs Beetle
+   on a fixed region -> next.
 
 ### Caveats
+
 - Δ-region must be IDENTICAL code on both (a tight loop body, or a pure-compute
   function). Avoid regions that cross turbo-load / overlay / dirty boundaries.
 - Relocated BIOS-shell funcs (phys 0x30000-0x5AFFF) dispatch at a different native
@@ -201,12 +210,13 @@ on a fixed region -> next.
   time. The comparator (cyc_watch + cycle_compare.py) is the validation backbone.
 
 ## 4. Tooling / oracle
+
 - Runtime TCP port 4500; Beetle oracle 4382. Always-on rings: `event_ring`,
   `wtrace_all` (write trace; `newest=1`). `freeze_check` has slice-trace + cycle
   fields. `PSX_EXIT_HALT=1` halts-and-serves at the pc=0 exit for post-mortem.
 - Build runtime: `cmake --build Tomba2Recomp/build-t2 --target psx-runtime`
   (PATH=/c/msys64/mingw64/bin). Recompiler: `cmake --build
-  _wt-tomba2/psxrecomp/recompiler/build-t2 --target psxrecomp-game`. Regen:
+_wt-tomba2/psxrecomp/recompiler/build-t2 --target psxrecomp-game`. Regen:
   `recompiler/build-t2/psxrecomp-game.exe --config game.toml` (rebuild tool first).
 - Reference: nocash psx-spx; the dirty-RAM interp is the in-process oracle for
   compiled code; Beetle is the HW oracle.
@@ -369,7 +379,7 @@ on a fixed region -> next.
   netplay headless ~38–40. Not dual-CPU contention and not GL present.
   Lockstep (INPUT_CONFIRM frame barrier + same-tick input rendezvous)
   keeps both MDEC peaks aligned. Async confirm / peer drift made FMV
-  *worse* (~22–28) via overlapped memory traffic. Barrier now UDP `poll()`
+  _worse_ (~22–28) via overlapped memory traffic. Barrier now UDP `poll()`
   (not `SDL_Delay(1)`); localhost peers pin to disjoint CPU halves (~45
   in A/B). Pipeline admit rewrite hung tick-0 — reverted.
 
@@ -426,7 +436,7 @@ on a fixed region -> next.
   2nd intro (Star Wars logo) edge + ~50 FPS.
 
 - **2026-07-19 (MotK FMV right-edge / 2/3 revert):**
-  Tried depth24 width=(CRTC*2)/3 (512→341) for right-edge junk; MotK
+  Tried depth24 width=(CRTC\*2)/3 (512→341) for right-edge junk; MotK
   intros rendered left-shifted with the right of the video clipped —
   confirms the Jul-18 finding (logo is centered in a 512 RGB line).
   Reverted 2/3. Kept: depth24→fmv_frame, short-band without force_4_3
@@ -619,6 +629,37 @@ on a fixed region -> next.
   fixed. Load-delay coalesce + inline `psx_advance_cycles`. Necessary but not
   sufficient for MotK FMV ≥50 with video.
 
+- **2026-07-19/20 (Tomba 2 warm-cache boot death ROOT-CAUSED + FIXED — overlay
+  alias-body CPS re-entry fall-through):** The splash→title death (host frame
+  ~1374, "execution completed, PC=0") was NEVER an IRQ/event race: production
+  rings proved DeliverEvent(0xF0000003,0x0020) ran and TestEvent consumed it.
+  The game then reloads its whole program image from disc (LBA 24–372 →
+  0x10000–0xBE7FF) and re-enters it; `dispatch(0x80089788)` (the fresh image's
+  ctor thunk) resolved by range to the ALIAS candidate `func_80089770`, whose
+  generated body's continuation switch had `default: break` falling into
+  `switch(entry)` — it ran the ALIAS'S OWN block (the crt0 shim tail: reload
+  $ra, call main-init) instead of the requested PC. Result: a 21-cycle
+  main-init↔alias loop leaking 0x40 of guest SP per round, marching the stack
+  down 1.5 MB until the frames overwrote the thunk's own code and execution
+  died in its own stack garbage. Cold passed because interiors fell to the
+  interpreter. FIX (code_generator.cpp): alias-body continuation switch now
+  emits alias-entry cases + the PR#46 fail-closed default
+  (`cpu->pc=_cont; psx_native_bad_entry(); return`); alias entry-switch default
+  fail-closed; overlay-mode cpu->pc guard now emitted even with an EMPTY
+  continuation set (single-block re-entry hole, both emitters). Codegen hash
+  rolled 6326a16c→7b3e9e15. Validated: fresh-cache reshard run + 2 warm runs
+  boot past the transition to the attract demo at 60 fps (screenshots), all
+  six unit tests + guards PASS. New ALWAYS-ON production observability landed
+  en route: `sp_ring` (stack-domain transitions), `disp_ring` (dispatch tail),
+  `overlay_native_ring` recent[] un-gated, event_ring enabled in production,
+  `psx_fatal_halt` halt-and-serve keyed on listener-live (PSX_EXIT_HALT works
+  on production+PSX_DEBUG_SERVER=1 runs), `debug_server_get_status`
+  implemented (was declared-only). Tooling: launcher autocompile uses explicit
+  Windows Python312; autocompile.c wraps the child line as `cmd.exe /C "…"`
+  (leading-quote mangling made every reshard fail silently). Follow-ups:
+  dirty-interp reserved-instruction abort should raise the guest RI exception;
+  `overlay_loader_bad_entry_stats` still lacks a TCP surface; other titles
+  inherit the emitter fix on next fw bump (regen+reshard per title).
 - **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
   Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
   FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,
@@ -672,7 +713,7 @@ on a fixed region -> next.
   Regen era-consistent: BIOS + Tomba + MMX6 images (emitter changed). NEXT: Tomba
   save+load validation under BOTH backends (user drives); overlay-shard cg-tag refresh
   per title; grow the handler set (UnDeliverEvent, RCnt, A0 libc) with kernel-decompile
-  + Beetle checks per handler.
+  - Beetle checks per handler.
 - **2026-07-01 (Tomba pause-menu wedge RESOLVED — stale-recompiler shards, guard shipped):**
   The post-merge Tomba menu wedge (loaded saves only) was NOT the IRQ-resume class the
   prior handoff claimed. Added an always-on exception-EXIT half to irqctx_ring
@@ -699,7 +740,7 @@ on a fixed region -> next.
   lag likely the same stale-shard all-interp fallback + rehash churn).
 
 - **2026-06-27 (device-region MMIO read waits — DONE, branch wt/tomba2-mmio-waits off the
-  I-cache tip):** Replaced the placeholder `region = (phys<RAM_SIZE)?3:0` in psx_cyc_readmem
+  I-cache tip):** Replaced the placeholder `region = (phys<RAM_SIZE)?3:0` in psx*cyc_readmem
   (memory.c) with the full Beetle MemRW device-region read-wait table (libretro.cpp:859-1131),
   size-aware: main RAM (phys<0x800000) +3; SPU 0x1F801C00-1FFF +36 (32-bit) / +16 (8/16-bit);
   CDC 0x1F801800-180F +6×size; GPU/MDEC/SysControl/FrontIO/SIO/IRQ/DMA/Timers (within
@@ -707,7 +748,7 @@ on a fixed region -> next.
   Threaded the access size (1/2/4) from psx_cyc_load_word/half/byte + psx_cyc_lwc2_read into
   psx_cyc_readmem (the SPU/CDC waits are width-dependent). The device wait combines with the
   existing +2 completion (+1 LWC2) and fudge exactly as Beetle ReadMemory (LDAbsorb = region +
-  completion). RUNTIME-ONLY — psx_cyc_load_* signatures unchanged, so NO emitter regen; just
+  completion). RUNTIME-ONLY — psx_cyc_load*\* signatures unchanged, so NO emitter regen; just
   rebuild runtime/cyctest. New ruler #2 loops `mmio_timer` (Timer0 read → +3 = 1 dev + 2 compl)
   and `mmio_spu` (32-bit SPU read → +38 = 36 + 2). VALIDATED: cyctest COMPILED (4600) == Beetle
   (4382) EXACT on ALL 15 loops incl. mmio_timer +3 / mmio_spu +38; the 13 prior loops unchanged.
@@ -796,7 +837,7 @@ on a fixed region -> next.
 
 - **2026-06-27 (load ReadFudge/LDAbsorb — IMPLEMENTED + VALIDATED, both rulers exact):**
   Shipped the shared per-instruction R3000A load-delay interlock. New `runtime/include/
-  psx_cyc.h`: §1 base + GPR_DEPRES + DO_LDS (`psx_cyc_step`) as static-inline helpers over
+psx_cyc.h`: §1 base + GPR*DEPRES + DO_LDS (`psx_cyc_step`) as static-inline helpers over
   new CPUState fields `read_absorb[33]/read_absorb_which/read_fudge/ld_which_t/ld_absorb`;
   `psx_cyc_load_word/half/byte` + `psx_cyc_lwc2_read` in memory.c do the Beetle ReadMemory
   timing (clear give-back, +2 fudge iff predecessor committed no load, region RAM +3 +
@@ -804,7 +845,7 @@ on a fixed region -> next.
   `psx_cyc_dep_res_mask` (transcribed from Beetle per-opcode GPR_DEP/RES) lives in
   psx_instr_cost.h. Wired into the dirty interp + BOTH static emitters (code_generator game,
   full_function_emitter+strict_translator BIOS); loads now route value reads through the
-  UNCHARGED psx_read_* (cpu->read_* rewired in main.cpp; the flat +4 charge_main_ram_read is
+  UNCHARGED psx_read*_ (cpu->read\__ rewired in main.cpp; the flat +4 charge_main_ram_read is
   gone). **Δ-validated against Beetle:** ruler #2 `load2` +10 → **+11** == Beetle, every other
   component still exact (alu+1/load+5/div+38/mult+15/gte_rtps+15/gte_nclip+8); ruler #1
   [c5c→ca4] 54 → **56** == Beetle steady-state (84/77 spikes = I-cache cold refill, P2). Tomba2
@@ -879,7 +920,7 @@ on a fixed region -> next.
   the wrong guest-cycle phase vs the cycle-paced timers/VBLANK → BIOS pad-detect
   state machine diverged. Step B (faithful fix): the pad fast-path now arms the
   **guest-cycle-paced ack scheduler** (`sio_pending_ack`/`sio_ack_remaining =
-  BAUD+ACK = 1258 cyc`, driven by `sio_advance`←`psx_advance_cycles`), identical
+BAUD+ACK = 1258 cyc`, driven by `sio_advance`←`psx_advance_cycles`), identical
   to the already-faithful card path. RESULT: load=4 boots **past the wedge to the
   intro FMV** (screenshot-verified, frame 11k+ stable). Ruler #1 native 54 vs
   Beetle 56 = the known load-ReadFudge gap on the load=4 branch, NOT a regression
@@ -926,11 +967,11 @@ on a fixed region -> next.
   - **Load double-count fix** (earlier today): psx_instr_base_cycles reverted to
     pure execute base (loads=1); memory.c owns the data-access wait-state.
   - Commits 9cec60a, 2b5ad88, 47bcfec, a3e8f28 (+ cyc_watch dedupe). NOT pushed.
-  NEXT: (1) calibrate memory.c load wait-state (native +7 vs Beetle +5: flat +6 →
-  ~4 + a ReadFudge term). (2) Apply per-instruction mode + muldiv stall to the BIOS
-  emitter (full_function_emitter.cpp) + dirty interp → closes ruler #1's div-stall
-  gap (still 30 vs 56). (3) GTE per-command cycles (same stall mechanism, gte.cpp
-  table). (4) I-cache fetch. Each Δ-gated on the rulers, FMV-verified.
+    NEXT: (1) calibrate memory.c load wait-state (native +7 vs Beetle +5: flat +6 →
+    ~4 + a ReadFudge term). (2) Apply per-instruction mode + muldiv stall to the BIOS
+    emitter (full_function_emitter.cpp) + dirty interp → closes ruler #1's div-stall
+    gap (still 30 vs 56). (3) GTE per-command cycles (same stall mechanism, gte.cpp
+    table). (4) I-cache fetch. Each Δ-gated on the rulers, FMV-verified.
 
 - **2026-06-26 (RULER #1 BUILT + load double-count bug found & fixed):** Built the
   game-independent BIOS-kernel cycle ruler the §3c "TOOLING NEXT" called for, and
@@ -980,7 +1021,7 @@ on a fixed region -> next.
   guest-cycle exposure to the Beetle oracle (MAIN checkout, additive diagnostic):
   beetle-psx/libretro.cpp accumulates per-frame `timestamp` (CPU->Run slice) into
   `beetle_total_guest_cycles` (+ reset on init) with `extern "C"
-  beetle_core_get_guest_cycles()`; runtime/src/beetle_debug_server.c h_ping now
+beetle_core_get_guest_cycles()`; runtime/src/beetle_debug_server.c h_ping now
   reports `guest_cycles`. Rebuilt beetle static lib + psx-beetle. VALIDATED (Rule
   0): guest_cycles advances ~565,022 cyc/frame = real PSX rate (33.8688MHz/~59.94).
   Beetle needs the .CUE (not raw .bin). FIRST CROSS-CHECK: native psx_cycle_count
@@ -1011,7 +1052,7 @@ on a fixed region -> next.
   absolute guest-cycle count); (2) add a C accessor through beetle_libretro.cpp +
   a `guest_cycles` debug command; (3) rebuild Beetle static lib + psx-beetle
   (slow: `cd beetle-psx && make platform=mingw_x86_64 STATIC_LINKING=1
-  HAVE_LIGHTREC=0 -j8`); (4) comparator: native psx_cycle_count (already in
+HAVE_LIGHTREC=0 -j8`); (4) comparator: native psx_cycle_count (already in
   freeze_check) vs Beetle guest_cycles at same-PC convergence. THEN transcribe
   Stage-2 costs (mult/div, GTE table, mem wait-states) one at a time, each verified
   by this comparator. Native cycle side already exists; Beetle side is the gap.
@@ -1020,20 +1061,20 @@ on a fixed region -> next.
   - GAME + OVERLAY emitter (code_generator.cpp `translate_basic_block`): FIXED in
     P2 (block_exec_cycles +1 for outside delay-slot clone). Overlay/alias path
     shares translate_basic_block → covered.
-  - BIOS emitter (full_function_emitter.cpp): NO undercount — different model. It
+  - BIOS emitter (full*function_emitter.cpp): NO undercount — different model. It
     emits delay slots IN-LINE at their real address (charged by the owning block
     via block_cycles count to next leader) and defers the branch via
-    psx_taken_/psx_delay_ flags, rather than emitting an uncounted clone. So the
+    psx_taken*/psx*delay* flags, rather than emitting an uncounted clone. So the
     delay-slot-is-leader case charges correctly. No change needed.
   - INTERP (exec_one callers): charges psx_advance_cycles(1u) per instruction
-    (3 sites). 
-  => The cost MODEL is "1 cycle/instruction", duplicated in 3 places (interp hard
-  1u; game emitter instruction_count; BIOS emitter leader-to-leader count). They
-  agree (Stage-1 backend-equivalent) but are NOT a shared function and NOT HW-
-  accurate (Stage-2). recompiler CAN include runtime headers (already includes
-  ../../runtime/include/ws_backdrop_detect.h) → a shared psx_instr_base_cycles()
-  header is feasible for P3.
-  NEXT CORRECTNESS STEPS (deliberate, not tail-of-session):
+    (3 sites).
+    => The cost MODEL is "1 cycle/instruction", duplicated in 3 places (interp hard
+    1u; game emitter instruction_count; BIOS emitter leader-to-leader count). They
+    agree (Stage-1 backend-equivalent) but are NOT a shared function and NOT HW-
+    accurate (Stage-2). recompiler CAN include runtime headers (already includes
+    ../../runtime/include/ws_backdrop_detect.h) → a shared psx_instr_base_cycles()
+    header is feasible for P3.
+    NEXT CORRECTNESS STEPS (deliberate, not tail-of-session):
   1. MEASURE FIRST (don't guess HW costs): native exposes psx_cycle_count already;
      build the Beetle half — add additive guest-cycle exposure to the Beetle oracle
      (main checkout beetle_debug_server.c) + a native-vs-Beetle cycle/first-
@@ -1044,11 +1085,11 @@ on a fixed region -> next.
      proof → then Stage-2 real R3000A costs calibrated against the measure).
   3. P6: regress other titles (breaking is OK per Rule -1; just know), delete
      Tomba2 overlay_native_block.
-  COMMIT: f9d50d7 on wt/tomba2 (local, not pushed, not merged to master).
+     COMMIT: f9d50d7 on wt/tomba2 (local, not pushed, not merged to master).
 - **2026-06-26 (P2 DONE — Tomba 2 reaches the intro FMV):** Implemented the
   delay-slot cycle-ownership fix in code_generator.cpp (translate_basic_block):
   `block_exec_cycles = instruction_count + (exit branch sits AT end_addr with a
-  delay slot outside the block ? 1 : 0)` — charges the always-executed delay-slot
+delay slot outside the block ? 1 : 0)` — charges the always-executed delay-slot
   clone that was previously uncounted (the -8 undercount). Applied to BOTH the
   slice budget and the block cycle charge. Regen + build clean. RESULT: native
   progresses past the frame-1824 logo-delay loop; screen animates; i_stat shows

@@ -66,6 +66,20 @@ typedef struct CPUState {
     uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
 
+/* Overlay DLLs batch per-instruction cycle charges in a DLL-local accumulator.
+ * A guest store is an observation boundary: MMIO handlers must see the cycle
+ * count through the store instruction, and RAM/self-modification/capture hooks
+ * must run after those cycles have been published to the host.  Generated code
+ * calls this immediately before every store (and before SWL/SWR's raw read).
+ * Static recompiled code and the interpreter share host cycle state directly,
+ * so their barrier compiles to nothing. */
+#ifdef PSX_OVERLAY_DLL_BUILD
+void overlay_flush_cycles(void);
+static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
+#else
+static inline void psx_store_cycle_barrier(void) { }
+#endif
+
 /* Faithful exception-return (fix B) — defined in runtime/src/interrupts.c. The
  * interrupted-thread resume PC is the REAL guest PC, stored in COP0.EPC and (by the
  * BIOS handler) in the thread's TCB EPC slot — never a sentinel, never a single
@@ -174,6 +188,18 @@ extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
+/* Normalize raw save-state/imported backing arrays to the architectural form
+ * expected by generated direct-register fast paths.  This is not a guest
+ * register write: in particular, it preserves a computed FLAG bit 31. */
+extern void     gte_canonicalize_cpu_state(CPUState* cpu);
+/* Drop host-only projection/geometry provenance after a raw machine-state
+ * rewind or discarded speculative pass. Guest-visible GTE registers are not
+ * changed. */
+extern void     gte_precision_timeline_invalidate(void);
+/* Isolate a speculative native validation pass from host-only projection
+ * caches while preserving the preceding authoritative interpreter result. */
+extern void     gte_precision_speculative_begin(void);
+extern void     gte_precision_speculative_end(void);
 extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 
 /* ============================================================================

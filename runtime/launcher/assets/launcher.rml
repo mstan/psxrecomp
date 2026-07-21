@@ -504,8 +504,8 @@ body.netplay-skin #switch-offline:hover {
 				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
 					</span></div>
-				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
+				<div class="set-row"><span class="set-lbl">Fullscreen</span><span class="set-ctl">
+					<button class="toggle" data-event-click="cycle_fullscreen"><span class="value">{{fullscreen_label}}</span></button></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>

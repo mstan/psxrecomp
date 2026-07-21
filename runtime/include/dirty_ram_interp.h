@@ -162,9 +162,23 @@ typedef struct {
                           * is the evidence stream for interior-alias seeds. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
-/* Companion table: every PC the interpreter actually executes (not just block
- * entries). overlay_capture uses both to report execution-verified seeds. */
-extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+/* Every aligned main-RAM word is a possible instruction PC.  Execution
+ * coverage only needs presence, not a hit count, so record it in a direct
+ * bitmap instead of probing a large hash table for every retired instruction.
+ * This covers all 524,288 RAM words (the old 262K-entry hash could saturate)
+ * and is also the execution-verified seed source used by overlay_capture. */
+#define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
+#define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
+extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+/* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
+ * guard; they clear that page's capture bits rather than serializing from the
+ * universal store hot path. */
+#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 16u
+extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
+/* Presence-only companion for interpreted block/dispatch entries. The richer
+ * counter table remains for telemetry, while capture can snapshot/reset this
+ * compact evidence independently at overlay-generation boundaries. */
+extern uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
 /* Block-entry ring buffer. Records every dispatch into dirty RAM with the
  * caller's RA at entry, plus argument context — answers
@@ -180,10 +194,16 @@ extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
  * `ra` is cpu->gpr[31] at dispatch time. For normal JAL-style calls,
  * (ra - 8) gives the caller's PC. For J/JR/tail-calls it's only a
  * heuristic — treat ra as "ra_callsite_guess", not authoritative. */
-#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~128 MB).
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Keep ABI-visible one-element sentinels so crash/debug stubs still link, while
+ * Release does not reserve the diagnostic rings' ~227 MiB of address space. */
+#define DIRTY_RAM_BLOCK_LOG_CAP 1u
+#else
+#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~224 MiB at 56 B each).
  * At ~580K dispatches/s during boot, this retains ~7s of history; at
  * ~10K/s during modal idle, ~400s. Sized for retroactive press-window
  * analysis without the prior 16K ring's 28-ms eviction problem. */
+#endif
 typedef struct {
     uint64_t seq;       /* monotonic, unique per entry */
     uint32_t target;    /* entry PC (RAM address) */
@@ -201,7 +221,11 @@ typedef struct {
 extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
 extern uint64_t              g_dirty_ram_block_log_seq;
 
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DIRTY_RAM_FLOW_LOG_CAP 1u
+#else
 #define DIRTY_RAM_FLOW_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;
@@ -217,7 +241,11 @@ typedef struct {
 extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
 extern uint64_t             g_dirty_ram_flow_log_seq;
 
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DIRTY_RAM_INSN_LOG_CAP 1u
+#else
 #define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;

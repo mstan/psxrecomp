@@ -15,6 +15,7 @@ cc -std=c99 -Wall -Wextra -Werror -fPIC -shared \
   "$root/runtime/tests/overlay_posix_fixture.c" \
   -o "$cache/80010000_DEADBEEF.so"
 : > "$cache/00000000_00000000.so"
+: > "$cache/80010000_DEADBEEF_13579BDF.so"
 : > "$cache/80010000_DEADBEG0.so"
 : > "$base/$other/80020000_12345678.so"
 

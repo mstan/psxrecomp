@@ -237,6 +237,9 @@ int main(int argc, char* argv[]) {
     toml += "# debug_port = 4370\n";
     toml += "window_title = \"" + game_name + " Recompiled\"\n";
     toml += "bios_hle = false\n";
+    toml += "\n";
+    toml += "[video]\n";
+    toml += "renderer = \"opengl\"\n";
 
     // Write output
     if (!output_path.empty() && !force_stdout) {

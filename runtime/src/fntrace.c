@@ -63,7 +63,60 @@ static inline int armed_match(uint32_t target) {
     return 0;
 }
 
+/* ── Stack-domain transition ring (ALWAYS-ON, every build) ─────────────────
+ * Records every dispatch where the guest SP crossed a 64 KB domain since the
+ * previous dispatch. Ordinary call nesting never moves SP that far, so the
+ * ring stays quiet except at genuine stack switches: game green-thread /
+ * coroutine context restores, longjmps, kernel thread changes, and crt0
+ * stack (re)initialization. Those transitions are exactly the provenance
+ * question in stack-corruption deaths (Tomba 2 splash→title reload: the
+ * guest resumed on a stack pointing INTO freshly loaded module code, and
+ * nothing recorded who installed that SP). Cost: two loads + xor + branch
+ * per dispatch; entries only on domain edges. Dumped via `sp_ring`. */
+SpDomainEntry g_spdom_ring[SPDOM_RING_CAP];
+uint64_t      g_spdom_seq = 0;
+static uint32_t s_spdom_prev_sp = 0;
+
+/* Always-on dispatch tail ring: the last DISP_TAIL_CAP dispatches with
+ * target/ra/sp/cycle. Unlike the armed fntrace ring this is unconditional —
+ * sized tiny so the post-mortem question "what was the exact dispatch
+ * sequence in the final iterations" is always answerable (the Tomba 2
+ * splash reload loop was invisible without it). Dumped via `disp_ring`. */
+DispTailEntry g_disp_tail[DISP_TAIL_CAP];
+uint64_t      g_disp_tail_seq = 0;
+
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    {
+        extern uint64_t psx_get_cycle_count(void);
+        DispTailEntry *t = &g_disp_tail[g_disp_tail_seq % DISP_TAIL_CAP];
+        t->target = target;
+        t->ra     = cpu->gpr[31];
+        t->sp     = cpu->gpr[29];
+        t->cycle  = psx_get_cycle_count();
+        g_disp_tail_seq++;
+    }
+    {
+        uint32_t sp_now = cpu->gpr[29];
+        if (((sp_now ^ s_spdom_prev_sp) & 0xFFFF0000u) != 0u) {
+            if (s_spdom_prev_sp != 0u) {
+                extern uint64_t psx_get_cycle_count(void);
+                extern uint32_t psx_read_word(uint32_t addr);
+                SpDomainEntry *e = &g_spdom_ring[g_spdom_seq % SPDOM_RING_CAP];
+                uint32_t pcb = psx_read_word(0x108u);
+                e->seq     = g_spdom_seq;
+                e->cycle   = psx_get_cycle_count();
+                e->prev_sp = s_spdom_prev_sp;
+                e->new_sp  = sp_now;
+                e->target  = target;
+                e->ra      = cpu->gpr[31];
+                e->tcb     = pcb ? psx_read_word(pcb & 0x1FFFFFFFu) : 0u;
+                e->frame   = (uint32_t)s_frame_count;
+                g_spdom_seq++;
+            }
+            s_spdom_prev_sp = sp_now;
+        }
+    }
+
     /* On-the-fly string translation (framework feature — text_xlate.cpp). The
      * generated psx_dispatch_impl calls us at the top of each dispatch iteration
      * with cpu->gpr[4..7] holding THIS call's args, BEFORE the target function

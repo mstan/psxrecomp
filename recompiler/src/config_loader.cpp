@@ -234,6 +234,25 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
     }
+    if (runtime.contains("overlay_capture_history")) {
+        rt.overlay_capture_history =
+            toml::find<bool>(runtime, "overlay_capture_history");
+    }
+    if (runtime.contains("overlay_capture_persist_dir")) {
+        rt.overlay_capture_persist_dir =
+            toml::find<std::string>(runtime, "overlay_capture_persist_dir");
+        const std::filesystem::path persist(rt.overlay_capture_persist_dir);
+        if (persist.is_absolute()) {
+            throw std::runtime_error(
+                "runtime.overlay_capture_persist_dir must be project-relative");
+        }
+        for (const auto& component : persist) {
+            if (component == "..") {
+                throw std::runtime_error(
+                    "runtime.overlay_capture_persist_dir must stay inside the project");
+            }
+        }
+    }
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
     }
@@ -1038,6 +1057,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    std::vector<uint32_t> ws_cull_negsub_sites;
+    std::vector<uint32_t> ws_cull_vxrange_sites;
+    std::vector<uint32_t> ws_cull_depth_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
@@ -1060,6 +1082,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("a1_sites",    ws_cull_a1_sites);
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            load_sites("negsub_sites", ws_cull_negsub_sites);
+            load_sites("vxrange_sites", ws_cull_vxrange_sites);
+            load_sites("depth_sites", ws_cull_depth_sites);
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
                 if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
@@ -1212,6 +1237,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
+        /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
+        /*ws_cull_depth_sites*/   ws_cull_depth_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,
@@ -1357,7 +1385,16 @@ UserSettings load_user_settings(const fs::path& path) {
             s.bios_hle = toml::find<bool>(v, "bios_hle"); s.has_bios_hle = true;
         });
         if (v.contains("fullscreen")) try_get([&]{
-            s.fullscreen = toml::find<bool>(v, "fullscreen"); s.has_fullscreen = true;
+            // Tri-state (0 off / 1 borderless / 2 exclusive). Back-compat: a
+            // settings.toml written before the tri-state migration stores this
+            // as a bool (true meant borderless desktop fullscreen).
+            try {
+                s.fullscreen = toml::find<int>(v, "fullscreen");
+            } catch (const std::exception&) {
+                s.fullscreen = toml::find<bool>(v, "fullscreen") ? 1 : 0;
+            }
+            if (s.fullscreen < 0 || s.fullscreen > 2) s.fullscreen = 0;
+            s.has_fullscreen = true;
         });
         if (v.contains("low_latency_input")) try_get([&]{
             s.low_latency_input = toml::find<bool>(v, "low_latency_input");
@@ -1532,7 +1569,7 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_bios_hle)
         f << "bios_hle          = " << (s.bios_hle ? "true" : "false") << "\n";
     if (s.has_fullscreen)
-        f << "fullscreen        = " << (s.fullscreen ? "true" : "false") << "\n";
+        f << "fullscreen        = " << s.fullscreen << "\n";
     if (s.has_low_latency_input)
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
     if (s.has_vsync)
