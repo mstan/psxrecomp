@@ -26,8 +26,7 @@ legally-obtained **disc image**. This project ships none of those.
 | Dependency | How it's provided | Used for |
 |---|---|---|
 | **SDL2** | System. Windows/MSVC: prebuilt pack auto-found at `../sdl2-msvc/SDL2-*`. Windows/MinGW + macOS + Linux: found via pkg-config. | Window, input, GL/Vulkan context, audio, threads |
-| **RmlUi** | **git submodule** `lib/RmlUi` (static) | The launcher UI |
-| **FreeType** | **git submodule** `lib/freetype` (static) | RmlUi's font engine |
+| **recomp-ui** | **git submodule** `lib/recomp-ui` (Dear ImGui, static) | Pre-boot launcher UI |
 | **fmt** 9.1.0 | vendored `recompiler/lib/fmt` | String formatting (runtime uses it header-only) |
 | **toml11** | vendored `recompiler/lib/toml11` | Parsing `game.toml` / configs |
 | **ELFIO** | vendored `recompiler/lib/ELFIO` | ELF parsing (recompiler only) |
@@ -42,13 +41,16 @@ the bundled `tcc` matters only for end-user release packages.
 
 ### Get the source (with submodules)
 
-RmlUi and FreeType are submodules, so clone recursively (or init after the fact):
+`lib/recomp-ui` is a submodule — clone recursively (or init after the fact):
 
 ```sh
 git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
 # or, in an existing clone:
 git submodule update --init --recursive
 ```
+
+Pre-boot launcher: Dear ImGui via `lib/recomp-ui` when `PSX_LAUNCHER=ON`
+(default). Use `-DPSX_LAUNCHER=OFF` to boot straight in.
 
 ## Per-platform prerequisites
 
@@ -102,9 +104,14 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 |---|---|---|
 | `PSX_DEBUG_TOOLS` | ON for Debug/RelWithDebInfo, OFF for Release | TCP debug server + heartbeat + per-block recording |
 | `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL2 + libgcc/libstdc++) |
-| `PSX_LAUNCHER` | ON | Build the RmlUi launcher UI |
+| `PSX_LAUNCHER` | ON | Build the Dear ImGui (recomp-ui) launcher |
 | `PSX_ENABLE_VULKAN` | OFF | Build the experimental Vulkan renderer |
 | `PSX_BUILD_COSIM` | OFF | Build the first-divergence co-sim oracle target |
+
+**Profile-guided optimization (game repos):** MotK and other titles may expose
+`-DPSX_PGO=generate|use` in their own `CMakeLists.txt` for host-bound scenes
+(e.g. intro FMV). See **[PGO.md](PGO.md)** for concepts, MotK’s
+`scripts/pgo_motk_intro.sh`, and when to retrain.
 
 ## Build and run a game
 

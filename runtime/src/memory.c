@@ -40,6 +40,11 @@ static uint8_t bios_rom[BIOS_ROM_SIZE];
 uint8_t *g_psx_ram = ram;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
+/* Enhancement (opt-in): while FMV is up, force g_psx_load_delay=0 (same as
+ * PSX_LOAD_DELAY=0) and restore afterward. */
+int g_psx_fmv_ld_relax_en = 0;
+static int s_fmv_ld_relax_armed = 0;
+static int s_fmv_ld_relax_saved = 1;
 
 /* Physical address translation for guest accesses. The 2 MB main RAM is
  * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
@@ -383,10 +388,18 @@ int dirty_ram_text_native_ok(uint32_t phys) {
  * Each pair is {virtual/physical lo, byte len}; non-code gaps and mutable data
  * on the same page are intentionally absent. Unlike the legacy 256-byte probe,
  * a mismatch never poisons an unrelated 4 KB page forever: every decision is
- * made from the live bytes the native body will actually execute. */
+ * made from the live bytes the native body will actually execute.
+ *
+ * exec_pc is the dispatch/resume address. Ranges that end at or before that PC
+ * are skipped, and a range that straddles it is clipped to [exec_pc, end). A
+ * runtime patch of a function prologue (MotK 0x80075F20 LUI retarget) must not
+ * block compiled continuations that never fetch the patched bytes. */
 int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
-                                    uint32_t count) {
+                                    uint32_t count,
+                                    uint32_t exec_pc) {
     if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+    uint32_t at = exec_pc & 0x1FFFFFFFu;
+    int any = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
@@ -395,6 +408,12 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
             g_text_native_blocked++;
             return 0;
         }
+        if (phys + len <= at) continue;
+        if (phys < at) {
+            len -= (at - phys);
+            phys = at;
+        }
+        any = 1;
         if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
             uint32_t off = 0;
             const uint8_t *live = ram + phys;
@@ -406,19 +425,16 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
             g_text_exact_last_mismatch = phys + off;
             g_text_exact_last_live = off < len ? live[off] : 0;
             g_text_exact_last_ref = off < len ? ref[off] : 0;
-            uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
-            uint32_t last_page = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
-            for (uint32_t page = first_page; page <= last_page; page++) {
-                uint32_t bit = 1u << (page & 31u);
-                uint32_t *word = &text_diverged_bitmap[page >> 5];
-                if (!(*word & bit)) {
-                    *word |= bit;
-                    g_text_diverged_pages++;
-                }
-            }
+            /* Stats only — do not sticky-poison the page. Continuations on the
+             * same page may still match their clipped ranges, and the legacy
+             * 256-byte probe must re-evaluate live bytes independently. */
             g_text_native_blocked++;
             return 0;
         }
+    }
+    if (!any) {
+        g_text_native_blocked++;
+        return 0;
     }
     return 1;
 }
@@ -1725,6 +1741,27 @@ int psx_load_delay_enabled(void) {
     return g_psx_load_delay;
 }
 
+void psx_fmv_load_delay_relax_update(int want_relax) {
+    if (!g_psx_fmv_ld_relax_en) {
+        if (s_fmv_ld_relax_armed) {
+            g_psx_load_delay = s_fmv_ld_relax_saved;
+            s_fmv_ld_relax_armed = 0;
+        }
+        return;
+    }
+    (void)psx_load_delay_enabled();
+    if (want_relax) {
+        if (!s_fmv_ld_relax_armed) {
+            s_fmv_ld_relax_saved = g_psx_load_delay;
+            g_psx_load_delay = 0;
+            s_fmv_ld_relax_armed = 1;
+        }
+    } else if (s_fmv_ld_relax_armed) {
+        g_psx_load_delay = s_fmv_ld_relax_saved;
+        s_fmv_ld_relax_armed = 0;
+    }
+}
+
 /* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on
  * PSX_ENABLE_BLOCK_CYCLES so the Beetle-oracle build (cycles off) does a plain read. */
 static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t size,
@@ -1735,7 +1772,9 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
      * MMX6 cutscene ordering. Read once; default on. */
     static int s_ld = -1;
     if (s_ld < 0) { const char* e = getenv("PSX_LOAD_DELAY"); s_ld = (e && e[0] == '0') ? 0 : 1; }
-    if (!s_ld) { (void)addr; (void)size; (void)rt; (void)reg_mask; return; }
+    if (!s_ld || !g_psx_load_delay) {
+        (void)addr; (void)size; (void)rt; (void)reg_mask; return;
+    }
     {
         uint8_t w = cpu->read_absorb_which;
         if (cpu->read_absorb[w]) cpu->read_absorb[w]--;

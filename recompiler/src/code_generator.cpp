@@ -114,12 +114,16 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
 
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
                                                 const std::string& indent) const {
-    return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+    return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+           "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
 }
 
 std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
                                                      const std::string& indent) const {
-    return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+    return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+           "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {
@@ -2202,6 +2206,15 @@ GeneratedFunction CodeGenerator::generate_function(
 
     std::stringstream body_ss;
     body_ss << "{\n";
+    /* Emitter BB load-charge defer (before CPS switch so continuations inherit
+     * it). cleanup attr ends defer on any return. IRQ edges flush mid-function. */
+    body_ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n"
+            << "#if defined(__GNUC__) || defined(__clang__)\n"
+            << config_.indent
+            << "__attribute__((cleanup(psx_cyc_bb_defer_cleanup))) int _psx_cyc_bb_guard = 1;\n"
+            << "#endif\n"
+            << config_.indent << "psx_cyc_bb_defer_begin();\n"
+            << "#endif\n";
 
     // CPS entry-switch: when the unified flat trampoline dispatches a
     // continuation address (a callee published cpu->pc = $ra back to us), route

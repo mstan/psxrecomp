@@ -55,6 +55,9 @@ extern int g_ls_replay_active;
  * psx_advance_cycles before IRQ checks, MMIO, or any cycle read that must
  * match the published counter. Guest totals at those barriers are unchanged. */
 extern uint32_t g_psx_cyc_batch;
+/* Emitter BB-defer depth: when >0, psx_cyc_charge skips mid-BB deadline
+ * probes (compiled IRQ edges / psx_cyc_bb_defer_end publish). */
+extern int g_psx_cyc_bb_defer;
 
 /* Advance guest time. The common production path is inlined: bump the
  * counter and only service devices when the next event deadline is due.

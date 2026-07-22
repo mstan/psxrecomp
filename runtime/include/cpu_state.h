@@ -77,6 +77,9 @@ typedef struct CPUState {
 void overlay_flush_cycles(void);
 static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
 #else
+/* Main runtime: MMIO wrappers call psx_devices_mmio_sync (batch flush).
+ * RAM stores need no publish here — keep this a no-op so MotK VLC store
+ * traffic does not defeat load-charge batching. */
 static inline void psx_store_cycle_barrier(void) { }
 #endif
 

@@ -273,8 +273,8 @@ prerequisites in [`docs/BUILDING.md`](docs/BUILDING.md)):
 
 - A C/C++ toolchain: MSVC or MinGW/MSYS2 (Windows), Apple Clang (macOS),
   Clang/GCC (Linux). CMake 3.20+; on macOS/Linux also `ninja` and `pkg-config`.
-- SDL2 (system / bundled). RmlUi and FreeType come in as **git submodules** —
-  clone with `--recurse-submodules`.
+- SDL2 (system / bundled). The Dear ImGui launcher (`lib/recomp-ui`) is a
+  **git submodule** — clone with `--recurse-submodules`.
 - A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
 - For game projects, a legally obtained game disc/EXE dump. Not included.
 

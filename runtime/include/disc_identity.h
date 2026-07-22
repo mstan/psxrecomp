@@ -6,7 +6,7 @@
 // serial prefix, and optionally compares against an expected serial / CRC32.
 //
 // Used both by the runtime's launch-time disc check (runtime/src/main.cpp)
-// and by the integrated launcher's "Disc verified" badge (launcher.cpp), so
+// and by the integrated launcher's "Disc verified" badge (recomp-ui), so
 // the two never drift apart.
 
 #pragma once

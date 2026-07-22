@@ -91,6 +91,13 @@ void debug_server_get_status(int *listening, int *port, int *error);
  * Call once per vblank. */
 void debug_server_poll(void);
 
+/* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
+ * active. The TCP command pump stays live; expensive per-dispatch/per-frame
+ * recording backs off so debug builds can still play FMVs at speed.
+ * Opt out with PSX_DEBUG_FMV_QUIET=0. */
+void debug_server_set_fmv_quiet(int quiet);
+int  debug_server_fmv_quiet(void);
+
 /* TCP serve-stall telemetry: cumulative main-thread ms spent inside
  * bounded TCP sends, and clients dropped for exceeding the send budget.
  * Surfaced in the freeze heartbeat / wedge dumps so a TCP-throttled run

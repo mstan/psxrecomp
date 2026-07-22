@@ -1608,6 +1608,11 @@ static uint16_t vram_write_pixels[1024 * 512];
 /* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
  * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
 static uint32_t s_d24_upload_x1 = 0;
+/* Vblanks to hold after GP1(07h) height change in depth24: skip present so
+ * the previous swap stays on screen, pin rgb_limit to trailing-8, and block
+ * span collapse (MotK intro→crawl one-frame right-edge flash). */
+static uint32_t s_d24_cutover_hold = 0;
+enum { D24_CUTOVER_HOLD_VBLANKS = 3u };
 static void depth24_note_upload(uint32_t x, uint32_t w);
 
 static void gp0_commit_cpu_to_vram(void) {
@@ -1845,6 +1850,7 @@ static void gpu_reset_state(int clear_vram) {
     s_ws_fmv_frame_cache = 0xFFFFFFFFu;
     s_ws_fmv_cached = 0;
     s_d24_upload_x1 = 0;
+    s_d24_cutover_hold = 0;
 }
 
 void gpu_init(void) {
@@ -2010,6 +2016,8 @@ void gpu_vblank_tick(void) {
     gpustat_poll_count = 0;
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (vblank_callback) vblank_callback();
+    if (s_d24_cutover_hold > 0u)
+        s_d24_cutover_hold--;
 }
 
 const uint16_t* gpu_get_vram(void) {
@@ -2028,14 +2036,36 @@ static void depth24_note_upload(uint32_t x, uint32_t w) {
     if (!(display_depth & 1u) || w == 0u) return;
     uint32_t x1 = x + w;
     if (x1 > 1024u) x1 = 1024u;
-    if (x1 > s_d24_upload_x1) s_d24_upload_x1 = x1;
+    /* MotK stays in depth24 across intro movies. A later movie may blit a
+     * narrower framebuffer strip than the previous max — collapse only for
+     * framebuffer-class A0s so present blanking tracks the new payload.
+     * Skinny CLUT/overlay uploads must NOT collapse the span: that punched a
+     * flickering black hole on the right edge as coverage oscillated. */
+    const int fb_class = (w >= 256u);
+    /* During cutover hold, only expand — a narrower first crawl A0 must not
+     * collapse movie1's span into a wide black pillar for one present. */
+    if (fb_class && s_d24_cutover_hold == 0u &&
+        s_d24_upload_x1 > 0u && x1 + 8u < s_d24_upload_x1)
+        s_d24_upload_x1 = x1;
+    else if (x1 > s_d24_upload_x1) {
+        /* After a span clear, ignore skinny CLUT/overlay A0s — they must not
+         * become the sole coverage (that punched a black pillar until the
+         * next FB blit). */
+        if (s_d24_upload_x1 == 0u && !fb_class) return;
+        s_d24_upload_x1 = x1;
+    }
 }
 
 uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w) {
-    if (!(display_depth & 1u) || s_d24_upload_x1 == 0u || crtc_w == 0u)
+    if (!(display_depth & 1u) || crtc_w == 0u)
         return crtc_w;
+    /* Cutover / unknown coverage: pin to trailing-8 blank. Never return a
+     * deep collapse below that during hold (black-pillar flash). */
+    if (s_d24_cutover_hold > 0u || s_d24_upload_x1 == 0u)
+        return (crtc_w >= 24u) ? (crtc_w - 8u) : crtc_w;
     uint32_t dx = display_x & 1023u;
-    if (s_d24_upload_x1 <= dx) return crtc_w;
+    if (s_d24_upload_x1 <= dx)
+        return (crtc_w >= 24u) ? (crtc_w - 8u) : crtc_w;
     uint32_t hw = s_d24_upload_x1 - dx;
     uint32_t rgb = (hw * 2u) / 3u;
     if (rgb == 0u || rgb >= crtc_w) return crtc_w;
@@ -2044,6 +2074,10 @@ uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w) {
 
 void gpu_depth24_upload_span_reset(void) {
     s_d24_upload_x1 = 0;
+}
+
+int gpu_depth24_cutover_hold_active(void) {
+    return (display_depth & 1u) && s_d24_cutover_hold > 0u;
 }
 
 /* ---- Present-time screen-colour LUT (verified-enhancement, opt-in) -------
@@ -2110,6 +2144,22 @@ static void gpu_rgb555_to_rgb888(uint16_t c, uint8_t* r, uint8_t* g, uint8_t* b)
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b) {
     if (di->depth24) {
+        /* MotK FMV: CRTC is 512 RGB but MDEC A0 often fills only ~504. The
+         * trailing halfwords are stale 15-bit 0x8000 → scanout as alternating
+         * (0,128,0)/(128,0,128). Blank beyond the tracked upload span, and
+         * always blank the last 8 RGB cols in depth24: movie1 can leave a
+         * full-width span across the intro→crawl cut while height is still
+         * 240 and display_y has already flipped — short-band-only blanking
+         * missed that one present. (Do not pair with skinny-A0 span collapse.) */
+        uint32_t lim = gpu_depth24_rgb_limit(di->display_x, di->width);
+        if (di->width >= 24u) {
+            uint32_t trail_lim = di->width - 8u;
+            if (lim > trail_lim) lim = trail_lim;
+        }
+        if (x >= lim) {
+            *r = *g = *b = 0;
+            return;
+        }
         uint32_t byte_x = ((di->display_x & 1023u) * 2u) + x * 3u;
         uint32_t vy = (di->display_y + y) & 511u;
         /* No horizontal wrap for 24-bit DAC scanout: bytes past the 2048-byte
@@ -4145,8 +4195,20 @@ static void gp1_v_display_range(uint32_t val) {
     /* GP1(07h): Vertical display range
      * bits 0-9: Y1
      * bits 10-19: Y2 */
+    uint32_t prev_h = (v_display_y2 > v_display_y1) ? (v_display_y2 - v_display_y1) : 0u;
     v_display_y1 = val & 0x3FF;
     v_display_y2 = (val >> 10) & 0x3FF;
+    /* MotK never leaves depth24 between intros; the crawl retargets GP1(07h)
+     * to a short band while the prior movie's upload span still claims full
+     * CRTC width. Drop coverage and arm cutover hold: present skips a few
+     * vblanks (keep last swap), rgb_limit pins trailing-8, no span collapse. */
+    if ((display_depth & 1u)) {
+        uint32_t h = (v_display_y2 > v_display_y1) ? (v_display_y2 - v_display_y1) : 0u;
+        if (h != prev_h) {
+            s_d24_upload_x1 = 0;
+            s_d24_cutover_hold = D24_CUTOVER_HOLD_VBLANKS;
+        }
+    }
 }
 
 static void gp1_display_mode(uint32_t val) {
@@ -4161,7 +4223,23 @@ static void gp1_display_mode(uint32_t val) {
     hres1 = val & 3;
     vres = (val >> 2) & 1;
     video_mode = (val >> 3) & 1;
-    display_depth = (val >> 4) & 1;
+    {
+        uint32_t prev_depth = display_depth & 1u;
+        display_depth = (val >> 4) & 1;
+        /* New 24-bit movie: drop prior upload coverage so present does not
+         * treat the previous FMV's full-width span as valid (MotK 2nd-intro
+         * cut showed one frame of stale right-edge VRAM). */
+        if ((display_depth & 1u) && !prev_depth)
+            s_d24_upload_x1 = 0;
+        /* Enhancement: arm FMV load-delay relax as soon as depth24 toggles
+         * (don't wait for the next vblank present). */
+        {
+            extern int g_psx_fmv_ld_relax_en;
+            extern void psx_fmv_load_delay_relax_update(int want_relax);
+            if (g_psx_fmv_ld_relax_en)
+                psx_fmv_load_delay_relax_update((display_depth & 1u) ? 1 : 0);
+        }
+    }
     vertical_interlace = (val >> 5) & 1;
     hres2 = (val >> 6) & 1;
     reverse_flag = (val >> 7) & 1;

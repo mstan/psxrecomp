@@ -223,6 +223,86 @@ _wt-tomba2/psxrecomp/recompiler/build-t2 --target psxrecomp-game`. Regen:
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-22 (MotK FMV — fmv_load_delay_relax rejected as MotK default):**
+  Session arm (`g_psx_load_delay=0`) → ~450–500 FPS title but intro STR
+  never starts MDEC (user: video does not load). Same failure class as
+  `load_accel.vsync_query`. MotK `game.toml` keeps `fmv_load_delay_relax =
+  false`; faithful ~45–55 intro FPS accepted. Framework knob remains for
+  A/B via `PSX_FMV_LOAD_DELAY_RELAX=1`.
+
+- **2026-07-22 (MotK 2nd intro — cutover present hold):**
+  Residual right-edge flicker after always last-8. GP1(07h) height change
+  arms a 3-vblank hold: skip Swap (keep prior frame), pin `rgb_limit` to
+  trailing-8, disable span collapse while hold is active. Covers wrong-band
+  present + narrow-first-A0 black pillar at intro→crawl.
+
+- **2026-07-21 (MotK 2nd intro — always depth24 last-8 blank):**
+  Residual one-frame right-edge artifact after span-0 fix. Cutover can
+  present with movie1's full upload span while height is still 240 and
+  `display_y` already on the crawl band — short-band-only last-8 missed
+  that frame. Fix: blank last 8 RGB cols for every depth24 present/scanout
+  (not only `h<240` / x1==0). Also: after span clear, only FB-class A0s
+  (`w>=256`) may re-establish coverage (skinny A0s ignored from zero).
+
+- **2026-07-21 (MotK 2nd intro — one-frame cut flash; span-0 ≠ full width):**
+  User: single right-edge flicker at intro→crawl cut (then clean). GP1(07h)
+  height change clears `s_d24_upload_x1`; `gpu_depth24_rgb_limit` treated
+  x1==0 as full CRTC → one present of stale `0x8000` before movie2 A0s.
+  Fix: unknown coverage blanks trailing 8 RGB cols (same margin as short
+  bands) until the next FB-class A0 re-establishes span.
+
+- **2026-07-21 (MotK 2nd intro — restore short-band last-8 + V-range reset):**
+  User screenshot of crawl ("A long time ago…"): right edge green/magenta
+  `0x8000` stripes; 1st intro clean. Movie1 maxes upload span; movie2's
+  FB A0 still writes those halfwords as junk so span blank alone fails.
+  Restore short-band (`h<240`) last-8 RGB blank; keep skinny-A0 collapse
+  disabled (`w >= 256` only); reset `s_d24_upload_x1` when GP1(07h) height
+  changes while depth24 (MotK never leaves 24-bit between intros).
+
+- **2026-07-21 (MotK FMV — right-edge black box from trailing blank):**
+  User: flickering black box on right during video after prior margin
+  fix. Cause: upload span collapsed on skinny overlay A0s → lim oscillated
+  (paired with last-8 blank). Fix: collapse span only for framebuffer-class
+  A0s (`w >= 256`). Short-band last-8 restored above for crawl junk.
+
+- **2026-07-21 (MotK FMV — emitter BB-defer + soft charge batch; no FPS gain):**
+  Shipped: `PSX_CYC_BATCH_SOFT=64` (skip deadline probe until batch ≥64),
+  and emitter BB-defer (`g_psx_cyc_bb_defer` + cleanup guard at every
+  compiled function entry; flush before `psx_check_interrupts_at`). MotK
+  regen'd + Release rebuild. Windowed PERF_DIAG heavy intro: guest ≈900
+  ms/s, pacer ≈5, host ≈44 fps — same floor as pre-batch (~42–48). Mid-BB
+  charge publish / deadline compare was not the limiter; residual is
+  load-delay / VLC instruction volume itself (or accept ~45 host floor /
+  retrain PGO after hot-path shape change).
+
+- **2026-07-21 (MotK FMV — patched delay loop native handoff):**
+  Hot dirty PCs `0x80075F3C`/`0x80075F40` were the MotK software delay
+  inside `func_80075F20`. Live LUI at `0x80075F20` is patched
+  `0x8007→0x8010`; exact-range guard compared the whole 0x30-byte function
+  for every continuation, so the delay loop stayed in dirty interp
+  (`native_handoffs=0`, ~198k exact mismatches). Fix: clip
+  `dirty_ram_text_native_ok_ranges` at `exec_pc`; stop page sticky-poison
+  on range mismatch; dirty interp re-enters compiled at call-return /
+  local-flow boundaries when `clean_game_text_miss` and ranges match.
+  MotK `generated/SLUS_005.62_dispatch.c` call sites updated (emitter too).
+  Measured (Release+PGO, windowed intro): `native_handoffs≈15.8k` (was 0),
+  `text_exact_mismatches≈3.9k` (was ~198k), top dirty no longer `0x80075F3C`
+  (now BIOS wait/poll PCs). FMV-band host FPS still ~45 med — delay-loop
+  interp was real waste but not the FPS floor; residual remains VLC
+  `0x8006A9F8`/`0x8006CBE4` load-delay volume / emitter charge batching.
+
+- **2026-07-21 (MotK FMV host — PERF_DIAG; load memcpy no gain):**
+  Windowed Release+PGO+native intro: guest work ≈920 ms/s during FMV,
+  pacer ≈0–6, GL upload 0 (depth24). Bottleneck is guest quantum under
+  load-delay VLC, not present. Shipped: host-LE `memcpy` in
+  `psx_cyc_load_{word,half}` (match `memory.c`), `PSX_NO_DEBUG_TOOLS`
+  strips MDEC `trace_event`, ported `debug_server_set_fmv_quiet` for
+  debug builds. A/B med FMV band ~48.5 → ~47.5 (noise). Next: PGO
+  retrain, then emitter-level load-charge batching for VLC leaves.
+
+- **2026-07-21 (docs: PGO guide):** Added `docs/PGO.md` (generate/use, MotK
+  `scripts/pgo_motk_intro.sh`, retrain rules). Linked from `docs/BUILDING.md`
+  and MotK `docs/PGO.md` / README.
 - **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
   Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
   accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
@@ -416,6 +496,19 @@ _wt-tomba2/psxrecomp/recompiler/build-t2 --target psxrecomp-game`. Regen:
   on leave scissor-clear the skipped FB union (GL) — never blind-restage
   RGB888-as-1555. Char-select shrink-to-left-center still under probe
   (OFX=256 @ 512 CRTC looks correct; may be authored layout / separate).
+
+- **2026-07-21 (MotK 2nd intro right-edge — scanout blank, not rising-edge):**
+  Capture (port 4520): MotK never leaves depth24 across intros; display_y
+  triple-buffers 0/128/256. Rising-edge force never armed. Cutover frame
+  shows MotK logo + trailing cols solid `(0,128,0)/(128,0,128)` = stale
+  15-bit `0x8000` halfwords as RGB888. Movie1 can max the upload span so
+  `rgb_limit` stays full for movie2. Fix: collapse span on narrower A0;
+  blank beyond limit in `gpu_display_pixel_rgb`; short bands (`h<240`)
+  always blank last 8 RGB cols. Present still full CRTC width.
+
+- **2026-07-21 (MotK 2nd intro one-frame right-edge flash):**
+  User: single flash at the 2nd-intro cut (just after new video starts).
+  First attempt (rising-edge force-fill) failed — MotK stays in depth24.
 
 - **2026-07-20 (MotK 2nd intro right-edge stretch):**
   `depth24_fix_trailing_margin` replicated the last good column when any

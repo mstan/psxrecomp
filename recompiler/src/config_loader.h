@@ -166,6 +166,13 @@ struct RuntimeConfig {
     // load wall-time. Streaming titles (e.g. Crash) must leave this off.
     bool                  turbo_loads = false;
 
+    // fmv_load_delay_relax: ENHANCEMENT opt-in. Forces g_psx_load_delay=0 for
+    // the offline session (same host win as PSX_LOAD_DELAY=0). Depth24/MDEC
+    // gating missed MotK VLC; session scope is intentional until a tighter
+    // arm is proven. Guest timing diverges from Beetle; off under netplay.
+    // Env PSX_FMV_LOAD_DELAY_RELAX=0/1 overrides.
+    bool                  fmv_load_delay_relax = false;
+
     // turbo_audio_sink: while turbo_loads is actively running unpaced, keep
     // rendering the exact guest-time SPU sample budget (so voice/CD state
     // advances) but discard those samples before the host playback queue.

@@ -9,7 +9,7 @@ body {
 	font-size: 15dp;
 }
 #root { width: 100%; height: 100%; display: block; overflow-y: auto; }
-#frame { display: block; padding: 22dp 26dp; }
+#frame { display: block; width: 100%; box-sizing: border-box; padding: 22dp 26dp; }
 
 /* ---- top bar ---- */
 .topbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 18dp; }
@@ -246,11 +246,18 @@ button:hover { background-color: #232d3c; }
 .modal-confirm:hover { background-color: #3b82f6; }
 
 /* ---- mode select (home) ---- */
-.home-wrap { display: block; padding: 48dp 40dp 20dp 40dp; }
+/* Stretch to the frame content width so the right gutter matches the left
+ * (home-wrap was shrink-wrapping to button text, leaving a wide empty right). */
+.home-view { display: block; width: 100%; box-sizing: border-box; }
+.home-wrap {
+	display: block; width: 100%; box-sizing: border-box;
+	padding: 48dp 40dp 20dp 40dp;
+}
 .home-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff; margin-bottom: 8dp; }
 .home-sub { display: block; color: #7d8590; font-size: 15dp; margin-bottom: 28dp; }
 .home-btn {
-	display: block; width: 100%; margin-bottom: 14dp; padding: 22dp 24dp;
+	display: block; width: 100%; box-sizing: border-box;
+	margin-bottom: 14dp; padding: 22dp 24dp;
 	background-color: #11161f; border: 1dp #1e2733; border-radius: 12dp;
 	color: #e6e9ef; font-size: 20dp; font-weight: bold; text-align: left;
 }
@@ -335,7 +342,7 @@ body.netplay-skin #switch-offline:hover {
 	</div>
 
 	<!-- ================= HOME (mode select) ================= -->
-	<div data-if="view == 'home'">
+	<div class="home-view" data-if="view == 'home'">
 		<div class="home-wrap">
 			<span class="home-title">{{game_name}} Recomp</span>
 			<span class="home-sub">Choose how you want to play</span>

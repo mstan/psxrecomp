@@ -256,6 +256,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
     }
+    if (runtime.contains("fmv_load_delay_relax")) {
+        rt.fmv_load_delay_relax = toml::find<bool>(runtime, "fmv_load_delay_relax");
+    }
     if (runtime.contains("turbo_audio_sink")) {
         rt.turbo_audio_sink = toml::find<bool>(runtime, "turbo_audio_sink");
     }

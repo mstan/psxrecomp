@@ -2153,6 +2153,8 @@ static void depth24_upload_policy(void) {
     if (d24 && !s_depth24_skip_up) {
         s_up_nrects = 0;
         rect_clear(&s_d24_skip_fb);
+        /* Rising edge into depth24: forget previous movie's upload span. */
+        gpu_depth24_upload_span_reset();
     } else if (!d24 && s_depth24_skip_up) {
         s_up_nrects = 0;
         depth24_clear_skipped_fb();

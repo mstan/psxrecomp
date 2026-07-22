@@ -123,6 +123,22 @@ static size_t s_resp_len = 0, s_resp_cap = 0;
 static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
+static volatile int s_fmv_quiet = 0;
+
+void debug_server_set_fmv_quiet(int quiet)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PSX_DEBUG_FMV_QUIET");
+        enabled = (!env || env[0] != '0') ? 1 : 0;
+    }
+    s_fmv_quiet = (enabled && quiet) ? 1 : 0;
+}
+
+int debug_server_fmv_quiet(void)
+{
+    return s_fmv_quiet ? 1 : 0;
+}
 
 /* ---- Frame counter (set by record_frame caller) ---- */
 /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
@@ -2030,6 +2046,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
+    if (s_fmv_quiet) return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
@@ -2236,6 +2253,7 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     (void)block_leader_phys;
     return;
 #else
+    if (s_fmv_quiet) return;
     cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
      * on the armed frame window; ~free (one branch) when disarmed. */
@@ -2249,6 +2267,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
+    if (s_fmv_quiet) return;
     ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
      * (normalized) block leader. Sampled before the block runs. */
@@ -4647,10 +4666,13 @@ static void handle_gpu_state(int id, const char *json)
     gpu_get_gp0_stats(&nop, &fill, &draw, &env, &copy);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
+    uint32_t d24_lim = di.depth24
+        ? gpu_depth24_rgb_limit(di.display_x, di.width) : di.width;
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
              "\"depth\":%d,\"depth24\":%d,"
+             "\"depth24_rgb_limit\":%u,"
              "\"disabled\":%d,"
              "\"h_display\":[%u,%u],\"v_display\":[%u,%u],"
              "\"hres1\":%u,\"hres2\":%u,"
@@ -4668,6 +4690,7 @@ static void handle_gpu_state(int id, const char *json)
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
+             (unsigned)d24_lim,
              di.disabled,
              hx1, hx2, hy1, hy2, hr1, hr2,
              gpustat,
@@ -12971,6 +12994,11 @@ void debug_server_poll(void)
 
 void debug_server_record_frame(void)
 {
+    if (s_fmv_quiet) {
+        s_history_count = s_frame_count + 1;
+        s_frame_count++;
+        return;
+    }
     if (!s_frame_history) return;
     if (!s_cpu) return;
 

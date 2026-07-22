@@ -2580,6 +2580,19 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
+#ifdef PSX_HAS_GAME_DISPATCH
+                /* Same boundary as overlay handoff: a patched prologue can force
+                 * the function entry into dirty interp, but a later continuation
+                 * whose remaining static ranges still match must return to
+                 * compiled code (MotK 0x80075F20 → delay loop at 0x80075F30). */
+                if (clean_game_text_miss && interp_enter_compiled(cpu, target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+#endif
                 /* Capture freeze gates ONLY the ring write — never flow. */
 #ifndef PSX_NO_DEBUG_TOOLS
                 if (!g_insn_log_frozen) {
@@ -2613,6 +2626,21 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+#ifdef PSX_HAS_GAME_DISPATCH
+        /* Call-return path (jal/jalr → finish_call_return) advances with
+         * transferred==0. Re-check compiled validity at the resume PC so a
+         * patched entry that nested a callee can hand the delay-slot tail /
+         * epilogue back to native without interpreting it. Gated on
+         * clean_game_text_miss so ordinary overlay dirty runs do not pay a
+         * per-instruction game-dispatch probe. */
+        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+            g_dirty_ram_native_handoffs++;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
+            OV_FPLOG_RET1();
+        }
+#endif
         /* Straight-line flow reaching the dispatch return contract — exit
          * so the loop returns into the suspended native caller (same
          * hazard as a transfer to stop_addr). */

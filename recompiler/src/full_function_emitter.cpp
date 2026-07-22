@@ -133,12 +133,18 @@ bool FullFunctionEmitter::emit_function(
         return e == nullptr || e[0] != '0';
     }();
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
-        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
-                                    bios_runtime_pc(resume_pc));
+        /* Flush emitter BB-deferred load charges before the IRQ edge so
+         * devices/I_STAT observe the same guest time as a per-insn publish. */
+        return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+               "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
+                           bios_runtime_pc(resume_pc));
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
-        return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+        return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+               "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -1149,6 +1155,12 @@ bool FullFunctionEmitter::emit_function(
 
     // Emit function header.
     out += fmt::format("void func_{:08X}(CPUState* cpu) {{\n", norm);
+    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n"
+           "#if defined(__GNUC__) || defined(__clang__)\n"
+           "    __attribute__((cleanup(psx_cyc_bb_defer_cleanup))) int _psx_cyc_bb_guard = 1;\n"
+           "#endif\n"
+           "    psx_cyc_bb_defer_begin();\n"
+           "#endif\n";
     // Direct-call entry hook: captures into fn_entry ring (gated by
     // fn_filter at runtime).  Lets us see direct-jal call paths that
     // never go through psx_dispatch.

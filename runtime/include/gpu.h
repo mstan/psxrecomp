@@ -44,6 +44,9 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
  * trailing margin without shrinking the CRTC-derived width globally. */
 uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w);
 void     gpu_depth24_upload_span_reset(void);
+/* Non-zero for a few vblanks after depth24 GP1(07h) height change — present
+ * should skip Swap so the previous frame stays on screen (MotK intro cut). */
+int      gpu_depth24_cutover_hold_active(void);
 /* GP1(06h)/GP1(07h)/GP1(08h) fields for debug (gpu_state). */
 void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
                         uint32_t *hres1_out, uint32_t *hres2_out);

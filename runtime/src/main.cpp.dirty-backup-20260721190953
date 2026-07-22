@@ -59,10 +59,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(PSX_LAUNCHER)
-#include "launcher.h"
-#endif
-#if defined(RECOMP_LAUNCHER)
-#include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher (prototype) */
+#include "launcher.h"          /* Result / NetplayLaunch */
+#include "recomp_launcher.h"   /* Dear ImGui launcher (lib/recomp-ui) */
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
 #endif
 #include <SDL.h>
@@ -611,9 +609,6 @@ int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
 extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
-/* Enhancement: FMV-scoped load-delay relax (memory.c). */
-extern int g_psx_fmv_ld_relax_en;
-extern "C" void psx_fmv_load_delay_relax_update(int want_relax);
 int      g_turbo_audio_sink_enabled = 0;
 int      g_turbo_audio_sink_active = 0;
 uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued */
@@ -2977,20 +2972,36 @@ static void load_transition_note(int read_active, int load_active,
     prev_turbo = turbo_active;
 }
 
-/* Depth24 FMV trailing margin: match scanout policy (upload-span limit +
- * always last-8 RGB cols). Present keeps full CRTC width — never crop the
- * GL/SDL rect (that caused a flickering pillar). */
+/* Depth24 FMV: last ~8 RGB columns can be stale/chroma junk while CRTC width
+ * stays full (e.g. MotK 512). Present width is never shrunk — cropping the
+ * GL/SDL rect left a flickering black pillar when upload coverage varied.
+ *
+ * Do NOT replicate the last good column: on MotK's starfield intro that turns
+ * a single tinted edge pixel into an 8-wide horizontal streak (flickering
+ * stretch into the pillar). Black-fill the margin instead. Require a dense
+ * chroma signal so sparse stars never trip the repair. */
 static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h) {
     if (!buf || w < 24u || h == 0u) return;
-    GpuDisplayInfo di;
-    gpu_get_display_info(&di);
-    if (!di.depth24) return;
-    uint32_t lim = gpu_depth24_rgb_limit(di.display_x, w);
-    uint32_t trail_lim = w - 8u;
-    if (lim > trail_lim) lim = trail_lim;
-    if (lim >= w) return;
+    const uint32_t margin = 8u;
+    const uint32_t edge = w - margin;
+    const uint32_t total = margin * h;
+    uint32_t junk_px = 0;
+    for (uint32_t x = edge; x < w; x++) {
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t p = buf[y * w + x];
+            int r = (int)((p >> 16) & 255u);
+            int g = (int)((p >> 8) & 255u);
+            int b = (int)(p & 255u);
+            int m = (r + g + b) / 3;
+            int ch = (r > m ? r - m : m - r) + (g > m ? g - m : m - g) +
+                     (b > m ? b - m : m - b);
+            if (ch > 40) junk_px++;
+        }
+    }
+    /* ~12% of margin texels — sparse stars stay; dense chroma fringe cleans. */
+    if (total == 0u || junk_px * 100u < total * 12u) return;
     for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = lim; x < w; x++)
+        for (uint32_t x = edge; x < w; x++)
             buf[y * w + x] = 0xFF000000u;
     }
 }
@@ -2998,8 +3009,6 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h) {
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
-    /* Quiet high-frequency rings while MDEC video is active (MotK FMV). */
-    debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();
     debug_server_poll();
@@ -3019,12 +3028,6 @@ static void sdl_vblank_present(void) {
     runtime_perf_frame_begin();
     RuntimePerfFrameScope runtime_perf_frame_scope;
     runtime_perf_diag_tick();
-
-    /* Enhancement: keep FMV load-delay relax armed for the session when
-     * enabled (force g_psx_load_delay=0). Scoping to depth24-only missed MotK
-     * VLC that runs before the display mode sample. Off under netplay. */
-    psx_fmv_load_delay_relax_update(
-        (g_psx_fmv_ld_relax_en && !psx_netplay_active()) ? 1 : 0);
 
     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
      * than presents so turbo and skipped-frame modes still report game speed.
@@ -3419,12 +3422,6 @@ static void sdl_vblank_present(void) {
         }
     }
 
-    /* Depth24 GP1(07h) height cutover (MotK intro→crawl): skip Swap for a few
-     * vblanks so the previous frame stays on screen — avoids one present of
-     * the wrong band / collapsed span on the right edge. Pace already ran. */
-    if (gpu_depth24_cutover_hold_active())
-        return;
-
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
@@ -3734,13 +3731,10 @@ static void sdl_vblank_present(void) {
 #endif
 }
 
-#if defined(RECOMP_LAUNCHER)
-// Host verification/inspection callbacks for the shared recomp-ui launcher.
-// The launcher re-runs these on every disc/memory-card change so the "Disc
-// verified" verdict + memcard block grids reflect the REAL images (parity with
-// the old RmlUi launcher, which computed the same facts inline). The expected
-// serial/CRC are passed via these file-scope statics (set just before
-// recomp_launcher_run_window) because the C-ABI callback can't capture locals.
+#if defined(PSX_LAUNCHER)
+// Host verification/inspection callbacks for recomp-ui. Re-run on every
+// disc/memory-card change. Expected serial/CRC via file-scope statics (C ABI
+// can't capture locals).
 namespace {
     std::string g_lnch_expected_serial;
     uint32_t    g_lnch_expected_crc  = 0;
@@ -3756,7 +3750,6 @@ namespace {
         std::snprintf(out->serial, sizeof(out->serial), "%s", serial.c_str());
         std::snprintf(out->region, sizeof(out->region), "%s", id.region.c_str());
         out->iso_ok = id.has_header ? 1 : 0;
-        // Verdict, mirroring the RmlUi launcher's state machine.
         if (!id.opened || !id.has_header)                            out->verdict = 3; // bad
         else if (id.expected_serial_given && !id.serial_matches)     out->verdict = 3; // wrong disc
         else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) out->verdict = 2; // warn
@@ -4011,24 +4004,6 @@ int main(int argc, char** argv) {
                 g_turbo_audio_sink_enabled = 1;
                 std::fprintf(stdout,
                     "psxrecomp: turbo_audio_sink enabled (opt-in)\n");
-            }
-            {
-                const char *fmv_ld = std::getenv("PSX_FMV_LOAD_DELAY_RELAX");
-                if (fmv_ld && fmv_ld[0])
-                    g_psx_fmv_ld_relax_en = (fmv_ld[0] != '0') ? 1 : 0;
-                else
-                    g_psx_fmv_ld_relax_en = gc.runtime.fmv_load_delay_relax ? 1 : 0;
-                if (g_psx_fmv_ld_relax_en) {
-                    std::fprintf(stdout,
-                        "psxrecomp: fmv_load_delay_relax enabled (enhancement; "
-                        "session-scoped, off under netplay)%s\n",
-                        (fmv_ld && fmv_ld[0]) ? " (environment override)" : "");
-                    /* Arm immediately for the whole offline session. Gating on
-                     * depth24/MDEC at vblank missed MotK's VLC hot path (still
-                     * ~40 FPS); session arm matches PSX_LOAD_DELAY=0 (~450+). */
-                    if (!psx_netplay_active())
-                        psx_fmv_load_delay_relax_update(1);
-                }
             }
             {
                 extern int g_idle_skip_enabled;
@@ -4619,16 +4594,7 @@ int main(int argc, char** argv) {
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
-#if defined(RECOMP_LAUNCHER)
-            /* ---- recomp-ui (Dear ImGui) launcher path — PROTOTYPE ----------
-             * Runs the shared, console-agnostic recomp-ui launcher (see
-             * F:\Projects\recomp-ui) INSTEAD OF the RmlUi launcher above. Unlike
-             * psx_launcher::run, recomp_launcher_run_window() creates + owns its
-             * own SDL2/GL window internally, so there is no lwin/lctx to manage
-             * here and no GL-attribute pre-configuration needed. The result is
-             * funneled into the same `seed` / `lr` locals the shared
-             * post-launcher block below (Quit / Launch handling + settings.toml
-             * persistence) already consumes, so that code needs no changes. */
+            /* Dear ImGui launcher (lib/recomp-ui). Owns its own SDL2/GL window. */
             std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
             std::string rui_initial_disc = resolved_disc.string();
             std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
@@ -4661,8 +4627,6 @@ int main(int argc, char** argv) {
             ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
                                  (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
 
-            /* ---- deeper PSX-style settings (capability-gated via launcher_profile
-             * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
             ls.window_width      = seed.window_width;
             ls.renderer           = seed.renderer;
             ls.supersampling      = seed.supersampling;
@@ -4674,10 +4638,6 @@ int main(int argc, char** argv) {
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
-            /* Localization: index of resolved_language within lang_menu_options
-             * (match by code; games with no [runtime].languages list leave
-             * lang_menu_options empty and this stays 0 / unused), mirroring
-             * lang_index_for() in launcher.cpp (RmlUi path, below). */
             ls.language_index = 0;
             for (size_t li = 0; li < lang_menu_options.size(); li++) {
                 if (lang_menu_options[li].code == resolved_language) {
@@ -4690,10 +4650,6 @@ int main(int argc, char** argv) {
                 std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", bios_str.c_str());
             }
 
-            /* Memory-card slots: point each slot at the REAL card the runtime
-             * will use — an explicit settings.toml path if set, else the default
-             * <memcard_dir>/cardN.mcd the runtime derives — so the launcher's
-             * block grids reflect the actual on-disk saves (memcard_inspect). */
             {
                 std::string mc1 = seed.has_memcard1_path ? seed.memcard1_path.string()
                                                          : (memcard_dir / "card1.mcd").string();
@@ -4705,61 +4661,33 @@ int main(int argc, char** argv) {
             ls.memcard_enabled[0] = seed.memcard1_enabled ? 1 : 0;
             ls.memcard_enabled[1] = seed.memcard2_enabled ? 1 : 0;
 
-            /* Region badge: game.toml [game] region wins verbatim; otherwise derive
-             * from the game_id serial prefix (SCUS/SLUS/LSP -> USA, SCES/SLES ->
-             * Europe, SCPS/SLPS/SLPM -> Japan). Empty/unknown -> no badge (gi.region
-             * left null; the launcher model treats that as "" and hides the row). */
             const std::string rui_region =
                 !game_region.empty() ? game_region : region_label_from_serial(game_id);
 
-            /* Localization: parallels the RmlUi ginfo.languages push_back loop
-             * below (#else arm) — one C-string array pointing at lang_menu_options'
-             * own storage (that vector outlives this call, it's a main()-scope
-             * local), so no separate copy is needed. Empty when the game declares
-             * no [runtime].languages -> Localization stays hidden (num_languages=0). */
             std::vector<const char*> rui_lang_labels;
             rui_lang_labels.reserve(lang_menu_options.size());
             for (const auto& lo : lang_menu_options) rui_lang_labels.push_back(lo.label.c_str());
 
             RecompLauncherCGameInfo gi{};
-            /* System identity + full PS1 settings-surface capability set (theme,
-             * platform label, rom_noun, pad-mode support, aspect mask base, and
-             * all has_* deep-settings flags) — one profile call keeps them from
-             * drifting apart across PSX titles. Per-game specifics below override
-             * only what the profile can't know. */
             launcher_profile_apply("psx", &gi);
             gi.name                 = game_name.empty() ? nullptr : game_name.c_str();
             gi.region               = rui_region.empty() ? nullptr : rui_region.c_str();
-            gi.has_expected_crc     = 0;      /* the launcher's simple file-CRC doesn't fit
-                                                  PSX multi-track discs — skip verification */
+            gi.has_expected_crc     = 0;      /* multi-track discs — skip file-CRC gate */
             gi.num_known_sha256     = 0;
             gi.widescreen_supported = ws_offered ? 1 : 0;
             gi.num_players          = game_players;
             gi.msu1_supported       = 0;
-            gi.sram_path            = nullptr;   /* PSX uses memory cards, not SRAM -> hide SAVES */
-            /* Pad-mode + aspect capabilities, sourced the same way the RmlUi
-             * launcher path (psx_launcher::GameInfo, below in the #else arm)
-             * sources ginfo.allow_hybrid/lock_mode/locked_mode/lock_device/
-             * ws_offered/ws_ultrawide_offered — from game.toml [controller]/
-             * [widescreen] via GameConfig. PSX always has pad modes. */
+            gi.sram_path            = nullptr;   /* PSX uses memory cards */
             gi.pad_mode_selectable  = ctrl_lock_mode ? 0 : 1;
             gi.allow_hybrid         = ctrl_allow_hybrid ? 1 : 0;
-            gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+            gi.locked_pad_mode      = p1_mode;
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
-            /* Localization menu: shown only when the game declares languages
-             * (mirrors the RmlUi ginfo.languages parity below). */
             if (!rui_lang_labels.empty()) {
                 gi.language_labels = rui_lang_labels.data();
                 gi.num_languages   = (int)rui_lang_labels.size();
             }
 
-            /* Real disc-verify + memcard-inspect (identify_disc / memcard_summary_path
-             * via the ae_* callbacks). The launcher re-runs these whenever the
-             * user changes the disc or a memory card, so the verdict + block
-             * grids reflect the actual images — parity with the RmlUi launcher.
-             * The expected serial/CRC ride on file-scope statics (the C-ABI
-             * callback can't capture these locals). */
             g_lnch_expected_serial = game_id;
             g_lnch_expected_crc    = game_disc_crc;
             g_lnch_has_crc         = game_has_disc_crc;
@@ -4783,18 +4711,12 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
-                 * legacy ls.widescreen bool (still set above for older callers). */
                 switch (ls.aspect_index) {
                     case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
                     case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
                     default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
                 }
                 seed.has_aspect_ratio = true;
-                /* has_texture_filter is on (PSX profile) so the launcher edits
-                 * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
-                 * is the legacy fallback field for consoles without the cap and is
-                 * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
                 p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
                 p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
@@ -4804,8 +4726,6 @@ int main(int argc, char** argv) {
                 seed.p1_mode = ls.pad_mode[0]; seed.has_p1_mode = true;
                 seed.p2_mode = ls.pad_mode[1]; seed.has_p2_mode = true;
 
-                /* ---- deeper PSX-style settings write-back (mirrors the seed
-                 * fields above), all gated on by the "psx" launcher_profile caps. */
                 seed.window_width          = ls.window_width;          seed.has_window_width          = true;
                 seed.renderer              = ls.renderer;              seed.has_renderer              = true;
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
@@ -4820,66 +4740,17 @@ int main(int argc, char** argv) {
                     seed.bios_path = ls.bios_path;
                     seed.has_bios_path = true;
                 }
-                /* Memory-card slots: enable flags + any Browse/New paths. */
                 seed.memcard1_enabled = ls.memcard_enabled[0] != 0; seed.has_memcard1_enabled = true;
                 seed.memcard2_enabled = ls.memcard_enabled[1] != 0; seed.has_memcard2_enabled = true;
                 if (ls.memcard_path[0][0]) { seed.memcard1_path = ls.memcard_path[0]; seed.has_memcard1_path = true; }
                 if (ls.memcard_path[1][0]) { seed.memcard2_path = ls.memcard_path[1]; seed.has_memcard2_path = true; }
 
-                /* Localization: persist the chosen language code (only meaningful
-                 * when the game declared a menu; otherwise leave seed.language
-                 * untouched) -- mirrors launcher.cpp's io.language write-back
-                 * (RmlUi path, below) exactly, down to the bounds check. */
                 if (!lang_menu_options.empty() && ls.language_index >= 0 &&
                     ls.language_index < (int)lang_menu_options.size()) {
                     seed.language = lang_menu_options[ls.language_index].code;
                     seed.has_language = true;
                 }
             }
-#else
-            configure_core_gl_context_attributes();
-
-            /* Launcher opens at the same 4:3 size the game will, so there's no
-             * jarring resize on LAUNCH. The dense dashboard needs a usable
-             * minimum, so the launcher floor is 1280 wide even if the game
-             * window is set smaller. */
-            int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
-            int lwin_h = 0;
-            clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
-            std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                     + " \xE2\x80\x94 Launcher";
-            SDL_Window* lwin = SDL_CreateWindow(
-                lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-            psx_launcher::Result lr = psx_launcher::Result::Unavailable;
-            if (lwin) {
-                SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
-                if (lctx) {
-                    SDL_GL_MakeCurrent(lwin, lctx);
-                    SDL_GL_SetSwapInterval(1);
-                    std::string assets = exe_dir_from_argv(argv[0]).string();
-                    psx_launcher::GameInfo ginfo;
-                    ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
-                    ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
-                    ginfo.expected_crc     = game_disc_crc;
-                    ginfo.has_expected_crc = game_has_disc_crc;
-                    ginfo.allow_hybrid     = ctrl_allow_hybrid;
-                    ginfo.lock_mode        = ctrl_lock_mode;
-                    ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
-                    ginfo.lock_device      = ctrl_lock_device;
-                    ginfo.ws_offered       = ws_offered;
-                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
-                    for (const auto& lo : lang_menu_options)
-                        ginfo.languages.push_back({ lo.code, lo.label });
-                    lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str(),
-                                           &launcher_netplay);
-                    SDL_GL_DeleteContext(lctx);
-                }
-                SDL_DestroyWindow(lwin);
-            }
-            /* Reset GL attributes so the emulator window starts from defaults. */
-            SDL_GL_ResetAttributes();
-#endif
 
             if (lr == psx_launcher::Result::Quit) {
                 std::fprintf(stdout, "psxrecomp: launcher closed; exiting.\n");
@@ -4905,8 +4776,8 @@ int main(int argc, char** argv) {
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
-                if (seed.has_fast_boot) fast_boot = seed.fast_boot;
-                if (seed.has_bios_hle)  bios_hle  = seed.bios_hle;
+                fast_boot = seed.fast_boot;
+                bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
@@ -5756,191 +5627,13 @@ session_reboot:
     return 0;
 
 soft_return_lobby:
-    /* Netplay soft-exit: tear down the match window, keep lobby WS, reopen room. */
+    /* Netplay soft-exit after a match. recomp-ui has no lobby/rematch panels
+     * yet — drop the WS and exit (CLI/env netplay can still start a new match). */
     teardown_game_session_keep_lobby();
-#if defined(PSX_LAUNCHER)
-    {
-        configure_core_gl_context_attributes();
-        int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
-        int lwin_h = 0;
-        clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
-        std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                 + " \xE2\x80\x94 Lobby";
-        SDL_Window* lwin = SDL_CreateWindow(
-            lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-        if (!lwin) {
-            std::fprintf(stderr, "psxrecomp: resume lobby window failed: %s\n",
-                         SDL_GetError());
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 1;
-        }
-        SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
-        if (!lctx) {
-            std::fprintf(stderr, "psxrecomp: resume lobby GL context failed: %s\n",
-                         SDL_GetError());
-            SDL_DestroyWindow(lwin);
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 1;
-        }
-        SDL_GL_MakeCurrent(lwin, lctx);
-        SDL_GL_SetSwapInterval(1);
-
-        /* Same seed surface as the first launcher open — including bios_hle /
-         * fast_boot. Omitting those left UserSettings defaults (false) and the
-         * post-Launch apply clobbered HLE boot-skip → Sony intro on offline
-         * relaunch after a netplay soft-return. */
-        PSXRecompV4::UserSettings seed;
-        seed.renderer = g_video_renderer;             seed.has_renderer = true;
-        seed.supersampling = g_video_scale;           seed.has_supersampling = true;
-        seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
-        seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
-        seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
-        seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
-        seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
-        seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
-        seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
-        seed.fullscreen = g_fullscreen;               seed.has_fullscreen = true;
-        seed.frame_interpolation = (g_frame_interpolation != 0);
-        seed.has_frame_interpolation = true;
-        seed.frame_interpolation_fps = g_frame_interpolation_fps;
-        seed.has_frame_interpolation_fps = true;
-        seed.aspect_num = g_video_aspect_num;
-        seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
-        seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
-        seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
-        seed.bios_path = bios_path_str;               seed.has_bios_path = true;
-        if (!disc_path_str.empty()) {
-            seed.disc_path = disc_path_str;           seed.has_disc_path = true;
-        }
-        seed.memcard_dir = memcard_dir;               seed.has_memcard_dir = true;
-        seed.memcard1_enabled = memcard1_enabled;     seed.has_memcard1_enabled = true;
-        seed.memcard2_enabled = memcard2_enabled;     seed.has_memcard2_enabled = true;
-        if (!memcard1_path.empty()) {
-            seed.memcard1_path = memcard1_path;       seed.has_memcard1_path = true;
-        }
-        if (!memcard2_path.empty()) {
-            seed.memcard2_path = memcard2_path;       seed.has_memcard2_path = true;
-        }
-        seed.language = resolved_language;            seed.has_language = true;
-        seed.p1_device = p1_device; seed.has_p1_device = true;
-        seed.p2_device = p2_device; seed.has_p2_device = true;
-        seed.p1_mode = p1_mode; seed.has_p1_mode = true;
-        seed.p2_mode = p2_mode; seed.has_p2_mode = true;
-        seed.deadzone = resolved_deadzone >= 0 ? resolved_deadzone : 12000;
-        seed.has_deadzone = true;
-        seed.window_width = g_video_win_w;            seed.has_window_width = true;
-        if (has_netplay_player_name) {
-            seed.netplay_player_name = netplay_player_name;
-            seed.has_netplay_player_name = true;
-        }
-
-        psx_launcher::GameInfo ginfo;
-        ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
-        ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
-        ginfo.expected_crc     = game_disc_crc;
-        ginfo.has_expected_crc = game_has_disc_crc;
-        ginfo.allow_hybrid     = ctrl_allow_hybrid;
-        ginfo.lock_mode        = ctrl_lock_mode;
-        ginfo.locked_mode      = p1_mode;
-        ginfo.lock_device      = ctrl_lock_device;
-        ginfo.ws_offered       = ws_offered;
-        ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
-        for (const auto& lo : lang_menu_options)
-            ginfo.languages.push_back({ lo.code, lo.label });
-
-        psx_launcher::NetplayLaunch resume_net{};
-        psx_launcher::RunOptions ropts;
-        ropts.resume_netplay_room = true;
-        std::string assets = exe_dir_from_argv(argv[0]).string();
-        psx_launcher::Result lr = psx_launcher::run(
-            lwin, lctx, seed, ginfo, assets.c_str(), &resume_net, ropts);
-
-        SDL_GL_DeleteContext(lctx);
-        SDL_DestroyWindow(lwin);
-        SDL_GL_ResetAttributes();
-
-        if (lr == psx_launcher::Result::Quit) {
-            std::fprintf(stdout, "psxrecomp: lobby closed after match; exiting.\n");
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 0;
-        }
-        if (lr != psx_launcher::Result::Launch) {
-            std::fprintf(stdout, "psxrecomp: resume lobby ended without launch; exiting.\n");
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 0;
-        }
-
-        /* Offline Launch after soft-return used to fall through and exit —
-         * same seed apply as the first launcher path, then rematch or offline. */
-        if (resume_net.enabled) {
-            net_cfg = resume_net.cfg;
-            net_cfg.enabled = 1;
-            g_netplay_from_lobby = 1;
-            std::fprintf(stdout,
-                "psxrecomp: rematch netplay slot=%d bind=%s peer=%s session=%u\n",
-                net_cfg.local_slot, net_cfg.bind_hostport, net_cfg.peer_hostport,
-                (unsigned)net_cfg.session_id);
-            std::fflush(stdout);
-        } else {
-            psx_netplay_config_defaults(&net_cfg);
-            net_cfg.enabled = 0;
-            g_netplay_from_lobby = 0;
-            std::fprintf(stdout, "psxrecomp: resume lobby → offline launch\n");
-            std::fflush(stdout);
-        }
-        g_video_renderer  = seed.renderer;
-        g_video_scale     = seed.supersampling;
-        g_video_aa        = seed.antialiasing;
-        g_video_texfilter = seed.texture_filter;
-        g_video_screen    = seed.screen_kind;
-        g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
-        g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
-        /* Only apply boot-skip flags when the seed actually carries them —
-         * never clobber game.toml / prior offline policy with UserSettings
-         * defaults (bios_hle=false). */
-        if (seed.has_fast_boot) fast_boot = seed.fast_boot;
-        if (seed.has_bios_hle)  bios_hle  = seed.bios_hle;
-        g_fullscreen      = seed.fullscreen;
-        g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
-        g_frame_interpolation_fps = seed.frame_interpolation_fps;
-        g_video_aspect_num = seed.aspect_num;
-        g_video_aspect_den = seed.aspect_den;
-        g_audio_spu_hq    = seed.spu_hq;
-        if (seed.has_skip_launcher) skip_launcher_setting = seed.skip_launcher;
-        if (seed.has_bios_path) {
-            settings_bios_storage = seed.bios_path.string();
-            bios_path = settings_bios_storage.c_str();
-            bios_path_str = settings_bios_storage;
-        }
-        if (seed.has_disc_path) {
-            seed.disc_path = normalize_disc_path_for_launch(seed.disc_path);
-            resolved_disc = seed.disc_path;
-            disc_path_str = resolved_disc.string();
-        }
-        if (seed.has_memcard1_enabled) memcard1_enabled = seed.memcard1_enabled;
-        if (seed.has_memcard2_enabled) memcard2_enabled = seed.memcard2_enabled;
-        if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
-        if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
-        if (seed.has_language) {
-            resolved_language = seed.language;
-            text_xlate_set_language(resolved_language.c_str());
-        }
-        p1_device = seed.p1_device; p2_device = seed.p2_device;
-        p1_mode = seed.p1_mode; p2_mode = seed.p2_mode;
-        if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
-        if (seed.has_window_width) g_video_win_w = seed.window_width;
-        PSXRecompV4::save_user_settings(
-            exe_dir_from_argv(argv[0]) / "settings.toml", seed);
-        goto session_reboot;
-    }
-#else
+    std::fprintf(stdout,
+        "psxrecomp: match ended — rematch lobby UI not in Dear ImGui launcher yet; "
+        "exiting.\n");
     psx_lobby_disconnect();
     SDL_Quit();
     return 0;
-#endif
 }

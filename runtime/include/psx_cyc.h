@@ -28,6 +28,7 @@
 #define PSX_CYC_H
 
 #include <stdint.h>
+#include <string.h>       /* memcpy — host-LE main-RAM loads in VLC hot path */
 #if defined(_MSC_VER)
 #include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
 #endif
@@ -38,10 +39,29 @@
 extern "C" {
 #endif
 
-/* Load-charge batching (MotK VLC): under the published deadline, accumulate
- * into g_psx_cyc_batch instead of storing psx_cycle_count every insn. Flush
- * at IRQ edges / MMIO (psx_cyc_batch_flush). Absorb/fudge state still updates
- * per insn — only the host counter publish is deferred. */
+/* Load-charge batching (MotK VLC): accumulate into g_psx_cyc_batch instead of
+ * storing psx_cycle_count every insn. Absorb/fudge still update per insn —
+ * only the host counter publish is deferred until:
+ *   - psx_cyc_batch_flush (IRQ / MMIO / savestate), or
+ *   - the deferred batch grows past PSX_CYC_BATCH_SOFT (device deadline check),
+ *   - or emitter BB-defer is active (g_psx_cyc_bb_defer): no mid-BB deadline
+ *     probe at all; compiled branches already flush via psx_check_interrupts.
+ * Guest totals at those barriers are unchanged. */
+enum { PSX_CYC_BATCH_SOFT = 64u };
+
+static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
+static inline void psx_cyc_bb_defer_end(void) {
+    if (g_psx_cyc_bb_defer > 0) g_psx_cyc_bb_defer--;
+    if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
+}
+static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
+/* GCC/Clang cleanup helper: emitter places one guard at function entry so
+ * every return path ends BB-defer (CPS/jr/bail) without per-site codegen. */
+static inline void psx_cyc_bb_defer_cleanup(int *guard) {
+    (void)guard;
+    psx_cyc_bb_defer_end();
+}
+
 static inline void psx_cyc_charge(uint32_t cycles) {
     if (cycles == 0u) return;
 #if defined(__GNUC__) || defined(__clang__)
@@ -56,14 +76,22 @@ static inline void psx_cyc_charge(uint32_t cycles) {
         psx_cycle_count += (uint64_t)cycles;
         return;
     }
-    uint64_t next = psx_cycle_count + (uint64_t)g_psx_cyc_batch + (uint64_t)cycles;
-    if (psx_next_service_cycle != 0u && next < psx_next_service_cycle) {
+#if !defined(PSX_COSIM)
+    {
         uint32_t sum = g_psx_cyc_batch + cycles;
         if (sum >= g_psx_cyc_batch) { /* no uint32 wrap */
             g_psx_cyc_batch = sum;
-            return;
+            /* Compiled BB defer: IRQ edges publish. Otherwise probe deadline
+             * only after a soft quantum so MotK VLC doesn't 64-bit-compare
+             * on every LW. */
+            if (g_psx_cyc_bb_defer > 0) return;
+            if (sum < (uint32_t)PSX_CYC_BATCH_SOFT) return;
+            uint64_t next = psx_cycle_count + (uint64_t)sum;
+            if (psx_next_service_cycle != 0u && next < psx_next_service_cycle)
+                return;
         }
     }
+#endif
     psx_advance_cycles(cycles); /* publishes any pending batch first */
 }
 
@@ -79,6 +107,14 @@ static inline void psx_cyc_base(CPUState* cpu) {
  * save/restore of ReadAbsorb[0]). */
 static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(reg_mask == 0u, 0)) return;
+    /* MotK VLC: most ALU/load masks are a single GPR — skip the ctz loop. */
+    if (__builtin_expect((reg_mask & (reg_mask - 1u)) == 0u, 1)) {
+        cpu->read_absorb[(unsigned)__builtin_ctz(reg_mask)] = 0u;
+        return;
+    }
+#endif
     while (reg_mask) {
 #if defined(_MSC_VER)
         unsigned long _psx_ctz_idx;
@@ -123,6 +159,9 @@ extern int      g_psx_load_delay;
 extern int      g_ls_mode;
 extern volatile int g_ds_recording;
 int psx_load_delay_enabled(void);
+/* Enhancement: arm/disarm FMV-scoped load-delay relax (toggles
+ * g_psx_load_delay like PSX_LOAD_DELAY=0 while depth24/MDEC is up). */
+void psx_fmv_load_delay_relax_update(int want_relax);
 uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
@@ -132,9 +171,17 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
                                           uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     uint32_t phys = addr & 0x1FFFFFFFu;
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u, 1)) {
+#else
     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+#endif
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(g_psx_load_delay != 0, 1)) {
+#else
         if (g_psx_load_delay) {
+#endif
             psx_cyc_base(cpu);
             psx_cyc_deps(cpu, reg_mask);
             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
@@ -146,11 +193,11 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
-        uint32_t off = phys & 0x1FFFFFu;
-        return (uint32_t)g_psx_ram[off]
-             | ((uint32_t)g_psx_ram[off + 1] << 8)
-             | ((uint32_t)g_psx_ram[off + 2] << 16)
-             | ((uint32_t)g_psx_ram[off + 3] << 24);
+        /* Same host-LE memcpy as memory.c psx_read_word — MotK VLC issues
+         * millions of aligned main-RAM LWs/s; byte-or was a measurable tax. */
+        uint32_t v;
+        memcpy(&v, g_psx_ram + (phys & 0x1FFFFFu), sizeof(v));
+        return v;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
 #else
@@ -164,9 +211,17 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
                                           uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     uint32_t phys = addr & 0x1FFFFFFFu;
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u, 1)) {
+#else
     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+#endif
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(g_psx_load_delay != 0, 1)) {
+#else
         if (g_psx_load_delay) {
+#endif
             psx_cyc_base(cpu);
             psx_cyc_deps(cpu, reg_mask);
             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
@@ -178,9 +233,9 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
-        uint32_t off = phys & 0x1FFFFFu;
-        return (uint16_t)((uint32_t)g_psx_ram[off]
-                        | ((uint32_t)g_psx_ram[off + 1] << 8));
+        uint16_t v;
+        memcpy(&v, g_psx_ram + (phys & 0x1FFFFFu), sizeof(v));
+        return v;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
 #else

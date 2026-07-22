@@ -6,6 +6,14 @@ widescreen, load acceleration, etc. Per-game enhancement ideas live in each
 game repo's ENHANCEMENTS.md. Active framework bugs referenced here live in the
 game repos' ISSUES.md until a framework tracker exists.
 
+## FMV load-delay relax (host FPS)
+
+**Opt-in** `[runtime] fmv_load_delay_relax = true` or `PSX_FMV_LOAD_DELAY_RELAX=1`.
+Forces `g_psx_load_delay=0` for the offline session (same as `PSX_LOAD_DELAY=0`).
+MotK (2026-07-22): session arm → ~450–500 FPS but **MDEC never starts** on
+intro STR — do not default on for MotK. Faithful delay ~45–55 FPS is the
+shipping choice. Off under netplay.
+
 ---
 
 ## R1 — OpenGL renderer (2nd backend): PLAYABLE, flicker root-caused + fixed
