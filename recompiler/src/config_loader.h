@@ -637,6 +637,15 @@ struct GameConfig {
     // + stretched-present path when native-wide is not regression-free.
     bool ws_native_wide = true;
 
+    // [widescreen] stretch_2d / stretch_fmv — "fill the whole widescreen"
+    // player-preference overrides for the 4:3 pins in
+    // gpu_ws_present_native_43(). stretch_2d: menus/title/loading & 2D-only
+    // scenes present stretched to the wide aspect (2D UI warps). stretch_fmv:
+    // FMV video presents stretched (4:3 video distorts). Runtime-only; off by
+    // default so the faithful 4:3 pillarbox stays the default.
+    bool ws_stretch_2d  = false;
+    bool ws_stretch_fmv = false;
+
     // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
     // space HUD sprites out to the true wide-frame corners (they otherwise sit
     // inset by the reveal offset). Runtime-only — no regen. Off by default.

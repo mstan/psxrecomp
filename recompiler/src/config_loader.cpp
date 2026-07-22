@@ -876,6 +876,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
     bool ws_native_wide = true;
+    bool ws_stretch_2d  = false;
+    bool ws_stretch_fmv = false;
     bool ws_nw_hud_corners = false;
     uint32_t ws_nw_left_hud_packet_lo = 0;
     uint32_t ws_nw_left_hud_packet_hi = 0;
@@ -996,6 +998,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
         if (ws.contains("native_wide"))
             ws_native_wide = toml::find<bool>(ws, "native_wide");
+        if (ws.contains("stretch_2d"))
+            ws_stretch_2d = toml::find<bool>(ws, "stretch_2d");
+        if (ws.contains("stretch_fmv"))
+            ws_stretch_fmv = toml::find<bool>(ws, "stretch_fmv");
         if (ws.contains("nw_hud_corners"))
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
         const bool has_nw_left_hud_lo = ws.contains("nw_left_hud_packet_lo");
@@ -1266,6 +1272,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
         /*ws_native_wide*/        ws_native_wide,
+        /*ws_stretch_2d*/         ws_stretch_2d,
+        /*ws_stretch_fmv*/        ws_stretch_fmv,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
         /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
         /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,

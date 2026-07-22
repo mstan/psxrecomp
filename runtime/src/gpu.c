@@ -144,6 +144,16 @@ static uint32_t ws_last_gte_stamp = (uint32_t)-1000;
 #define WS_GTE_GAME_MODE_HYSTERESIS 45u
 void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
 
+/* Opt-in "fill the whole widescreen" overrides for the 4:3 pins in
+ * gpu_ws_present_native_43(). These STRETCH 4:3 content to the wide aspect
+ * (2D UI warps, 4:3 FMV distorts) — a player preference, off by default so the
+ * faithful 4:3 pillarbox stays the default. stretch_2d: menus/title/loading &
+ * 2D-only scenes present wide. stretch_fmv: FMV video presents wide. */
+static int      ws_stretch_2d  = 0;
+static int      ws_stretch_fmv = 0;
+void gpu_ws_set_stretch_2d(int on)  { ws_stretch_2d  = on ? 1 : 0; }
+void gpu_ws_set_stretch_fmv(int on) { ws_stretch_fmv = on ? 1 : 0; }
+
 /* World-scale 3D signal for the 2D-only-scene classifier (sprite-tag titles).
  * Shaded-prim presence proved to be a FALSE world signal: task-clear /
  * new-task title cards are gouraud-shaded screen-space tiles animated over
@@ -250,15 +260,18 @@ static int      s_ws_fmv_cached = 0;
 
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
-    if (!ws_game_mode()) return 1;                 /* full-2D screen */
-    if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
+    if (!ws_stretch_2d) {
+        if (!ws_game_mode()) return 1;             /* full-2D screen -> 4:3 */
+        if (ws_2d_only_scene()) return 1;          /* 2D-only gameplay scene -> 4:3 */
+    }
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_ws_fmv_frame_cache) {
         s_ws_fmv_frame_cache = f;
         GpuDisplayInfo di; gpu_get_display_info(&di);
         s_ws_fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
     }
-    return s_ws_fmv_cached;
+    if (s_ws_fmv_cached && !ws_stretch_fmv) return 1;  /* FMV -> 4:3 (unless opted to stretch) */
+    return 0;
 }
 
 /* Squash applies only when configured AND the frame is being stretched. */

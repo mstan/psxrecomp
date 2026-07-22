@@ -554,6 +554,8 @@ static bool          g_ws_hud_sprt = false;
 /* Runtime-only transition cleanup; kept out of gpu.h because generated game
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
+extern "C" void gpu_ws_set_stretch_2d(int on);
+extern "C" void gpu_ws_set_stretch_fmv(int on);
 extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
 extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
@@ -4528,6 +4530,11 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* [widescreen] stretch_2d / stretch_fmv — "fill the whole widescreen"
+             * overrides: menus/2D and FMV present stretched instead of 4:3
+             * pillarbox. Off by default (faithful). */
+            gpu_ws_set_stretch_2d(gc.ws_stretch_2d ? 1 : 0);
+            gpu_ws_set_stretch_fmv(gc.ws_stretch_fmv ? 1 : 0);
             /* Keep titles with known native-wide regressions on the original
              * projection-squash + stretched-present widescreen path. */
             g_ws_native_wide = gc.ws_native_wide ? 1 : 0;
