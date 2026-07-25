@@ -2404,14 +2404,16 @@ static inline int32_t draw_area_wide_x_margin(void) {
 
 static inline void draw_area_host_x_bounds(int32_t *left, int32_t *right) {
     int32_t margin = draw_area_wide_x_margin();
+    *left  = (int32_t)draw_area_left;
+    *right = (int32_t)draw_area_right;
     if (margin > 0) {
-        /* ws_nw_sync_target uses draw_area_left as the framebuffer base and
-         * configures a surface ws_disp_w()+2*margin pixels wide. */
-        *left  = (int32_t)draw_area_left - margin;
-        *right = (int32_t)draw_area_left + (int32_t)ws_disp_w() + margin - 1;
-    } else {
-        *left  = (int32_t)draw_area_left;
-        *right = (int32_t)draw_area_right;
+        /* Use the union of the guest draw area and the widescreen mirror.
+         * Wider staging areas may share the framebuffer X origin; clamping them
+         * to the mirror width would drop valid canonical VRAM writes. */
+        int32_t wide_left  = (int32_t)draw_area_left - margin;
+        int32_t wide_right = (int32_t)draw_area_left + (int32_t)ws_disp_w() + margin - 1;
+        if (wide_left  < *left)  *left  = wide_left;
+        if (wide_right > *right) *right = wide_right;
     }
 }
 
