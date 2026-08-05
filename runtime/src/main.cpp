@@ -153,6 +153,7 @@ extern "C" {
 /* memory.c */
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
+extern "C" void     psx_irq_set_cause_ptr(uint32_t *p);
 extern "C" uint32_t memory_get_bios_checksum(void);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
@@ -6975,6 +6976,10 @@ session_reboot:
 
     /* Let memory subsystem see SR for cache-isolation checks. */
     memory_set_sr_ptr(&cpu.cop0[12]);
+
+    /* Wire the CAUSE.IP2 mirror (interrupts.c): IP2 is combinational on real
+     * hardware and must track (I_STAT & I_MASK) through acks/mask writes. */
+    psx_irq_set_cause_ptr(&cpu.cop0[13]);
 
     /* Wire debug server to CPU state for register queries. */
     debug_server_set_cpu(&cpu);
