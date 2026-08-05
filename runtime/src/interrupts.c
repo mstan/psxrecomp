@@ -119,9 +119,32 @@ extern uint32_t i_mask;
  * I_STAT bit so the device-event ring sees every raise from one place with the
  * exact guest cycle. Pure addition over `i_stat |= (1<<bit)` — identical effect
  * on i_stat, plus the trace note (no-op unless the ring is armed). */
+/* CAUSE.IP2 is combinational on real hardware: it mirrors the INTC line
+ * ((I_STAT & I_MASK) != 0) and drops the instant the guest acks I_STAT or
+ * masks the source. This runtime previously only ever SET bit 10 at
+ * delivery and never cleared it, leaving a phantom IP2 in COP0.CAUSE. The
+ * retail kernel's exception dispatcher loops on CAUSE.IP&SR.IM to decide
+ * whether to service again before returning — a stale IP2 with I_STAT==0
+ * spins it forever in its event-scan (MOHU Mission 1 weapon-draw freeze:
+ * kernel event routine 0x1E88 flooding the interp ring, exceptions
+ * climbing, guest never progressing). Mirror the line at every point it
+ * can change: raise, I_STAT ack, I_MASK write, and the HLE context
+ * restore that reloads a saved CAUSE. */
+static uint32_t *s_cause_ptr;
+void psx_irq_set_cause_ptr(uint32_t *p) { s_cause_ptr = p; }
+void psx_irq_refresh_cause_ip2(void)
+{
+    if (!s_cause_ptr) return;
+    if ((i_stat & i_mask & 0x7FFu) != 0u)
+        *s_cause_ptr |= (1u << 10);
+    else
+        *s_cause_ptr &= ~(1u << 10);
+}
+
 void psx_irq_raise(uint32_t bit, uint32_t detail)
 {
     i_stat |= (1u << bit);
+    psx_irq_refresh_cause_ip2();
     device_trace_note(bit, detail);
 }
 
@@ -309,11 +332,26 @@ static int should_defer_vblank_for_sio(void) {
     return since_progress < VBLANK_DEFER_STALE_CYCLES;
 }
 
+/* Mid-dispatch audio pump. The SPU on real hardware is autonomous: it keeps
+ * consuming samples while the CPU busy-waits. Our audio pump normally runs
+ * from the main loop between presented frames — a guest busy-wait that never
+ * completes a frame starves it, freezing voice positions. A game waiting on
+ * the SPU IRQ (voice playback crossing 0x1F801DA4) then deadlocks: the IRQ
+ * it waits for needs SPU time that only advances when the wait ends (MOHU
+ * Mission 1 weapon-draw freeze — kernel TestEvent busy-wait on event class
+ * 0xF0000009 while voice 0 marches toward the parked IRQ address). This
+ * VBlank edge demonstrably still fires during such waits, so pump audio
+ * here too; the pump is guest-cycle-budgeted (delta/768) and same-thread,
+ * making double-pumping from here + the main loop a no-op. */
+static void (*s_midframe_audio_pump)(void);
+void psx_set_midframe_audio_pump(void (*fn)(void)) { s_midframe_audio_pump = fn; }
+
 static void fire_vblank_edge(void) {
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
     cycles_since_vblank -= VBLANK_CYCLES;
+    if (s_midframe_audio_pump) s_midframe_audio_pump();
     dispatch_count = 0;
     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,

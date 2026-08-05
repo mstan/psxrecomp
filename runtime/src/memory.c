@@ -752,17 +752,21 @@ static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width
  * the freeze heartbeat against g_vblank_raise/deliver counts. */
 uint64_t g_vblank_ack_count = 0;
 
+extern void psx_irq_refresh_cause_ip2(void);   /* interrupts.c — CAUSE.IP2 mirror */
+
 static void interrupt_write_stat_masked(uint32_t val, uint32_t mask) {
     uint32_t ack_mask = mask & 0x7FFu;
     uint32_t before = i_stat;
     i_stat = (i_stat & ~ack_mask) | (i_stat & val & ack_mask);
     if ((before & 1u) && !(i_stat & 1u)) g_vblank_ack_count++;  /* VBLANK bit 1->0 */
+    psx_irq_refresh_cause_ip2();
 }
 
 static void interrupt_write_mask_masked(uint32_t val, uint32_t mask, uint8_t width) {
     uint32_t old = i_mask;
     i_mask = ((i_mask & ~mask) | (val & mask)) & 0x7FFu;
     imask_trace_record(old, i_mask, width);
+    psx_irq_refresh_cause_ip2();
 }
 
 /* Getters for debug server */

@@ -23,6 +23,35 @@
 static uint8_t  spu_ram[SPU_RAM_SIZE];
 static uint16_t spu_regs[SPU_REG_COUNT];
 static uint32_t transfer_addr;
+
+/* ---- SPU IRQ (I_STAT bit 9) ----
+ * Real hardware raises the SPU interrupt when ANY SPU-RAM access (voice
+ * ADPCM fetch, FIFO/DMA transfer, CD-audio write) touches the address in
+ * 0x1F801DA4 (units of 8 bytes), while SPUCNT bit 6 enables it. The flag
+ * mirrors in SPUSTAT bit 6 and is acknowledged by clearing SPUCNT bit 6.
+ * Games use this to detect sound-bank upload completion by parking the IRQ
+ * address at the end of the upload region — MOHU's Mission 1 parks it after
+ * the weapon sound bank and busy-waits on kernel event class 0xF0000009
+ * spec 0x20; without this IRQ the wait never ends (the weapon-draw freeze).
+ * Modeled triggers: transfer writes/reads (FIFO + DMA4 both directions).
+ * NOT yet modeled: voice playback fetch crossing the address (streaming
+ * double-buffer engines) — extend spu_irq_check_range from the voice
+ * decode loop when a consumer needs it. */
+static uint32_t spu_irq_addr;   /* byte address (reg value << 3) */
+static int      spu_irq_flag;   /* SPUSTAT bit 6 latch, one-shot until re-arm */
+
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
+
+static void spu_irq_check_range(uint32_t lo, uint32_t len)
+{
+    uint16_t cnt = spu_regs[(0x1F801DAAu - 0x1F801C00u) >> 1];
+    if (!(cnt & 0x0040u)) return;   /* SPUCNT.6: IRQ disabled */
+    if (spu_irq_flag) return;       /* already latched */
+    if (spu_irq_addr >= lo && spu_irq_addr < lo + len) {
+        spu_irq_flag = 1;
+        psx_irq_raise(9, spu_irq_addr);   /* I_STAT bit 9 = SPU */
+    }
+}
 static uint32_t key_on_count;
 static uint64_t render_frames;
 static uint64_t nonzero_frames;
@@ -314,6 +343,12 @@ static void decode_block(SpuVoice *v) {
     uint32_t addr = v->cur_addr & (SPU_RAM_SIZE - 1u);
     if (addr + 16u > SPU_RAM_SIZE) addr = 0;
 
+    /* Voice ADPCM fetch is an SPU-RAM access: it triggers the SPU IRQ when
+     * the 16-byte block covers the programmed IRQ address. This is the sync
+     * technique MOHU's engine waits on at Mission 1 start (event class
+     * 0xF0000009): a keyed-on voice plays into the parked IRQ address. */
+    spu_irq_check_range(addr, 16u);
+
     uint8_t header = spu_ram[addr + 0u];
     uint8_t flags = spu_ram[addr + 1u];
     int shift = header & 0x0F;
@@ -544,6 +579,8 @@ void spu_init(void) {
     memset(voices, 0, sizeof(voices));
     memset(s_events, 0, sizeof(s_events));
     transfer_addr = 0;
+    spu_irq_addr = 0;
+    spu_irq_flag = 0;
     key_on_count = 0;
     render_frames = 0;
     nonzero_frames = 0;
@@ -765,7 +802,8 @@ uint32_t spu_read(uint32_t addr) {
                  * OpenBIOS's shell MOD player waits for (SPUSTAT & 0x7FF)
                  * == 0 after clearing SPUCNT and spun forever. */
                 uint16_t cnt = spu_regs[reg_index(0x1F801DAAu)];
-                return (uint32_t)((cnt & 0x3Fu) | (((cnt >> 5) & 1u) << 7));
+                return (uint32_t)((cnt & 0x3Fu) | (((cnt >> 5) & 1u) << 7)
+                                  | ((uint32_t)(spu_irq_flag ? 1u : 0u) << 6));
             }
             /* ENDX (end-block-reached latch). Real hw sets bit v when voice
              * v decodes a block whose flag byte has bit 0; KEYON[v] clears
@@ -839,6 +877,17 @@ void spu_write(uint32_t addr, uint32_t value) {
                 key_off((uint32_t)(uint16_t)value << 16);
             }
 
+            if (addr == 0x1F801DA4u) {
+                spu_irq_addr = (((uint32_t)(uint16_t)value) << 3)
+                               & (SPU_RAM_SIZE - 1u);
+            }
+
+            if (addr == 0x1F801DAAu) {
+                /* Clearing SPUCNT bit 6 acknowledges/re-arms the IRQ. */
+                if (!((uint16_t)value & 0x0040u))
+                    spu_irq_flag = 0;
+            }
+
             if (addr == 0x1F801DA6u) {
                 transfer_addr = ((uint32_t)(uint16_t)value) << 3;
                 if (transfer_addr >= SPU_RAM_SIZE) transfer_addr = 0;
@@ -849,6 +898,7 @@ void spu_write(uint32_t addr, uint32_t value) {
                     spu_ram[transfer_addr]     = (uint8_t)(value & 0xFF);
                     spu_ram[transfer_addr + 1] = (uint8_t)((value >> 8) & 0xFF);
                 }
+                spu_irq_check_range(transfer_addr, 2);
                 transfer_addr = (transfer_addr + 2) % SPU_RAM_SIZE;
             }
         }
@@ -862,6 +912,7 @@ void spu_dma_write(uint32_t word) {
         spu_ram[transfer_addr + 2] = (uint8_t)((word >> 16) & 0xFF);
         spu_ram[transfer_addr + 3] = (uint8_t)((word >> 24) & 0xFF);
     }
+    spu_irq_check_range(transfer_addr, 4);
     transfer_addr = (transfer_addr + 4) % SPU_RAM_SIZE;
 }
 
@@ -878,6 +929,7 @@ uint32_t spu_dma_read(void) {
              | ((uint32_t)spu_ram[transfer_addr + 2] << 16)
              | ((uint32_t)spu_ram[transfer_addr + 3] << 24);
     }
+    spu_irq_check_range(transfer_addr, 4);   /* any SPU-RAM access triggers */
     transfer_addr = (transfer_addr + 4) % SPU_RAM_SIZE;
     return word;
 }

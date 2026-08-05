@@ -340,7 +340,14 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
         uint32_t saved_sr = cpu->read_word(save + 140u);
         cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
     }
+    /* Restore the saved CAUSE but re-derive IP2: on hardware the IP bits are
+     * live interrupt-line state, never memory — restoring a stale IP2 from a
+     * context saved before the ack re-latches a phantom interrupt. */
     cpu->cop0[13] = cpu->read_word(save + 144u);
+    {
+        extern void psx_irq_refresh_cause_ip2(void);
+        psx_irq_refresh_cause_ip2();
+    }
     cpu->gpr[26] = cpu->read_word(save + 128u);
     psx_assert_no_sentinel_pc("restore_context_from_tcb", tcb, cpu->gpr[26]);
     thread_ctx_ring_log(cpu, tcb, cpu->gpr[26], 1);

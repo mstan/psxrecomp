@@ -154,6 +154,7 @@ extern "C" {
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
 extern "C" void     psx_irq_set_cause_ptr(uint32_t *p);
+extern "C" void     psx_set_midframe_audio_pump(void (*fn)(void));
 extern "C" uint32_t memory_get_bios_checksum(void);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
@@ -6641,6 +6642,9 @@ session_reboot:
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
             (void)psx_sdl_audio_resume(sdl_audio_device);
+            /* Keep SPU time flowing during guest busy-waits: pump from the
+             * VBlank edge too (guest-cycle-budgeted; see interrupts.c). */
+            psx_set_midframe_audio_pump([]() { sdl_audio_pump(); });
         }
     }
 #endif
