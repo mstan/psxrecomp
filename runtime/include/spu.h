@@ -102,6 +102,7 @@ void spu_write(uint32_t addr, uint32_t value);
 
 /* DMA channel 4 interface */
 void spu_dma_write(uint32_t word);
+uint32_t spu_dma_read(void);
 int spu_dma_ready(void);
 
 /* CD-ROM XA/CDDA input path. Samples are stereo 44.1 kHz PCM entering the

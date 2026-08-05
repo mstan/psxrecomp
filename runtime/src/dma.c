@@ -795,9 +795,11 @@ static uint32_t execute_ch4_spu(void) {
                           channels[4].madr & 0x1FFFFCu);
     } else {
         for (uint32_t i = 0; i < total_words; i++) {
-            psx_write_word(addr, 0);
+            psx_write_word(addr, spu_dma_read());
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
+        audio_trace_event(AUDIO_EV_DMA_READ, total_words,
+                          channels[4].madr & 0x1FFFFCu);
     }
 
     channels[4].madr = addr;

@@ -865,6 +865,23 @@ void spu_dma_write(uint32_t word) {
     transfer_addr = (transfer_addr + 4) % SPU_RAM_SIZE;
 }
 
+/* SPU RAM -> CPU RAM (DMA4 read direction, SPUCNT transfer mode 3).
+ * Gran Turismo carries its cross-EXE GAMESTATUS block ('GTos' magic +
+ * CRC-CCITT) through SPU RAM across GTMENU->GTMAIN Exec transitions; a
+ * zero-stubbed readback fails that checksum and the game falls back to
+ * its cold-boot chain (race load "resets" to the intro FMV). */
+uint32_t spu_dma_read(void) {
+    uint32_t word = 0;
+    if (transfer_addr + 3 < SPU_RAM_SIZE) {
+        word = (uint32_t)spu_ram[transfer_addr]
+             | ((uint32_t)spu_ram[transfer_addr + 1] << 8)
+             | ((uint32_t)spu_ram[transfer_addr + 2] << 16)
+             | ((uint32_t)spu_ram[transfer_addr + 3] << 24);
+    }
+    transfer_addr = (transfer_addr + 4) % SPU_RAM_SIZE;
+    return word;
+}
+
 int spu_dma_ready(void) {
     return 1;
 }
