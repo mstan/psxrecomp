@@ -3069,8 +3069,14 @@ static int capture_pad_slot(int s, PsxNetPad* out) {
     const bool suppress_stick = (eff_analog != 0);
     uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player, suppress_stick)
                                  : (uint16_t)0xFFFF;
+    /* Keyboard/mouse binds are ALWAYS live alongside the routed device: a
+     * player with a gamepad routed still gets mouse fire / keyboard keys
+     * (active-low AND — unpressed sources are a no-op). Without this, routing
+     * P1 to a pad silently discarded every keybinds.ini/mouse bind, which
+     * defeats dual bindings (pad in hand, mouse for aiming). kind==1 already
+     * consumed the keyboard via pad_buttons_for — don't AND it twice. */
+    if (p.kind != 1) btn &= pad_from_keyboard(player);
     if (dev_here) {
-        btn &= pad_from_keyboard(1);                        /* keyboard P1 binds  */
         btn &= dev_all_controllers_buttons(suppress_stick); /* any plugged-in pad */
     }
 
