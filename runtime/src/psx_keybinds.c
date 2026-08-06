@@ -8,10 +8,21 @@
  */
 #include "psx_keybinds.h"
 
+#include <SDL.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <stddef.h>
+
+/* Mouse-button pseudo-scancodes. Values sit above SDL's keyboard scancode
+ * space (SDL_NUM_SCANCODES == 512), so they flow through the existing
+ * bind/save/load/rebind machinery as ordinary SDL_Scancode values while
+ * held() resolves them against SDL_GetMouseState() instead of the keyboard
+ * array. INI names: Mouse1 (left) .. Mouse5 (X2), plus LMB/RMB/MMB aliases. */
+#define PSXKB_MOUSE_SC_BASE 512                       /* + SDL_BUTTON_* (1..5) */
+#define PSXKB_MOUSE_SC(btn) ((SDL_Scancode)(PSXKB_MOUSE_SC_BASE + (btn)))
+#define PSXKB_IS_MOUSE_SC(sc) \
+    ((int)(sc) > PSXKB_MOUSE_SC_BASE && (int)(sc) <= PSXKB_MOUSE_SC_BASE + 5)
 
 /* PSX pad word bits (active-low), standard DualShock layout. Matches the
  * PAD_* masks in main.cpp / beetle_main.cpp. */
@@ -145,11 +156,25 @@ static SDL_Scancode name_to_scancode(const char *name) {
     if (!strcmp(buf, "escape") || !strcmp(buf, "esc"))    return SDL_SCANCODE_ESCAPE;
     if (!strcmp(buf, "backspace"))                        return SDL_SCANCODE_BACKSPACE;
     if (!strcmp(buf, "none") || !strcmp(buf, ""))         return SDL_SCANCODE_UNKNOWN;
+    /* Mouse buttons: Mouse1..Mouse5 (SDL button order: 1=left, 2=middle,
+     * 3=right, 4=X1, 5=X2) plus the common aliases. */
+    if (!strncmp(buf, "mouse", 5) && buf[5] >= '1' && buf[5] <= '5' && !buf[6])
+        return PSXKB_MOUSE_SC(buf[5] - '0');
+    if (!strcmp(buf, "lmb") || !strcmp(buf, "mouse left"))   return PSXKB_MOUSE_SC(SDL_BUTTON_LEFT);
+    if (!strcmp(buf, "mmb") || !strcmp(buf, "mouse middle")) return PSXKB_MOUSE_SC(SDL_BUTTON_MIDDLE);
+    if (!strcmp(buf, "rmb") || !strcmp(buf, "mouse right"))  return PSXKB_MOUSE_SC(SDL_BUTTON_RIGHT);
+    if (!strcmp(buf, "mouse x1"))                            return PSXKB_MOUSE_SC(SDL_BUTTON_X1);
+    if (!strcmp(buf, "mouse x2"))                            return PSXKB_MOUSE_SC(SDL_BUTTON_X2);
     return SDL_SCANCODE_UNKNOWN;
 }
 
 static const char *scancode_to_name(SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return "None";
+    if (PSXKB_IS_MOUSE_SC(sc)) {
+        static const char *mouse_names[5] =
+            { "Mouse1", "Mouse2", "Mouse3", "Mouse4", "Mouse5" };
+        return mouse_names[(int)sc - PSXKB_MOUSE_SC_BASE - 1];
+    }
     const char *name = SDL_GetScancodeName(sc);
     return (name && name[0]) ? name : "None";
 }
@@ -212,6 +237,8 @@ static void write_ini(const char *path) {
         "# Use SDL key names. Common: A B C ... Z, 0-9, F1-F12, Up Down Left Right,\n"
         "# Return, Tab, Space, Left Shift, Right Shift, Left Ctrl, Right Ctrl,\n"
         "# Backspace, Escape, Backslash. Use \"None\" to leave an input unbound.\n"
+        "# Mouse buttons also bind: Mouse1 (left), Mouse2 (middle), Mouse3 (right),\n"
+        "# Mouse4/Mouse5 (side); aliases LMB, MMB, RMB.\n"
         "#\n"
         "# Buttons: up/down/left/right, cross/circle/square/triangle, l1/r1/l2/r2,\n"
         "# l3/r3 (stick clicks), start/select. ls_* / rs_* are the left/right\n"
@@ -279,10 +306,16 @@ static PsxPlayerBinds *player_binds(int player) {
     return (player == 2) ? &s_binds.p2 : &s_binds.p1;
 }
 
-/* Is the scancode at button-def index i currently held for this player? */
+/* Is the scancode at button-def index i currently held for this player?
+ * Mouse pseudo-scancodes MUST be checked before indexing keys[] — they sit
+ * beyond the keyboard state array (SDL_NUM_SCANCODES entries). */
 static int held(const uint8_t *keys, const PsxPlayerBinds *pb, int i) {
     SDL_Scancode sc = *(const SDL_Scancode *)((const char *)pb + s_buttons[i].offset);
-    return sc != SDL_SCANCODE_UNKNOWN && keys[sc];
+    if (PSXKB_IS_MOUSE_SC(sc)) {
+        Uint32 m = SDL_GetMouseState(NULL, NULL);
+        return (m & SDL_BUTTON((int)sc - PSXKB_MOUSE_SC_BASE)) != 0;
+    }
+    return sc != SDL_SCANCODE_UNKNOWN && (int)sc < SDL_NUM_SCANCODES && keys[sc];
 }
 
 uint16_t psx_keybinds_pad_word(const uint8_t *keys, int player) {
