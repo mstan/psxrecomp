@@ -91,6 +91,11 @@ const char  *psx_keybinds_button_name(int button);          /* "up".."rs_right" 
 const char  *psx_keybinds_button_label(int button);         /* pretty, e.g. "Cross" */
 SDL_Scancode psx_keybinds_get_button(int player, int button);
 void         psx_keybinds_set_button(int player, int button, SDL_Scancode sc);
+/* Alternate (secondary) binding per control: both the primary and the alt
+ * assert the input (e.g. cross = X, Mouse1). Stored in keybinds.ini as a
+ * comma-separated second name; SDL_SCANCODE_UNKNOWN = no alt. */
+SDL_Scancode psx_keybinds_get_button_alt(int player, int button);
+void         psx_keybinds_set_button_alt(int player, int button, SDL_Scancode sc);
 /* Reset one player's bindings to the built-in defaults (P2 = all unbound). */
 void         psx_keybinds_reset_player(int player);
 /* Persist the current bindings to keybinds.ini (path resolved by
