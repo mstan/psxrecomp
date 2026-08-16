@@ -17,6 +17,7 @@
 #include "memcard.h"
 #include "debug_server.h"
 #include "event_ring.h"
+#include "gpu.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -424,7 +425,7 @@ static int sio_txn_open = 0;
 static void sio_arm_card_ct_defer_guard(void) {
     extern uint64_t psx_get_cycle_count(void);
     uint64_t now = psx_get_cycle_count();
-    uint64_t until = now + 564480ull * 2ull;
+    uint64_t until = now + (uint64_t)gpu_vblank_period_cycles() * 2ull;
     if (until > s_card_ct_defer_until_cyc)
         s_card_ct_defer_until_cyc = until;
 }
@@ -547,7 +548,7 @@ static void ape_card_unstick_maybe(int allow_b4e38_synth) {
     psx_irq_raise(IRQ_SIO0, 0);
     /* ~2ms between pulses — faster than one VB/8 so two pops can land
      * before BIOS clears I_MASK.7 for good. */
-    s_ape_unstick_cool_cyc = now + 564480ull / 32ull;
+    s_ape_unstick_cool_cyc = now + (uint64_t)gpu_vblank_period_cycles() / 32ull;
     if (s_card_handoff_armed)
         card_handoff_push(6, (uint8_t)(a6 & 0xffu));
     if (++s_ape_torn_pulses >= 128)
@@ -597,15 +598,15 @@ int sio_card_handoff_cap(void) { return CARD_HANDOFF_CAP; }
 int sio_card_handoff_armed(void) { return s_card_handoff_armed; }
 
 int sio_hold_present_for_card(void) {
-    /* NTSC VBlank period — matches interrupts.c VBLANK_CYCLES. */
+    /* Current CRTC VBlank period — matches interrupts.c. */
     enum { SIO_PRESENT_HOLD_STALE_VB = 10 };
-    static const uint64_t stale_cycles =
-        564480ull * (uint64_t)SIO_PRESENT_HOLD_STALE_VB;
     static uint32_t s_hold_seq;
     static uint64_t s_hold_progress_cyc;
     static int s_hold_armed;
     uint32_t seq;
     uint64_t now;
+    const uint64_t stale_cycles =
+        (uint64_t)gpu_vblank_period_cycles() * (uint64_t)SIO_PRESENT_HOLD_STALE_VB;
 
     if (!sio_card_protocol_active()) {
         s_hold_armed = 0;

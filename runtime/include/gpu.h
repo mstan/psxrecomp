@@ -51,6 +51,26 @@ void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
 int  gpu_display_is_depth24(void);
+/* GP1(08h) bit 3: 0 = NTSC, 1 = PAL. */
+int  gpu_display_is_pal(void);
+/* Guest CPU cycles per CRTC frame (33.8688 MHz / 60 NTSC, / 50 PAL). */
+#define PSX_VBLANK_CYCLES_NTSC 564480u
+#define PSX_VBLANK_CYCLES_PAL  677376u
+uint32_t gpu_vblank_period_cycles(void);
+/*
+ * Force guest cycles per VBlank regardless of GP1(08h) PAL/NTSC. 0 clears.
+ * Used so NTSC display mode can keep a 50 Hz IRQ (25 fps with stock skip)
+ * for audio-safe ports of PAL titles. Still divided by the Nx multiplier.
+ */
+void gpu_set_crtc_vblank_period_override(uint32_t cycles);
+uint32_t gpu_get_crtc_vblank_period_override(void);
+/*
+ * Experimental enhancement: GooseStation-style Nx video timing. Multiplier 2
+ * halves the guest VBlank period (NTSC 120 Hz / PAL 100 Hz CRTC). Default 1.
+ * Host wall-clock pacing is separate (psx_mod_set_native_vblank_rate).
+ */
+void gpu_set_crtc_refresh_multiplier(uint32_t multiplier);
+uint32_t gpu_get_crtc_refresh_multiplier(void);
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b);
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);

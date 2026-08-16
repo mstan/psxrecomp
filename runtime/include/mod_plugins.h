@@ -134,6 +134,20 @@ int psx_mod_set_adaptive_display_aspect(uint32_t max_numerator,
 int psx_mod_set_native_vblank_rate(uint32_t frames_per_second);
 
 /*
+ * GooseStation-style Nx CRTC: divide guest cycles per VBlank by `multiplier`
+ * (1 = stock, 2 = NTSC 120 Hz / PAL 100 Hz). Pair with
+ * psx_mod_set_native_vblank_rate(base_hz * multiplier) so wall-clock and
+ * guest time stay aligned; otherwise audio and realtime speed drift.
+ */
+int psx_mod_set_crtc_refresh_multiplier(uint32_t multiplier);
+/*
+ * Force the guest VBlank IRQ period to a fixed CRTC rate (50 or 60 Hz), or
+ * pass 0 to follow GP1(08h) again. Does not change the GPU video-mode bit —
+ * NTSC display programming can keep a 50 Hz IRQ for audio-safe PAL ports.
+ */
+int psx_mod_set_crtc_vblank_hz(uint32_t hz);
+
+/*
  * Enable presentation-only frame interpolation while leaving guest VBlank,
  * game logic, timers, and audio at their stock cadence. The OpenGL presenter
  * temporally blends completed guest frames at the requested output rate on its

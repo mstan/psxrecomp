@@ -3192,6 +3192,43 @@ int gpu_display_is_depth24(void) {
     return (int)(display_depth & 1u);
 }
 
+int gpu_display_is_pal(void) {
+    return (int)(video_mode & 1u);
+}
+
+/* Opt-in Nx CRTC (mod plugins). 1 = stock; 2 = half-period VBlank. */
+static uint32_t s_crtc_refresh_multiplier = 1u;
+/* 0 = derive from GP1 video_mode; else absolute period before Nx divide. */
+static uint32_t s_crtc_period_override = 0u;
+
+void gpu_set_crtc_refresh_multiplier(uint32_t multiplier) {
+    if (multiplier < 1u)
+        multiplier = 1u;
+    if (multiplier > 8u)
+        multiplier = 8u;
+    s_crtc_refresh_multiplier = multiplier;
+}
+
+uint32_t gpu_get_crtc_refresh_multiplier(void) {
+    return s_crtc_refresh_multiplier ? s_crtc_refresh_multiplier : 1u;
+}
+
+void gpu_set_crtc_vblank_period_override(uint32_t cycles) {
+    s_crtc_period_override = cycles;
+}
+
+uint32_t gpu_get_crtc_vblank_period_override(void) {
+    return s_crtc_period_override;
+}
+
+uint32_t gpu_vblank_period_cycles(void) {
+    const uint32_t base = s_crtc_period_override
+        ? s_crtc_period_override
+        : (video_mode ? PSX_VBLANK_CYCLES_PAL : PSX_VBLANK_CYCLES_NTSC);
+    const uint32_t mult = gpu_get_crtc_refresh_multiplier();
+    return base / mult;
+}
+
 void gpu_get_display_info(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
