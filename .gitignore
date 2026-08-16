@@ -20,6 +20,9 @@ ghidra/
 # Backup of the working state — see CURRENT_STATE.md for what this contains.
 .happypath/
 
+# Local git worktrees (never commit as gitlinks — breaks recursive submodule CI)
+.worktrees/
+
 # Build artifacts
 recompiler/build/
 recompiler/build-asan/
