@@ -23,7 +23,7 @@ namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
 constexpr uint32_t kMaxFormatVersion = 5;
-constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxArchiveBytes = 0xffffffffull; /* ZIP32 size fields */
 constexpr uint32_t kMaxArchiveFiles = 4096;
 
 std::map<std::string, ModBuiltinResolver>& builtin_resolvers() {
@@ -383,6 +383,117 @@ bool parse_zip(const std::vector<uint8_t>& bytes, std::vector<ZipEntry>& entries
         entries.push_back(std::move(e));
         at += 46ull + name_len + extra_len + comment_len;
     }
+    return true;
+}
+
+void zip_put_u16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back((uint8_t)(v & 0xff));
+    out.push_back((uint8_t)((v >> 8) & 0xff));
+}
+
+void zip_put_u32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back((uint8_t)(v & 0xff));
+    out.push_back((uint8_t)((v >> 8) & 0xff));
+    out.push_back((uint8_t)((v >> 16) & 0xff));
+    out.push_back((uint8_t)((v >> 24) & 0xff));
+}
+
+bool write_store_zip(const fs::path& root, std::vector<uint8_t>& out, std::string* error) {
+    struct Item {
+        std::string name;
+        std::vector<uint8_t> data;
+        uint32_t crc = 0;
+        uint32_t local_offset = 0;
+    };
+    std::vector<Item> items;
+    std::error_code ec;
+    uint64_t total = 0;
+    if (!fs::is_directory(root)) {
+        set_error(error, "package directory is missing");
+        return false;
+    }
+    for (const fs::directory_entry& entry :
+         fs::recursive_directory_iterator(root, ec)) {
+        if (ec) {
+            set_error(error, "cannot read package directory: " + ec.message());
+            return false;
+        }
+        if (!entry.is_regular_file(ec)) continue;
+        fs::path rel = fs::relative(entry.path(), root, ec);
+        if (ec) continue;
+        std::string name = rel.generic_string();
+        if (!safe_archive_name(name)) continue;
+        Item item;
+        item.name = std::move(name);
+        if (!read_file(entry.path(), item.data, error)) return false;
+        if (item.data.size() > 0xffffffffull) {
+            set_error(error, "file exceeds ZIP32 size");
+            return false;
+        }
+        total += item.data.size();
+        if (total > 0xffffffffull) {
+            set_error(error, "package exceeds ZIP32 size");
+            return false;
+        }
+        if (items.size() >= kMaxArchiveFiles) {
+            set_error(error, "package has too many files to transfer");
+            return false;
+        }
+        item.crc = crc32_compute(item.data.data(), item.data.size());
+        items.push_back(std::move(item));
+    }
+    if (items.empty()) {
+        set_error(error, "package directory has no files");
+        return false;
+    }
+    out.clear();
+    out.reserve((size_t)total + items.size() * 96u + 64u);
+    for (Item& item : items) {
+        item.local_offset = (uint32_t)out.size();
+        zip_put_u32(out, 0x04034b50u);
+        zip_put_u16(out, 20);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u32(out, item.crc);
+        zip_put_u32(out, (uint32_t)item.data.size());
+        zip_put_u32(out, (uint32_t)item.data.size());
+        zip_put_u16(out, (uint16_t)item.name.size());
+        zip_put_u16(out, 0);
+        out.insert(out.end(), item.name.begin(), item.name.end());
+        out.insert(out.end(), item.data.begin(), item.data.end());
+    }
+    const uint32_t central_offset = (uint32_t)out.size();
+    for (const Item& item : items) {
+        zip_put_u32(out, 0x02014b50u);
+        zip_put_u16(out, 20);
+        zip_put_u16(out, 20);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u32(out, item.crc);
+        zip_put_u32(out, (uint32_t)item.data.size());
+        zip_put_u32(out, (uint32_t)item.data.size());
+        zip_put_u16(out, (uint16_t)item.name.size());
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u16(out, 0);
+        zip_put_u32(out, 0);
+        zip_put_u32(out, item.local_offset);
+        out.insert(out.end(), item.name.begin(), item.name.end());
+    }
+    const uint32_t central_size = (uint32_t)out.size() - central_offset;
+    zip_put_u32(out, 0x06054b50u);
+    zip_put_u16(out, 0);
+    zip_put_u16(out, 0);
+    zip_put_u16(out, (uint16_t)items.size());
+    zip_put_u16(out, (uint16_t)items.size());
+    zip_put_u32(out, central_size);
+    zip_put_u32(out, central_offset);
+    zip_put_u16(out, 0);
     return true;
 }
 
@@ -2504,8 +2615,22 @@ bool ModPackageManager::install_archive(const fs::path& archive,
                                         std::string* installed_version,
                                         std::string* error) {
     std::vector<uint8_t> bytes;
+    if (!read_file(archive, bytes, error)) return false;
+    return install_archive_bytes(bytes.data(), bytes.size(), installed_id,
+                                 installed_version, error);
+}
+
+bool ModPackageManager::install_archive_bytes(const uint8_t* data, size_t size,
+                                              std::string* installed_id,
+                                              std::string* installed_version,
+                                              std::string* error) {
+    if (!data || size == 0) {
+        set_error(error, "empty archive");
+        return false;
+    }
+    std::vector<uint8_t> bytes(data, data + size);
     std::vector<ZipEntry> entries;
-    if (!read_file(archive, bytes, error) || !parse_zip(bytes, entries, error))
+    if (!parse_zip(bytes, entries, error))
         return false;
     const auto manifest_entry = std::find_if(entries.begin(), entries.end(),
         [](const ZipEntry& e) { return e.name == "manifest.toml" && !e.directory; });
@@ -2559,6 +2684,22 @@ bool ModPackageManager::install_archive(const fs::path& archive,
     if (installed_id) *installed_id = package.id;
     if (installed_version) *installed_version = package.version;
     return true;
+}
+
+bool ModPackageManager::export_archive(const std::string& id, const std::string& version,
+                                       std::vector<uint8_t>& out,
+                                       std::string* error) const {
+    const auto pit = packages_.find(id);
+    if (pit == packages_.end()) {
+        set_error(error, "package is not installed");
+        return false;
+    }
+    const auto vit = pit->second.find(version);
+    if (vit == pit->second.end()) {
+        set_error(error, "package version is not installed");
+        return false;
+    }
+    return write_store_zip(vit->second.root, out, error);
 }
 
 bool ModPackageManager::remove_version(const std::string& id, const std::string& version,

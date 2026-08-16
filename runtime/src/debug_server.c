@@ -45,6 +45,7 @@
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
 #include "lockstep.h"
+#include "psx_ram.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,7 +161,7 @@ uint64_t s_frame_count = 0;
  * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
  * classifies the fork: pc differs but wr matches => same writes via a different
  * control path; wr differs => actual state divergence. Reusable for any title.
- * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
+ * Hashed over main RAM (phys < live size) only — game state lives there; MMIO/
  * scratchpad churn (device polling) would add benign cross-backend noise. */
 uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
 uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
@@ -177,7 +178,7 @@ static PSX_BSS FpEntry  s_fp_ring[FP_RING_CAP];
 static uint32_t s_fp_head  = 0;
 static uint64_t s_fp_total = 0;
 
-/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
+/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys < live size)
  * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
  * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
  * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
@@ -194,7 +195,7 @@ static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
         g_fp_sp_count++;
         return;
     }
-    if (phys >= 0x200000u) return;                  /* main RAM only */
+    if (phys >= g_psx_ram_size) return;                  /* main RAM only */
     uint64_t h = g_fp_wr_hash;
     h = (h ^ (uint64_t)phys) * 1099511628211ULL;
     h = (h ^ (uint64_t)val)  * 1099511628211ULL;
@@ -5127,9 +5128,9 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+    /* Effectively the entire live main RAM in one shot.  Response uses a heap-
      * sized envelope so we don't truncate. */
-    if (len > 0x200000) len = 0x200000;
+    if ((uint32_t)len > g_psx_ram_size) len = (int)g_psx_ram_size;
 
     /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
     size_t env = 256;
@@ -9458,7 +9459,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
-        if (phys < 0x200000u)
+        if (phys < g_psx_ram_size)
             rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
         else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
             rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);

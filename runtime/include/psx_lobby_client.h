@@ -16,6 +16,11 @@ extern "C" {
 #define PSX_LOBBY_MAX_MEMBERS 8
 #define PSX_LOBBY_MAX_LAN_EPS 4
 #define PSX_LOBBY_LANG_LEN 16
+#define PSX_LOBBY_MAX_MODS 12
+#define PSX_LOBBY_MOD_ID_LEN 96
+#define PSX_LOBBY_MOD_VER_LEN 32
+#define PSX_LOBBY_MOD_NAME_LEN 48
+#define PSX_LOBBY_MOD_FEATS_LEN 96
 
 #ifndef PSX_GAME_VERSION
 #define PSX_GAME_VERSION "dev"
@@ -38,6 +43,16 @@ typedef struct PsxLobbyRow {
     int      latency_ms;
 } PsxLobbyRow;
 
+/* One package the host requires, or one package a peer has installed. */
+typedef struct PsxLobbyModPkg {
+    char id[PSX_LOBBY_MOD_ID_LEN];
+    char ver[PSX_LOBBY_MOD_VER_LEN];
+    char name[PSX_LOBBY_MOD_NAME_LEN];   /* host required list (UI); empty on offers */
+    char feats[PSX_LOBBY_MOD_FEATS_LEN]; /* host enabled feature ids, comma-separated */
+    int  builtin;                        /* 1 = shipped with the title (still transferable) */
+    uint32_t size;                       /* archive bytes, 0 = unknown */
+} PsxLobbyModPkg;
+
 typedef struct PsxLobbyMember {
     int  slot;
     char player_id[PSX_LOBBY_ID_LEN];
@@ -48,7 +63,22 @@ typedef struct PsxLobbyMember {
     int  bios_can_openbios;   /* linked OpenBIOS backend */
     int  bios_can_scph1001;   /* linked retail + validated dump available */
     int  bios_prefer_openbios; /* explicit OpenBIOS pick (not retail) */
+    /* Peer installed-package catalog from set_ready mod_offer (0 if missing). */
+    int  mod_offer_valid;
+    int  mod_count;
+    PsxLobbyModPkg mods[PSX_LOBBY_MAX_MODS];
 } PsxLobbyMember;
+
+/*
+ * Local installed-package catalog advertised on join / set_ready. The host
+ * chooses which packages/features the match will run; missing guests are
+ * prompted to download before seating (online WS transfer).
+ */
+typedef struct PsxLobbyModOffer {
+    int  valid;
+    int  count;
+    PsxLobbyModPkg pkgs[PSX_LOBBY_MAX_MODS];
+} PsxLobbyModOffer;
 
 /*
  * Local BIOS capability advertised on set_ready (see docs/BIOS_SELECTION.md
@@ -83,6 +113,9 @@ typedef struct PsxLobbyMatchCaps {
     char language[PSX_LOBBY_LANG_LEN];
     /* Settled match BIOS: "openbios" | "scph1001" | "" (unset / legacy). */
     char session_bios[16];
+    /* Host-required packages (unique id+ver with any enabled feature). Empty = vanilla. */
+    int  mod_count;
+    PsxLobbyModPkg mods[PSX_LOBBY_MAX_MODS];
 } PsxLobbyMatchCaps;
 
 typedef struct PsxLobbyJoinInfo {
@@ -236,12 +269,40 @@ int  psx_lobby_local_ready(void);
 /* True when every seated player is ready and player_count >= 2. */
 int  psx_lobby_all_ready(void);
 
-/* Toggle ready in the current lobby (attaches current bios_offer). */
+/* Toggle ready in the current lobby (attaches current bios_offer + mod_offer). */
 int  psx_lobby_set_ready(int ready);
 
 /* Local BIOS offer used on the next set_ready (and included in settle). */
 void psx_lobby_set_bios_offer(const PsxLobbyBiosOffer *offer);
 const PsxLobbyBiosOffer *psx_lobby_bios_offer(void);
+
+/* Local installed-package catalog attached to the next set_ready / join. */
+void psx_lobby_set_mod_offer(const PsxLobbyModOffer *offer);
+const PsxLobbyModOffer *psx_lobby_mod_offer(void);
+
+/* Pre-join missing-mod handshake (op:need_mods). Not seated until installed. */
+int  psx_lobby_need_mods_count(void);
+int  psx_lobby_need_mods_get(int index, PsxLobbyModPkg *out);
+int  psx_lobby_need_mods_can_transfer(void);
+const char *psx_lobby_need_mods_lobby_id(void);
+const char *psx_lobby_pending_join_password(void);
+const char *psx_lobby_pending_join_bind(void);
+int  psx_lobby_mod_xfer_start(void);          /* guest: ask host to send missing pkgs */
+void psx_lobby_mod_xfer_cancel(void);
+int  psx_lobby_mod_xfer_progress(void);       /* -1 idle, -2 fail, 0..100 */
+int  psx_lobby_mod_xfer_failed(char *err, size_t err_cap);
+void psx_lobby_mod_xfer_note_fail(const char *err);
+int  psx_lobby_mod_xfer_pull(char *from, size_t from_cap,
+                             PsxLobbyModPkg *mods, int max);
+int  psx_lobby_mod_xfer_queue_pkg(const char *id, const char *ver, const char *sha256,
+                                  uint8_t *zip, uint32_t zip_len);
+int  psx_lobby_mod_xfer_queue_done(void);
+int  psx_lobby_mod_xfer_connected(void);
+int  psx_lobby_mod_xfer_send_idle(void);
+void psx_lobby_mod_xfer_send_fail(const char *to_player_id, const char *err);
+/* Guest: take a completed received package (caller frees *data). */
+int  psx_lobby_mod_package_take(PsxLobbyModPkg *meta, uint8_t **data, uint32_t *len);
+int  psx_lobby_mod_xfer_host_done(void); /* 1 after host sends the ICE end marker */
 
 /*
  * Settle session BIOS from seated peers' bios_offer (+ local offer):

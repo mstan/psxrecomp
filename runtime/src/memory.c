@@ -1,7 +1,7 @@
 /* memory.c — Phase 2 PS1 memory system.
  *
  * Physical address routing:
- *   0x00000000..0x001FFFFF — 2 MB RAM
+ *   0x00000000..0x007FFFFF — main RAM (2 MB × 4 mirrors, or unique 8 MB)
  *   0x1F800000..0x1F8003FF — 1 KB scratchpad
  *   0x1F801000..0x1F803FFF — MMIO (fatal abort)
  *   0x1FC00000..0x1FC7FFFF — 512 KB BIOS ROM (read-only)
@@ -24,18 +24,24 @@
 #include "dirty_ram_interp.h"
 #include "psx_cycles.h"
 #include "starvation_ring.h"
+#include "psx_ram.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define RAM_SIZE        (2 * 1024 * 1024)
+/* Host backing is always 8 MiB. Live size/mask select 2 MB mirrors vs unique 8 MB. */
+#define RAM_SIZE        PSX_RAM_CAPACITY
 #define SCRATCHPAD_SIZE 1024
 #define BIOS_ROM_SIZE   (512 * 1024)
 #define MOD_MEMORY_BASE 0x1F000000u
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
 static uint8_t ram[RAM_SIZE];
+static int s_ram_8mb_requested;
+
+uint32_t g_psx_ram_size = PSX_RAM_2MB;
+uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 static uint8_t mod_memory[MOD_MEMORY_SIZE];
@@ -98,22 +104,39 @@ uint8_t *g_psx_ram = ram;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
-/* Physical address translation for guest accesses. The 2 MB main RAM is
- * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
- * register, default 0x0B88) and games rely on it — Kula World's crt0
- * parks $sp in the 4th mirror (0x807FFFF8). Fold the mirrors here so the
- * RAM bounds checks below see canonical offsets; without this, mirror
- * writes fell into the open-bus no-op and mirror reads returned 0 (the
- * guest's stack silently vanished and $ra came back as 0). */
+/* Physical address translation for guest accesses. Retail 2 MB DRAM is
+ * mirrored 4x across the first 8 MB of each segment and games rely on it —
+ * Kula World's crt0 parks $sp in the 4th mirror (0x807FFFF8). The 8 MB
+ * hardware mod maps that window uniquely instead (DuckStation-style). Fold
+ * with the live mask so RAM bounds checks below see canonical offsets. */
 static inline uint32_t psx_phys_addr(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys < 0x00800000u) phys &= (uint32_t)(RAM_SIZE - 1);
+    if (phys < 0x00800000u) phys &= g_psx_ram_mask;
     return phys;
 }
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
+uint32_t memory_get_ram_bytes(void) { return g_psx_ram_size; }
+int      psx_ram_8mb_active(void) { return g_psx_ram_size > PSX_RAM_2MB; }
+
+void psx_ram_reset_size_request(void) { s_ram_8mb_requested = 0; }
+
+int psx_mod_set_main_ram_8mb(int enabled) {
+    s_ram_8mb_requested = enabled ? 1 : 0;
+    return 1;
+}
+
+static void psx_ram_apply_size_request(void) {
+    if (s_ram_8mb_requested) {
+        g_psx_ram_size = PSX_RAM_8MB;
+        g_psx_ram_mask = PSX_RAM_8MB - 1u;
+    } else {
+        g_psx_ram_size = PSX_RAM_2MB;
+        g_psx_ram_mask = PSX_RAM_2MB - 1u;
+    }
+}
 
 void memory_clear_low_boot_scratch(void) {
     memset(ram, 0, 0x10u);
@@ -683,6 +706,8 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
     if (count > DIRTY_RAM_BITMAP_WORDS) count = DIRTY_RAM_BITMAP_WORDS;
     for (uint32_t i = 0; i < count; i++)
         dirty_ram_bitmap[i] = words[i];
+    for (uint32_t i = count; i < DIRTY_RAM_BITMAP_WORDS; i++)
+        dirty_ram_bitmap[i] = 0;
     /* Bitmap replace bypasses clean→dirty transitions; bump so interpreter
      * site caches keyed on g_dirty_ram_code_gen cannot survive a restore. */
     g_dirty_ram_code_gen++;
@@ -1002,6 +1027,9 @@ static uint32_t s_bios_checksum = 0;
 uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 
 void memory_init(const char* bios_path) {
+    psx_ram_apply_size_request();
+    if (g_psx_ram_size > PSX_RAM_2MB)
+        fprintf(stdout, "psxrecomp: unique 8 MB main RAM (no 2 MB mirrors)\n");
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
     /* Rematch re-enters without process exit — wipe sticky I/O regs that
@@ -2065,10 +2093,10 @@ static inline int psx_cyc_main_ram_fast_addr(uint32_t addr, uint32_t width,
         return 0;
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys >= 0x00800000u) return 0;
-    phys &= (uint32_t)(RAM_SIZE - 1);
+    phys &= g_psx_ram_mask;
     /* Aligned guest loads cannot cross this boundary, but fail closed for a
      * malformed/unaligned caller instead of introducing a host OOB read. */
-    if (phys > (uint32_t)RAM_SIZE - width) return 0;
+    if (phys > g_psx_ram_size - width) return 0;
     *phys_out = phys;
     return 1;
 }

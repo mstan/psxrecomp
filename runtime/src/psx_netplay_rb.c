@@ -134,6 +134,7 @@ uint32_t psx_netplay_rb_rtt_estimate_ms(void) { return 0; }
 #include "psx_scheduler.h"
 #include "savestate.h"
 #include "spu.h"
+#include "psx_ram.h"
 
 #include "recomp_net/recomp_net.h"
 
@@ -191,9 +192,10 @@ static int g_empty_span_verify_pending;
 static int g_episode_snap_applied;
 
 /* Live-path snap every N ticks (raw boot_state ~3.5MB, no zlib). Resim still
- * snaps every tick so episode baselines stay dense.
- * Override: PSX_NET_SNAP_INTERVAL (default 16 — was 8; live memcpy was a
- * major FPS tax stacked on per-frame RAM digests). */
+ * snaps every tick so episode baselines stay dense. The ring itself is only
+ * 40 slots (RBE_SNAP_RING_DEFAULT_DEPTH): 24 TipHold runway + FMV/interval
+ * slack, not a deep history. Override: PSX_NET_SNAP_INTERVAL (default 16 —
+ * was 8; live memcpy was a major FPS tax stacked on per-frame RAM digests). */
 static uint32_t snap_interval(void)
 {
     static int latched;
@@ -1579,8 +1581,8 @@ static int rb_resume_pc_ok(uint32_t pc)
     if ((pc & 0xfff00000u) == 0xbfc00000u)
         return 1; /* BIOS ROM */
     phys = pc & 0x1fffffffu;
-    /* 2MB main RAM; skip the low scratch page (catches 0xB0 / 0x800000B0). */
-    if (phys >= 0x1000u && phys < 0x200000u)
+    /* Live main RAM; skip the low scratch page (catches 0xB0 / 0x800000B0). */
+    if (phys >= 0x1000u && phys < g_psx_ram_size)
         return 1;
     return 0;
 }
@@ -6153,6 +6155,7 @@ void psx_netplay_rb_start(void)
     gpu_vram_dirty_set_tracking(1);
     boot_state_vram_mirror_reset();
 
+    /* 40 slots: TipHold runway 24 + FMV/interval slack (see rbengine header). */
     g_snaps = netplay_snap_ring_create(NETPLAY_SNAP_RING_DEFAULT_DEPTH);
     tip_dense_reset();
     if (!g_snaps) {

@@ -6,6 +6,7 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"
+#include "psx_ram.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,8 +55,6 @@ static uint32_t digest_module(uint32_t (*bytes_fn)(void), void (*write_fn)(uint8
     write_fn(buf);
     return crc32_compute(buf, n);
 }
-
-#define NP_RAM_SIZE (2u * 1024u * 1024u)
 
 uint32_t netplay_cdrom_digest(void)
 {
@@ -159,7 +158,7 @@ void netplay_core_digest_parts(const CPUState* cpu, NetplayCoreParts* out)
 
     ram = memory_get_ram_ptr();
     if (ram)
-        crc_ram = crc32_update(crc_ram, ram, NP_RAM_SIZE);
+        crc_ram = crc32_update(crc_ram, ram, memory_get_ram_bytes());
 
     wc = dirty_ram_get_bitmap_word_count();
     for (i = 0; i < wc; i++) {

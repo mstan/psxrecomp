@@ -5,6 +5,7 @@
 #ifdef __cplusplus
 #include <filesystem>
 #include <string>
+#include <vector>
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"
 #endif
@@ -18,10 +19,21 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
                             std::string* error = nullptr);
 bool mod_runtime_commit(const std::filesystem::path& disc_path = {},
                         std::string* error = nullptr);
-/* Drop the in-session mod plan for a netplay launch without rewriting the
- * user's persisted offline selection on disk. Netplay is always vanilla for
- * now (no synced mod plans). */
+bool mod_runtime_commit(const std::filesystem::path& disc_path,
+                        std::string* error,
+                        bool persist);
+/* Drop the in-session mod plan for a vanilla netplay launch without rewriting
+ * the user's persisted offline selection on disk. */
 bool mod_runtime_clear_for_netplay(std::string* error = nullptr);
+/* Online lobby: apply the host match_caps mod plan (no disk persist).
+ * LAN / empty plan: clear for a vanilla session. */
+bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path = {},
+                                    std::string* error = nullptr);
+bool mod_runtime_export_package(const std::string& id, const std::string& version,
+                                std::vector<uint8_t>& out, std::string* sha256_hex,
+                                std::string* error = nullptr);
+bool mod_runtime_install_bytes(const uint8_t* data, size_t size,
+                               std::string* error = nullptr);
 const std::string& mod_runtime_fingerprint();
 const std::filesystem::path& mod_runtime_effective_disc_path();
 

@@ -3,6 +3,7 @@
 
 #include "text_xlate.h"
 #include "cpu_state.h"
+#include "psx_ram.h"
 
 #include <cstdint>
 #include <cstring>
@@ -36,14 +37,12 @@ namespace {
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
-// Guest RAM access (little-endian, no swizzle). Main RAM is 2 MB, mirrored
-// across [0,0x800000). Returns 0 / no-op for out-of-range.
+// Guest RAM access (little-endian, no swizzle). Fold KUSEG/KSEG0/KSEG1 into
+// live DRAM (2 MB mirrors or unique 8 MB). Returns 0 / no-op for out-of-range.
 // ---------------------------------------------------------------------------
-constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
-
 inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
     uint32_t p = va & 0x1FFFFFFFu;
-    if (p < 0x00800000u) { *pa_out = p & (kRamSize - 1u); return true; }
+    if (p < 0x00800000u) { *pa_out = p & g_psx_ram_mask; return true; }
     return false;  // I/O / BIOS / scratchpad — not translatable text storage
 }
 inline uint8_t grb(uint8_t* ram, uint32_t va) {

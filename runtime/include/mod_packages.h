@@ -321,6 +321,13 @@ public:
                          std::string* installed_id = nullptr,
                          std::string* installed_version = nullptr,
                          std::string* error = nullptr);
+    bool install_archive_bytes(const std::uint8_t* data, size_t size,
+                               std::string* installed_id = nullptr,
+                               std::string* installed_version = nullptr,
+                               std::string* error = nullptr);
+    bool export_archive(const std::string& id, const std::string& version,
+                        std::vector<std::uint8_t>& out,
+                        std::string* error = nullptr) const;
     bool remove_version(const std::string& id, const std::string& version,
                         std::string* error = nullptr);
 

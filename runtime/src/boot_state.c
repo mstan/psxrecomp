@@ -8,6 +8,7 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
+#include "psx_ram.h"
 #include "pst_wire.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -37,7 +38,6 @@ static double boot_state_mono_ms(void) {
 /* Compress payloads at/above this size (RAM/VRAM/SPU/dirty dominate I/O). */
 #define BOOT_STATE_ZLIB_MIN 256u
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
 #define SPAD_SIZE  (1024u)
 #define VRAM_W     1024
 #define VRAM_H     512
@@ -45,6 +45,7 @@ static double boot_state_mono_ms(void) {
 
 /* ---- core accessors (existing runtime modules) ---- */
 extern uint8_t*  memory_get_ram_ptr(void);
+extern uint32_t  memory_get_ram_bytes(void);
 extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
@@ -375,7 +376,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     ok = write_header_le(o, &h);
 
     if (ok) ok = write_cpu_section(o, cpu);
-    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        RAM_SIZE);
+    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
@@ -485,8 +486,8 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
     *out_len = 0;
     memset(&o, 0, sizeof o);
     o.no_zlib = no_zlib ? 1 : 0;
-    /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (RAM+VRAM+SPU). */
-    o.cap = no_zlib ? (5u * 1024u * 1024u) : (2u * 1024u * 1024u);
+    /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (2 MB RAM) or ~9.5 MiB (8 MB). */
+    o.cap = no_zlib ? (12u * 1024u * 1024u) : (2u * 1024u * 1024u);
     o.data = (uint8_t*)malloc(o.cap);
     if (!o.data) return 0;
     if (!boot_state_save_to(&o, cpu, bios_checksum, entry_pc)) {
@@ -539,11 +540,11 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     }
     case BS_SEC_RAM:
-        if (len != RAM_SIZE) return 0;
-        memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
+        if (len != memory_get_ram_bytes()) return 0;
+        memcpy(memory_get_ram_ptr(), p, memory_get_ram_bytes());
         {
             extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
-            psx_kernel_bless_note_range(0, RAM_SIZE);
+            psx_kernel_bless_note_range(0, memory_get_ram_bytes());
         }
         return 1;
     case BS_SEC_SPAD:

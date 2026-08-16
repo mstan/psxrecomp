@@ -80,7 +80,7 @@ typedef struct {
  */
 enum {
     BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
-    BS_SEC_RAM    = 0x02,  /* 2 MB main RAM                                       */
+    BS_SEC_RAM    = 0x02,  /* live main RAM (2 MB retail or unique 8 MB)           */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */
     BS_SEC_IRQ    = 0x04,  /* i_stat / i_mask / cycles_since_vblank (12B; 8B ok)  */
     BS_SEC_TIMER  = 0x05,  /* 3 root counters (counter/mode/target/irq/frac)      */
