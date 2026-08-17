@@ -380,6 +380,8 @@ static GLuint s_repl_prog = 0;
 static GLint  s_uReplTex = -1, s_uReplOrigin = -1, s_uReplSrc = -1;
 static GLint  s_uReplMaskset = -1, s_uReplSemipass = -1, s_uReplSemimode = -1;
 static GLint  s_uReplDebug = -1;
+static GLint  s_uReplVram = -1, s_uReplRecolour = -1;
+static int    s_repl_recolour = 0;   /* armed alongside s_repl_tex */
 int g_repl_debug = 0;               /* tex_pack repl_debug=1 */
 /* TEX_VS's projection uniforms, for the REPLACEMENT program's own copy.
  *
@@ -1116,6 +1118,30 @@ static const char *REPL_FS =
     "uniform int u_semipass;\n"
     "uniform int u_semimode;\n"
     "uniform int u_maskset;\n"
+    "uniform usampler2D u_vram;\n"
+    "uniform int u_recolour;  /* 1 = take colour from the live CLUT */\n"
+    "int vram_at(int x, int y){\n"
+    "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+    "}\n"
+    "vec3 col5(int raw){\n"
+    "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+    "}\n"
+    /* The palette this draw is actually using, as a 15-bit texel.
+     *
+     * Index 0 is the cutout hole, so the ink is the first entry after it that
+     * is not fully transparent black. That is exact for the two-entry palettes
+     * these masks are drawn with, which is the only case u_recolour is ever set
+     * for (tex_pack gates on the image having a single colour). Returns 0 if
+     * the palette is empty, and the caller then keeps the image's own colour
+     * rather than painting the glyph black. */
+    "int clut_ink(){\n"
+    "  int n = (v_depth == 1) ? 256 : 16;\n"
+    "  for (int i = 1; i < n; i++) {\n"
+    "    int raw = vram_at(v_clut.x + i, v_clut.y);\n"
+    "    if (raw != 0) return raw;\n"
+    "  }\n"
+    "  return 0;\n"
+    "}\n"
     /* Diagnostic: paint every replaced fragment solid magenta with no discard.
      * Splits "the draw never reaches the framebuffer" from "it reaches it and
      * samples nothing", which no amount of reading the code settles. */
@@ -1141,6 +1167,16 @@ static const char *REPL_FS =
     "  if (u_debug == 0 && t.a < 0.5/255.0) discard;\n"
     "  int stp = (u_debug != 0) ? 0 : ((t.a > 0.75) ? 0 : 1);\n"
     "  vec3 rgb = (u_debug != 0) ? vec3(1.0, 0.0, 1.0) : t.rgb;\n"
+    /* Palette-agnostic substitution: shape from the pack, colour from the game.
+     * The image's own RGB is whichever variant happened to be on disk, so it is
+     * discarded; alpha still decides the cutout, because that is the SHAPE and
+     * the pack is the authority on it. STP comes from the live entry too -- a
+     * different CLUT may set the bit differently, and reading it off the stale
+     * image would blend the glyph wrongly. */
+    "  if (u_debug == 0 && u_recolour != 0) {\n"
+    "    int ink = clut_ink();\n"
+    "    if (ink != 0) { rgb = col5(ink); stp = (ink >> 15) & 1; }\n"
+    "  }\n"
     /* u_debug is kept, not removed: painting replaced fragments solid magenta
      * with no discard is what finally separated "the draw never lands" from
      * "it lands and samples nothing", after four wrong guesses that each cost
@@ -2067,6 +2103,16 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glUniform2f(s_uReplSrc, s_repl_src[0], s_repl_src[1]);
     p_glUniform1i(s_uReplMaskset, s_mask_set);
     p_glUniform1i(s_uReplDebug, g_repl_debug);
+    /* Unit 1, because unit 0 already holds the replacement image. s_tex_prog
+     * puts VRAM on unit 0 since it has nothing else to bind; sharing that here
+     * would have the sampler read the pack PNG as if it were VRAM. Uniforms are
+     * per-PROGRAM, so this has to be set against s_repl_prog specifically --
+     * the same trap that once left every replaced primitive degenerate. */
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    p_glUniform1i(s_uReplVram, 1);
+    p_glUniform1i(s_uReplRecolour, s_repl_recolour);
     s_depth_armed = s_pgxp_depth && s_pq_valid;
     p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
 
@@ -2629,6 +2675,7 @@ static void glb_set_replacement(const void *repl) {
     }
 
     s_repl_tex = tex;
+    s_repl_recolour = r->recolour ? 1 : 0;
     s_repl_origin[0] = (float)r->origin_u;
     s_repl_origin[1] = (float)r->origin_v;
     s_repl_src[0]    = (float)r->src_w;
@@ -3061,6 +3108,8 @@ static int init_gpu_raster(void) {
     s_uReplSemipass = p_glGetUniformLocation(s_repl_prog, "u_semipass");
     s_uReplSemimode = p_glGetUniformLocation(s_repl_prog, "u_semimode");
     s_uReplDebug    = p_glGetUniformLocation(s_repl_prog, "u_debug");
+    s_uReplVram     = p_glGetUniformLocation(s_repl_prog, "u_vram");
+    s_uReplRecolour = p_glGetUniformLocation(s_repl_prog, "u_recolour");
     s_repl_uXoff    = p_glGetUniformLocation(s_repl_prog, "u_xoff");
     s_repl_uXhalf   = p_glGetUniformLocation(s_repl_prog, "u_xhalf");
     s_repl_uXscale  = p_glGetUniformLocation(s_repl_prog, "u_xscale");

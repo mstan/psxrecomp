@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <cstdio>
@@ -90,6 +91,22 @@ struct State {
      * pack itself unmodified. */
     std::vector<uint32_t> excluded;
 
+    /* Any one pack key per TEXTURE hash, for the palette-agnostic fallback.
+     *
+     * A pack entry is keyed (texture, palette), but the game recolours text by
+     * swapping the CLUT: it draws a glyph once per outline offset in the outline
+     * palette and once more in the fill palette, and it animates those colours.
+     * That is far more palettes than any pack ships -- measured on the WipEout 3
+     * title screen: 348 distinct CLUTs in use, 153 with no pack entry. Every one
+     * of those draws fell back to the original low-res texture, which is why a
+     * string renders crisp in one frame and blocky in the next, and why HD glyph
+     * fills appeared wrapped in a low-res outline.
+     *
+     * So when the exact key misses we still know the right IMAGE -- the texture
+     * hash identifies it -- we just do not know its colour. Recolouring from the
+     * live CLUT recovers that; see repl_is_mask for when it is safe. */
+    std::unordered_map<uint32_t, uint64_t> by_tex;
+
     /* Sorted (hash << 32) | palette_hash key sets. */
     std::vector<uint64_t> known;    /* files present in the pack on disk       */
     std::vector<uint64_t> dumped;   /* keys written this session (dedup)       */
@@ -127,6 +144,7 @@ struct State {
         int      src_w = 0, src_h = 0;/* source texture, TEXELS           */
         int      origin_u = 0, origin_v = 0; /* upload origin in the page */
         bool     tried = false;
+        bool     mask = false;        /* single ink colour: safe to recolour */
         std::vector<uint8_t> pixels;  /* RGBA8, w*h*4                     */
         uint32_t gl_handle = 0;       /* backend-owned; 0 = not uploaded  */
     };
@@ -147,6 +165,14 @@ struct State {
 
     /* Diagnostics. */
     uint64_t n_repl_hit = 0, n_repl_miss = 0, n_repl_decoded = 0, n_repl_failed = 0;
+    /* Draws served by the palette-agnostic fallback, and draws it declined
+     * because the pack image carries real colour structure. The second number
+     * is the one that says whether the gate is doing its job. */
+    uint64_t n_repl_recolour = 0, n_repl_multicol = 0;
+    /* Why a lookup produced nothing. "hit + miss" alone cannot tell "the pack
+     * has no image for this texture" from "no upload backs this primitive",
+     * and those want opposite fixes. */
+    uint64_t n_repl_calls = 0, n_repl_nocontain = 0, n_repl_notex = 0;
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
     uint64_t n_dump_written = 0, n_dump_failed = 0;
@@ -332,6 +358,7 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     g.uploads.clear();
     g.pal_memo.clear();
     g.known.clear();
+    g.by_tex.clear();
     g.dumped.clear();
     g.matched.clear();
     g.dump_dir_ready = false;
@@ -365,6 +392,9 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
             if (std::sscanf(fn.c_str(), "%x-%x.%15s", &h, &p, ext) != 3) continue;
             if (std::strcmp(ext, "png") != 0) continue;   /* v1 decodes PNG only */
             key_set_insert(g.known, pack_key(h, p));
+            /* First file wins: any palette variant of a texture is an equally
+             * good SHAPE source, since only the CLUT differs between them. */
+            g.by_tex.emplace((uint32_t)h, pack_key(h, p));
         }
 
         /* Optional per-pack exclusions. */
@@ -469,6 +499,31 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
     g.n_uploads++;
 }
 
+/* Is this replacement a single-colour MASK -- one ink colour plus holes?
+ *
+ * This is the gate on palette-agnostic substitution, and it has to be a
+ * property of the DATA, not a list of texture hashes we happen to know are
+ * fonts. Recolouring means throwing the image's RGB away and taking the colour
+ * from the live CLUT instead. That is exact when the image only ever had one
+ * colour to begin with -- a glyph, an icon, a HUD symbol -- and wrong for
+ * anything with internal colour structure, where it would flatten the artwork
+ * to a single hue. So: allow it only where there is nothing to lose.
+ *
+ * Alpha here is meaning, not opacity (0 = colour index 0, the cutout hole), so
+ * a pixel only counts as ink once it is past the same threshold the shader
+ * discards on. Anti-aliased edges keep the ink colour and vary alpha, so they
+ * do not make an image look multi-coloured. */
+static bool image_is_mask(const std::vector<uint8_t> &px) {
+    bool seen = false;
+    uint8_t r0 = 0, g0 = 0, b0 = 0;
+    for (size_t i = 0; i + 3 < px.size(); i += 4) {
+        if (px[i + 3] == 0) continue;             /* hole: carries no colour */
+        if (!seen) { r0 = px[i]; g0 = px[i + 1]; b0 = px[i + 2]; seen = true; continue; }
+        if (px[i] != r0 || px[i + 1] != g0 || px[i + 2] != b0) return false;
+    }
+    return seen;
+}
+
 /* Decode a pack entry on first use. Caller holds g.mu. Returns null when there
  * is no file for this key or it could not be decoded; the failure is cached so
  * a broken entry is not reopened every frame. */
@@ -512,6 +567,7 @@ State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
     if (px && w > 0 && h > 0) {
         r.w = w; r.h = h;
         r.pixels.assign(px, px + (size_t)w * h * 4);
+        r.mask = image_is_mask(r.pixels);
         g.n_repl_decoded++;
     } else {
         g.n_repl_failed++;
@@ -558,18 +614,38 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
      *
      * So: require CONTAINMENT, and scan newest-first, since a later upload to
      * the same VRAM region is the live one. */
+    g.n_repl_calls++;
+    bool contained = false;
     for (size_t i = g.uploads.size(); i-- > 0; ) {
         const Upload &up = g.uploads[i];
         if (rx < up.x || ry < up.y ||
             rx + rw > up.x + up.w || ry + rh > up.y + up.h) continue;
-        const uint64_t key = pack_key(up.hash, pal);
-        if (!key_set_contains(g.known, key)) continue;
+        contained = true;
+        uint64_t key = pack_key(up.hash, pal);
+        int recolour = 0;
+        if (!key_set_contains(g.known, key)) {
+            /* No file for this exact CLUT. We still know WHICH image this is --
+             * the texture hash says so -- we just do not know its colour, so
+             * borrow any variant's shape and take the colour from the live CLUT
+             * in the shader. Gated on that variant being a single-colour mask,
+             * where there is no colour structure to destroy. Without this, the
+             * game's own colour animation silently disables the pack: on the
+             * title screen 153 of 348 CLUTs in use ship no file. */
+            auto it = g.by_tex.find(up.hash);
+            if (it == g.by_tex.end()) { g.n_repl_notex++; continue; }
+            key = it->second;
+            recolour = 1;
+        }
         bool skip = false;
         for (uint32_t ex : g.excluded) { if (ex == up.hash) { skip = true; break; } }
         if (skip) continue;
 
         State::Repl *r = repl_get_locked(key, up, shift, base_x, base_y);
         if (!r) { g.n_repl_miss++; return 0; }
+        if (recolour) {
+            if (!r->mask) { g.n_repl_multicol++; return 0; }
+            g.n_repl_recolour++;
+        }
 
         out->pixels   = r->pixels.data();
         out->width    = r->w;
@@ -580,9 +656,11 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         out->origin_v = r->origin_v;
         out->id       = r->key;
         out->gl_handle = &r->gl_handle;
+        out->recolour = recolour;
         g.n_repl_hit++;
         return 1;
     }
+    if (!contained) g.n_repl_nocontain++;
     g.n_repl_miss++;
     return 0;
 }
@@ -708,7 +786,10 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             "\"pal_hash\":%llu,\"pal_memo_hit\":%llu,\"dumped\":%zu,"
             "\"dump_written\":%llu,\"dump_failed\":%llu,"
             "\"repl_images\":%zu,\"repl_decoded\":%llu,\"repl_failed\":%llu,"
-            "\"repl_hit\":%llu,\"repl_miss\":%llu}",
+            "\"repl_hit\":%llu,\"repl_miss\":%llu,"
+            "\"repl_recolour\":%llu,\"repl_multicol\":%llu,"
+            "\"repl_calls\":%llu,\"repl_nocontain\":%llu,"
+            "\"repl_notex\":%llu}",
             (int)g.replace_on, (int)g.dump_on,
             pack_dir.c_str(), dump_dir.c_str(),
             g.known.size(), g.matched.size(), g.uploads.size(),
@@ -719,7 +800,12 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             (unsigned long long)g.n_dump_written, (unsigned long long)g.n_dump_failed,
             g.repl.size(),
             (unsigned long long)g.n_repl_decoded, (unsigned long long)g.n_repl_failed,
-            (unsigned long long)g.n_repl_hit, (unsigned long long)g.n_repl_miss);
+            (unsigned long long)g.n_repl_hit, (unsigned long long)g.n_repl_miss,
+            (unsigned long long)g.n_repl_recolour,
+            (unsigned long long)g.n_repl_multicol,
+            (unsigned long long)g.n_repl_calls,
+            (unsigned long long)g.n_repl_nocontain,
+            (unsigned long long)g.n_repl_notex);
     } else if (!std::strcmp(subcmd, "uploads")) {
         n = std::snprintf(out, (size_t)cap, "[");
         for (size_t i = 0; i < g.uploads.size() && n < cap - 64; i++) {

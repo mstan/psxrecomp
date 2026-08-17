@@ -94,6 +94,11 @@ typedef struct {
     int origin_u, origin_v;  /* source origin in the page, texels */
     unsigned long long id;
     unsigned *gl_handle;
+    /* 1 = this image was matched on TEXTURE hash alone because the pack ships
+     * no file for the draw's CLUT. It is a single-colour mask, so the shape is
+     * right but the colour is whatever palette variant happened to be on disk;
+     * the renderer must take the colour from the live CLUT instead. */
+    int recolour;
 } TexPackRepl;
 
 /* 1 when this primitive has a replacement (decoding it on first use), 0
