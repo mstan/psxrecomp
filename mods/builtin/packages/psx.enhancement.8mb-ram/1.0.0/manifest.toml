@@ -3,7 +3,7 @@ id = "psx.enhancement.8mb-ram"
 version = "1.0.0"
 name = "8 MB Main RAM"
 author = "psxrecomp"
-description = "Maps unique 8 MiB DRAM across the 8 MiB window instead of 2 MiB mirrored 4×. Needed by patches that allocate heaps above 2 MB. Breaks games that park the stack in a RAM mirror. Both netplay peers must match."
+description = "Maps unique 8 MiB DRAM across the 8 MiB window (DuckStation-style) for enhancement heaps. Still-aliased high code PCs fold to the low 2 MiB for AOT; unique high code may run interpreted until overlay-compiled. Both netplay peers must match."
 resolver = "declarative"
 save_compatibility = "isolated"
 
@@ -13,7 +13,7 @@ game_id = "*"
 [[feature]]
 id = "8mb-ram"
 name = "8 MB Main RAM"
-description = "Disabled by default. Turn this on only for titles whose patches or mods actually use RAM above 2 MB (for example Wipeout 3 enhanced visuals). Retail games do not get faster from empty high RAM, and mirror-stack games will crash."
+description = "Disabled by default. Turn this on for titles whose patches use RAM above 2 MB (for example Wipeout 3 enhanced visuals). Registers the full high window as unique DRAM."
 group = "Hardware"
 default_enabled = false
 

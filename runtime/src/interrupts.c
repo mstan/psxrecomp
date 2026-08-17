@@ -1602,6 +1602,8 @@ irq_deliver_eval:
             if (psx_scheduler_top_level_resume_active() &&
                 cpu->pc != 0u && (cpu->pc & 3u) == 0u) {
                 uint32_t phys = cpu->pc & 0x1FFFFFFFu;
+                if (phys < 0x00800000u)
+                    phys &= 0x001FFFFFu;
                 if (phys < 0x00200000u ||
                     (phys >= 0x1FC00000u && phys < 0x1FC80000u))
                     real_pc = cpu->pc;
@@ -1622,6 +1624,8 @@ irq_deliver_eval:
          * ROM pc still falls back to the sentinel (pre-fix behavior);
          * RAM acceptance is unchanged byte-for-byte. */
         uint32_t real_phys = real_pc & 0x1FFFFFFFu;
+        if (real_phys < 0x00800000u)
+            real_phys &= 0x001FFFFFu;
         int resume_in_ram  = real_phys < 0x00200000u;
         int resume_in_rom  = real_phys >= 0x1FC00000u && real_phys < 0x1FC80000u &&
                              psx_is_dispatchable(real_pc);

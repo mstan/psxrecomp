@@ -215,6 +215,36 @@ bool restored_main_matches_plan(const RuntimeMods& s, uint32_t& failed_at) {
     return true;
 }
 
+/* True when every planned MainExe replacement byte is already live in RAM.
+ * Used after savestate restore so we do not re-psx_write + dirty executable
+ * pages for a checkpoint that was saved with the plan already applied
+ * (re-dirty + overlay invalidate soft-locks enhanced 8 MB titles). */
+bool restored_main_has_replacements(const RuntimeMods& s) {
+    std::map<uint32_t, uint8_t> desired;
+    for (const ModResolution::Write& write : s.plan.writes) {
+        if (write.target != ModPatchTarget::MainExe) continue;
+        if (write.fields.empty()) {
+            for (size_t i = 0; i < write.replacement.size(); ++i)
+                desired[(uint32_t)write.location + (uint32_t)i] =
+                    write.replacement[i];
+        } else {
+            for (const ModResolution::Write::Field& field : write.fields) {
+                for (size_t i = 0; i < field.replacement.size(); ++i)
+                    desired[
+                        (uint32_t)write.location +
+                        (uint32_t)field.offset + (uint32_t)i] =
+                        field.replacement[i];
+            }
+        }
+    }
+    if (desired.empty()) return true;
+    for (const auto& kv : desired) {
+        if (psx_read_byte(kv.first) != kv.second)
+            return false;
+    }
+    return true;
+}
+
 bool sha256_file(const std::filesystem::path& path, std::string& out,
                  std::string* error) {
     out.clear();
@@ -1214,20 +1244,18 @@ extern "C" void mod_runtime_on_dispatch(uint32_t target) {
     if (!s.initialized || s.main_applied ||
         (target & 0x1FFFFFFFu) != s.entry_phys) return;
 
-    for (const ModResolution::Write& write : s.plan.writes) {
-        if (write.target != ModPatchTarget::MainExe) continue;
-        for (size_t i = 0; i < write.expected.size(); ++i) {
-            if (psx_read_byte((uint32_t)write.location + (uint32_t)i) !=
-                write.expected[i]) {
-                std::fprintf(stderr,
-                    "psxrecomp: mod plan %s rejected at 0x%08X "
-                    "(expected-byte guard failed; booting unmodified)\n",
-                    s.plan.fingerprint.c_str(),
-                    (unsigned)((uint32_t)write.location + (uint32_t)i));
-                s.main_applied = true;
-                return;
-            }
-        }
+    /* Disc overlays can rewrite the boot EXE while the BIOS LoadExe path
+     * reads it, so by entry RAM may already hold plan replacements. Accept
+     * stock expected OR the planned replacement (same rule as savestate
+     * reapply); reject only when live bytes match neither. */
+    uint32_t failed_at = 0;
+    if (!restored_main_matches_plan(s, failed_at)) {
+        std::fprintf(stderr,
+            "psxrecomp: mod plan %s rejected at 0x%08X "
+            "(expected-byte guard failed; booting unmodified)\n",
+            s.plan.fingerprint.c_str(), (unsigned)failed_at);
+        s.main_applied = true;
+        return;
     }
     for (const ModResolution::Write& write : s.plan.writes) {
         if (write.target != ModPatchTarget::MainExe) continue;
@@ -1244,15 +1272,23 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
 
-    if (!s.main_applied) {
-        uint32_t failed_at = 0;
-        if (!restored_main_matches_plan(s, failed_at)) {
-            std::fprintf(stderr,
-                "psxrecomp: mod plan %s rejected after savestate restore at "
-                "0x%08X (expected-byte guard failed)\n",
-                s.plan.fingerprint.c_str(), (unsigned)failed_at);
-            return;
-        }
+    /* Always validate: stock expected OR planned replacement. Reject only
+     * when live bytes match neither (corrupt / foreign checkpoint). */
+    uint32_t failed_at = 0;
+    if (!restored_main_matches_plan(s, failed_at)) {
+        std::fprintf(stderr,
+            "psxrecomp: mod plan %s rejected after savestate restore at "
+            "0x%08X (expected-byte guard failed)\n",
+            s.plan.fingerprint.c_str(), (unsigned)failed_at);
+        return;
+    }
+
+    /* Checkpoint saved under this plan already carries replacements in RAM.
+     * Re-psx_write + dirty_ram_mark_executable_range after overlay invalidate
+     * soft-locks enhanced 8 MB sessions; leave bytes alone. */
+    if (restored_main_has_replacements(s)) {
+        s.main_applied = true;
+        return;
     }
 
     bool applied = false;
@@ -1409,6 +1445,7 @@ extern "C" int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback) {
     using namespace PSXRecompV4;
     if (!id || !*id || !address || !callback) return 0;
+    if (!mod_register_function_entry_plugin_id(id)) return 0;
     auto& plugins = function_entry_plugins();
     const auto duplicate = std::find_if(
         plugins.begin(), plugins.end(), [&](const FunctionEntryPlugin& item) {
@@ -1422,8 +1459,19 @@ extern "C" int psx_mod_register_function_entry_plugin(
 extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
     if (!cpu) return;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return;
     for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
-        if (plugin.address == address) plugin.callback(cpu, address);
+        if (plugin.address != address) continue;
+        bool enabled = false;
+        for (const ModResolution::Plugin& planned : s.plan.plugins) {
+            if (planned.id == plugin.id) {
+                enabled = true;
+                break;
+            }
+        }
+        if (!enabled) continue;
+        plugin.callback(cpu, address);
     }
 }
 

@@ -1193,7 +1193,7 @@ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're de
  * cadence, too much to charge every host for a feature many never open. */
 static int           g_rewind_enabled = 0;
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
-static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
+static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15/30) */
 static int           g_hotkey_pad_rewind = 1272;       /* select + r3 */
 static int           g_hotkey_pad_save_state_menu = 2040;/* select + r1 */
 static uint32_t      g_savestate_input_guard_min_until = 0;
@@ -3754,7 +3754,13 @@ static std::unordered_map<std::string, ControllerMap> controller_maps_by_guid;
 
 static const ControllerMap& controller_map_for(const PlayerInput& p) {
     if (p.guid[0]) {
-        auto it = controller_maps_by_guid.find(p.guid);
+        char lower[40]{};
+        for (size_t i = 0; i < sizeof(lower) - 1 && p.guid[i]; ++i)
+            lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(p.guid[i])));
+        auto it = controller_maps_by_guid.find(lower);
+        if (it != controller_maps_by_guid.end()) return it->second;
+        // Legacy files may have stored mixed-case GUIDs before normalize.
+        it = controller_maps_by_guid.find(p.guid);
         if (it != controller_maps_by_guid.end()) return it->second;
     }
     return controller_map;
@@ -4115,14 +4121,26 @@ static void load_input_config(const char* argv0) {
         } else if (section == "mapping") {
             for (auto& entry : controller_map) {
                 if (key == entry.ini_name) {
-                    entry.sources = parse_source_list(value);
+                    std::vector<ControllerSource> parsed = parse_source_list(value);
+                    const std::string vlow = lower_copy(trim_copy(value));
+                    const bool explicit_none =
+                        vlow.empty() || vlow == "none" || vlow == "disabled";
+                    /* Keep defaults when the value is garbage (typo) so a bad
+                     * line cannot silently unbind a working control. */
+                    if (!parsed.empty() || explicit_none)
+                        entry.sources = std::move(parsed);
                     break;
                 }
             }
         } else if (guid_target) {
             for (auto& entry : *guid_target) {
                 if (key == entry.ini_name) {
-                    entry.sources = parse_source_list(value);
+                    std::vector<ControllerSource> parsed = parse_source_list(value);
+                    const std::string vlow = lower_copy(trim_copy(value));
+                    const bool explicit_none =
+                        vlow.empty() || vlow == "none" || vlow == "disabled";
+                    if (!parsed.empty() || explicit_none)
+                        entry.sources = std::move(parsed);
                     break;
                 }
             }
@@ -4186,7 +4204,7 @@ static void open_player(PlayerInput& p, int self_slot) {
         /* Skip a device already opened by another player. */
         SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
         if (device_claimed_by_other(self_slot, inst)) continue;
-        if (p.guid[0] && std::strcmp(buf, p.guid) == 0) { chosen = i; break; }
+        if (p.guid[0] && lower_copy(buf) == lower_copy(p.guid)) { chosen = i; break; }
         if (fallback < 0) fallback = i;
     }
     if (chosen < 0) chosen = fallback;
@@ -4202,6 +4220,8 @@ static void open_player(PlayerInput& p, int self_slot) {
         {
             SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(chosen);
             SDL_JoystickGetGUIDString(g, p.guid, (int)sizeof(p.guid));
+            for (char* c = p.guid; *c; ++c)
+                *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
         }
         const char* name = SDL_GameControllerName(p.handle);
         std::fprintf(stdout, "psxrecomp runtime: opened controller for slot: %s\n",

@@ -1245,7 +1245,7 @@ struct UserSettings {
     // 50 / 100 / 150 / 200 (default 50). Runtime clamps + snaps to those steps.
     bool has_rewind_depth   = false; int  rewind_depth   = 50;
     // [video] rewind_interval: frames between local rewind snaps. UI offers
-    // 1 / 4 / 8 / 12 / 15 (default 15).
+    // 1 / 4 / 8 / 12 / 15 / 30 (default 15; 8 MB soft-default is 30).
     bool has_rewind_interval = false; int rewind_interval = 15;
     // [hotkeys] controller-only host shortcuts. Values use recomp-ui's
     // RECOMP_LAUNCHER_PAD_* encoding (0 = unbound, 1+button, 100+axis).

@@ -2371,10 +2371,10 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("rewind_interval")) try_get([&]{
             int d = toml::find<int>(v, "rewind_interval");
-            static const int opts[5] = {1, 4, 8, 12, 15};
+            static const int opts[6] = {1, 4, 8, 12, 15, 30};
             int best = opts[0];
             int best_d = d > best ? d - best : best - d;
-            for (int i = 1; i < 5; ++i) {
+            for (int i = 1; i < 6; ++i) {
                 int dd = d > opts[i] ? d - opts[i] : opts[i] - d;
                 if (dd < best_d) { best_d = dd; best = opts[i]; }
             }

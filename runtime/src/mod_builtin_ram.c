@@ -1,12 +1,12 @@
 /*
- * Framework-owned unique 8 MB main RAM, available to every game.
+ * Framework-owned 8 MB main RAM, available to every game.
  *
  * Retail PS1 DRAM is 2 MiB mirrored 4× across 0x00000000–0x007FFFFF. Some
  * homebrew / enhancement patches park heaps above 2 MB (Wipeout 3 enhanced,
- * TM4 later). This opt-in maps unique DRAM across that window instead.
- * Default is off: mirror-stack titles (Kula World $sp at 0x807FFFF8) break
- * if 8 MB is forced on. Both netplay peers must match; the plan fingerprint
- * already includes enabled mods.
+ * TM4 later). This opt-in enables 8 MB capacity and registers the full high
+ * window as unique DRAM. Instruction PCs on still-aliased pages fold to the
+ * low 2 MiB; unique high code runs via dirty-RAM until overlay-AOT covers it.
+ * Default is off. Both netplay peers must match.
  */
 #include "mod_plugins.h"
 

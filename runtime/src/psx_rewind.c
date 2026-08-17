@@ -12,6 +12,7 @@
 #include "psx_cycles.h"
 #include "psx_netplay.h"
 #include "psx_netplay_rb.h"
+#include "psx_ram.h"
 #include "psx_scheduler.h"
 #include "savestate.h"
 
@@ -28,6 +29,9 @@
 #define RW_MAX_DEPTH   200
 #define RW_DEF_DEPTH    50
 #define RW_DEF_INTERVAL 15
+/* Soft defaults when 8 MB RAM is live and the user has not set prefs. */
+#define RW_DEF_DEPTH_8MB    50
+#define RW_DEF_INTERVAL_8MB 30
 /* Match netplay §96 FMV media snaps (default 4; MEDIA_KF uses 2). */
 #define RW_DEF_FMV_INTERVAL 4
 #define RW_FMV_MDEC_HYSTERESIS 8u
@@ -212,14 +216,14 @@ static uint32_t normalize_rewind_depth(uint32_t v)
     return best;
 }
 
-/* UI offers 1/4/8/12/15. */
+/* UI offers 1/4/8/12/15/30 (30 softens 8 MB capture cost). */
 static uint32_t normalize_rewind_interval(uint32_t v)
 {
-    static const uint32_t opts[5] = {1u, 4u, 8u, 12u, 15u};
+    static const uint32_t opts[6] = {1u, 4u, 8u, 12u, 15u, 30u};
     uint32_t best = opts[0];
     uint32_t best_d = v > best ? v - best : best - v;
     unsigned i;
-    for (i = 1; i < 5; i++) {
+    for (i = 1; i < 6; i++) {
         uint32_t d = v > opts[i] ? v - opts[i] : opts[i] - v;
         if (d < best_d) {
             best_d = d;
@@ -274,16 +278,26 @@ static int rewind_wanted(void)
         else
             s_enabled = 0;
         {
-            uint32_t iv_def = s_interval_pref > 0 ? (uint32_t)s_interval_pref
-                                                  : RW_DEF_INTERVAL;
+            uint32_t iv_def;
+            if (s_interval_pref > 0)
+                iv_def = (uint32_t)s_interval_pref;
+            else if (psx_ram_8mb_active())
+                iv_def = RW_DEF_INTERVAL_8MB;
+            else
+                iv_def = RW_DEF_INTERVAL;
             s_interval = normalize_rewind_interval(
                 env_u32("PSX_REWIND_INTERVAL", iv_def, 1u, 60u));
         }
         s_fmv_interval =
             env_u32("PSX_REWIND_FMV_INTERVAL", RW_DEF_FMV_INTERVAL, 1u, 16u);
         {
-            uint32_t depth_def = s_depth_pref > 0 ? (uint32_t)s_depth_pref
-                                                  : RW_DEF_DEPTH;
+            uint32_t depth_def;
+            if (s_depth_pref > 0)
+                depth_def = (uint32_t)s_depth_pref;
+            else if (psx_ram_8mb_active())
+                depth_def = RW_DEF_DEPTH_8MB;
+            else
+                depth_def = RW_DEF_DEPTH;
             s_depth = normalize_rewind_depth(
                 env_u32("PSX_REWIND_DEPTH", depth_def, 4u, RW_MAX_DEPTH));
         }
@@ -495,7 +509,9 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         return 0;
     snap = *cpu;
     snap.pc = pc;
-    if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
+    /* zlib (not raw): 8 MB raw snaps were ~9.5 MiB and dominated FPS.
+     * Netplay still uses raw (latency budget); rewind prefers size. */
+    if (!boot_state_save_buffer(&snap, s_bios, s_entry, &blob, &len) ||
         !blob || !len)
         return 0;
     if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {

@@ -109,13 +109,13 @@ int  boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
                      uint32_t entry_pc, const char* path);
 
 /* Same as boot_state_save, but into a malloc'd buffer (caller frees *out_data).
- * Compresses large sections (disk-oriented). */
+ * Compresses large sections (disk + local rewind). */
 int  boot_state_save_buffer(const CPUState* cpu, uint32_t bios_checksum,
                             uint32_t entry_pc, uint8_t** out_data,
                             size_t* out_len);
 
-/* In-memory ring snaps: same sections, no zlib. Load accepts either form.
- * Avoids compress2 on ~3.5 MiB RAM+VRAM+SPU every live/resim snap (FPS). */
+/* In-memory netplay ring snaps: same sections, no zlib. Load accepts either
+ * form. Prefer over zlib when every tick must stay under a hard latency budget. */
 int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint8_t** out_data,
                                 size_t* out_len);

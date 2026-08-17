@@ -42,14 +42,17 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
     uint32_t p = va & 0x1FFFFFFFu;
-    if (p < 0x00800000u) { *pa_out = p & g_psx_ram_mask; return true; }
+    if (p < 0x00800000u) { *pa_out = psx_ram_map_read(p); return true; }
     return false;  // I/O / BIOS / scratchpad — not translatable text storage
 }
 inline uint8_t grb(uint8_t* ram, uint32_t va) {
     uint32_t pa; return ram_fold(va, &pa) ? ram[pa] : 0u;
 }
 inline void gwb(uint8_t* ram, uint32_t va, uint8_t v) {
-    uint32_t pa; if (ram_fold(va, &pa)) ram[pa] = v;
+    uint32_t p = va & 0x1FFFFFFFu;
+    if (p >= 0x00800000u) return;
+    p = psx_ram_map_write(p);
+    ram[p] = v;
 }
 inline bool va_in_ram(uint32_t va) { uint32_t pa; return ram_fold(va, &pa); }
 // Bless a just-written patch region into the text-image guard (see the extern

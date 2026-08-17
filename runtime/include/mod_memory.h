@@ -30,8 +30,9 @@ static inline int psx_mod_gpu_dma_aperture_offset_for(
 }
 
 /*
- * Fold DMA addresses through live main RAM (2 MiB retail or unique 8 MiB)
- * unless the address is inside the allocated GPU-DMA enhancement aperture.
+ * Fold DMA addresses through live main RAM (2 MiB retail or unique 8 MiB
+ * registered high pages) unless the address is inside the allocated GPU-DMA
+ * enhancement aperture.
  */
 static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
     uint32_t address, uint32_t used) {
@@ -39,7 +40,7 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
     if (psx_mod_gpu_dma_aperture_offset_for(
             canonical, 4u, used, (uint32_t *)0))
         return canonical;
-    return canonical & (g_psx_ram_mask & ~3u);
+    return psx_ram_map_read(canonical) & ~3u;
 }
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);

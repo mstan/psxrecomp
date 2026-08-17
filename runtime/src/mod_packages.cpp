@@ -34,6 +34,9 @@ std::map<std::string, ModBuiltinResolver>& builtin_resolvers() {
 struct RegisteredPlugin {
     PSXModActivationCallback activation = nullptr;
     PSXModVBlankCallback vblank = nullptr;
+    /* Function-entry callbacks live in mod_runtime; this flag makes the id
+     * visible to package resolve (manifest [[plugin]] / mod_plugin_registered). */
+    bool function_entry = false;
 };
 
 std::map<std::string, RegisteredPlugin>& registered_plugins() {
@@ -1560,10 +1563,17 @@ bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void)) {
     return true;
 }
 
+bool mod_register_function_entry_plugin_id(const std::string& id) {
+    if (!valid_id(id)) return false;
+    registered_plugins()[id].function_entry = true;
+    return true;
+}
+
 bool mod_plugin_registered(const std::string& id) {
     const auto found = registered_plugins().find(id);
     return found != registered_plugins().end() &&
-        (found->second.activation || found->second.vblank);
+        (found->second.activation || found->second.vblank ||
+         found->second.function_entry);
 }
 
 void mod_invoke_activation_plugin(const std::string& id) {

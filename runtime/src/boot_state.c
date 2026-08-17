@@ -545,6 +545,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         {
             extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
             psx_kernel_bless_note_range(0, memory_get_ram_bytes());
+            psx_ram_resync_high_after_restore();
         }
         return 1;
     case BS_SEC_SPAD:

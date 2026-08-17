@@ -384,6 +384,9 @@ bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver res
 void mod_clear_builtin_resolvers_for_tests();
 bool mod_register_activation_plugin(const std::string& id, void (*callback)(void));
 bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void));
+/* Mark a function-entry plugin id as trusted for package resolve. Callbacks
+ * remain in mod_runtime; same id may bind multiple guest addresses. */
+bool mod_register_function_entry_plugin_id(const std::string& id);
 bool mod_plugin_registered(const std::string& id);
 void mod_invoke_activation_plugin(const std::string& id);
 void mod_invoke_vblank_plugin(const std::string& id);
