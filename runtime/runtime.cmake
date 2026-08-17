@@ -1064,6 +1064,7 @@ function(psxrecomp_add_runtime_target target)
                 find_program(CMAKE_RC_COMPILER
                     NAMES llvm-rc llvm-windres windres
                     HINTS
+                        "$ENV{RETCOMM_TOOLCHAIN_DIR}/bin"
                         "$ENV{RETCOMM_TOOLCHAIN}/bin"
                         "$ENV{CMAKE_CLANG_V1}/bin"
                     DOC "Windows resource compiler for APP_ICON .rc")
