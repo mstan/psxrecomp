@@ -207,20 +207,7 @@ static int tex_pack_note_rect(int u0, int v0, int u1, int v1,
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
     tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
-    /* Identity tracking only — rects are deliberately NOT substituted.
-     *
-     * The backend consumes a replacement in its textured-TRIANGLE path; rect
-     * and sprite prims take their own route and never sample it, so arming one
-     * here only produced primitives that drew nothing. On this title that is
-     * the entire 2D layer: the HUD meters, the boxes, and every glyph (the font
-     * atlases are addressed by sprites), which is why enabling the pack
-     * erased the interface while the 3D scene was fine.
-     *
-     * Tracking still runs, so the dumper, the match set and the UV census are
-     * unaffected and a pack authored for 2D art still gets identified — it
-     * simply is not applied until the rect path is wired up too. */
-    (void)sx; (void)sy; (void)sw; (void)sh;
-    return 0;
+    return tex_pack_arm(lim, clut_x, clut_y, texpage, sx, sy, sx + sw, sy + sh);
 }
 
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,

@@ -729,6 +729,25 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
                                i ? "," : "", u.x, u.y, u.w, u.h, (unsigned)u.hash);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "repl")) {
+        /* Each decoded replacement with the numbers that address it. If a
+         * texture draws blank, this is where to look first: src_w/src_h are
+         * the SOURCE size in texels and origin_u/v its offset within the
+         * texture page, and the shader maps (u - origin) / src into the image.
+         * Wrong values there sample outside the image and discard. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.repl.size() && n < cap - 160; i++) {
+            const State::Repl &r = g.repl[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"img_w\":%d,\"img_h\":%d,"
+                "\"src_w\":%d,\"src_h\":%d,\"origin_u\":%d,\"origin_v\":%d,"
+                "\"decoded\":%s}",
+                i ? "," : "",
+                (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
+                r.w, r.h, r.src_w, r.src_h, r.origin_u, r.origin_v,
+                r.pixels.empty() ? "false" : "true");
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "armed")) {
         /* Every texture that actually got substituted, with the screen box its
          * primitives covered. Cross-reference against where the HUD draws. */

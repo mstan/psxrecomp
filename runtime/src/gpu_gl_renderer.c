@@ -374,6 +374,19 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
 static GLuint s_repl_prog = 0;
 static GLint  s_uReplTex = -1, s_uReplOrigin = -1, s_uReplSrc = -1;
 static GLint  s_uReplMaskset = -1, s_uReplSemipass = -1, s_uReplSemimode = -1;
+static GLint  s_uReplDebug = -1;
+int g_repl_debug = 0;               /* tex_pack repl_debug=1 */
+/* TEX_VS's projection uniforms, for the REPLACEMENT program's own copy.
+ *
+ * Uniforms are per-program. s_geo_prog and s_tex_prog get these initialised at
+ * startup precisely because, as the comment there says, GLSL zeroes them and
+ * that collapses every x to u_xcenter — and u_xhalf = 0 divides by zero on top.
+ * s_repl_prog sharing the vertex SOURCE does not share its uniform state, so
+ * without this every replaced primitive was a degenerate off-screen triangle
+ * and rasterized nothing at all. That, not sampling or masking, is why the 2D
+ * layer vanished whenever a pack was enabled. */
+static GLint s_repl_uXoff = -1, s_repl_uXhalf = -1;
+static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
 static GLuint s_repl_tex = 0;                       /* armed for the next prim */
 static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
 /* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
@@ -1080,6 +1093,10 @@ static const char *REPL_FS =
     "uniform int u_semipass;\n"
     "uniform int u_semimode;\n"
     "uniform int u_maskset;\n"
+    /* Diagnostic: paint every replaced fragment solid magenta with no discard.
+     * Splits "the draw never reaches the framebuffer" from "it reaches it and
+     * samples nothing", which no amount of reading the code settles. */
+    "uniform int u_debug;\n"
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
     "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw) + vec2(0.999));\n"
@@ -1087,9 +1104,13 @@ static const char *REPL_FS =
     /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
      * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
      * STP clear. It is not coverage. */
-    "  if (t.a < 0.5/255.0) discard;\n"
-    "  int stp = (t.a > 0.75) ? 0 : 1;\n"
-    "  vec3 rgb = t.rgb;\n"
+    "  if (u_debug == 0 && t.a < 0.5/255.0) discard;\n"
+    "  int stp = (u_debug != 0) ? 0 : ((t.a > 0.75) ? 0 : 1);\n"
+    "  vec3 rgb = (u_debug != 0) ? vec3(1.0, 0.0, 1.0) : t.rgb;\n"
+    /* u_debug is kept, not removed: painting replaced fragments solid magenta
+     * with no discard is what finally separated "the draw never lands" from
+     * "it lands and samples nothing", after four wrong guesses that each cost
+     * a build. Reach for it first next time (tex_pack repl_debug=1). */
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
     "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
@@ -1973,6 +1994,7 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glUniform2f(s_uReplOrigin, s_repl_origin[0], s_repl_origin[1]);
     p_glUniform2f(s_uReplSrc, s_repl_src[0], s_repl_src[1]);
     p_glUniform1i(s_uReplMaskset, s_mask_set);
+    p_glUniform1i(s_uReplDebug, g_repl_debug);
 
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
@@ -1984,18 +2006,20 @@ static void draw_repl_prim(const float *verts, int semi) {
     tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
                              s_mask_set);
 
-    /* Native-wide mirror, matching flush_tex_batch's treatment. */
+    /* Native-wide mirror, matching flush_tex_batch's treatment — but with THIS
+     * program's uniform locations. Passing s_tex_* here would write the wide
+     * transform into the other program while this one kept its defaults. */
     if (g_wide_cur && s_ws_ablate != 1) {
         int dx = wide_dx();
         s_bd_gate = 0;
         gl_perf_mirror_begin();
-        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
-        wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+        wide_target_begin(dx, s_repl_uXoff, s_repl_uXhalf);
+        wide_set_bd_scale(s_repl_uXscale, s_repl_uXcenter);
         if (s_ws_ablate != 2)
             tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
                                      s_mask_set);
-        wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+        wide_clear_bd_scale(s_repl_uXscale, s_repl_uXcenter);
+        wide_target_end(s_repl_uXoff, s_repl_uXhalf);
         gl_perf_mirror_end();
     }
     hr_end();
@@ -2910,6 +2934,12 @@ static int init_gpu_raster(void) {
     s_uReplMaskset  = p_glGetUniformLocation(s_repl_prog, "u_maskset");
     s_uReplSemipass = p_glGetUniformLocation(s_repl_prog, "u_semipass");
     s_uReplSemimode = p_glGetUniformLocation(s_repl_prog, "u_semimode");
+    s_uReplDebug    = p_glGetUniformLocation(s_repl_prog, "u_debug");
+    s_repl_uXoff    = p_glGetUniformLocation(s_repl_prog, "u_xoff");
+    s_repl_uXhalf   = p_glGetUniformLocation(s_repl_prog, "u_xhalf");
+    s_repl_uXscale  = p_glGetUniformLocation(s_repl_prog, "u_xscale");
+    s_repl_uXcenter = p_glGetUniformLocation(s_repl_prog, "u_xcenter");
+    s_repl_uShift   = p_glGetUniformLocation(s_repl_prog, "u_shift");
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -2998,6 +3028,14 @@ static int init_gpu_raster(void) {
         p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"), shift);
         p_glUniform1f(s_tex_uXoff, 0.0f);
         p_glUniform1f(s_tex_uXhalf, 512.0f);
+        /* Same defaults for the replacement program's own copy of TEX_VS's
+         * uniforms — see the note beside their declarations. */
+        p_glUseProgram(s_repl_prog);
+        p_glUniform1f(s_repl_uShift, shift);
+        p_glUniform1f(s_repl_uXoff, 0.0f);
+        p_glUniform1f(s_repl_uXhalf, 512.0f);
+        p_glUniform1f(s_repl_uXscale, 1.0f);
+        p_glUniform1f(s_repl_uXcenter, 0.0f);
         p_glUseProgram(s_blit_prog);
         p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
         p_glUseProgram(0);

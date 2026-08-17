@@ -7915,6 +7915,13 @@ static void handle_tex_pack(int id, const char *json)
 {
     /* repl=0/1 toggles substitution live. An A/B that needs a rebuild is an
      * A/B that does not get run. */
+    const int dbg = json_get_int(json, "repl_debug", -1);
+    if (dbg >= 0) {
+        extern int g_repl_debug;
+        g_repl_debug = dbg ? 1 : 0;
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl_debug\":%d}", id, g_repl_debug);
+        return;
+    }
     const int repl = json_get_int(json, "repl", -1);
     if (repl >= 0) {
         send_fmt("{\"id\":%d,\"ok\":true,\"repl\":%d}",
