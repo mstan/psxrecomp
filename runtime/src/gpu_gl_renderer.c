@@ -116,6 +116,8 @@
 #define PSXGL_DEPTH24_STENCIL8      0x88F0
 #define PSXGL_R16UI                 0x8234
 #define PSXGL_RED_INTEGER           0x8D94
+#define PSXGL_BGRA                  0x80E1  /* host-order ARGB readback */
+#define PSXGL_PACK_ROW_LENGTH       0x0D02  /* glReadPixels dest pitch, in PIXELS */
 #define PSXGL_FUNC_ADD              0x8006
 #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
 #define PSXGL_CONSTANT_ALPHA        0x8003
@@ -157,6 +159,7 @@ typedef void   (APIENTRY *PFN_glBlendEquationSeparate)(GLenum, GLenum);
 typedef void   (APIENTRY *PFN_glGenVertexArrays)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindVertexArray)(GLuint);
 typedef void   (APIENTRY *PFN_glActiveTexture)(GLenum);
+typedef void   (APIENTRY *PFN_glGenerateMipmap)(GLenum);
 typedef void   (APIENTRY *PFN_glGenBuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindBuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glBufferData)(GLenum, ptrdiff_t, const void *, GLenum);
@@ -220,6 +223,7 @@ static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
 static PFN_glBindVertexArray   p_glBindVertexArray;
 static PFN_glActiveTexture     p_glActiveTexture;
+static PFN_glGenerateMipmap    p_glGenerateMipmap;
 static PFN_glGenBuffers        p_glGenBuffers;
 static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
@@ -274,6 +278,7 @@ static int load_modern_gl(void) {
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
+    LOAD(p_glGenerateMipmap, "glGenerateMipmap");
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
@@ -387,6 +392,13 @@ int g_repl_debug = 0;               /* tex_pack repl_debug=1 */
  * layer vanished whenever a pack was enabled. */
 static GLint s_repl_uXoff = -1, s_repl_uXhalf = -1;
 static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
+
+/* PGXP depth ([video] pgxp_depth). Off is the shipped default and must be
+ * bit-identical to a build without the feature: the shader's z term is 0, the
+ * depth test stays disabled, and the buffer is never cleared. */
+static int   s_pgxp_depth = 0;         /* configured */
+static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
+static GLint s_tex_uDepthOn = -1, s_repl_uDepthOn = -1;
 static GLuint s_repl_tex = 0;                       /* armed for the next prim */
 static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
 /* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
@@ -443,6 +455,10 @@ int g_ws_bd_phase_mode   = 1;   /* (retained for the debug command; unused since
  * batch's gate (batch flushes when a prim's gate differs, so a batch is uniform). */
 static int s_bd_gate = 0;
 static int s_tb_gate = 0;
+/* Whether the open batch's prims carry recovered W, so depth may apply. It is
+ * a batch KEY below, because a batch mixing prims with and without provenance
+ * could not be given one depth state. */
+static int s_tb_depth = 0;
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
@@ -1039,6 +1055,7 @@ static const char *TEX_VS =
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+    "uniform int   u_depth_on;/* PGXP depth: write z from a_q; 0 = flat */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
     "flat out int v_persp;\n"
@@ -1064,7 +1081,13 @@ static const char *TEX_VS =
     "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
     "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
-    "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
+    /* PGXP depth (u_depth_on). a_q is the normalised 1/z the projection
+     * recovered, so 1 - a_q rises with distance and gives a depth that sorts
+     * correctly where the ordering table's one-bucket-per-primitive cannot.
+     * Multiplied by w because the pipeline divides by it, leaving exactly
+     * 1 - a_q in NDC. Zero when off, which is the original expression. */
+    "  float zc = (u_depth_on != 0 && a_q > 0.0) ? (1.0 - a_q) * w : 0.0;\n"
+    "  gl_Position = vec4(ndc * w, zc, w); }\n";
 /* HD replacement fragment program. Shares TEX_VS, so position handling — the
  * u_shift grid alignment, the native-wide x transforms, the perspective w
  * divide — is bit-identical to the normal textured path; only the texel fetch
@@ -1099,8 +1122,19 @@ static const char *REPL_FS =
     "uniform int u_debug;\n"
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
-    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw) + vec2(0.999));\n"
-    "  vec4 t = texture(u_repl, (uv - u_origin) / u_src);\n"
+    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
+    /* +0.5 is texel CENTRE, and it is load-bearing here in a way it never was
+     * on the PS1 path. An integer u addresses texel u, whose span in the
+     * replacement is [u, u+1); sampling at u alone lands on its left EDGE. With
+     * NEAREST that still resolves to the right texel, so the omission was
+     * invisible — but this path is LINEAR (a pack image carries detail the
+     * texel grid does not), and there a half-texel shift blends in whatever
+     * sits one texel over. On a font atlas that neighbour is the adjacent
+     * glyph's cell, so every glyph quad drew a hairline of its neighbour along
+     * its own edge: background-coloured slivers cutting through letters and
+     * ink-coloured ones in the gaps. Clamp to v_limits.zw (not +0.999) so the
+     * far edge lands on the last texel's centre rather than past it. */
+    "  vec4 t = texture(u_repl, (uv - u_origin + vec2(0.5)) / u_src);\n"
     /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
      * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
      * STP clear. It is not coverage. */
@@ -1364,6 +1398,23 @@ static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
+    /* PGXP depth needs a per-frame clear; the PS1 has no depth buffer and so
+     * the game never clears one. Done on the first draw of each frame rather
+     * than from a new hook, so nothing outside this file has to know the
+     * feature exists. Scissor is enabled but not yet set for the draw area, so
+     * the clear covers the whole surface. */
+    if (s_pgxp_depth) {
+        extern uint64_t s_frame_count;
+        static uint64_t s_depth_frame = (uint64_t)-1;
+        if (s_frame_count != s_depth_frame) {
+            s_depth_frame = s_frame_count;
+            glDisable(GL_SCISSOR_TEST);
+            glDepthMask(GL_TRUE);
+            glClearDepth(1.0);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+        }
+    }
     if (clip_to_draw_area) {
         int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
@@ -1372,6 +1423,7 @@ static void hr_begin(int clip_to_draw_area) {
     }
 }
 static void hr_end(void) {
+    if (s_pgxp_depth) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
      * host draws (OSD) that re-enable blend do not inherit B-F math. */
@@ -1799,9 +1851,27 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
  * mask_stencil(mask) where pass 2 needs mask_stencil(1) — and the resulting
  * mask-bit corruption took out the whole HUD, including with replacement
  * disabled. The mask/stencil protocol lives here, once. */
+/* Arm or disarm depth for the draw about to happen.
+ *
+ * `armed` is the batch's provenance verdict, not a preference: a primitive
+ * whose W was never recovered has no meaningful depth, so it must neither test
+ * nor write, or it compares against whatever the last 3D polygon left there and
+ * disappears. That is every 2D element in the game, which is why this is gated
+ * on the same signal the perspective path uses rather than on the config flag
+ * alone. Semi-transparent prims test but do not WRITE, the usual rule, so a
+ * translucent surface cannot occlude what is behind it. */
+static void depth_state(int armed, int semi) {
+    if (!s_pgxp_depth) return;
+    if (!armed) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); return; }
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(semi >= 0 ? GL_FALSE : GL_TRUE);
+}
+
 static void tex_batch_draw_passes_ex(int nverts, int semi,
                                      GLint uSemipass, GLint uSemimode, int mask) {
     p_glUniform1i(uSemimode, semi < 0 ? 0 : semi);
+    depth_state(s_depth_armed, semi);
     if (semi < 0) {
         glDisable(GL_BLEND);
         mask_stencil(mask);
@@ -1896,6 +1966,8 @@ static void flush_tex_batch(void) {
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glUniform1i(s_tex_uDepthOn, s_tb_depth);
+    s_depth_armed = s_tb_depth;
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1995,6 +2067,8 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glUniform2f(s_uReplSrc, s_repl_src[0], s_repl_src[1]);
     p_glUniform1i(s_uReplMaskset, s_mask_set);
     p_glUniform1i(s_uReplDebug, g_repl_debug);
+    s_depth_armed = s_pgxp_depth && s_pq_valid;
+    p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
 
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
@@ -2184,6 +2258,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * prim alone (composited fully before the next), let opaque prims
          * keep batching. Cost is one draw per semi prim. */
         int isolate = (semi >= 0);
+        /* Recovered W is what makes this prim's depth meaningful; s_pq_valid is
+         * the same provenance verdict the perspective path uses. */
+        const int depth_ok = s_pgxp_depth && s_pq_valid;
         int reason = -1;
         if (s_tb_n > 0) {
             if (isolate) reason = 0;
@@ -2193,6 +2270,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (gate != s_tb_gate) reason = 4;
             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+            else if (depth_ok != s_tb_depth) reason = 4;   /* depth is a key too */
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -2202,6 +2280,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+            s_tb_depth = depth_ok;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
@@ -2512,7 +2591,17 @@ static void glb_set_precise_triangle(int enabled,
  * CLAMP_TO_EDGE, not repeat: the shader clamps UVs to the prim's own sample
  * bounds first, and wrapping would fetch a neighbouring atlas cell at the
  * seams. LINEAR even when the PS1 path is nearest — the whole point is that the
- * image carries detail the texel grid does not. */
+ * image carries detail the texel grid does not.
+ *
+ * Mipmapped, and that is not optional. A pack image is an integer upscale (16x
+ * for the font atlases) of a source the game draws at or near its native texel
+ * size, so on screen it is MINIFIED several times over. Unmipmapped LINEAR then
+ * samples roughly one texel in N and drops the rest, which shreds any thin
+ * hard-edged stroke — the F500 font garbles into noise at small sizes while
+ * fatter art survives. The deepest mip a font draw can select sits around the
+ * original texel grid, where a level is the box-average of one source pixel,
+ * i.e. the original bitmap; so this is never worse than vanilla and gets
+ * sharper as the internal resolution goes up. */
 static void glb_set_replacement(const void *repl) {
     if (!repl) { s_repl_tex = 0; return; }
     const TexPackRepl *r = (const TexPackRepl *)repl;
@@ -2530,12 +2619,14 @@ static void glb_set_replacement(const void *repl) {
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        p_glGenerateMipmap ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->width, r->height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, r->pixels);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (p_glGenerateMipmap) p_glGenerateMipmap(GL_TEXTURE_2D);
         if (r->gl_handle) *r->gl_handle = (unsigned)tex;
     }
 
@@ -2640,7 +2731,44 @@ static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
     gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1);
 }
 static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
-static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
+/* Read the SUPERSAMPLED display rect straight out of the hr FBO.
+ *
+ * This used to be ensure_cpu() + sw_render_display_hires(), which is a
+ * contradiction: ensure_cpu() packs the FBO back down to the 1x 15-bit CPU
+ * mirror, so every supersampled pixel — the SSAA edges, the perspective UVs,
+ * the HD replacement texels — was averaged away BEFORE the "hires" resolve ran.
+ * sw_render_display_hires then found no CPU hi-res mirror, filled dw*dh of a
+ * (dw*S)*(dh*S) buffer, and the caller honestly downgraded to "scale 1". Net
+ * effect: on the GL backend, screenshot_hires silently could not see anything
+ * that only exists at high internal resolution — i.e. exactly the class of work
+ * it was written to verify. Diagnosing HD artifacts from its output means
+ * diagnosing them at 508x256.
+ *
+ * BGRA because the caller wants host-order 0xAARRGGBB; GL_RGBA would land
+ * byte-reversed. Alpha in the FBO is the PS1 mask bit, not opacity, so it is
+ * replaced with opaque rather than written into the PNG as transparency. */
+static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){
+    const int S = s_scale;
+    if (!s_ctx || !s_raster_ok || !s_hr_fbo || S <= 1 || !o || dw <= 0 || dh <= 0) {
+        ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh);
+    }
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    const int ow = dw * S, oh = dh * S;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, p / (int)sizeof(uint32_t));
+    glReadPixels(dx * S, dy * S, ow, oh, PSXGL_BGRA, GL_UNSIGNED_BYTE, o);
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    for (int y = 0; y < oh; y++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)o + (size_t)y * (size_t)p);
+        for (int x = 0; x < ow; x++) row[x] |= 0xFF000000u;
+    }
+    return ow * oh;
+}
 /* While GP1 depth24 is on, packed RGB888 lives in the CPU mirror and is
  * presented via gl_renderer_present — never as 1555 FBO texels. Queuing those
  * MDEC A0 rects hits UP_RECTS_MAX (16) and force-flushes mid-movie (MotK intro
@@ -2940,6 +3068,7 @@ static int init_gpu_raster(void) {
     s_repl_uXscale  = p_glGetUniformLocation(s_repl_prog, "u_xscale");
     s_repl_uXcenter = p_glGetUniformLocation(s_repl_prog, "u_xcenter");
     s_repl_uShift   = p_glGetUniformLocation(s_repl_prog, "u_shift");
+    s_repl_uDepthOn = p_glGetUniformLocation(s_repl_prog, "u_depth_on");
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -3000,6 +3129,7 @@ static int init_gpu_raster(void) {
     s_geo_uXcenter = p_glGetUniformLocation(s_geo_prog, "u_xcenter");
     s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
     s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+    s_tex_uDepthOn = p_glGetUniformLocation(s_tex_prog, "u_depth_on");
     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
@@ -3346,6 +3476,12 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
 }
+
+void gl_renderer_set_pgxp_depth(int enabled) {
+    s_pgxp_depth = enabled ? 1 : 0;
+    if (!s_pgxp_depth) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
+}
+int gl_renderer_pgxp_depth(void) { return s_pgxp_depth; }
 
 void gl_renderer_set_pillarbox_edge_fill(int enabled) {
     s_pillarbox_edge_fill = enabled ? 1 : 0;
