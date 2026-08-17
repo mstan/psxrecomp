@@ -9,6 +9,33 @@ extern "C" {
 
 struct CPUState;
 
+/* A deferred cooperative thread switch may snapshot CPUState only after the
+ * guest PC and all architectural registers reach the same committed boundary.
+ *
+ * Site 0 is an ordinary compiled block leader. Site 1 is a dirty-RAM transfer
+ * boundary after the instruction and delay slot retire. Other interpreter
+ * pump sites can still have a hidden call/return obligation.
+ *
+ * A site-1 poll can publish its resume PC before CPUState.pc reflects that
+ * boundary. Require both views to identify the same guest address. KSEG
+ * aliases are equivalent. */
+static inline int psx_deferred_switch_boundary_materialized(
+    int dirty_pump_site,
+    int dispatch_depth,
+    int call_unit_depth,
+    uint32_t cpu_pc,
+    uint32_t resume_pc)
+{
+    uint32_t resume_phys = resume_pc & 0x1FFFFFFFu;
+
+    if (dispatch_depth > 1 || call_unit_depth != 0) return 0;
+    if (resume_phys < 0x00010000u) return 0;
+    if (dirty_pump_site == 0) return 1;
+    if (dirty_pump_site != 1) return 0;
+
+    return ((cpu_pc ^ resume_pc) & 0x1FFFFFFFu) == 0u;
+}
+
 /* IRQ bit positions in I_STAT/I_MASK */
 #define IRQ_VBLANK  0
 #define IRQ_GPU     1

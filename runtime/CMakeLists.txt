@@ -35,6 +35,12 @@ if(BUILD_TESTING)
     add_test(NAME cause_ip2_combinational_test
              COMMAND cause_ip2_combinational_test)
 
+    add_executable(deferred_switch_boundary_test
+        tests/test_deferred_switch_boundary.c)
+    target_include_directories(deferred_switch_boundary_test PRIVATE include)
+    add_test(NAME deferred_switch_boundary_test
+             COMMAND deferred_switch_boundary_test)
+
     add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE

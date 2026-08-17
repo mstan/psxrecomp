@@ -46,6 +46,7 @@
  * static BIOS exception handler is NOT interp code, so we clear it around the
  * handler dispatch (see psx_check_interrupts). */
 extern int g_dirty_interp_active;
+extern int g_call_unit_depth;
 extern uint32_t g_dirty_safe_resume_pc;
 
 /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
@@ -1231,10 +1232,14 @@ void psx_check_interrupts(CPUState* cpu) {
                 s_defer_switch_target  = 0;
                 s_defer_switch_from    = 0;
                 debug_server_log_thread_event(33, cpu, from_tcb, to_tcb, resume_pc);
-            } else if (g_cosim_dirty_pump_site != 0) {
-                /* Not a real suspend boundary: dirty interpreter pump sites expose
-                 * committed PCs for IRQ timing, but the matching CPUState may not
-                 * be materialized yet. */
+            } else if (!psx_deferred_switch_boundary_materialized(
+                           g_cosim_dirty_pump_site,
+                           g_psx_dispatch_depth,
+                           g_call_unit_depth,
+                           cpu->pc,
+                           resume_pc)) {
+                /* Keep the switch pending until CPUState and the published resume
+                 * PC describe one fully committed guest boundary. */
             } else if (resume_pc != 0u && (resume_pc & 0x3u) == 0u &&
                        psx_is_dispatchable(resume_pc)) {
                 /* Materialized clean boundary: re-save the deferred thread cleanly
