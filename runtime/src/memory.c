@@ -44,22 +44,14 @@ uint32_t g_psx_ram_size = PSX_RAM_2MB;
 uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
 
 /* High-bank pages registered as unique DRAM in 8 MB mode (enhancement heaps).
- * Index 0 = page 512 (phys 0x200000). Unregistered high banks keep 2 MiB fold. */
-#define PSX_RAM_HIGH_PAGE0   (PSX_RAM_2MB >> 12)          /* 512 */
-#define PSX_RAM_HIGH_PAGES   ((PSX_RAM_8MB - PSX_RAM_2MB) >> 12) /* 1536 */
-#define PSX_RAM_HIGH_BITWORDS ((PSX_RAM_HIGH_PAGES + 31u) / 32u)
-static uint32_t s_ram_high_unique[PSX_RAM_HIGH_BITWORDS];
+ * Index 0 = page 512 (phys 0x200000). Unregistered high banks keep 2 MiB fold.
+ * The bitmap and the map/unique helpers live in psx_ram.h so psx_cyc.h's
+ * inlined load fast path resolves them without an out-of-line call — the
+ * build has no LTO, so every guest LW/LH used to pay a real call here. */
 /* Sticky registration requested before/across memory_init (8 MB plugin). */
 static uint32_t s_ram_high_registered[PSX_RAM_HIGH_BITWORDS];
 
-static inline int psx_ram_high_page_unique(uint32_t page) {
-    uint32_t i, bit;
-    if (page < PSX_RAM_HIGH_PAGE0 || page >= (PSX_RAM_8MB >> 12))
-        return 1;
-    i = page - PSX_RAM_HIGH_PAGE0;
-    bit = 1u << (i & 31u);
-    return (s_ram_high_unique[i >> 5] & bit) != 0;
-}
+uint32_t g_psx_ram_high_unique[PSX_RAM_HIGH_BITWORDS];
 
 static inline void psx_ram_high_page_mark(uint32_t page) {
     uint32_t i, bit;
@@ -67,29 +59,13 @@ static inline void psx_ram_high_page_mark(uint32_t page) {
         return;
     i = page - PSX_RAM_HIGH_PAGE0;
     bit = 1u << (i & 31u);
-    s_ram_high_unique[i >> 5] |= bit;
+    g_psx_ram_high_unique[i >> 5] |= bit;
     s_ram_high_registered[i >> 5] |= bit;
 }
 
 static void psx_ram_apply_registered_bitmap(void) {
-    memcpy(s_ram_high_unique, s_ram_high_registered, sizeof(s_ram_high_unique));
-}
-
-uint32_t psx_ram_map_read(uint32_t phys) {
-    phys &= 0x1FFFFFFFu;
-    if (phys >= PSX_RAM_WINDOW)
-        return phys;
-    if (g_psx_ram_size <= PSX_RAM_2MB)
-        return phys & (PSX_RAM_2MB - 1u);
-    if (phys < PSX_RAM_2MB)
-        return phys;
-    if (psx_ram_high_page_unique(phys >> 12))
-        return phys;
-    return phys & (PSX_RAM_2MB - 1u);
-}
-
-uint32_t psx_ram_map_write(uint32_t phys) {
-    return psx_ram_map_read(phys);
+    memcpy(g_psx_ram_high_unique, s_ram_high_registered,
+           sizeof(g_psx_ram_high_unique));
 }
 
 void psx_ram_register_unique(uint32_t addr, uint32_t len) {
@@ -244,11 +220,11 @@ int psx_mod_set_main_ram_8mb(int enabled) {
          * enhanced heaps that write through the top bank; partial aliasing
          * folded those stores onto overlay RAM and crashed race start. */
         memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
-        memset(s_ram_high_unique, 0, sizeof(s_ram_high_unique));
+        memset(g_psx_ram_high_unique, 0, sizeof(g_psx_ram_high_unique));
         psx_ram_register_unique(PSX_RAM_2MB, PSX_RAM_8MB - PSX_RAM_2MB);
     } else {
         memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
-        memset(s_ram_high_unique, 0, sizeof(s_ram_high_unique));
+        memset(g_psx_ram_high_unique, 0, sizeof(g_psx_ram_high_unique));
     }
     return 1;
 }

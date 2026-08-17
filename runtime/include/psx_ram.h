@@ -35,10 +35,43 @@ int      psx_ram_8mb_active(void);
 /* Drop a previous launch's request before mod activation (rematch / launcher). */
 void     psx_ram_reset_size_request(void);
 
+/* High-bank unique-page bitmap (defined in memory.c). Index 0 = page 512
+ * (phys 0x200000). Exposed so the map helpers below inline into the generated
+ * game C: psx_cyc.h's load fast path calls psx_ram_map_read on every guest
+ * LW/LH and the runtime is built without LTO, so an out-of-line definition
+ * cost a real call per load in the hottest loop in the emulator. */
+#define PSX_RAM_HIGH_PAGE0    (PSX_RAM_2MB >> 12)                  /* 512  */
+#define PSX_RAM_HIGH_PAGES    ((PSX_RAM_8MB - PSX_RAM_2MB) >> 12)  /* 1536 */
+#define PSX_RAM_HIGH_BITWORDS ((PSX_RAM_HIGH_PAGES + 31u) / 32u)
+extern uint32_t g_psx_ram_high_unique[PSX_RAM_HIGH_BITWORDS];
+
+static inline int psx_ram_high_page_unique(uint32_t page) {
+    uint32_t i, bit;
+    if (page < PSX_RAM_HIGH_PAGE0 || page >= (PSX_RAM_8MB >> 12))
+        return 1;
+    i = page - PSX_RAM_HIGH_PAGE0;
+    bit = 1u << (i & 31u);
+    return (g_psx_ram_high_unique[i >> 5] & bit) != 0;
+}
+
 /* Canon physical offset for a main-RAM read (0 .. window). */
-uint32_t psx_ram_map_read(uint32_t phys);
+static inline uint32_t psx_ram_map_read(uint32_t phys) {
+    phys &= 0x1FFFFFFFu;
+    if (phys >= PSX_RAM_WINDOW)
+        return phys;
+    if (g_psx_ram_size <= PSX_RAM_2MB)
+        return phys & (PSX_RAM_2MB - 1u);
+    if (phys < PSX_RAM_2MB)
+        return phys;
+    if (psx_ram_high_page_unique(phys >> 12))
+        return phys;
+    return phys & (PSX_RAM_2MB - 1u);
+}
+
 /* Canon physical offset for a main-RAM store (folds unregistered high). */
-uint32_t psx_ram_map_write(uint32_t phys);
+static inline uint32_t psx_ram_map_write(uint32_t phys) {
+    return psx_ram_map_read(phys);
+}
 /* Mark [addr, addr+len) unique in 8 MB mode (enhancement heaps). */
 void     psx_ram_register_unique(uint32_t addr, uint32_t len);
 /* Fold main-RAM code PCs to the low 2 MiB mirror when the high page is still

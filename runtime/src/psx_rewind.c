@@ -281,10 +281,18 @@ static int rewind_wanted(void)
             uint32_t iv_def;
             if (s_interval_pref > 0)
                 iv_def = (uint32_t)s_interval_pref;
-            else if (psx_ram_8mb_active())
-                iv_def = RW_DEF_INTERVAL_8MB;
             else
                 iv_def = RW_DEF_INTERVAL;
+            /* 8 MB soft default as a FLOOR, not an else-branch. main.cpp
+             * always pushes g_rewind_interval (settings.toml always carries
+             * rewind_interval, and it defaults to RW_DEF_INTERVAL), so
+             * s_interval_pref is always > 0 and the old else-if made
+             * RW_DEF_INTERVAL_8MB unreachable dead code — 8 MB captured
+             * every 15 frames, ~4x the bytes of a 2 MB snap, measured at
+             * 5-7% of frame time in WipEout 3 ntscfull8. PSX_REWIND_INTERVAL
+             * still overrides below for anyone who wants denser snaps. */
+            if (psx_ram_8mb_active() && iv_def < RW_DEF_INTERVAL_8MB)
+                iv_def = RW_DEF_INTERVAL_8MB;
             s_interval = normalize_rewind_interval(
                 env_u32("PSX_REWIND_INTERVAL", iv_def, 1u, 60u));
         }

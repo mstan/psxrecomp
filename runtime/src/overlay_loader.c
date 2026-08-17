@@ -116,7 +116,9 @@ static int       s_cand_n = 0;
  * scales catastrophically once a warmed cache contains hundreds of variant
  * DLLs. Index candidates by the 4 KiB RAM pages touched by their code ranges;
  * a continuation then examines only candidates that could contain its PC. */
-#define RANGE_PAGE_COUNT (2u * 1024u * 1024u / 4096u)
+/* Full 8 MiB capacity: 8 MB-mod shards live in the high banks (WipEout 3
+ * ntscfull8 engine at 0x781000+) and their continuations must be indexable. */
+#define RANGE_PAGE_COUNT (8u * 1024u * 1024u / 4096u)
 #define RANGE_LINK_CAP   (CAND_CAP * 8)
 typedef struct { int cand, next; } RangeLink;
 static int       s_range_page_head[RANGE_PAGE_COUNT];
@@ -182,7 +184,7 @@ static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
 static void exact_entry_set(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    if (phys < 8u * 1024u * 1024u && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
     }
@@ -190,7 +192,7 @@ static void exact_entry_set(uint32_t phys) {
 
 static int exact_entry_has(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
+    if (phys >= 8u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
     uint32_t word = phys >> 2;
     return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
 }
@@ -585,8 +587,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0u || lo >= 2u * 1024u * 1024u ||
-            len > 2u * 1024u * 1024u - lo) {
+        if (len == 0u || lo >= 8u * 1024u * 1024u ||
+            len > 8u * 1024u * 1024u - lo) {
             s_static_match_crc_misses++;
             return 0;
         }
@@ -662,7 +664,9 @@ typedef struct {
     int      n;
 } ManFn;
 
-#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
+/* Full 8 MiB host capacity: 8 MB-mod shards (high-bank enhancement code)
+ * must pass manifest entry/range validation. Backing RAM is always 8 MiB. */
+#define OVERLAY_RAM_SIZE (8u * 1024u * 1024u)
 #define MANIFEST_LINE_MAX 128u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
 #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
@@ -676,12 +680,15 @@ enum {
 static int man_structurally_valid(const ManFn *m) {
     if (!m || !m->has_crc || m->n < 1 || m->n > MAX_CODE_RANGES)
         return 0;
-    if ((m->entry & 0xFFE00000u) != 0x80000000u) return 0;
+    /* KSEG0 within the 8 MiB capacity (mask keeps bits 31..23): 8 MB-mod
+     * shards carry high-bank entries (0x80780000+); the old 0xFFE00000 mask
+     * additionally required phys < 2 MiB and rejected them structurally. */
+    if ((m->entry & 0xFF800000u) != 0x80000000u) return 0;
     uint32_t entry = m->entry & 0x1FFFFFFFu;
     if ((entry & 3u) != 0u || entry >= OVERLAY_RAM_SIZE) return 0;
     int entry_covered = 0;
     for (int r = 0; r < m->n; r++) {
-        if ((m->lo[r] & 0xFFE00000u) != 0x80000000u) return 0;
+        if ((m->lo[r] & 0xFF800000u) != 0x80000000u) return 0;
         uint32_t lo = m->lo[r] & 0x1FFFFFFFu;
         uint32_t len = m->len[r];
         if ((lo & 3u) != 0u || (len & 3u) != 0u || len < 4u ||
@@ -895,7 +902,7 @@ static int mips_control_kind(uint32_t instr) {
 static int ranges_contain_word(const uint32_t *lo_list,
                                const uint32_t *len_list, int n,
                                uint32_t phys) {
-    if ((phys & 3u) != 0u || phys > (2u * 1024u * 1024u) - 4u) return 0;
+    if ((phys & 3u) != 0u || phys > (8u * 1024u * 1024u) - 4u) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
         uint32_t len = len_list[r];
@@ -911,7 +918,7 @@ static int ranges_contain_word(const uint32_t *lo_list,
 static int ranges_delay_slots_hashed(const uint32_t *lo_list,
                                      const uint32_t *len_list, int n) {
     const uint8_t *ram = memory_get_ram_ptr();
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = 8u * 1024u * 1024u;  /* full backing capacity */
     if (!ram || n < 1 || n > MAX_CODE_RANGES) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
@@ -3236,8 +3243,18 @@ static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys,
     LazyMan *lm = &s_lazy_man[li];
     int ci = lm->cache_idx;
     if (ci < 0 || ci >= s_cache_idx_count) return 0;
+    /* Region agreement is CONTAINMENT, not equality. The walkback recovers
+     * region_start from the sticky dirty-page bitmap, but capture epochs key
+     * regions by executed-page evidence — the two disagree whenever the dirty
+     * run has a hole inside a captured region (measured: dispatch at 0x172868
+     * recovered 0x172000 vs shard key 0x16F000; every interior continuation
+     * then failed to load its owner DLL forever, WipEout 3 ntscfull8 ran
+     * 57M dispatches/bench through the interpreter). Identity is not weakened:
+     * lazy_man_contains pins phys inside the function's ranges and
+     * lazy_man_matches verifies the function's LIVE bytes against the
+     * manifest CRC at those addresses. */
     return (!require_region_start ||
-            s_cache_idx[ci].region_start == region_start) &&
+            s_cache_idx[ci].region_start <= region_start) &&
         !s_cache_idx[ci].load_failed &&
         !s_cache_idx[ci].capacity_suppressed &&
         !dll_already_loaded(s_cache_idx[ci].path) &&
@@ -3331,8 +3348,11 @@ retry_artifact:
         int ci = s_lazy_man[li].cache_idx;
         /* Cross-region recovery is safe only for a fully coherent CPS bundle.
          * A partial exact-function match can have snapshot-specific internal
-         * tails, so retain it as fallback only when the heuristic base agrees. */
-        if (s_cache_idx[ci].region_start == region_start &&
+         * tails, so retain it as fallback only when the heuristic base agrees
+         * — by containment, matching lazy_is_loadable: the dirty-bitmap
+         * walkback recovers a start INSIDE the captured (executed-page keyed)
+         * region whenever the dirty run has a hole. */
+        if (s_cache_idx[ci].region_start <= region_start &&
             lazy_candidate_preferred(li, fallback))
             fallback = li;
         /* Entry chains are newest-first/semantic. Preserve their established
