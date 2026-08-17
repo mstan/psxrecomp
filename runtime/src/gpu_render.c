@@ -12,6 +12,8 @@
 
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
+#include "gpu_uv.h"
+#include "tex_pack.h"
 #include <stdio.h>
 
 static const GpuRenderBackend SW_BACKEND = {
@@ -101,7 +103,7 @@ void gr_set_texture_filter(int bilinear)             { g_b->set_texture_filter(b
 int  gr_texture_filter(void)                         { return g_b->texture_filter(); }
 void gr_set_semi_transparency(int e, int m)          { g_b->set_semi_transparency(e, m); }
 void gr_set_mask_bits(int s, int c)                  { g_b->set_mask_bits(s, c); }
-void gr_set_texture_window(uint32_t raw)             { g_b->set_texture_window(raw); }
+void gr_set_texture_window(uint32_t raw)             { tex_pack_set_texture_window(raw); g_b->set_texture_window(raw); }
 void gr_set_color_modulation(int r, int g, int b, int raw) { g_b->set_color_modulation(r, g, b, raw); }
 void gr_set_precise_triangle(int enabled, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
                              int32_t x2, int32_t y2) {
@@ -112,8 +114,14 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(enabled, q0, q1, q2);
 }
-void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
-void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
+void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  {
+    tex_pack_invalidate(x, y, w, h);
+    g_b->fill_rect(x, y, w, h, c);
+}
+void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
+    tex_pack_invalidate(dx, dy, w, h);
+    g_b->copy_rect(sx, sy, dx, dy, w, h);
+}
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
     g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
 }
@@ -121,9 +129,28 @@ void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint1
                               int x2, int y2, uint16_t c2) {
     g_b->draw_gouraud_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
 }
+/* HD texture identity. Hooked here rather than in a backend so software, GL and
+ * Vulkan all feed the same tracker, and so the uv-limit model stays the single
+ * one in gpu_uv.h — the backends derive their own `lim` from these same helpers
+ * and the same (pre-compensation) uv values, so the rect we match against is the
+ * rect they sample. No-op unless a pack or the dumper is enabled. */
+static void tex_pack_note_tri(int x0, int y0, int u0, int v0,
+                              int x1, int y1, int u1, int v1,
+                              int x2, int y2, int u2, int v2,
+                              uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (!tex_pack_active()) return;
+    const int xs[3] = { x0, x1, x2 }, ys[3] = { y0, y1, y2 };
+    const int us[3] = { u0, u1, u2 }, vs[3] = { v0, v1, v2 };
+    int lim[4];
+    psx_uv_tri_limits(xs, ys, us, vs, lim);
+    tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
+}
+
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
+                      clut_x, clut_y, texpage);
     g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
                                 clut_x, clut_y, texpage);
 }
@@ -132,16 +159,30 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
                                       int x2, int y2, int u2, int v2, uint32_t c2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw) {
+    tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
+                      clut_x, clut_y, texpage);
     g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
 }
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
+/* Rect prims carry their uv corners directly; u1/v1 are the EXCLUSIVE corner,
+ * which for the unscaled form is u+w / v+h (matching glb_draw_textured_rect). */
+static void tex_pack_note_rect(int u0, int v0, int u1, int v1,
+                               uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (!tex_pack_active()) return;
+    int lim[4];
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
+}
+
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    tex_pack_note_rect(u, v, u + w, v + h, clut_x, clut_y, texpage);
     g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    tex_pack_note_rect(u0, v0, u1, v1, clut_x, clut_y, texpage);
     g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);
 }
 void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) { g_b->draw_line(x0, y0, x1, y1, c); }
@@ -154,9 +195,14 @@ int gr_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
 int gr_render_display_hires(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
     return g_b->render_display_hires(o, p, dx, dy, dw, dh);
 }
-void gr_vram_write(int x, int y, uint16_t pixel)     { g_b->vram_write(x, y, pixel); }
+void gr_vram_write(int x, int y, uint16_t pixel)     { tex_pack_invalidate(x, y, 1, 1); g_b->vram_write(x, y, pixel); }
 uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }
-void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { g_b->vram_transfer_in(x, y, w, h, d); }
+void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  {
+    /* The staged rect `d` is the hash preimage: CRC32 over it is the texture
+     * hash a Beetle-format pack is keyed by. */
+    tex_pack_on_upload(x, y, w, h, d);
+    g_b->vram_transfer_in(x, y, w, h, d);
+}
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }
 void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }

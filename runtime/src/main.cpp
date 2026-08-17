@@ -1,4 +1,4 @@
-﻿/* main.cpp — Phase 3 runtime entry point.
+/* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
  * the recompiled reset vector. BIOS drives execution; SDL presents
@@ -13,6 +13,7 @@
 #include "cdrom.h"
 #include "fntrace.h"
 #include "text_xlate.h"
+#include "tex_pack.h"
 #include "boot_state.h"
 #include "bios_hle.h"
 #include "bios_hle_plan.h"
@@ -1181,6 +1182,12 @@ static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
+/* HD texture pack (tex_pack.cpp). Both default off: replacement needs a pack on
+ * disk, and dumping is an authoring/verification tool that writes a PNG per
+ * newly-seen texture. */
+static int           g_hd_textures    = 0;
+static int           g_hd_texture_dump = 0;
+static std::string   g_hd_texture_dir;
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
@@ -11265,6 +11272,9 @@ int main(int argc, char** argv) {
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
+            g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
+            g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
+            g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -13028,6 +13038,20 @@ int main(int argc, char** argv) {
             "psxrecomp: stock disc remains %s; mounting private mod cache %s\n",
             resolved_disc.string().c_str(), mod_disc.string().c_str());
     }
+
+    /* HD texture pack. Keyed off the STOCK disc, not mod_disc: the pack folder
+     * belongs next to the user's own image (where a RetroArch-authored pack
+     * already sits) and must not move when a disc-patching mod is toggled. */
+    {
+        const char *hd_env = std::getenv("PSX_HD_TEXTURE_DUMP");
+        if (hd_env && hd_env[0] && std::strcmp(hd_env, "0") != 0) g_hd_texture_dump = 1;
+        hd_env = std::getenv("PSX_HD_TEXTURES");
+        if (hd_env && hd_env[0]) g_hd_textures = (std::strcmp(hd_env, "0") != 0) ? 1 : 0;
+        hd_env = std::getenv("PSX_HD_TEXTURE_DIR");
+        if (hd_env && hd_env[0]) g_hd_texture_dir = hd_env;
+    }
+    tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
+                  g_hd_texture_dir.c_str());
 
 session_reboot:
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */

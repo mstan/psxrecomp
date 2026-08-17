@@ -55,29 +55,32 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, size_t len
     if (len) fwrite(data, 1, len, f);
     png_put_be32(f, crc ^ 0xFFFFFFFFu);
 }
-/* Write an RGB (3 bytes/pixel, top-down) buffer as a PNG. Returns 1 on success. */
-static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
+/* Write an interleaved 8-bit, top-down buffer as a PNG. `chans` is 3 (truecolor
+ * RGB) or 4 (truecolor RGBA). Returns 1 on success. */
+static int png_write_n(FILE *f, const uint8_t *px, uint32_t w, uint32_t h, int chans) {
     static const uint8_t sig[8] = { 137,80,78,71,13,10,26,10 };
+    if (chans != 3 && chans != 4) return 0;
     fwrite(sig, 1, 8, f);
 
     uint8_t ihdr[13];
     ihdr[0]=(uint8_t)(w>>24); ihdr[1]=(uint8_t)(w>>16); ihdr[2]=(uint8_t)(w>>8); ihdr[3]=(uint8_t)w;
     ihdr[4]=(uint8_t)(h>>24); ihdr[5]=(uint8_t)(h>>16); ihdr[6]=(uint8_t)(h>>8); ihdr[7]=(uint8_t)h;
     ihdr[8]=8;   /* bit depth   */
-    ihdr[9]=2;   /* color type 2 = truecolor RGB */
+    ihdr[9]=(uint8_t)(chans == 4 ? 6 : 2);  /* color type 2 = RGB, 6 = RGBA */
     ihdr[10]=0;  /* compression */
     ihdr[11]=0;  /* filter      */
     ihdr[12]=0;  /* interlace   */
     png_chunk(f, "IHDR", ihdr, sizeof ihdr);
 
     /* Filtered raw scanlines: each row prefixed with filter byte 0 (None). */
-    size_t raw_len = (size_t)h * (1 + (size_t)w * 3);
+    size_t stride = (size_t)w * (size_t)chans;
+    size_t raw_len = (size_t)h * (1 + stride);
     uint8_t *raw = (uint8_t *)malloc(raw_len);
     if (!raw) return 0;
     for (uint32_t y = 0; y < h; y++) {
-        uint8_t *row = raw + (size_t)y * (1 + (size_t)w * 3);
+        uint8_t *row = raw + (size_t)y * (1 + stride);
         row[0] = 0;
-        memcpy(row + 1, rgb + (size_t)y * w * 3, (size_t)w * 3);
+        memcpy(row + 1, px + (size_t)y * stride, stride);
     }
 
     /* zlib stream: 2-byte header + stored DEFLATE blocks + 4-byte Adler32. */
@@ -107,6 +110,18 @@ static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
     free(z);
     png_chunk(f, "IEND", NULL, 0);
     return 1;
+}
+
+/* Write an RGB (3 bytes/pixel, top-down) buffer as a PNG. Returns 1 on success. */
+static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
+    return png_write_n(f, rgb, w, h, 3);
+}
+
+/* Write an RGBA (4 bytes/pixel, top-down, straight alpha) buffer as a PNG.
+ * Used by the HD texture dumper (tex_pack.cpp), which needs the alpha channel
+ * to carry the PS1 transparent / opaque / semi-transparent distinction. */
+static int png_write_rgba(FILE *f, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    return png_write_n(f, rgba, w, h, 4);
 }
 
 #endif /* PSX_PNG_WRITE_H */

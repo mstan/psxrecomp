@@ -406,6 +406,22 @@ struct RuntimeConfig {
     // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
 
+    // hd_textures: load a Beetle PSX HW-format HD texture pack from
+    // <disc dir>/<disc stem>-texture-replacements/. See runtime/include/tex_pack.h.
+    bool                  video_hd_textures = false;
+
+    // hd_texture_dump: write every texture the game draws to
+    // <disc dir>/<disc stem>-texture-dump/ as <texhash>-<palhash>.png. The
+    // authoring path for new packs, and the instrument that proves our hashes
+    // match Beetle's (diff the two dumps' filename sets). Costs a synchronous
+    // PNG write per newly-seen texture, so it is a tool, not a play setting.
+    bool                  video_hd_texture_dump = false;
+
+    // hd_texture_dir: parent directory for both folders above. Empty (default)
+    // means the directory the disc image lives in, which is where a pack
+    // authored for RetroArch already expects to sit.
+    std::string           video_hd_texture_dir;
+
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
     // fraction away when it saturates SXY to integer screen pixels; vertices of
