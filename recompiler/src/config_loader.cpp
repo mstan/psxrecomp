@@ -117,6 +117,24 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
         h.u32(site.result);
     }
 
+    // Widen sites change emitted code, so they must contribute to overlay
+    // cache identity exactly as keep sites do -- otherwise migrating a site
+    // from keep to widen would silently reuse the pinned overlay.
+    std::vector<WidescreenCullWidenSite> widen_sites = c.ws_cull_widen_sites;
+    std::sort(widen_sites.begin(), widen_sites.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.address != b.address) return a.address < b.address;
+                  if (a.expected != b.expected) return a.expected < b.expected;
+                  return (int)a.mode < (int)b.mode;
+              });
+    h.tag("cull_widen");
+    h.u32((uint32_t)widen_sites.size());
+    for (const auto& site : widen_sites) {
+        h.u32(site.address);
+        h.u32(site.expected);
+        h.u32((uint32_t)site.mode);
+    }
+
     std::vector<WidescreenAngleSite> angle_sites = c.ws_cull_angle_sites;
     std::sort(angle_sites.begin(), angle_sites.end(),
               [](const auto& a, const auto& b) {
@@ -1682,6 +1700,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_nclip_exact_sites;
     std::vector<uint32_t> ws_cull_branch_keep_sites;
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<WidescreenCullWidenSite> ws_cull_widen_sites;
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     WidescreenAspectConeConfig ws_aspect_cone;
     int ws_cull_guard_pixels = 0;
@@ -1746,6 +1765,57 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                             config_path.string(), site.address));
                     }
                     ws_cull_keep_sites.push_back(site);
+                }
+            }
+            if (cull.contains("widen")) {
+                std::set<uint32_t> seen;
+                for (const auto& item : toml::find<toml::array>(cull, "widen")) {
+                    WidescreenCullWidenSite site;
+                    site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                             "widescreen.cull.widen.address");
+                    site.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                              "widescreen.cull.widen.expected");
+                    const std::string mode =
+                        toml::find<std::string>(item, "mode");
+                    const uint32_t op = site.expected >> 26;
+                    const uint32_t fn = site.expected & 0x3Fu;
+                    const bool is_imm = (op == 0x0Au) || (op == 0x0Bu);
+                    const bool is_reg = (op == 0u && (fn == 0x2Au || fn == 0x2Bu));
+                    if (!is_imm && !is_reg) {
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.widen]] expected must be "
+                            "SLT/SLTU/SLTI/SLTIU",
+                            config_path.string()));
+                    }
+                    if (mode == "imm_upper")      site.mode = WsCullWidenMode::ImmUpper;
+                    else if (mode == "imm_lower") site.mode = WsCullWidenMode::ImmLower;
+                    else if (mode == "bound_rt")  site.mode = WsCullWidenMode::BoundRt;
+                    else if (mode == "bound_rs")  site.mode = WsCullWidenMode::BoundRs;
+                    else {
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.widen]] mode must be one of "
+                            "imm_upper, imm_lower, bound_rt, bound_rs",
+                            config_path.string()));
+                    }
+                    // The mode has to match the instruction shape: an
+                    // immediate mode on a register compare (or vice versa)
+                    // would widen an operand that does not exist.
+                    const bool mode_is_imm =
+                        site.mode == WsCullWidenMode::ImmUpper ||
+                        site.mode == WsCullWidenMode::ImmLower;
+                    if (mode_is_imm != is_imm) {
+                        throw std::runtime_error(fmt::format(
+                            "{}: [[widescreen.cull.widen]] 0x{:08X} mode '{}' "
+                            "does not match the instruction form (imm modes are "
+                            "for SLTI/SLTIU, bound modes for SLT/SLTU)",
+                            config_path.string(), site.address, mode));
+                    }
+                    if (!seen.insert(site.address & 0x1FFFFFFFu).second) {
+                        throw std::runtime_error(fmt::format(
+                            "{}: duplicate [[widescreen.cull.widen]] address 0x{:08X}",
+                            config_path.string(), site.address));
+                    }
+                    ws_cull_widen_sites.push_back(site);
                 }
             }
             if (cull.contains("angle")) {
@@ -2149,6 +2219,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_nclip_exact_sites*/ ws_cull_nclip_exact_sites,
         /*ws_cull_branch_keep_sites*/ ws_cull_branch_keep_sites,
         /*ws_cull_keep_sites*/    ws_cull_keep_sites,
+        /*ws_cull_widen_sites*/   ws_cull_widen_sites,
         /*ws_cull_angle_sites*/   ws_cull_angle_sites,
         /*ws_aspect_cone*/         ws_aspect_cone,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,

@@ -983,6 +983,55 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             reg_name(dst), vanilla, site.result, comment);
     }
 
+    // Screen-edge compares whose BOUND follows the live reveal margin. Unlike a
+    // keep site this never pins the verdict, so a clip-code packer keeps
+    // classifying honestly and the clipper subdivides at the revealed edge
+    // instead of emitting a primitive the GPU will discard. Identity at 4:3.
+    for (const auto& site : config_.ws_cull_widen_sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: cull widen expected 0x{:08X} at 0x{:08X}, found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        const bool imm_mode = site.mode == WsCullWidenMode::ImmUpper ||
+                              site.mode == WsCullWidenMode::ImmLower;
+        uint32_t dst = 0;
+        std::string call;
+        if (imm_mode) {
+            if (!(opcode == 0x0A || opcode == 0x0B)) {
+                fmt::print(stderr,
+                           "ERROR: cull widen site 0x{:08X} imm mode on non-SLTI (0x{:08X})\n",
+                           addr, instr);
+                std::exit(1);
+            }
+            dst = get_rt(instr);
+            call = fmt::format(
+                "{}({}, {}u)",
+                site.mode == WsCullWidenMode::ImmUpper ? "psx_ws_cull_slti"
+                                                       : "psx_ws_cull_slti_lower",
+                reg_name(get_rs(instr)), get_imm16(instr));
+        } else {
+            if (!(opcode == 0x00 && (funct == 0x2A || funct == 0x2B))) {
+                fmt::print(stderr,
+                           "ERROR: cull widen site 0x{:08X} bound mode on non-SLT (0x{:08X})\n",
+                           addr, instr);
+                std::exit(1);
+            }
+            dst = get_rd(instr);
+            call = fmt::format(
+                "psx_ws_cull_slt_widen({}, {}, {})",
+                reg_name(get_rs(instr)), reg_name(get_rt(instr)),
+                site.mode == WsCullWidenMode::BoundRt ? 1 : 0);
+        }
+        return fmt::format(
+            "{} = (uint32_t){};"
+            "  /* ws cull bound follows reveal margin */{}",
+            reg_name(dst), call, comment);
+    }
+
     // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
     // auto_backdrop). At a detected window's START/END finalize, route the value
     // through psx_ws_backdrop_value(orig, is_end): identity at 4:3, but in
@@ -3276,6 +3325,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt); /* ws cull register-bound widen (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";

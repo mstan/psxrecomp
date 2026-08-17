@@ -1421,6 +1421,29 @@ int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
     return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
 }
 
+/* Register-bound widen for `SLT rd, rs, rt` ([[widescreen.cull.widen]]).
+ *
+ * The keep-site helper above PINS a verdict, which is correct only for a
+ * separately proven binary decision. At a clip-code packer it is actively
+ * wrong: pinning the classifier tells the clipper nothing crosses the screen
+ * edge, so polygons that do are never subdivided, are submitted with
+ * coordinates outside the GPU's legal primitive range, and the hardware drops
+ * the whole primitive. Widening moves the BOUND instead, so the clipper still
+ * classifies correctly and simply clips at the revealed edge.
+ *
+ * `bound_is_rt` selects which operand carries the bound, which is the only
+ * thing that differs between the two idioms:
+ *   bound_is_rt : coord in rs, bound in rt -> rs <  rt + m   (upper edge)
+ *   otherwise   : bound in rs, coord in rt -> rs + m <  rt   (lower edge)
+ * Both reduce to the vanilla `(int32_t)rs < (int32_t)rt` at margin 0, so 4:3
+ * stays bit-for-bit identical. */
+int psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt) {
+    const int32_t m = psx_ws_x_margin();
+    const int32_t a = (int32_t)rs, b = (int32_t)rt;
+    return bound_is_rt ? ((a < b + m) ? 1 : 0)
+                       : ((a + m < b) ? 1 : 0);
+}
+
 /* Signed left-edge widen for the funnel's `bltz maxSX, reject`: reject only
  * when the prim ends left of the REVEALED edge (maxSX < -margin). Returns the
  * branch predicate. Identity at margin 0 (4:3). */

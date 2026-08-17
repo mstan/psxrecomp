@@ -99,6 +99,31 @@ struct WidescreenCullKeepSite {
     uint32_t result = 0;   // forced comparison result (0 or 1)
 };
 
+// Screen-edge compare whose BOUND follows the live reveal margin, rather than
+// having its verdict pinned like a keep site.
+//
+// `keep` is right only for a separately proven binary decision. At a clip-code
+// packer it is wrong: pinning the classifier tells the clipper that nothing
+// crosses the screen edge, so crossing polygons are never subdivided, are
+// submitted with coordinates outside the GPU's legal primitive range, and the
+// hardware discards them whole. Moving the bound keeps the classification
+// honest and simply clips at the revealed edge.
+//
+// `mode` names which operand carries the bound and which way it travels. Every
+// mode is identity at margin 0, so 4:3 output stays bit-for-bit unchanged.
+enum class WsCullWidenMode {
+    ImmUpper,  // SLTI/SLTIU: coord < imm + m   (right/bottom edge)
+    ImmLower,  // SLTI/SLTIU: coord < imm - m   (left/top edge)
+    BoundRt,   // SLT/SLTU:   rs    < rt  + m   (coord in rs, bound in rt)
+    BoundRs,   // SLT/SLTU:   rs + m <  rt      (bound in rs, coord in rt)
+};
+
+struct WidescreenCullWidenSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded SLT/SLTU/SLTI/SLTIU instruction
+    WsCullWidenMode mode = WsCullWidenMode::ImmUpper;
+};
+
 // Aspect-scaled 12-bit angular half-extent. These sites load a positive angle
 // constant with `addi[u] rt,zero,imm`; the runtime widens tan(angle) by the
 // live horizontal reveal factor. Full-word guards prevent overlay-address
@@ -955,6 +980,7 @@ struct GameConfig {
     // where maximal overdraw is preferable to range guessing. Each entry is
     // guarded by the complete MIPS word; 4:3 executes the vanilla comparison.
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<WidescreenCullWidenSite> ws_cull_widen_sites;
     // Exact 12-bit angular half-extents used by terrain-cell frusta.
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     // Full-word-guarded model-participation cosine compares widened only in

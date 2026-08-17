@@ -325,6 +325,11 @@ int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
 int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm);
+/* Register-bound widen for SLT ([[widescreen.cull.widen]]). bound_is_rt picks
+ * which operand carries the bound: 1 -> rs < rt + m, 0 -> rs + m < rt. Identity
+ * at margin 0. Use instead of pinning a clip classifier, which stops the
+ * clipper subdividing and gets whole primitives dropped by the GPU. */
+int  psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt);
 int  psx_ws_cull_bltz(uint32_t v);
 int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 /* True if a run of instruction words carries the screen-extent reject signature
