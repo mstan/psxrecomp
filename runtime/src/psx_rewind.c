@@ -48,6 +48,15 @@ static int  rewind_pump_compress(size_t budget);
 #define RW_DEF_INTERVAL_8MB 30
 /* Match netplay §96 FMV media snaps (default 4; MEDIA_KF uses 2). */
 #define RW_DEF_FMV_INTERVAL 4
+/* ...but NOT at 8 MB, for the same reason RW_DEF_INTERVAL_8MB exists, only more
+ * so. An 8 MB snapshot is ~10 MiB raw, and do_capture streams the deflate at
+ * RW_ZSLICE (1 MiB) per vblank — so a single capture needs ~10 vblanks to drain
+ * and the next one is skipped while s_zpend is active. Asking for one every 4
+ * frames therefore never achieves 4: it just pins the compressor at 100% duty
+ * on the emu thread for the whole movie. Measured on the WipEout 3 ntscfull8
+ * intro: 17% of FMV frame rate, for rewind granularity the pump cannot deliver.
+ * PSX_REWIND_FMV_INTERVAL still overrides for anyone who wants denser snaps. */
+#define RW_DEF_FMV_INTERVAL_8MB 30
 #define RW_FMV_MDEC_HYSTERESIS 8u
 #define RW_PANEL_W     640
 #define RW_PANEL_H     176
@@ -310,8 +319,13 @@ static int rewind_wanted(void)
             s_interval = normalize_rewind_interval(
                 env_u32("PSX_REWIND_INTERVAL", iv_def, 1u, 60u));
         }
-        s_fmv_interval =
-            env_u32("PSX_REWIND_FMV_INTERVAL", RW_DEF_FMV_INTERVAL, 1u, 16u);
+        {
+            uint32_t fmv_def = RW_DEF_FMV_INTERVAL;
+            if (psx_ram_8mb_active() && fmv_def < RW_DEF_FMV_INTERVAL_8MB)
+                fmv_def = RW_DEF_FMV_INTERVAL_8MB;
+            s_fmv_interval =
+                env_u32("PSX_REWIND_FMV_INTERVAL", fmv_def, 1u, 60u);
+        }
         {
             uint32_t depth_def;
             if (s_depth_pref > 0)
