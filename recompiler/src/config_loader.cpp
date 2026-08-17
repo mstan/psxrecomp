@@ -2329,14 +2329,14 @@ UserSettings load_user_settings(const fs::path& path) {
         const toml::value& h = toml::find(doc, "hotkeys");
         if (h.contains("rewind_pad")) try_get([&]{
             const auto n = toml::find<int64_t>(h, "rewind_pad");
-            if (n >= 0 && n < 256) {
+            if (pad_bind_value_ok(n)) {
                 s.hotkey_pad_rewind = (int)n;
                 s.has_hotkey_pad_rewind = true;
             }
         });
         if (h.contains("save_state_menu_pad")) try_get([&]{
             const auto n = toml::find<int64_t>(h, "save_state_menu_pad");
-            if (n >= 0 && n < 256) {
+            if (pad_bind_value_ok(n)) {
                 s.hotkey_pad_save_state_menu = (int)n;
                 s.has_hotkey_pad_save_state_menu = true;
             }

@@ -55,6 +55,20 @@ inline constexpr int VIDEO_RENDERER_OPENGL = 1;
 inline constexpr int VIDEO_RENDERER_VULKAN = 2;
 inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
 
+// Controller-hotkey bind encoding, mirroring recomp-ui's RECOMP_LAUNCHER_PAD_*
+// (recomp_launcher.h): 0 = unbound, 1..99 = button (1 + SDL button code),
+// 100..999 = axis, 1000+ = a CHORD, encoded as 1000 + a bitmask of SDL button
+// codes. Two buttons held together is the normal case (select+r3), so a real
+// value here is routinely five digits.
+//
+// The bound matters: a naive `< 256` check silently rejects every chord, so a
+// saved rewind_pad = 1272 was dropped on load and pad hotkeys were only ever
+// configurable to single buttons. SDL defines about 21 gamepad buttons, so cap
+// the mask at 32 bits' worth and let the runtime ignore bits no controller can
+// produce.
+inline constexpr int PAD_BIND_MAX = 1000 + (1 << 21);
+inline bool pad_bind_value_ok(long long n) { return n >= 0 && n < PAD_BIND_MAX; }
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
