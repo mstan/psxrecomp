@@ -116,6 +116,9 @@ int  boot_state_save_buffer(const CPUState* cpu, uint32_t bios_checksum,
 
 /* In-memory netplay ring snaps: same sections, no zlib. Load accepts either
  * form. Prefer over zlib when every tick must stay under a hard latency budget. */
+/* One-shot VRAM source override for the next save (rewind async readback);
+ * pass NULL to clear. Only affects the classic full-VRAM section. */
+void boot_state_set_vram_override(const uint16_t *vram);
 int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint8_t** out_data,
                                 size_t* out_len);

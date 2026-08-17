@@ -813,6 +813,25 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
         if (observed && (page >> 5) < bw)
             bitmap[page >> 5] |= 1u << (page & 31u);
     }
+    /* PSX_CAPTURE_DIAG=1: report how much executed-PC evidence this snapshot
+     * actually saw, split at the 2 MiB line, so a missing 8 MB high bank is
+     * attributable to evidence vs enumeration vs scope. */
+    if (getenv("PSX_CAPTURE_DIAG")) {
+        uint32_t lo_pages = 0, hi_pages = 0, hi_words = 0;
+        for (uint32_t page = 0; page < ram_size / 4096u; page++) {
+            if ((page >> 5) >= bw) break;
+            if ((bitmap[page >> 5] >> (page & 31u)) & 1u) {
+                if (page >= (0x200000u >> 12)) hi_pages++; else lo_pages++;
+            }
+        }
+        for (uint32_t w = (0x200000u >> 2); w < (ram_size >> 2); w++)
+            if ((exec_pc_bitmap[w >> 5] >> (w & 31u)) & 1u) hi_words++;
+        fprintf(stderr,
+            "psxrecomp: [capdiag] scope=0x%X-0x%X ram=0x%X pages: low=%u high=%u ; "
+            "exec_pc bits >=2MB = %u ; overlay_floor=0x%X\n",
+            scope_lo, scope_hi, ram_size, lo_pages, hi_pages, hi_words,
+            (unsigned)OVERLAY_REGION_FLOOR);
+    }
 }
 
 static uint64_t overlay_capture_write_current(const char *reason,
@@ -951,6 +970,11 @@ int overlay_capture_count(void)
 #define AUTOCAP_COOLDOWN_MS     5000ull
 #define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
 #define AUTOCAP_WRITE_RETRY_MAX_FRAMES 60u /* cap failed-I/O retry at ~1 s */
+/* Failed provider requests before the compile trigger is treated as absent and
+ * the pending signature retired. Hosts without an in-process compiler spawn
+ * (Linux/macOS: autocompile_request() is Windows-only) would otherwise pin the
+ * pending flag forever and stall ALL periodic autocapture after the first fire. */
+#define AUTOCAP_PROVIDER_MAX_ATTEMPTS 8u
 
 static int      s_autocap_enabled    = 0;
 static uint64_t s_autocap_last_check = 0;
@@ -1157,6 +1181,32 @@ static int autocap_provider_request_try(const CodeProvider *cp, uint64_t frame)
         return 0;
     }
     s_autocap_provider_attempts++;
+    /* Bound the retries. A host with no in-process compiler spawn can NEVER
+     * satisfy this request — autocompile_request() is Windows-only and returns
+     * 0 on Linux/macOS, which use the manual compile_overlays.py flow — yet
+     * available() still reports configured, so the failure is indistinguishable
+     * from a transient one here. Retrying forever pinned
+     * s_autocap_provider_sig_pending set, and the periodic autocapture gate
+     * returns early whenever it is: exactly ONE snapshot was ever written per
+     * session and every later evidence epoch was discarded.
+     *
+     * The durable capture is already committed by this point; the request is
+     * only the compile trigger. After a bounded number of failures, retire the
+     * pending signature (with backoff) so periodic capture keeps converging for
+     * an offline compile. Measured on WipEout 3 ntscfull8: the mod installs its
+     * high bank with CPU stores, never CD DMA, so periodic executed-page
+     * autocapture is that code's ONLY capture path — with this stuck, 0 of 27
+     * captured regions were high-bank and the high bank interpreted forever. */
+    if (s_autocap_provider_attempts >= AUTOCAP_PROVIDER_MAX_ATTEMPTS) {
+        if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
+            s_autocap_backoff <<= 1;
+        s_autocap_next_ok = frame +
+            (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+        s_autocap_provider_sig_pending = 0;
+        s_autocap_provider_retry_frame = 0;
+        s_autocap_provider_attempts = 0;
+        return 0;
+    }
     s_autocap_provider_retry_frame = frame +
         autocap_write_retry_delay(s_autocap_provider_attempts);
     return 1;

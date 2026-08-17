@@ -1447,10 +1447,23 @@ static void lazy_miss_invalidate_loader(void) {
     }
 }
 
+/* Watched-code invalidation is PAGE-granular, not global. The historical
+ * global generation (s_lazy_watched_code_gen) was bumped by
+ * overlay_loader_note_code_write on EVERY guest data write to ANY watched
+ * page — and candidate code pages are mixed code+data on real games, written
+ * many times per frame in-race. That gave every negative memo a lifetime of
+ * under a frame, so try_load_region's full manifest scan re-ran per dispatch
+ * anyway (profiled at 32% of process CPU under turbo WITH the memo, WipEout 3
+ * ntscfull8). Keying each entry on its own page's generation keeps the exact
+ * correctness event — "bytes at/near this PC may now match a previously
+ * absent variant" — while writes to unrelated pages no longer wipe anything.
+ * Cross-page CPS bundles whose OTHER pages change are covered by loader_gen
+ * (every DLL publish) and g_dirty_ram_code_gen (code writes/DMA), the same
+ * events that already re-run the scan. */
 static int lazy_miss_cached(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     return e->phys == phys && e->code_gen == g_dirty_ram_code_gen &&
-           e->watched_code_gen == s_lazy_watched_code_gen &&
+           e->watched_code_gen == overlay_watch_pagegen_sum(phys & ~3u, 4u) &&
            e->loader_gen == s_lazy_loader_gen;
 }
 
@@ -1458,7 +1471,7 @@ static void lazy_miss_record(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     e->phys = phys;
     e->code_gen = g_dirty_ram_code_gen;
-    e->watched_code_gen = s_lazy_watched_code_gen;
+    e->watched_code_gen = overlay_watch_pagegen_sum(phys & ~3u, 4u);
     e->loader_gen = s_lazy_loader_gen;
 }
 
@@ -3295,6 +3308,19 @@ static int try_load_region(uint32_t phys) {
 
     if (!overlay_loads_allowed())
         return 0;
+    /* Negative memo — profiled load-bearing. A dispatch PC in the overlay
+     * window with NO loadable shard re-ran this full scan (dirty walkback +
+     * manifest bucket + per-page range links, each with gen-gated CRC work)
+     * on EVERY dispatch: the exact-entry/CPS call site above never reaches
+     * the terminal lazy_miss_record, so nothing remembered the failure.
+     * Measured (WipEout 3 ntscfull8, mod-patched text kept dirty at the
+     * game-start baseline): try_load_region = 46% of total process CPU while
+     * the interpreter itself was 4%. The memo self-expires on any code write
+     * (g_dirty_ram_code_gen), watched-page write, or new DLL publish
+     * (load_one_dll -> lazy_miss_invalidate_loader), so a shard that becomes
+     * available or bytes that change re-run the scan exactly once. */
+    if (lazy_miss_cached(phys))
+        return 0;
 
     uint32_t page_sz = 4096u;
 
@@ -3381,12 +3407,13 @@ retry_artifact:
         }
     }
     int selected = lazy_choose_complete_or_fallback(best, fallback);
-    if (selected < 0) return 0;
+    if (selected < 0) { lazy_miss_record(phys); return 0; }
     if (lazy_load_selected(selected)) return 1;
     /* An unloadable/corrupt GCC artifact must not suppress an older immutable
      * repair or the TCC fallback. lazy_load_selected marks the failed cache
      * entry, so a bounded re-selection chooses the next live candidate. */
     if (++select_attempts < s_cache_idx_count) goto retry_artifact;
+    lazy_miss_record(phys);
     return 0;
 }
 
@@ -3394,6 +3421,72 @@ retry_artifact:
  * interior CPS continuation. The latter must use its already-loaded range owner
  * first (the Whoopee 0x107624 fix); the former must be allowed to publish its
  * exact DLL even when a broader conservative owner contains the same PC. */
+/* ---- dispatch-miss classification (PSX_OVERLAY_MISS_DIAG=1) -------------
+ * 97.5% of overlay dispatches fall back to interp (measured: 1.35M native vs
+ * 53.5M fallback). That single number cannot distinguish "nothing was ever
+ * captured for this PC" from "a shard exists but its bytes no longer match"
+ * from "it matches but the DLL is unusable" — which are three different bugs
+ * with three different fixes. Classify each FIRST-TIME miss (the memoized
+ * negative path is counted separately) and report periodically. */
+static uint64_t s_miss_no_manifest = 0; /* no captured shard declares this PC  */
+static uint64_t s_miss_crc         = 0; /* declared, but live bytes differ     */
+static uint64_t s_miss_unusable    = 0; /* matches, but DLL load_failed/suppr. */
+static uint64_t s_miss_other       = 0; /* matched+usable yet still fell back  */
+static uint64_t s_miss_cachedhit   = 0; /* memoized negative, no search done   */
+static int      s_miss_diag        = -1;
+static void miss_diag_dump(int force);
+
+static int miss_diag_on(void) {
+    if (s_miss_diag < 0) s_miss_diag = getenv("PSX_OVERLAY_MISS_DIAG") ? 1 : 0;
+    return s_miss_diag;
+}
+
+static void miss_classify(uint32_t phys) {
+    if (!miss_diag_on() || !s_active) return;
+    uint32_t bucket = (phys * 2654435761u) & LAZY_ENTRY_MASK;
+    int any = 0, crcfail = 0, unusable = 0, usable = 0;
+    for (int li = s_lazy_entry_head[bucket]; li >= 0;
+         li = s_lazy_man[li].next_entry) {
+        if ((s_lazy_man[li].fn.entry & 0x1FFFFFFFu) != phys) continue;
+        any = 1;
+        if (!lazy_man_matches(&s_lazy_man[li])) { crcfail = 1; continue; }
+        int ci = s_lazy_man[li].cache_idx;
+        if (ci < 0 || ci >= s_cache_idx_count ||
+            s_cache_idx[ci].load_failed || s_cache_idx[ci].capacity_suppressed)
+            unusable = 1;
+        else usable = 1;
+    }
+    if (!any)          s_miss_no_manifest++;
+    else if (usable)   s_miss_other++;
+    else if (crcfail)  s_miss_crc++;
+    else if (unusable) s_miss_unusable++;
+    miss_diag_dump(0);
+}
+
+/* force=1 ignores the rate limit (periodic tick / shutdown). */
+static void miss_diag_dump(int force) {
+    if (!miss_diag_on()) return;
+    uint64_t tot = s_miss_no_manifest + s_miss_crc + s_miss_unusable +
+                   s_miss_other;
+    if (!force && (tot & 0x3Fu) != 0u) return;
+    fprintf(stderr,
+        "psxrecomp: [missdiag] distinct first-time misses=%llu  no_manifest=%llu "
+        "crc_mismatch=%llu unusable=%llu matched_but_fellback=%llu ; "
+        "memoized_negative_hits=%llu native=%llu interp=%llu\n",
+        (unsigned long long)tot,
+        (unsigned long long)s_miss_no_manifest,
+        (unsigned long long)s_miss_crc,
+        (unsigned long long)s_miss_unusable,
+        (unsigned long long)s_miss_other,
+        (unsigned long long)s_miss_cachedhit,
+        (unsigned long long)s_disp_native,
+        (unsigned long long)s_disp_interp);
+}
+
+/* Called from the loader status query so a run always emits a final tally even
+ * when fewer than the rate-limit number of distinct misses occurred. */
+void overlay_loader_miss_diag_report(void) { miss_diag_dump(1); }
+
 static int lazy_has_exact_entry(uint32_t phys) {
     /* Same overlay-off hazard as overlay_find_by_range: the lazy entry index
      * (s_lazy_entry_head) is -1-initialized only when overlay_cache is enabled;
@@ -3531,6 +3624,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
     if (!s_active) return 0;
     if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
+        if (miss_diag_on()) s_miss_cachedhit++;
         s_disp_interp++;
         return 0;
     }
@@ -3844,7 +3938,10 @@ retry_candidates:
         goto retry_candidates;
     }
 
-    if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
+    if (overlay_cache_window_contains(phys)) {
+        miss_classify(phys);
+        lazy_miss_record(phys);
+    }
     s_disp_interp++;
     return 0;
 }
@@ -4820,6 +4917,10 @@ void overlay_loader_get_status(int *active, int *registered,
                                uint32_t *checked_out, int checked_max,
                                int *checked_written,
                                uint32_t *last_crc_out, int *last_file_found_out) {
+    /* PSX_OVERLAY_MISS_DIAG: emit the running tally on every status poll (the
+     * periodic perf-diag line) so a run reports even when the distinct-miss
+     * count never reaches the rate limit. */
+    miss_diag_dump(1);
     if (active)          *active          = s_active;
     if (registered)      *registered      = s_valid_count;
     if (regions_checked) *regions_checked = s_nchecked;

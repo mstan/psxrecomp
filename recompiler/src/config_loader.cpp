@@ -2560,6 +2560,13 @@ UserSettings load_user_settings(const fs::path& path) {
             s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
         });
     }
+    if (doc.contains("savestate")) {
+        const toml::value& ss = toml::find(doc, "savestate");
+        if (ss.contains("dir")) try_get([&]{
+            const auto p = toml::find<std::string>(ss, "dir");
+            if (!p.empty()) { s.savestate_dir = fs::path(p); s.has_savestate_dir = true; }
+        });
+    }
     if (doc.contains("localization")) {
         const toml::value& lc = toml::find(doc, "localization");
         if (lc.contains("language")) try_get([&]{
@@ -2780,6 +2787,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         if (s.has_memcard2_enabled)
             f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
     }
+    if (s.has_savestate_dir)
+        f << "\n[savestate]\ndir = \"" << fwd(s.savestate_dir) << "\"\n";
 
     {
         bool any_ctrl = s.has_deadzone || s.has_multitap_enabled ||

@@ -72,6 +72,22 @@ static inline uint32_t psx_ram_map_read(uint32_t phys) {
 static inline uint32_t psx_ram_map_write(uint32_t phys) {
     return psx_ram_map_read(phys);
 }
+
+/* Fold main-RAM code PCs to the low 2 MiB mirror when the high page is still
+ * aliased (not registered unique). Unique high code keeps its real PC.
+ * Inline because the generated dispatch table calls this on EVERY dispatch
+ * (psx_game_find_entry) and the runtime is built without LTO. */
+static inline uint32_t psx_ram_canon_code_addr_inline(uint32_t addr) {
+    uint32_t seg = addr & 0xE0000000u;
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    /* Fold high→low only while the page is still a 2 MiB mirror alias.
+     * Registered unique high pages may hold real enhancement code (Wipeout
+     * 0x80781xxx); folding those onto low RAM executes the wrong bytes. */
+    if (phys < PSX_RAM_WINDOW && phys >= PSX_RAM_2MB &&
+        !psx_ram_high_page_unique(phys >> 12))
+        phys &= (PSX_RAM_2MB - 1u);
+    return seg | phys;
+}
 /* Mark [addr, addr+len) unique in 8 MB mode (enhancement heaps). */
 void     psx_ram_register_unique(uint32_t addr, uint32_t len);
 /* Fold main-RAM code PCs to the low 2 MiB mirror when the high page is still

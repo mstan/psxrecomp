@@ -19,6 +19,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
+#include "psx_sdl.h"
+
+/* Amortized snapshot compression (logic near do_capture below). */
+#define RW_ZSLICE (1u * 1024u * 1024u)
+static struct {
+    int      active;
+    uint32_t tick;
+    uint8_t *raw;   size_t raw_len; size_t in_pos;
+    uint8_t *out;   size_t out_cap;
+    z_stream zs;
+} s_zpend;
+static void rewind_pending_abort(void);
+static int  rewind_pump_compress(size_t budget);
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 #include "retcomm_rbengine/snap_ring.h"
@@ -458,6 +472,7 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 
 void psx_rewind_shutdown(void)
 {
+    rewind_pending_abort();
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
     free(s_thumbs);
@@ -489,6 +504,15 @@ int psx_rewind_needs_present(void)
     return s_open || s_slide > 0.01f || s_anim_dir != 0;
 }
 
+/* Async VRAM readback pre-arm (GL backend). Kicked one frame before a capture
+ * is due so the GPU->PBO copy overlaps a full frame; consumed in do_capture.
+ * 0 on non-GL backends / missing extension — capture falls back to the
+ * synchronous gr_vram_transfer_out path. */
+extern int gl_renderer_vram_readback_begin(void);
+extern int gl_renderer_vram_readback_finish(uint16_t *dst);
+static int       s_vram_prearmed;
+static uint16_t *s_vram_async;   /* 1 MiB, lazily allocated */
+
 void psx_rewind_note_frame(void)
 {
     uint32_t iv;
@@ -499,6 +523,79 @@ void psx_rewind_note_frame(void)
     if (s_last_capture_frame == 0xffffffffu ||
         s_frame - s_last_capture_frame >= iv)
         s_capture_due = 1;
+    else if (iv >= 2 && s_frame - s_last_capture_frame == iv - 1u &&
+             !s_zpend.active && !s_vram_prearmed)
+        s_vram_prearmed = gl_renderer_vram_readback_begin();
+}
+
+/* ---- Amortized snapshot compression --------------------------------------
+ * The old capture ran boot_state_save_buffer (serialize + zlib, Z_BEST_SPEED)
+ * synchronously on the emulation thread. At 8 MB main RAM that is ~9.5 MiB
+ * through deflate ≈ 20-30 ms in ONE frame, every capture interval — a 2 Hz
+ * judder that a 1-second FPS average completely hides (measured with
+ * PSX_HITCH_DIAG: guest=30-45 ms at exactly f=32/62/92 with interval=30;
+ * rewind off ⇒ zero guest spikes >25 ms).
+ *
+ * Now the capture frame only RAW-serializes (boot_state_save_buffer_raw,
+ * pure memcpy work, ~2-3 ms) and the deflate is streamed in ~1 MiB slices on
+ * subsequent vblanks (~2 ms each) via rewind_pump_compress(). The finished
+ * blob is an "RWZ1" envelope [magic][u32 raw_len][zlib stream] stored in the
+ * ring; do_load transparently unwraps it. No worker thread: everything stays
+ * on the emulation thread, so ring ordering and savestate interactions are
+ * unchanged — do_load just finishes any in-flight compression first. While a
+ * compression is in flight new captures wait (FMV densify at interval=4 will
+ * effectively capture every ~raw_len/slice frames instead — acceptable).
+ * (s_zpend / RW_ZSLICE are declared with the file-top forward decls so
+ * psx_rewind_note_frame's prearm check can see them.) */
+
+static void rewind_pending_abort(void)
+{
+    if (!s_zpend.active) return;
+    deflateEnd(&s_zpend.zs);
+    free(s_zpend.raw);
+    free(s_zpend.out);
+    memset(&s_zpend, 0, sizeof s_zpend);
+}
+
+/* Advance the in-flight compression by at most `budget` input bytes.
+ * Returns 1 while still pending, 0 when idle/finished. The z_stream keeps its
+ * own output cursor across calls; only the input is sliced. avail_out is the
+ * full compressBound up front, so the terminal Z_FINISH always completes in a
+ * single deflate call. */
+static int rewind_pump_compress(size_t budget)
+{
+    if (!s_zpend.active) return 0;
+    for (;;) {
+        size_t remain = s_zpend.raw_len - s_zpend.in_pos;
+        size_t chunk  = remain;
+        int    flush  = Z_FINISH;
+        if (chunk > budget) { chunk = budget; flush = Z_NO_FLUSH; }
+        s_zpend.zs.next_in  = s_zpend.raw + s_zpend.in_pos;
+        s_zpend.zs.avail_in = (uInt)chunk;
+        int rc = deflate(&s_zpend.zs, flush);
+        size_t consumed = chunk - s_zpend.zs.avail_in;
+        s_zpend.in_pos += consumed;
+        if (flush == Z_FINISH) {
+            if (rc == Z_STREAM_END) {
+                size_t zbytes  = (s_zpend.out_cap - 8u) - s_zpend.zs.avail_out;
+                size_t out_len = 8u + zbytes;
+                uint8_t *blob  = s_zpend.out;
+                uint32_t tick  = s_zpend.tick;
+                deflateEnd(&s_zpend.zs);
+                free(s_zpend.raw);
+                memset(&s_zpend, 0, sizeof s_zpend);
+                if (!rbe_snap_ring_store(s_ring, tick, blob, out_len))
+                    free(blob);
+                return 0;
+            }
+            rewind_pending_abort();  /* bound-sized out: cannot happen */
+            return 0;
+        }
+        if (rc != Z_OK) { rewind_pending_abort(); return 0; }
+        budget -= consumed;
+        if (budget == 0 || consumed == 0)
+            return 1;
+    }
 }
 
 static int do_capture(CPUState *cpu, uint32_t resume_pc)
@@ -512,20 +609,70 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
 
     if (!cpu || !s_ring)
         return 0;
+    if (s_zpend.active)   /* previous snapshot still compressing */
+        return 0;
     pc = rewind_resolve_resume_pc(cpu, resume_pc);
     if (!psx_irq_resume_context_snapshot_safe_at(pc) || !resume_pc_ok(pc))
         return 0;
     snap = *cpu;
     snap.pc = pc;
-    /* zlib (not raw): 8 MB raw snaps were ~9.5 MiB and dominated FPS.
-     * Netplay still uses raw (latency budget); rewind prefers size. */
-    if (!boot_state_save_buffer(&snap, s_bios, s_entry, &blob, &len) ||
-        !blob || !len)
-        return 0;
-    if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {
-        free(blob);
+    {
+        /* PSX_HITCH_DIAG: time the raw serialize itself — the zlib was only
+         * part of the historical capture spike; the VRAM readback inside the
+         * serializer is the other suspect. */
+        static int diag = -1;
+        if (diag < 0) diag = getenv("PSX_HITCH_DIAG") ? 1 : 0;
+        unsigned long long t0 = diag ? SDL_GetPerformanceCounter() : 0;
+        /* Consume the VRAM readback kicked one frame ago: the serializer then
+         * memcpys from the mapped copy instead of draining the GL pipeline
+         * with a synchronous glReadPixels (measured 8-17 ms per capture). */
+        int vram_async = 0;
+        if (s_vram_prearmed) {
+            s_vram_prearmed = 0;
+            if (!s_vram_async)
+                s_vram_async = (uint16_t *)malloc(1024u * 512u * 2u);
+            if (s_vram_async &&
+                gl_renderer_vram_readback_finish(s_vram_async)) {
+                boot_state_set_vram_override(s_vram_async);
+                vram_async = 1;
+            }
+        }
+        int ok = boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len);
+        if (vram_async)
+            boot_state_set_vram_override(NULL);
+        if (diag) {
+            double ms = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 /
+                        (double)SDL_GetPerformanceFrequency();
+            if (ms > 4.0)
+                fprintf(stderr, "[HITCH] rewind raw-serialize %.1fms (len=%zu)\n",
+                        ms, len);
+        }
+        if (!ok || !blob || !len)
+            return 0;
+    }
+    /* Stage the streaming deflate; the envelope header goes in up front. */
+    uLong bound = compressBound((uLong)len);
+    uint8_t *out = (uint8_t *)malloc(8u + (size_t)bound);
+    if (!out) { free(blob); return 0; }
+    memcpy(out, "RWZ1", 4);
+    out[4] = (uint8_t)(len);
+    out[5] = (uint8_t)(len >> 8);
+    out[6] = (uint8_t)(len >> 16);
+    out[7] = (uint8_t)(len >> 24);
+    memset(&s_zpend.zs, 0, sizeof s_zpend.zs);
+    if (deflateInit(&s_zpend.zs, Z_BEST_SPEED) != Z_OK) {
+        free(blob); free(out);
         return 0;
     }
+    s_zpend.active   = 1;
+    s_zpend.tick     = tick;
+    s_zpend.raw      = blob;
+    s_zpend.raw_len  = len;
+    s_zpend.in_pos   = 0;
+    s_zpend.out      = out;
+    s_zpend.out_cap  = 8u + (size_t)bound;
+    s_zpend.zs.next_out  = out + 8;
+    s_zpend.zs.avail_out = (uInt)bound;
     capture_thumb(thumb);
     list_push(tick, thumb);
     s_last_capture_frame = s_frame;
@@ -547,8 +694,28 @@ static int do_load(CPUState *cpu, uint32_t tick)
     data = rbe_snap_ring_peek(s_ring, tick, &size);
     if (!data || !size)
         return 0;
-    if (!boot_state_load_buffer(data, size, s_bios, s_entry, cpu))
+    /* "RWZ1" envelope from the amortized capture: [magic][u32 raw_len][zlib].
+     * Unwrap before handing to the section loader. Pre-envelope blobs (plain
+     * boot_state streams) pass through unchanged. */
+    if (size > 12 && memcmp(data, "RWZ1", 4) == 0) {
+        size_t raw_len = (size_t)data[4] | ((size_t)data[5] << 8) |
+                         ((size_t)data[6] << 16) | ((size_t)data[7] << 24);
+        uint8_t *raw = raw_len ? (uint8_t *)malloc(raw_len) : NULL;
+        uLongf dl = (uLongf)raw_len;
+        if (!raw ||
+            uncompress(raw, &dl, (const Bytef *)data + 8,
+                       (uLong)(size - 8)) != Z_OK ||
+            dl != raw_len) {
+            free(raw);
+            return 0;
+        }
+        int ok = boot_state_load_buffer(raw, raw_len, s_bios, s_entry, cpu);
+        free(raw);
+        if (!ok)
+            return 0;
+    } else if (!boot_state_load_buffer(data, size, s_bios, s_entry, cpu)) {
         return 0;
+    }
     if (!resume_pc_ok(cpu->pc))
         return 0;
     rbe_snap_ring_drop_after(s_ring, tick);
@@ -573,9 +740,16 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
         s_load_pending = 0;
         s_open = 0;
         s_anim_dir = -1;
+        /* Finish any in-flight snapshot compression synchronously so its tick
+         * is in the ring (the thumbnail list already references it) before
+         * the load peeks/drops. User-initiated, so the few ms are fine. */
+        while (rewind_pump_compress((size_t)-1)) {}
         (void)do_load(cpu, tick);
         return;
     }
+    /* Amortize the pending snapshot deflate: ~1 MiB (~2 ms) per vblank
+     * instead of the whole ~9.5 MiB (~20-30 ms) in the capture frame. */
+    (void)rewind_pump_compress(RW_ZSLICE);
     if (s_capture_due && !s_open && !psx_netplay_active())
         (void)do_capture(cpu, resume_pc);
 }

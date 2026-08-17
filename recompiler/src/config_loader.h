@@ -1336,6 +1336,15 @@ struct UserSettings {
     bool has_memcard2_path    = false; std::filesystem::path memcard2_path;
     bool has_memcard1_enabled = false; bool memcard1_enabled = true;
     bool has_memcard2_enabled = false; bool memcard2_enabled = true;
+    // [savestate] dir — where slot .pst files live. Savestates used to be
+    // pinned to the memcard dir, which makes the two impossible to place
+    // independently. Two builds of one game (e.g. a stock 2 MB build and an
+    // 8 MB-mod build) want SHARED memory cards but SEPARATE savestates: the
+    // .pst name embeds only entry_pc, identical across builds, so a shared
+    // dir collides on filename and every cross-build load is refused by the
+    // boot_state codegen_hash guard. Unset => falls back to the memcard dir,
+    // preserving the historical layout for every existing project.
+    bool has_savestate_dir  = false; std::filesystem::path savestate_dir;
 
     // [controller] — per-player input device + pad type + deadzone.
     // device is one of:

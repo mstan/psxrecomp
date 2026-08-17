@@ -327,6 +327,16 @@ static int write_timer_section(BsOut* o) {
 
 /* ============================ SAVE ============================ */
 
+/* Rewind's async-readback override: when set, the next full-VRAM section is
+ * serialized from this caller-owned buffer (a PBO readback kicked one frame
+ * earlier) instead of gr_vram_transfer_out's synchronous GL pipeline drain.
+ * One-shot per save; the caller clears it after boot_state_save_buffer_raw. */
+static const uint16_t *s_vram_save_override = NULL;
+void boot_state_set_vram_override(const uint16_t *vram)
+{
+    s_vram_save_override = vram;
+}
+
 /* Classic full VRAM section (offline / zlib / tracking off). */
 static int write_vram_section_full(BsOut *o)
 {
@@ -334,7 +344,10 @@ static int write_vram_section_full(BsOut *o)
     int ok;
     if (!vbuf)
         return 0;
-    gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
+    if (s_vram_save_override)
+        memcpy(vbuf, s_vram_save_override, VRAM_SIZE);
+    else
+        gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
     s_last_vram_dirty_rows = VRAM_H;
     s_last_vram_incremental = 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
