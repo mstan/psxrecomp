@@ -70,6 +70,23 @@ struct State {
     /* GP0(E2h), decoded. mask == 0 on both axes means "no texture window". */
     int tw_mask_x = 0, tw_mask_y = 0, tw_off_x = 0, tw_off_y = 0;
 
+    /* Distinct sample rects per texture, in TEXEL coordinates relative to the
+     * texture page (lim, exactly as the primitive addressed it).
+     *
+     * Authoring a replacement for an ATLAS needs to know where its cells are,
+     * and a proportional font atlas has no grid to infer: the dumped bitmap
+     * packs rows with no separating scanline and each glyph is a different
+     * width, so reading cells back out of the image is guesswork. The game
+     * already states every cell exactly, once per draw — this just records the
+     * distinct ones. Authoring aid; nothing in the replace path reads it. */
+    struct UvRect {
+        uint64_t key;                    /* (tex hash << 32) | palette hash */
+        uint16_t u0, v0, u1, v1;         /* inclusive texel bounds          */
+        int16_t  origin_u, origin_v;     /* upload's texel origin in-page   */
+        uint32_t hits;
+    };
+    std::vector<UvRect> uv_rects;
+
     /* Diagnostics. */
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
@@ -406,6 +423,28 @@ extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
         if (g.replace_on && key_set_contains(g.known, key)) key_set_insert(g.matched, key);
         if (g.dump_on && key_set_insert(g.dumped, key))
             dump_upload(up, depth, clut_x, clut_y, pal);
+
+        /* Census of distinct cells, only while dumping — this is an authoring
+         * tool and the linear scan below is not something a play session
+         * should carry. Capped; a font atlas needs a couple of hundred. */
+        if (g.dump_on && g.uv_rects.size() < 4096) {
+            const int ou = (up.x - base_x) << shift;
+            const int ov = up.y - base_y;
+            bool seen = false;
+            for (State::UvRect &r : g.uv_rects) {
+                if (r.key == key && r.u0 == lim[0] && r.v0 == lim[1] &&
+                    r.u1 == lim[2] && r.v1 == lim[3]) { r.hits++; seen = true; break; }
+            }
+            if (!seen) {
+                State::UvRect r;
+                r.key = key;
+                r.u0 = (uint16_t)lim[0]; r.v0 = (uint16_t)lim[1];
+                r.u1 = (uint16_t)lim[2]; r.v1 = (uint16_t)lim[3];
+                r.origin_u = (int16_t)ou; r.origin_v = (int16_t)ov;
+                r.hits = 1;
+                g.uv_rects.push_back(r);
+            }
+        }
     }
 }
 
@@ -465,6 +504,21 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             n += std::snprintf(out + n, (size_t)(cap - n),
                                "%s{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hash\":\"%x\"}",
                                i ? "," : "", u.x, u.y, u.w, u.h, (unsigned)u.hash);
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "uvs")) {
+        /* Every distinct cell a draw addressed, per texture. For an atlas this
+         * IS the cell layout, stated by the game rather than inferred from the
+         * bitmap. Only populated while dumping. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.uv_rects.size() && n < cap - 128; i++) {
+            const State::UvRect &r = g.uv_rects[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"u0\":%u,\"v0\":%u,\"u1\":%u,\"v1\":%u,"
+                "\"ou\":%d,\"ov\":%d,\"hits\":%u}",
+                i ? "," : "",
+                (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
+                r.u0, r.v0, r.u1, r.v1, r.origin_u, r.origin_v, r.hits);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "dumped") || !std::strcmp(subcmd, "missing")) {
