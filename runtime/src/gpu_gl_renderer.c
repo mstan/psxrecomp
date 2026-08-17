@@ -127,7 +127,8 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
-#define GL_MAX_INTERNAL_SCALE 4
+/* GL_MAX_INTERNAL_SCALE lives in gpu_render.h — main.cpp needs it to pick the
+ * per-backend ceiling before the GL context exists. */
 
 /* ---- Loaded modern-GL entry points ------------------------------------- */
 typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
@@ -2649,6 +2650,31 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
 }
 
 static int init_gpu_raster(void) {
+    /* Clamp the requested SSAA scale to what this driver can actually back.
+     * The hi-res target is VRAM_W x VRAM_H at `scale`, so the limiting factor
+     * is GL_MAX_TEXTURE_SIZE (and the renderbuffer limit for the depth/stencil
+     * attachment). Without this a too-large scale reaches glTexImage2D, fails
+     * silently, and surfaces only as "GL FBO incomplete" with no indication
+     * that the scale was the cause. */
+    {
+        GLint max_tex = 0, max_rb = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+        int lim = max_tex;
+        if (max_rb > 0 && max_rb < lim) lim = max_rb;
+        if (lim > 0) {
+            /* Width is the binding dimension: VRAM_W (1024) > VRAM_H (512). */
+            int max_scale = lim / VRAM_W;
+            if (max_scale < 1) max_scale = 1;
+            if (s_req_scale > max_scale) {
+                fprintf(stdout,
+                        "psxrecomp: GL supersampling %dx exceeds this driver's "
+                        "%dx%d texture limit; clamping to %dx\n",
+                        s_req_scale, lim, lim, max_scale);
+                s_req_scale = max_scale;
+            }
+        }
+    }
     s_scale = s_req_scale;
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);

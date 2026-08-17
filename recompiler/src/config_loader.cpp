@@ -586,9 +586,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         const toml::value& video = toml::find(cfg, "video");
         if (video.contains("supersampling")) {
             const auto n = toml::find<int64_t>(video, "supersampling");
-            if (n < 1 || n > 4) {
+            /* GL renders SSAA into an FBO rather than the software path's
+             * VRAM-sized mirror, so it scales well past 4x. The runtime picks
+             * the ceiling per backend and clamps again to the driver's real
+             * texture limit once a context exists. */
+            if (n < 1 || n > 16) {
                 throw std::runtime_error(fmt::format(
-                    "[video] supersampling out of range (1..4): {}", n));
+                    "[video] supersampling out of range (1..16): {}", n));
             }
             rt.video_supersampling = static_cast<int>(n);
         }
@@ -2343,7 +2347,7 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("supersampling")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "supersampling");
-            if (n >= 1 && n <= 4) { s.supersampling = (int)n; s.has_supersampling = true; }
+            if (n >= 1 && n <= 16) { s.supersampling = (int)n; s.has_supersampling = true; }
         });
         if (v.contains("window_width")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "window_width");

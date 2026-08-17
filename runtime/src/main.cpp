@@ -11380,6 +11380,20 @@ int main(int argc, char** argv) {
                     (int)addresses.size());
             }
             {
+                std::vector<uint32_t> addresses, expected, modes;
+                addresses.reserve(gc.ws_cull_widen_sites.size());
+                expected.reserve(gc.ws_cull_widen_sites.size());
+                modes.reserve(gc.ws_cull_widen_sites.size());
+                for (const auto& site : gc.ws_cull_widen_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                    modes.push_back((uint32_t)site.mode);
+                }
+                gpu_ws_set_cull_widen_sites(
+                    addresses.data(), expected.data(), modes.data(),
+                    (int)addresses.size());
+            }
+            {
                 std::vector<uint32_t> addresses, expected;
                 addresses.reserve(gc.ws_cull_angle_sites.size());
                 expected.reserve(gc.ws_cull_angle_sites.size());
@@ -13166,7 +13180,19 @@ session_reboot:
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
     if (g_video_scale < 1) g_video_scale = 1;
-    if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
+    /* The ceiling is per-backend, not global. SW_MAX_INTERNAL_SCALE exists
+     * because the software path allocates a VRAM-sized hi-res MIRROR that costs
+     * 1 MB * scale^2; under GL that mirror stays at 1x (glb_set_scale) and the
+     * cost is an FBO instead, so GL can go considerably higher. Applying the
+     * software limit to every backend capped GL at 4x -- about 2048x960
+     * internal -- which is well short of 1440p/4K/8K on hardware that can
+     * trivially do it. The GL backend clamps again to the driver's real texture
+     * limit once the context exists. */
+    {
+        const int max_scale = (g_video_renderer == 1) ? GL_MAX_INTERNAL_SCALE
+                                                      : SW_MAX_INTERNAL_SCALE;
+        if (g_video_scale > max_scale) g_video_scale = max_scale;
+    }
     if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
         gr_set_scale(g_video_scale);
         if (g_video_scale > 1) {

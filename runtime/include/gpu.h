@@ -268,6 +268,11 @@ void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_cull_keep_sites(const uint32_t *addresses,
                                 const uint32_t *expected,
                                 const uint32_t *results, int nsites);
+/* [[widescreen.cull.widen]] sites, so the dirty-RAM interpreter and any overlay
+ * shard reach the same widened verdict the AOT image does. */
+void gpu_ws_set_cull_widen_sites(const uint32_t *addresses,
+                                 const uint32_t *expected,
+                                 const uint32_t *modes, int nsites);
 void gpu_ws_set_angle_sites(const uint32_t *addresses,
                             const uint32_t *expected, int nsites);
 void gpu_ws_set_aspect_cone(const uint32_t *addresses,
@@ -301,6 +306,8 @@ uint32_t psx_ws_xclip_bound(uint32_t vanilla);
 uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced);
 int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
                           uint32_t *out);
+int psx_ws_cull_widen_site(uint32_t pc, uint32_t instr, uint32_t rs,
+                           uint32_t rt, uint32_t imm, uint32_t *out);
 uint32_t psx_ws_angle_widen(uint32_t vanilla);
 int psx_ws_angle_site(uint32_t pc, uint32_t instr, uint32_t *out);
 uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla,

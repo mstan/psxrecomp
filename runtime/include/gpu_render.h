@@ -201,6 +201,15 @@ typedef struct GpuRenderBackend {
                            int base_x);
 } GpuRenderBackend;
 
+/* GL supersampling ceiling. Deliberately separate from SW_MAX_INTERNAL_SCALE:
+ * the software path allocates a VRAM-sized hi-res MIRROR costing 1 MB * scale^2
+ * (256 MB at 16x), but under GL that mirror stays at 1x and the cost is an FBO
+ * the GPU already has memory for. 16x is a 16384x8192 render target, the
+ * GL_MAX_TEXTURE_SIZE floor for desktop GL 3.3; the GL backend clamps again to
+ * the driver's real limit once a context exists. */
+#define GL_MAX_INTERNAL_SCALE 16
+
+
 #ifdef __cplusplus
 }
 #endif

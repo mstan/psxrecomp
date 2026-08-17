@@ -664,6 +664,58 @@ int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
     return 0;
 }
 
+/* [[widescreen.cull.widen]] site registry — the interpreter's half.
+ *
+ * The recompiler emits the widened helper directly into native code, but the
+ * same PC can also execute under the dirty-RAM interpreter, or inside an
+ * overlay shard built without this config. Without a runtime lookup those
+ * paths would evaluate the VANILLA compare while the AOT image evaluates the
+ * widened one, so the same site would cull differently depending on which
+ * backend happened to run it. Registering the sites here keeps both paths on
+ * the same verdict, exactly as the keep registry above does. */
+typedef struct {
+    uint32_t address;
+    uint32_t expected;
+    uint32_t mode;   /* WsCullWidenMode: 0 imm_upper, 1 imm_lower,
+                      *                  2 bound_rt,  3 bound_rs */
+} WsCullWidenSite;
+static WsCullWidenSite ws_cull_widen_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_cull_widen_n = 0;
+
+void gpu_ws_set_cull_widen_sites(const uint32_t *addresses,
+                                 const uint32_t *expected,
+                                 const uint32_t *modes, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_cull_widen_n = nsites;
+    for (int i = 0; i < nsites; i++) {
+        ws_cull_widen_sites[i].address = addresses[i] & 0x1FFFFFFFu;
+        ws_cull_widen_sites[i].expected = expected[i];
+        ws_cull_widen_sites[i].mode = modes[i];
+    }
+}
+
+/* Returns 1 and writes the widened verdict when `pc`/`instr` is a registered
+ * widen site. `rs`/`rt` are the live operand values; `imm` the sign-extendable
+ * immediate for the SLTI forms. Identity at margin 0 in every mode. */
+int psx_ws_cull_widen_site(uint32_t pc, uint32_t instr, uint32_t rs,
+                           uint32_t rt, uint32_t imm, uint32_t *out) {
+    const uint32_t phys = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < ws_cull_widen_n; i++) {
+        const WsCullWidenSite *site = &ws_cull_widen_sites[i];
+        if (site->address != phys || site->expected != instr) continue;
+        if (!out) return 1;
+        switch (site->mode) {
+            case 0:  *out = (uint32_t)psx_ws_cull_slti(rs, imm);        break;
+            case 1:  *out = (uint32_t)psx_ws_cull_slti_lower(rs, imm);  break;
+            case 2:  *out = (uint32_t)psx_ws_cull_slt_widen(rs, rt, 1); break;
+            default: *out = (uint32_t)psx_ws_cull_slt_widen(rs, rt, 0); break;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 typedef struct {
     uint32_t address;
     uint32_t expected;

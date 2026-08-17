@@ -1829,7 +1829,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             uint32_t vanilla =
                 ((int32_t)cpu->gpr[rs] < (int32_t)cpu->gpr[rt]) ? 1u : 0u;
             uint32_t kept = vanilla;
-            if (!psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
+            /* A widen site moves the bound; a keep site pins the verdict. A
+             * site is only ever one of the three, but check widen first so a
+             * config migrated from keep to widen cannot be served the pinned
+             * answer by a stale entry. */
+            if (!psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept) &&
+                !psx_ws_cull_widen_site(pc, insn, cpu->gpr[rs], cpu->gpr[rt],
+                                        0u, &kept))
                 (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
             cpu->gpr[rd] = kept;
             cpu->gpr[0] = 0;
@@ -1998,6 +2004,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     {
         uint32_t vanilla = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         uint32_t kept = vanilla;
+        uint32_t widened = 0;
         if (psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
             cpu->gpr[rt] = kept;
         else if (psx_ws_cull_keep_site(pc, insn, vanilla, &kept))
@@ -2007,6 +2014,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
+        else if (psx_ws_cull_widen_site(pc, insn, cpu->gpr[rs], 0u, imm,
+                                        &widened))
+            cpu->gpr[rt] = widened;
         else if (psx_ws_is_cull_slti_lower_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti_lower(
                 cpu->gpr[rs], imm);

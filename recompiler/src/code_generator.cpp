@@ -996,8 +996,8 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                        site.expected, addr, instr);
             std::exit(1);
         }
-        const bool imm_mode = site.mode == WsCullWidenMode::ImmUpper ||
-                              site.mode == WsCullWidenMode::ImmLower;
+        const bool imm_mode = site.mode == PSXRecompV4::WsCullWidenMode::ImmUpper ||
+                              site.mode == PSXRecompV4::WsCullWidenMode::ImmLower;
         uint32_t dst = 0;
         std::string call;
         if (imm_mode) {
@@ -1010,7 +1010,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             dst = get_rt(instr);
             call = fmt::format(
                 "{}({}, {}u)",
-                site.mode == WsCullWidenMode::ImmUpper ? "psx_ws_cull_slti"
+                site.mode == PSXRecompV4::WsCullWidenMode::ImmUpper ? "psx_ws_cull_slti"
                                                        : "psx_ws_cull_slti_lower",
                 reg_name(get_rs(instr)), get_imm16(instr));
         } else {
@@ -1024,7 +1024,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             call = fmt::format(
                 "psx_ws_cull_slt_widen({}, {}, {})",
                 reg_name(get_rs(instr)), reg_name(get_rt(instr)),
-                site.mode == WsCullWidenMode::BoundRt ? 1 : 0);
+                site.mode == PSXRecompV4::WsCullWidenMode::BoundRt ? 1 : 0);
         }
         return fmt::format(
             "{} = (uint32_t){};"
