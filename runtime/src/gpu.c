@@ -4907,8 +4907,13 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
         groups[i] = ws_ui_prepass[i].group;
     ws_ui_group_assign(groups, ws_ui_prepass_count, ws_disp_w(),
                        ws_auto_ui_dense);
-    for (uint32_t i = 0; i < ws_ui_prepass_count; i++)
+    for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
         ws_ui_prepass[i].group.anchor = group_origin + groups[i].anchor;
+        /* Copy the union-find root back too. Without this ws_ui_groups reports
+         * the stale insert-time index, which reads as "nothing merged" even
+         * when runs formed -- the exact question the command exists to answer. */
+        ws_ui_prepass[i].group.root = groups[i].root;
+    }
 }
 
 /* Per-opcode execution counters (exposed via gpu_get_opcode_stats) */
