@@ -71,6 +71,52 @@ void tex_pack_set_texture_window(uint32_t raw);
 void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x, uint16_t clut_y,
                                uint16_t texpage);
 
+/* ---- replacement lookup (the substitution path) ---- */
+
+/* A decoded replacement plus everything needed to address it from a primitive's
+ * texture-page UVs:
+ *
+ *     s = (u - origin_u) / src_w      t = (v - origin_v) / src_h
+ *
+ * i.e. the source texture occupies src_w x src_h TEXELS starting at
+ * (origin_u, origin_v) within the texture page, and the replacement image
+ * covers exactly that region at whatever resolution it happens to be. The
+ * caller never needs to know the upscale factor.
+ *
+ * `pixels` is RGBA8, width*height*4, owned by tex_pack and stable for the
+ * process lifetime. `gl_handle` points at a slot the backend may use to cache
+ * an uploaded texture name so it uploads each image once; tex_pack only ever
+ * reads it as an opaque value. `id` identifies the entry for that caching. */
+typedef struct {
+    const unsigned char *pixels;
+    int width, height;       /* replacement image, pixels */
+    int src_w, src_h;        /* source texture, texels    */
+    int origin_u, origin_v;  /* source origin in the page, texels */
+    unsigned long long id;
+    unsigned *gl_handle;
+} TexPackRepl;
+
+/* 1 when this primitive has a replacement (decoding it on first use), 0
+ * otherwise. Cheap no-op unless replacement is enabled and the pack is
+ * non-empty. */
+int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x, uint16_t clut_y,
+                                uint16_t texpage, TexPackRepl *out);
+
+/* Live enable/disable for substitution, independent of the pack being loaded.
+ * Exists so an A/B costs a command instead of a rebuild — every wrong guess
+ * about why replacement broke the HUD cost a full build-and-relaunch cycle,
+ * and half of those could have been settled in ten seconds. -1 = query. */
+int tex_pack_replace_enabled(int set);
+
+/* Census of primitives that were actually ARMED with a replacement, keyed by
+ * texture and carrying the primitive's SCREEN bounds.
+ *
+ * The counters say how many draws were replaced but not WHICH, and that is the
+ * open question: the HUD's own font atlases are never matched, yet the HUD
+ * disappears whenever substitution is on. If a HUD-region primitive shows up
+ * here, it is being drawn through some other texture's replacement image. */
+void tex_pack_note_armed(unsigned long long id, int x0, int y0, int x1, int y1);
+
 /* Debug-server surface. subcmd:
  *   "stats"    -> counters + folder paths + pack/dump coverage
  *   "uploads"  -> JSON array of the live tracked uploads {x,y,w,h,hash}

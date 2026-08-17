@@ -1,9 +1,17 @@
 /* tex_pack.cpp — HD texture replacement / dumping. See tex_pack.h for the
  * on-disk format and the Beetle PSX HW compatibility contract.
  *
- * Phase 1 scope: upload tracking, texture + palette hashing, and the dumper.
- * Nothing here touches rendering yet — the point of this stage is to prove our
- * filenames match Beetle's byte-for-byte before any shader work is done.
+ * Phase 1 was upload tracking, texture + palette hashing, and the dumper: prove
+ * our filenames match Beetle's byte-for-byte before any shader work. That held,
+ * and the counters said so (292 pack entries indexed, 80 asked for by a draw in
+ * a single race) — but "matched" only ever meant "a draw wanted this key". No
+ * pixels were substituted, because nothing here decoded a replacement and no
+ * renderer sampled one, so a pack could look like it was working while changing
+ * nothing on screen.
+ *
+ * Phase 2 closes that: decode a matched entry (lazily, on first use), and hand
+ * the draw path the image plus the mapping from texture-page UVs into it.
+ * Binding and sampling is the backend's job — see gr_set_replacement.
  *
  * C++ rather than C purely for <filesystem> (directory creation and the pack
  * scan), the same reason text_xlate.cpp is C++; the API is extern "C".
@@ -14,6 +22,13 @@
 #include "gpu.h"
 #include "crc32.h"
 #include "png_write.h"
+
+/* Declarations only — STB_IMAGE_IMPLEMENTATION is compiled in
+ * psx_window_icon.cpp. Its STBI_NO_STDIO must be matched here or the
+ * declarations disagree with the definitions that exist: that build has no
+ * stbi_load(), only the from-memory entry point, so we read the file. */
+#define STBI_NO_STDIO
+#include "../third_party/stb_image.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -62,6 +77,19 @@ struct State {
     std::vector<Upload>  uploads;
     std::vector<PalMemo> pal_memo;
 
+    /* Texture hashes the pack must NOT replace, from an optional exclude.txt
+     * in the pack directory (one lowercase %x texture hash per line, '#'
+     * comments). Matched on the TEXTURE hash alone, so one line covers every
+     * palette variant of the same image.
+     *
+     * This exists because a single bad entry can be catastrophic rather than
+     * cosmetic: WipEout 3 draws all of its text from four font atlases, so
+     * replacing those with images that render wrong erases every glyph in the
+     * game — menus, HUD, everything — while the rest of the pack is fine. Being
+     * able to drop one texture beats disabling the whole pack, and keeps the
+     * pack itself unmodified. */
+    std::vector<uint32_t> excluded;
+
     /* Sorted (hash << 32) | palette_hash key sets. */
     std::vector<uint64_t> known;    /* files present in the pack on disk       */
     std::vector<uint64_t> dumped;   /* keys written this session (dedup)       */
@@ -87,7 +115,38 @@ struct State {
     };
     std::vector<UvRect> uv_rects;
 
+    /* Decoded replacement images, keyed like everything else. Loaded lazily on
+     * the first draw that asks for one — indexing the pack reads filenames
+     * only, so a 292-entry pack costs nothing until its textures are actually
+     * on screen, and a pack far larger than VRAM never has to fit at once.
+     * `pixels` empty with `tried` set means the file failed to decode; we
+     * remember that so a broken entry is not re-opened every frame. */
+    struct Repl {
+        uint64_t key;
+        int      w = 0, h = 0;        /* replacement image, pixels        */
+        int      src_w = 0, src_h = 0;/* source texture, TEXELS           */
+        int      origin_u = 0, origin_v = 0; /* upload origin in the page */
+        bool     tried = false;
+        std::vector<uint8_t> pixels;  /* RGBA8, w*h*4                     */
+        uint32_t gl_handle = 0;       /* backend-owned; 0 = not uploaded  */
+    };
+    std::vector<Repl> repl;
+
+    /* Live override for substitution (tex_pack_replace_enabled). Separate from
+     * replace_on so the pack stays indexed and the counters keep working while
+     * the actual pixel swap is toggled for an A/B. */
+    bool repl_apply = true;
+
+    /* Which primitives were armed, and where they landed on screen. */
+    struct Armed {
+        uint64_t id;                     /* (tex hash << 32) | palette hash */
+        int16_t  x0, y0, x1, y1;         /* primitive screen bounds         */
+        uint32_t hits;
+    };
+    std::vector<Armed> armed;
+
     /* Diagnostics. */
+    uint64_t n_repl_hit = 0, n_repl_miss = 0, n_repl_decoded = 0, n_repl_failed = 0;
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
     uint64_t n_dump_written = 0, n_dump_failed = 0;
@@ -307,6 +366,19 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
             if (std::strcmp(ext, "png") != 0) continue;   /* v1 decodes PNG only */
             key_set_insert(g.known, pack_key(h, p));
         }
+
+        /* Optional per-pack exclusions. */
+        if (FILE *f = std::fopen((g.pack_dir / "exclude.txt").string().c_str(), "r")) {
+            char line[128];
+            while (std::fgets(line, sizeof(line), f)) {
+                char *s = line;
+                while (*s == ' ' || *s == '\t') s++;
+                if (*s == '#' || *s == '\n' || *s == '\r' || *s == '\0') continue;
+                unsigned h = 0;
+                if (std::sscanf(s, "%x", &h) == 1) g.excluded.push_back(h);
+            }
+            std::fclose(f);
+        }
     }
 
     std::printf("[tex_pack] replace=%d dump=%d pack=%s (%zu entries) dump_dir=%s\n",
@@ -395,6 +467,152 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
     up.pixels.assign(pixels, pixels + n);
     g.uploads.push_back(std::move(up));
     g.n_uploads++;
+}
+
+/* Decode a pack entry on first use. Caller holds g.mu. Returns null when there
+ * is no file for this key or it could not be decoded; the failure is cached so
+ * a broken entry is not reopened every frame. */
+State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
+                             int base_x, int base_y) {
+    for (State::Repl &r : g.repl) {
+        if (r.key == key)
+            return (r.tried && r.pixels.empty()) ? nullptr : &r;
+    }
+
+    State::Repl r;
+    r.key   = key;
+    r.tried = true;
+    r.src_w = up.w << shift;      /* upload width is halfwords; texels differ by depth */
+    r.src_h = up.h;
+    r.origin_u = (up.x - base_x) << shift;
+    r.origin_v = up.y - base_y;
+
+    char name[64];
+    std::snprintf(name, sizeof(name), "%x-%x.png",
+                  (unsigned)(key >> 32), (unsigned)(key & 0xFFFFFFFFu));
+    const std::filesystem::path path = g.pack_dir / name;
+
+    std::vector<uint8_t> file;
+    if (FILE *f = std::fopen(path.string().c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long len = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (len > 0) {
+            file.resize((size_t)len);
+            if (std::fread(file.data(), 1, file.size(), f) != file.size())
+                file.clear();
+        }
+        std::fclose(f);
+    }
+
+    int w = 0, h = 0, comp = 0;
+    stbi_uc *px = file.empty() ? nullptr
+                               : stbi_load_from_memory(file.data(), (int)file.size(),
+                                                       &w, &h, &comp, 4);
+    if (px && w > 0 && h > 0) {
+        r.w = w; r.h = h;
+        r.pixels.assign(px, px + (size_t)w * h * 4);
+        g.n_repl_decoded++;
+    } else {
+        g.n_repl_failed++;
+    }
+    if (px) stbi_image_free(px);
+
+    g.repl.push_back(std::move(r));
+    State::Repl &ins = g.repl.back();
+    return ins.pixels.empty() ? nullptr : &ins;
+}
+
+extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
+                                           uint16_t clut_y, uint16_t texpage,
+                                           TexPackRepl *out) {
+    if (!out) return 0;
+    if (!tex_pack_active() || !lim) return 0;
+
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.replace_on || !g.repl_apply || g.known.empty()) return 0;
+
+    int depth = (texpage >> 7) & 3;
+    if (depth > 2) depth = 2;
+    const int shift  = (depth == 0) ? 2 : (depth == 1) ? 1 : 0;
+    const int base_x = (texpage & 0xF) * 64;
+    const int base_y = ((texpage >> 4) & 1) * 256;
+
+    const int pal_n = (depth == 0) ? 16 : (depth == 1) ? 256 : 0;
+    const uint32_t pal = palette_hash(clut_x, clut_y, pal_n);
+
+    int rx, ry, rw, rh;
+    sampled_vram_rect(lim, base_x, base_y, shift, &rx, &ry, &rw, &rh);
+
+    /* Which upload actually BACKS this primitive, not merely which ones its
+     * sample rect brushes against.
+     *
+     * The matched-set bookkeeping in tex_pack_on_textured_prim intentionally
+     * uses overlap, because that is Beetle's rule for "this pack entry got
+     * asked for". Substituting pixels is a stricter question: the replacement
+     * image covers exactly one upload's rect, and UVs outside it address
+     * nothing. Taking the first OVERLAPPING upload that happened to have a pack
+     * entry substituted an unrelated texture under the primitive's own UVs --
+     * which is why every glyph vanished while the font's own key was still
+     * reported unmatched. It was sampling someone else's image.
+     *
+     * So: require CONTAINMENT, and scan newest-first, since a later upload to
+     * the same VRAM region is the live one. */
+    for (size_t i = g.uploads.size(); i-- > 0; ) {
+        const Upload &up = g.uploads[i];
+        if (rx < up.x || ry < up.y ||
+            rx + rw > up.x + up.w || ry + rh > up.y + up.h) continue;
+        const uint64_t key = pack_key(up.hash, pal);
+        if (!key_set_contains(g.known, key)) continue;
+        bool skip = false;
+        for (uint32_t ex : g.excluded) { if (ex == up.hash) { skip = true; break; } }
+        if (skip) continue;
+
+        State::Repl *r = repl_get_locked(key, up, shift, base_x, base_y);
+        if (!r) { g.n_repl_miss++; return 0; }
+
+        out->pixels   = r->pixels.data();
+        out->width    = r->w;
+        out->height   = r->h;
+        out->src_w    = r->src_w;
+        out->src_h    = r->src_h;
+        out->origin_u = r->origin_u;
+        out->origin_v = r->origin_v;
+        out->id       = r->key;
+        out->gl_handle = &r->gl_handle;
+        g.n_repl_hit++;
+        return 1;
+    }
+    g.n_repl_miss++;
+    return 0;
+}
+
+extern "C" int tex_pack_replace_enabled(int set) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (set >= 0) g.repl_apply = set != 0;
+    return g.repl_apply ? 1 : 0;
+}
+
+extern "C" void tex_pack_note_armed(unsigned long long id,
+                                    int x0, int y0, int x1, int y1) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    for (State::Armed &a : g.armed) {
+        if (a.id == id) {
+            if (x0 < a.x0) a.x0 = (int16_t)x0;
+            if (y0 < a.y0) a.y0 = (int16_t)y0;
+            if (x1 > a.x1) a.x1 = (int16_t)x1;
+            if (y1 > a.y1) a.y1 = (int16_t)y1;
+            a.hits++;
+            return;
+        }
+    }
+    if (g.armed.size() >= 256) return;
+    State::Armed a;
+    a.id = id;
+    a.x0 = (int16_t)x0; a.y0 = (int16_t)y0;
+    a.x1 = (int16_t)x1; a.y1 = (int16_t)y1;
+    a.hits = 1;
+    g.armed.push_back(a);
 }
 
 extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
@@ -488,7 +706,9 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             "\"pack_entries\":%zu,\"pack_matched\":%zu,\"live_uploads\":%zu,"
             "\"uploads\":%llu,\"upload_dedup\":%llu,\"kills\":%llu,\"prims\":%llu,"
             "\"pal_hash\":%llu,\"pal_memo_hit\":%llu,\"dumped\":%zu,"
-            "\"dump_written\":%llu,\"dump_failed\":%llu}",
+            "\"dump_written\":%llu,\"dump_failed\":%llu,"
+            "\"repl_images\":%zu,\"repl_decoded\":%llu,\"repl_failed\":%llu,"
+            "\"repl_hit\":%llu,\"repl_miss\":%llu}",
             (int)g.replace_on, (int)g.dump_on,
             pack_dir.c_str(), dump_dir.c_str(),
             g.known.size(), g.matched.size(), g.uploads.size(),
@@ -496,7 +716,10 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             (unsigned long long)g.n_kills, (unsigned long long)g.n_prims,
             (unsigned long long)g.n_pal_hash, (unsigned long long)g.n_pal_memo_hit,
             g.dumped.size(),
-            (unsigned long long)g.n_dump_written, (unsigned long long)g.n_dump_failed);
+            (unsigned long long)g.n_dump_written, (unsigned long long)g.n_dump_failed,
+            g.repl.size(),
+            (unsigned long long)g.n_repl_decoded, (unsigned long long)g.n_repl_failed,
+            (unsigned long long)g.n_repl_hit, (unsigned long long)g.n_repl_miss);
     } else if (!std::strcmp(subcmd, "uploads")) {
         n = std::snprintf(out, (size_t)cap, "[");
         for (size_t i = 0; i < g.uploads.size() && n < cap - 64; i++) {
@@ -504,6 +727,19 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             n += std::snprintf(out + n, (size_t)(cap - n),
                                "%s{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hash\":\"%x\"}",
                                i ? "," : "", u.x, u.y, u.w, u.h, (unsigned)u.hash);
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "armed")) {
+        /* Every texture that actually got substituted, with the screen box its
+         * primitives covered. Cross-reference against where the HUD draws. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.armed.size() && n < cap - 128; i++) {
+            const State::Armed &a = g.armed[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"tex\":\"%x-%x\",\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"hits\":%u}",
+                i ? "," : "",
+                (unsigned)(a.id >> 32), (unsigned)(a.id & 0xFFFFFFFFu),
+                a.x0, a.y0, a.x1, a.y1, a.hits);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "uvs")) {

@@ -7913,6 +7913,15 @@ static void handle_ws_menu_edge_fill(int id, const char *json)
  * building a new one. Defaults to stats. */
 static void handle_tex_pack(int id, const char *json)
 {
+    /* repl=0/1 toggles substitution live. An A/B that needs a rebuild is an
+     * A/B that does not get run. */
+    const int repl = json_get_int(json, "repl", -1);
+    if (repl >= 0) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl\":%d}",
+                 id, tex_pack_replace_enabled(repl));
+        return;
+    }
+
     char sub[32];
     if (!json_get_str(json, "sub", sub, sizeof(sub)))
         strncpy(sub, "stats", sizeof(sub) - 1);

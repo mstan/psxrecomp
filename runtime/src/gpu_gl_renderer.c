@@ -70,6 +70,7 @@
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
+#include "tex_pack.h"     /* TexPackRepl — HD replacement handed to the draw */
 #include "host_time.h"
 #include "latency_ring.h"
 #include "frame_pacing.h"
@@ -147,8 +148,8 @@ typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
-typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
+typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
@@ -210,8 +211,8 @@ static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
 static PFN_glUniform2i         p_glUniform2i;
-static PFN_glUniform4i         p_glUniform4i;
 static PFN_glUniform2f         p_glUniform2f;
+static PFN_glUniform4i         p_glUniform4i;
 static PFN_glUniform4f         p_glUniform4f;
 static PFN_glBlendColor        p_glBlendColor;
 static PFN_glBlendFuncSeparate p_glBlendFuncSeparate;
@@ -363,6 +364,18 @@ static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 /* Programs. */
 static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+/* HD texture replacement. Deliberately a SEPARATE program and a separate draw
+ * (draw_repl_prim) rather than a mode inside the batch: a replaced prim binds a
+ * different texture through different uniforms, so folding it into
+ * flush_tex_batch meant routing that function's uniform writes through
+ * indirection — and getting that subtly wrong silently broke every UI draw,
+ * including with replacement disabled. Keeping the batch path byte-identical to
+ * the version without this feature makes that class of bug impossible. */
+static GLuint s_repl_prog = 0;
+static GLint  s_uReplTex = -1, s_uReplOrigin = -1, s_uReplSrc = -1;
+static GLint  s_uReplMaskset = -1, s_uReplSemipass = -1, s_uReplSemimode = -1;
+static GLuint s_repl_tex = 0;                       /* armed for the next prim */
+static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
 /* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
  * semi(1) q(1)
  * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch).
@@ -1039,6 +1052,55 @@ static const char *TEX_VS =
     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
     "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
     "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
+/* HD replacement fragment program. Shares TEX_VS, so position handling — the
+ * u_shift grid alignment, the native-wide x transforms, the perspective w
+ * divide — is bit-identical to the normal textured path; only the texel fetch
+ * differs. Instead of indexing VRAM through a CLUT it samples an RGBA image,
+ * addressed with the page-relative mapping tex_pack supplies:
+ *
+ *     s = (u - origin.x) / src.x     t = (v - origin.y) / src.y
+ *
+ * so the replacement's own resolution never appears here; a 16x atlas and a 1:1
+ * image are addressed the same way.
+ *
+ * The tail from u_semipass onward is TEX_FS verbatim, and must stay that way.
+ * frag.a is the PS1 MASK BIT, not opacity, and blend_factor's alpha is the
+ * dual-source destination factor — writing either as coverage sets the mask bit
+ * on every replaced pixel and makes later masked draws vanish. */
+static const char *REPL_FS =
+    "#version 330\n"
+    "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+    "smooth in vec2 v_uv_p; flat in int v_persp;\n"
+    "out vec4 frag; out vec4 blend_factor;\n"
+    "flat in ivec2 v_tpage; flat in ivec2 v_clut; flat in int v_depth;\n"
+    "flat in int v_raw; flat in ivec4 v_limits; flat in int v_semi;\n"
+    "uniform sampler2D u_repl;\n"
+    "uniform vec2 u_origin;   /* source origin within the page, texels */\n"
+    "uniform vec2 u_src;      /* source size, texels                   */\n"
+    "uniform int u_semipass;\n"
+    "uniform int u_semimode;\n"
+    "uniform int u_maskset;\n"
+    "void main(){\n"
+    "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw) + vec2(0.999));\n"
+    "  vec4 t = texture(u_repl, (uv - u_origin) / u_src);\n"
+    /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
+     * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
+     * STP clear. It is not coverage. */
+    "  if (t.a < 0.5/255.0) discard;\n"
+    "  int stp = (t.a > 0.75) ? 0 : 1;\n"
+    "  vec3 rgb = t.rgb;\n"
+    "  if (u_semipass == 1 && stp == 1) discard;\n"
+    "  if (u_semipass == 2 && stp == 0) discard;\n"
+    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  float dst_factor = 0.0;\n"
+    "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+    "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+    "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
+    "  }\n"
+    "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
+    "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
+    "}\n";
 static const char *TEX_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
@@ -1708,20 +1770,29 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
  * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
  * whose two passes do not self-overlap. */
-static void tex_batch_draw_passes(int nverts, int semi) {
-    p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+/* Parameterised on the fragment program's uniform locations and the mask flag
+ * so the HD-replacement draw can use this EXACT logic instead of a second copy.
+ *
+ * That second copy is not hypothetical: writing one by hand dropped the
+ * s_mask_check stencil-only fixup, the semi == 4 dual-source case, and used
+ * mask_stencil(mask) where pass 2 needs mask_stencil(1) — and the resulting
+ * mask-bit corruption took out the whole HUD, including with replacement
+ * disabled. The mask/stencil protocol lives here, once. */
+static void tex_batch_draw_passes_ex(int nverts, int semi,
+                                     GLint uSemipass, GLint uSemimode, int mask) {
+    p_glUniform1i(uSemimode, semi < 0 ? 0 : semi);
     if (semi < 0) {
         glDisable(GL_BLEND);
-        mask_stencil(s_tb_mask);
-        p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
+        mask_stencil(mask);
+        p_glUniform1i(uSemipass, 0);                   /* all texels, one ordered colour pass */
         glDrawArrays(GL_TRIANGLES, 0, nverts);
         if (s_mask_check) {
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
             mask_stencil(1);
-            p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
+            p_glUniform1i(uSemipass, 2);               /* STP=1 texels set the mask bit */
             glDrawArrays(GL_TRIANGLES, 0, nverts);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        } else if (!s_tb_mask) {
+        } else if (!mask) {
             /* Alpha is already exact; defer its duplicate stencil encoding
              * until a later GP0(E6h) actually enables destination masking. */
             s_stencil_valid = 0;
@@ -1734,20 +1805,25 @@ static void tex_batch_draw_passes(int nverts, int semi) {
         glEnable(GL_BLEND);
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
         p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
-        if (s_tb_mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
-        p_glUniform1i(s_uSemipass, 0);
+        if (mask) mask_stencil(1); else glDisable(GL_STENCIL_TEST);
+        p_glUniform1i(uSemipass, 0);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
-        if (!s_tb_mask) s_stencil_valid = 0;
+        if (!mask) s_stencil_valid = 0;
     } else {
         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
-        mask_stencil(s_tb_mask);
-        p_glUniform1i(s_uSemipass, 1);
+        mask_stencil(mask);
+        p_glUniform1i(uSemipass, 1);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
         apply_psx_blend(semi);                         /* Pass 2: STP=1 texels (blended) */
         mask_stencil(1);
-        p_glUniform1i(s_uSemipass, 2);
+        p_glUniform1i(uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
     }
+}
+
+/* The batch's call: byte-for-byte the previous behaviour. */
+static void tex_batch_draw_passes(int nverts, int semi) {
+    tex_batch_draw_passes_ex(nverts, semi, s_uSemipass, s_uSemimode, s_tb_mask);
 }
 
 /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
@@ -1876,6 +1952,61 @@ static void flush_flat_batch(void) {
     hr_end();
 }
 
+/* Draw ONE HD-replaced triangle, immediately and on its own.
+ *
+ * Deliberately standalone rather than a mode inside flush_tex_batch. A replaced
+ * prim needs a different program, texture and uniforms; teaching the batch to
+ * carry that meant indirecting flush_tex_batch's uniform writes, and a mistake
+ * there took out every UI draw even with replacement switched off. This way the
+ * batch path is untouched — byte-identical to a build without this feature —
+ * and the cost is one draw call per replaced prim, which is what isolating them
+ * would have cost anyway.
+ *
+ * `verts` is 3 vertices in the standard TEXV layout, so TEX_VS reads them
+ * exactly as it does from the batch. Caller has already flushed for ordering. */
+static void draw_repl_prim(const float *verts, int semi) {
+    hr_begin(1);
+    p_glUseProgram(s_repl_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_repl_tex);
+    p_glUniform1i(s_uReplTex, 0);
+    p_glUniform2f(s_uReplOrigin, s_repl_origin[0], s_repl_origin[1]);
+    p_glUniform2f(s_uReplSrc, s_repl_src[0], s_repl_src[1]);
+    p_glUniform1i(s_uReplMaskset, s_mask_set);
+
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(3 * TEXV * sizeof(float)),
+                   verts, PSXGL_STREAM_DRAW);
+
+    /* The SAME pass logic the batch uses, with this program's uniforms. Not a
+     * second implementation — that is what broke the HUD. */
+    tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
+                             s_mask_set);
+
+    /* Native-wide mirror, matching flush_tex_batch's treatment. */
+    if (g_wide_cur && s_ws_ablate != 1) {
+        int dx = wide_dx();
+        s_bd_gate = 0;
+        gl_perf_mirror_begin();
+        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+        wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+        if (s_ws_ablate != 2)
+            tex_batch_draw_passes_ex(3, semi, s_uReplSemipass, s_uReplSemimode,
+                                     s_mask_set);
+        wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+        gl_perf_mirror_end();
+    }
+    hr_end();
+}
+
+/* Defined below, next to the batch vertex writer it mirrors. */
+static int repl_take_tri(const int *xs, const int *ys, const int *us, const int *vs,
+                         const float *col, uint16_t clut_x, uint16_t clut_y,
+                         int base_x, int base_y, int depth, int rawtex,
+                         const int *lim, int semi);
+
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
  * or GL_LINES; verts are (x, y, r, g, b, a) tuples with colors as 1555. */
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
@@ -1998,6 +2129,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
      * state goes in the vertex; only these keys force a new draw. */
     {
         flush_flat_batch();   /* painter order: flat GEO before textured */
+        /* HD replacement takes the prim before any batch state is touched, so
+         * everything below is reached only by prims the batch actually draws. */
+        if (repl_take_tri(xs, ys, us, vs, col, clut_x, clut_y,
+                          base_x, base_y, depth, rawtex, lim, semi))
+            return;
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
         int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
         /* Batch key: keep opaque as -1. Dual-source (4) is only for semi modes
@@ -2060,6 +2196,39 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
+}
+
+/* Divert a prim with an armed HD replacement out of the batch entirely: drain
+ * what is queued so submission order holds, then draw it through the
+ * replacement program. Returns 1 when it handled the prim.
+ *
+ * Building the vertices here (rather than reusing the batch's writer) is what
+ * keeps the batch path untouched. The layout must stay in step with the writer
+ * above — same TEXV stride, same attribute order — because both feed TEX_VS. */
+static int repl_take_tri(const int *xs, const int *ys, const int *us, const int *vs,
+                         const float *col, uint16_t clut_x, uint16_t clut_y,
+                         int base_x, int base_y, int depth, int rawtex,
+                         const int *lim, int semi) {
+    if (!s_repl_tex) return 0;
+    flush_tex_batch();
+
+    float verts[3 * TEXV];
+    for (int i = 0; i < 3; i++) {
+        float *vp = &verts[i * TEXV];
+        vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+        vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+        vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
+        vp[8]  = (float)base_x;  vp[9]  = (float)base_y;
+        vp[10] = (float)clut_x;  vp[11] = (float)clut_y;
+        vp[12] = (float)depth;   vp[13] = (float)rawtex;
+        vp[14] = (float)lim[0];  vp[15] = (float)lim[1];
+        vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+        vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;
+        vp[19] = s_pq_valid ? s_pq[i] : 0.0f;
+    }
+    draw_repl_prim(verts, semi);
+    return 1;
 }
 
 /* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
@@ -2311,6 +2480,48 @@ static void glb_set_precise_triangle(int enabled,
     }
     sw_set_precise_triangle(enabled, x0,y0, x1,y1, x2,y2);
 }
+/* Arm the HD replacement for the next textured prim, uploading its image the
+ * first time it is seen. tex_pack owns the decoded pixels and hands us a slot
+ * to cache the GL name in, so each image uploads once and the pack's total size
+ * never has to be resident.
+ *
+ * CLAMP_TO_EDGE, not repeat: the shader clamps UVs to the prim's own sample
+ * bounds first, and wrapping would fetch a neighbouring atlas cell at the
+ * seams. LINEAR even when the PS1 path is nearest — the whole point is that the
+ * image carries detail the texel grid does not. */
+static void glb_set_replacement(const void *repl) {
+    if (!repl) { s_repl_tex = 0; return; }
+    const TexPackRepl *r = (const TexPackRepl *)repl;
+    if (!r->pixels || r->width <= 0 || r->height <= 0 ||
+        r->src_w <= 0 || r->src_h <= 0) {
+        s_repl_tex = 0;
+        return;
+    }
+
+    GLuint tex = r->gl_handle ? (GLuint)*r->gl_handle : 0;
+    if (!tex) {
+        glGenTextures(1, &tex);
+        if (!tex) { s_repl_tex = 0; return; }
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->width, r->height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, r->pixels);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (r->gl_handle) *r->gl_handle = (unsigned)tex;
+    }
+
+    s_repl_tex = tex;
+    s_repl_origin[0] = (float)r->origin_u;
+    s_repl_origin[1] = (float)r->origin_v;
+    s_repl_src[0]    = (float)r->src_w;
+    s_repl_src[1]    = (float)r->src_h;
+}
+
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
@@ -2688,7 +2899,17 @@ static int init_gpu_raster(void) {
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
     s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
-    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog || !s_stencil_prog) return 0;
+    /* Dual-source (the "1") matches s_tex_prog: REPL_FS writes the same
+     * frag/blend_factor pair, so a replaced prim uses identical blend plumbing. */
+    s_repl_prog = build_program_ex(TEX_VS, REPL_FS, 1);
+    if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog ||
+        !s_stencil_prog || !s_repl_prog) return 0;
+    s_uReplTex      = p_glGetUniformLocation(s_repl_prog, "u_repl");
+    s_uReplOrigin   = p_glGetUniformLocation(s_repl_prog, "u_origin");
+    s_uReplSrc      = p_glGetUniformLocation(s_repl_prog, "u_src");
+    s_uReplMaskset  = p_glGetUniformLocation(s_repl_prog, "u_maskset");
+    s_uReplSemipass = p_glGetUniformLocation(s_repl_prog, "u_semipass");
+    s_uReplSemimode = p_glGetUniformLocation(s_repl_prog, "u_semimode");
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -4477,6 +4698,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
     .set_precise_triangle = glb_set_precise_triangle,
     .set_perspective_triangle = glb_set_perspective_triangle,
+    .set_replacement          = glb_set_replacement,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
     .draw_textured_triangle = glb_draw_textured_triangle,

@@ -142,6 +142,11 @@ typedef struct GpuRenderBackend {
                                  int32_t x1, int32_t y1,
                                  int32_t x2, int32_t y2);
     void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
+    /* Optional: HD texture replacement for the NEXT textured primitive. `repl`
+     * is a const TexPackRepl* (void* to keep this header free of tex_pack.h),
+     * or NULL to clear. Set immediately before the draw and cleared after, the
+     * same one-shot contract as set_precise_triangle. */
+    void (*set_replacement)(const void *repl);
     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,

@@ -134,56 +134,108 @@ void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint1
  * one in gpu_uv.h — the backends derive their own `lim` from these same helpers
  * and the same (pre-compensation) uv values, so the rect we match against is the
  * rect they sample. No-op unless a pack or the dumper is enabled. */
-static void tex_pack_note_tri(int x0, int y0, int u0, int v0,
-                              int x1, int y1, int u1, int v1,
-                              int x2, int y2, int u2, int v2,
-                              uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    if (!tex_pack_active()) return;
+/* Arm (or clear) the backend's replacement slot for the primitive about to be
+ * drawn. Same one-shot contract as set_precise_triangle: set before, cleared
+ * after, so a primitive without a replacement can never inherit the previous
+ * one's. Cheap no-op when no pack is loaded — the lookup exits on the first
+ * test — and entirely absent for backends that do not implement it. */
+static int tex_pack_arm(const int lim[4], uint16_t clut_x, uint16_t clut_y,
+                        uint16_t texpage,
+                        int sx0, int sy0, int sx1, int sy1) {
+    if (!g_b->set_replacement) return 0;
+    TexPackRepl r;
+    if (!tex_pack_lookup_replacement(lim, clut_x, clut_y, texpage, &r)) return 0;
+    /* Record WHICH primitive got substituted and where it landed, not just how
+     * many. Counters alone could not distinguish "the HUD is being replaced by
+     * the wrong image" from "replacement damages state the HUD needs". */
+    tex_pack_note_armed(r.id, sx0, sy0, sx1, sy1);
+    g_b->set_replacement(&r);
+    return 1;
+}
+
+static void tex_pack_disarm(int armed) {
+    if (armed && g_b->set_replacement) g_b->set_replacement(NULL);
+}
+
+static int tex_pack_note_tri(int x0, int y0, int u0, int v0,
+                             int x1, int y1, int u1, int v1,
+                             int x2, int y2, int u2, int v2,
+                             uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    if (!tex_pack_active()) return 0;
     const int xs[3] = { x0, x1, x2 }, ys[3] = { y0, y1, y2 };
     const int us[3] = { u0, u1, u2 }, vs[3] = { v0, v1, v2 };
     int lim[4];
     psx_uv_tri_limits(xs, ys, us, vs, lim);
     tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
+    int sx0 = xs[0], sx1 = xs[0], sy0 = ys[0], sy1 = ys[0];
+    for (int i = 1; i < 3; i++) {
+        if (xs[i] < sx0) sx0 = xs[i];
+        if (xs[i] > sx1) sx1 = xs[i];
+        if (ys[i] < sy0) sy0 = ys[i];
+        if (ys[i] > sy1) sy1 = ys[i];
+    }
+    return tex_pack_arm(lim, clut_x, clut_y, texpage, sx0, sy0, sx1, sy1);
 }
 
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
-                      clut_x, clut_y, texpage);
+    const int armed = tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1,
+                                        x2, y2, u2, v2, clut_x, clut_y, texpage);
     g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
                                 clut_x, clut_y, texpage);
+    tex_pack_disarm(armed);
 }
 void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c0,
                                       int x1, int y1, int u1, int v1, uint32_t c1,
                                       int x2, int y2, int u2, int v2, uint32_t c2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw) {
-    tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
-                      clut_x, clut_y, texpage);
+    const int armed = tex_pack_note_tri(x0, y0, u0, v0, x1, y1, u1, v1,
+                                        x2, y2, u2, v2, clut_x, clut_y, texpage);
     g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
+    tex_pack_disarm(armed);
 }
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
 /* Rect prims carry their uv corners directly; u1/v1 are the EXCLUSIVE corner,
  * which for the unscaled form is u+w / v+h (matching glb_draw_textured_rect). */
-static void tex_pack_note_rect(int u0, int v0, int u1, int v1,
-                               uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    if (!tex_pack_active()) return;
+static int tex_pack_note_rect(int u0, int v0, int u1, int v1,
+                              uint16_t clut_x, uint16_t clut_y, uint16_t texpage,
+                              int sx, int sy, int sw, int sh) {
+    if (!tex_pack_active()) return 0;
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
     tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
+    /* Identity tracking only — rects are deliberately NOT substituted.
+     *
+     * The backend consumes a replacement in its textured-TRIANGLE path; rect
+     * and sprite prims take their own route and never sample it, so arming one
+     * here only produced primitives that drew nothing. On this title that is
+     * the entire 2D layer: the HUD meters, the boxes, and every glyph (the font
+     * atlases are addressed by sprites), which is why enabling the pack
+     * erased the interface while the 3D scene was fine.
+     *
+     * Tracking still runs, so the dumper, the match set and the UV census are
+     * unaffected and a pack authored for 2D art still gets identified — it
+     * simply is not applied until the rect path is wired up too. */
+    (void)sx; (void)sy; (void)sw; (void)sh;
+    return 0;
 }
 
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    tex_pack_note_rect(u, v, u + w, v + h, clut_x, clut_y, texpage);
+    const int armed = tex_pack_note_rect(u, v, u + w, v + h, clut_x, clut_y, texpage,
+                                         x, y, w, h);
     g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
+    tex_pack_disarm(armed);
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    tex_pack_note_rect(u0, v0, u1, v1, clut_x, clut_y, texpage);
+    const int armed = tex_pack_note_rect(u0, v0, u1, v1, clut_x, clut_y, texpage,
+                                         x, y, w, h);
     g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);
+    tex_pack_disarm(armed);
 }
 void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) { g_b->draw_line(x0, y0, x1, y1, c); }
 void gr_draw_shaded_line(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1) {
