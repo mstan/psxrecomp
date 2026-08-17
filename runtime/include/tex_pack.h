@@ -37,14 +37,29 @@
 extern "C" {
 #endif
 
-/* One-time init, called once the disc path is resolved. `disc_path` is the
- * loaded .cue/.bin/.chd — the pack and dump folder names derive from its stem,
- * matching Beetle's `retro_cd_base_name`. `dir_override`, when non-empty,
- * replaces the disc's directory as the parent of both folders. Cheap no-op (and
- * tex_pack_active() stays 0) when both flags are 0. */
+/* One-time init, called once the disc path is resolved.
+ *
+ * `disc_path` is the loaded .cue/.bin/.chd; the pack and dump folder names
+ * derive from its stem, matching Beetle's `retro_cd_base_name`. `dir_override`,
+ * when non-empty, replaces the disc's directory as the parent of both folders.
+ *
+ * `pack_dir`, when non-empty, is used DIRECTLY as the replacement folder and
+ * overrides that derivation entirely. This is the managed-pack path: a launcher
+ * keeps packs in its own store under an arbitrary id, and there is no reason to
+ * force such a folder to be named after the disc. When it is empty the Beetle
+ * drop-in convention applies unchanged, so a pack dropped next to the disc
+ * still just works. The dump folder always follows the disc-stem convention.
+ *
+ * Cheap no-op (and tex_pack_active() stays 0) when both flags are 0. */
 void tex_pack_init(const char *disc_path, int enable_replace, int enable_dump,
-                   const char *dir_override);
+                   const char *dir_override, const char *pack_dir);
 void tex_pack_shutdown(void);
+
+/* Write <pack dir>/coverage.json: how much of the active pack the session
+ * actually drew, plus the entries it never asked for. Safe to call from
+ * std::atexit and safe to call more than once; a no-op when no pack is active.
+ * The launcher reads this to show per-pack coverage without running the game. */
+void tex_pack_write_coverage(void);
 
 /* 1 when either replacement or dumping is on. The gr_* hooks test this first so
  * a disabled build costs one predictable branch per primitive. */

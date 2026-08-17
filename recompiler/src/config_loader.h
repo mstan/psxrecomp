@@ -1252,6 +1252,19 @@ struct UserSettings {
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    // HD texture pack. Persisted here (not only in game.toml) because both the
+    // in-exe recomp-ui toggle and retcomm-launcher's per-title pack manager need
+    // to write them, and settings.toml is the file both already co-own.
+    //
+    // hd_texture_pack is the ACTIVE PACK FOLDER itself, not a parent — that is
+    // what a manager selects, and a managed pack is named by its own id rather
+    // than after the disc. Empty falls back to the Beetle convention (a
+    // <disc stem>-texture-replacements folder beside the disc image), so a
+    // hand-dropped pack still works with nothing persisted here. Distinct from
+    // RuntimeConfig::video_hd_texture_dir, which relocates the whole convention
+    // (both pack and dump) and stays a game.toml/env developer knob.
+    bool has_hd_textures     = false; bool hd_textures = false;
+    bool has_hd_texture_pack = false; std::filesystem::path hd_texture_pack;
     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
     bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;

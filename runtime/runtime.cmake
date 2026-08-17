@@ -1604,20 +1604,49 @@ function(psxrecomp_add_runtime_target target)
     # can still use -DPSX_ENABLE_VULKAN=OFF to produce the inert stub explicitly.
     option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" ON)
     if(PSX_ENABLE_VULKAN)
-    # $VULKAN_SDK first; else find_path. Unset before find_path — an empty
-    # normal _vk_inc makes find_path a no-op on modern CMake (Homebrew miss).
+    # $VULKAN_SDK first; then headers inside CMAKE_SYSROOT (RetComM jammy pack);
+    # else host find_path only when not using a sysroot. Host /usr/include is
+    # invisible (and unsafe) under clang --sysroot=…/toolchains/…/sysroot —
+    # that combination made Hub Linux builds fail with:
+    #   vulkan/vulkan.h: file not found
+    # after configure claimed "headers /usr/include".
     set(_vk_inc "")
+    set(_vk_inc_from_sdk FALSE)
     if(DEFINED ENV{VULKAN_SDK})
         if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
             set(_vk_inc "$ENV{VULKAN_SDK}/Include")
+            set(_vk_inc_from_sdk TRUE)
         elseif(EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
             set(_vk_inc "$ENV{VULKAN_SDK}/include")
+            set(_vk_inc_from_sdk TRUE)
         endif()
     endif()
-    if(NOT _vk_inc)
+    if(NOT _vk_inc AND CMAKE_SYSROOT)
+        if(EXISTS "${CMAKE_SYSROOT}/usr/include/vulkan/vulkan.h")
+            set(_vk_inc "${CMAKE_SYSROOT}/usr/include")
+        elseif(EXISTS "${CMAKE_SYSROOT}/include/vulkan/vulkan.h")
+            set(_vk_inc "${CMAKE_SYSROOT}/include")
+        endif()
+    endif()
+    if(NOT _vk_inc AND NOT CMAKE_SYSROOT)
         unset(_vk_inc CACHE)
         unset(_vk_inc)
         find_path(_vk_inc vulkan/vulkan.h)
+    endif()
+    # Last-chance: find_path may still run under a sysroot build if callers
+    # cleared CMAKE_SYSROOT after option() — reject host paths that sit
+    # outside the active sysroot unless they came from VULKAN_SDK.
+    if(_vk_inc AND CMAKE_SYSROOT AND NOT _vk_inc_from_sdk)
+        file(TO_CMAKE_PATH "${CMAKE_SYSROOT}" _psx_vk_sysroot)
+        file(TO_CMAKE_PATH "${_vk_inc}" _psx_vk_inc_norm)
+        string(FIND "${_psx_vk_inc_norm}" "${_psx_vk_sysroot}" _psx_vk_under)
+        if(NOT _psx_vk_under EQUAL 0)
+            message(STATUS
+                "Vulkan backend: ignoring host headers ${_vk_inc} "
+                "(outside CMAKE_SYSROOT=${CMAKE_SYSROOT}); "
+                "install vulkan-headers into the sysroot or set VULKAN_SDK")
+            set(_vk_inc "")
+        endif()
     endif()
     find_program(GLSLC_EXE NAMES glslc
         HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")

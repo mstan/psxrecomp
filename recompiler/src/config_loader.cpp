@@ -2368,6 +2368,13 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto m = toml::find<std::string>(v, "fmv_filter");
             if (video_fmv_filter_parse(m, &s.fmv_filter)) s.has_fmv_filter = true;
         });
+        if (v.contains("hd_textures")) try_get([&]{
+            s.hd_textures = toml::find<bool>(v, "hd_textures"); s.has_hd_textures = true;
+        });
+        if (v.contains("hd_texture_pack")) try_get([&]{
+            s.hd_texture_pack = fs::path(toml::find<std::string>(v, "hd_texture_pack"));
+            s.has_hd_texture_pack = true;
+        });
         if (v.contains("geometry_correction")) try_get([&]{
             s.geometry_correction = toml::find<bool>(v, "geometry_correction");
             s.has_geometry_correction = true;
@@ -2697,6 +2704,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
     if (s.has_fmv_filter)
         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+    if (s.has_hd_textures)
+        f << "hd_textures       = " << (s.hd_textures ? "true" : "false") << "\n";
+    if (s.has_hd_texture_pack)
+        f << "hd_texture_pack   = \"" << fwd(s.hd_texture_pack) << "\"\n";
     if (s.has_geometry_correction)
         f << "geometry_correction   = "
           << (s.geometry_correction ? "true" : "false") << "\n";

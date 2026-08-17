@@ -1190,7 +1190,8 @@ static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
  * newly-seen texture. */
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
-static std::string   g_hd_texture_dir;
+static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
@@ -10868,6 +10869,13 @@ namespace {
          * lifetime; "" when the build shipped no PNG, which recomp-ui treats
          * as "leave the toolkit default". */
         gi->window_icon_path = psx_window_icon_path(g_lnch_argv0);
+        /* HD texture pack. The in-exe UI is deliberately just an on/off switch
+         * plus the active pack's folder — installing, listing and comparing
+         * packs is retcomm-launcher's per-title job, and duplicating that
+         * surface here would mean two implementations of the same thing.
+         * Offered only once a pack is actually selected, so a title with no
+         * packs shows no dead control. */
+        gi->hdpack_supported = g_hd_texture_pack.empty() ? 0 : 1;
 #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
         g_lnch_game_players = game_players_n;
         /* ae_disc_verify only fills netplay_ok/disc_fp when this is true. */
@@ -11698,6 +11706,8 @@ int main(int argc, char** argv) {
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+        if (us.has_hd_textures)     g_hd_textures     = us.hd_textures ? 1 : 0;
+        if (us.has_hd_texture_pack) g_hd_texture_pack = us.hd_texture_pack.string();
         if (us.has_geometry_correction)
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
@@ -12382,6 +12392,11 @@ int main(int argc, char** argv) {
             ls.supersampling      = seed.supersampling;
             ls.antialiasing       = seed.antialiasing ? 1 : 0;
             ls.texture_filter     = seed.texture_filter;
+            /* HD textures: on/off plus the active pack folder, which the UI
+             * shows read-only. Selection itself belongs to the launcher. */
+            ls.hdpack_enabled     = g_hd_textures ? 1 : 0;
+            std::snprintf(ls.hdpack_dir, sizeof(ls.hdpack_dir), "%s",
+                          g_hd_texture_pack.c_str());
             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
@@ -13080,6 +13095,10 @@ int main(int argc, char** argv) {
     /* HD texture pack. Keyed off the STOCK disc, not mod_disc: the pack folder
      * belongs next to the user's own image (where a RetroArch-authored pack
      * already sits) and must not move when a disc-patching mod is toggled. */
+    /* Precedence: game.toml < settings.toml (applied above with the other
+     * [video] keys) < environment. settings.toml is the layer both the
+     * launcher's pack manager and recomp-ui's toggle write, so a pack selected
+     * in either survives the other; env stays a developer override. */
     {
         const char *hd_env = std::getenv("PSX_HD_TEXTURE_DUMP");
         if (hd_env && hd_env[0] && std::strcmp(hd_env, "0") != 0) g_hd_texture_dump = 1;
@@ -13087,9 +13106,14 @@ int main(int argc, char** argv) {
         if (hd_env && hd_env[0]) g_hd_textures = (std::strcmp(hd_env, "0") != 0) ? 1 : 0;
         hd_env = std::getenv("PSX_HD_TEXTURE_DIR");
         if (hd_env && hd_env[0]) g_hd_texture_dir = hd_env;
+        hd_env = std::getenv("PSX_HD_TEXTURE_PACK");
+        if (hd_env && hd_env[0]) g_hd_texture_pack = hd_env;
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
-                  g_hd_texture_dir.c_str());
+                  g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
+    /* Coverage report for the launcher's per-pack stats. atexit alongside the
+     * other end-of-session flushes; a no-op when no pack is active. */
+    std::atexit(tex_pack_write_coverage);
 
 session_reboot:
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
@@ -14387,6 +14411,9 @@ soft_return_lobby:
         ls.supersampling = g_video_scale;
         ls.antialiasing = g_video_aa ? 1 : 0;
         ls.texture_filter = g_video_texfilter;
+        ls.hdpack_enabled = g_hd_textures ? 1 : 0;
+        std::snprintf(ls.hdpack_dir, sizeof(ls.hdpack_dir), "%s",
+                      g_hd_texture_pack.c_str());
         ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
@@ -14662,6 +14689,11 @@ soft_return_lobby:
                 us.has_antialiasing = true;
                 us.texture_filter = ls.texture_filter;
                 us.has_texture_filter = true;
+                /* Only the toggle is user-editable here; hdpack_dir is shown
+                 * read-only, so the launcher's pack choice is never clobbered. */
+                g_hd_textures = ls.hdpack_enabled ? 1 : 0;
+                us.hd_textures = ls.hdpack_enabled != 0;
+                us.has_hd_textures = true;
                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
                 us.has_fmv_filter = true;
                 us.geometry_correction = ls.geometry_correction != 0;
