@@ -412,7 +412,7 @@ static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
  * fragment shader read the noperspective varying — i.e. bit-identical to the
  * pre-feature pipeline. */
-#define TEXV 20
+#define TEXV 21
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
@@ -424,6 +424,8 @@ static int     s_pc_valid = 0;                  /* sub-pixel positions present *
 static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  */
 static int     s_pq_valid = 0;                  /* perspective weights present */
 static float   s_pq[3];
+static int     s_pz_valid = 0;
+static float   s_pz[3];      /* absolute GTE screen Z, 0..65535 */
 
 /* TEX program uniforms. */
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
@@ -1054,6 +1056,7 @@ static const char *TEX_VS =
     "layout(location=7) in vec4 a_limits;\n"
     "layout(location=8) in float a_semi;\n"
     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
+    "layout(location=10) in float a_z;  /* absolute GTE screen Z; 0 = none    */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
@@ -1090,7 +1093,14 @@ static const char *TEX_VS =
      * correctly where the ordering table's one-bucket-per-primitive cannot.
      * Multiplied by w because the pipeline divides by it, leaving exactly
      * 1 - a_q in NDC. Zero when off, which is the original expression. */
-    "  float zc = (u_depth_on != 0 && a_q > 0.0) ? (1.0 - a_q) * w : 0.0;\n"
+    /* Depth from the ABSOLUTE screen Z, not from a_q. a_q is q/qmax, normalised
+     * within one triangle, so it says nothing about where this triangle sits
+     * against any other -- deriving depth from it gave every triangle its own
+     * private 0..1 range and shattered the scene. The GTE's 16-bit screen Z is
+     * a single global scale, so map it straight to NDC. Multiplied by w because
+     * the pipeline divides by it. */
+    "  float zc = (u_depth_on != 0 && a_z > 0.0)\n"
+    "               ? ((a_z / 65535.0) * 2.0 - 1.0) * w : 0.0;\n"
     "  gl_Position = vec4(ndc * w, zc, w); }\n";
 /* HD replacement fragment program. Shares TEX_VS, so position handling — the
  * u_shift grid alignment, the native-wide x transforms, the perspective w
@@ -2149,7 +2159,7 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glUniform1i(s_uReplRecolour, s_repl_recolour);
     p_glUniform1i(s_uReplInk, s_repl_ink);
     p_glUniform1f(s_uReplRefMax, s_repl_ref_max);
-    s_depth_armed = s_pgxp_depth && s_pq_valid;
+    s_depth_armed = s_pgxp_depth && s_pz_valid;
     p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
 
     p_glBindVertexArray(s_tex_vao);
@@ -2348,7 +2358,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         int isolate = (semi >= 0);
         /* Recovered W is what makes this prim's depth meaningful; s_pq_valid is
          * the same provenance verdict the perspective path uses. */
-        const int depth_ok = s_pgxp_depth && s_pq_valid;
+        const int depth_ok = s_pgxp_depth && s_pz_valid;
         int reason = -1;
         if (s_tb_n > 0) {
             if (isolate) reason = 0;
@@ -2383,6 +2393,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
+            vp[20] = s_pz_valid ? s_pz[i] : 0.0f;                   /* a_z; 0 = none   */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -2417,6 +2428,7 @@ static int repl_take_tri(const int *xs, const int *ys, const int *us, const int 
         vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
         vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;
         vp[19] = s_pq_valid ? s_pq[i] : 0.0f;
+        vp[20] = s_pz_valid ? s_pz[i] : 0.0f;
     }
     draw_repl_prim(verts, semi);
     return 1;
@@ -2736,6 +2748,13 @@ static void glb_set_replacement(const void *repl) {
     s_repl_src[1]    = (float)r->src_h;
 }
 
+/* Absolute GTE screen Z for PGXP depth. Kept apart from the perspective
+ * weights because those are normalised per triangle and carry no
+ * cross-triangle ordering; see gr_set_depth_triangle. */
+static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
+    s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
+    s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
+}
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
@@ -3299,6 +3318,7 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
+        p_glVertexAttribPointer(10, 1, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* z    */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);
@@ -4975,6 +4995,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
     .set_precise_triangle = glb_set_precise_triangle,
     .set_perspective_triangle = glb_set_perspective_triangle,
+    .set_depth_triangle = glb_set_depth_triangle,
     .set_replacement          = glb_set_replacement,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,

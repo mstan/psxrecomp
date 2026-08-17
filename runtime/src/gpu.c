@@ -3490,6 +3490,7 @@ void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
  * association through ordering-table reordering and rejects CPU-built UI. */
 static void prepare_texture_triangle(int i0, int i1, int i2) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+    gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
     s_texcorr.attempts++;
     if (!s_texture_correction_enabled) { s_texcorr.no_correction++; return; }
     if (gp0_cmd_source_addr == 0xFFFFFFFFu) { s_texcorr.no_source++; return; }
@@ -3510,6 +3511,12 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
     s_texcorr.armed++;
     gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
+    /* The magnitude the line above normalises away. q/qmax is a per-triangle
+     * relative weight -- correct for UV correction, and meaningless as a depth,
+     * because it cannot say where this triangle sits against any other. The
+     * real GTE screen Z is right here, so hand it over unscaled and let the
+     * backend map it to NDC. */
+    gr_set_depth_triangle(1, (float)z[0], (float)z[1], (float)z[2]);
 }
 
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
