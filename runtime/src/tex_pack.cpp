@@ -34,7 +34,6 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <cstdio>
@@ -91,22 +90,6 @@ struct State {
      * pack itself unmodified. */
     std::vector<uint32_t> excluded;
 
-    /* Any one pack key per TEXTURE hash, for the palette-agnostic fallback.
-     *
-     * A pack entry is keyed (texture, palette), but the game recolours text by
-     * swapping the CLUT: it draws a glyph once per outline offset in the outline
-     * palette and once more in the fill palette, and it animates those colours.
-     * That is far more palettes than any pack ships -- measured on the WipEout 3
-     * title screen: 348 distinct CLUTs in use, 153 with no pack entry. Every one
-     * of those draws fell back to the original low-res texture, which is why a
-     * string renders crisp in one frame and blocky in the next, and why HD glyph
-     * fills appeared wrapped in a low-res outline.
-     *
-     * So when the exact key misses we still know the right IMAGE -- the texture
-     * hash identifies it -- we just do not know its colour. Recolouring from the
-     * live CLUT recovers that; see repl_is_mask for when it is safe. */
-    std::unordered_map<uint32_t, uint64_t> by_tex;
-
     /* Sorted (hash << 32) | palette_hash key sets. */
     std::vector<uint64_t> known;    /* files present in the pack on disk       */
     std::vector<uint64_t> dumped;   /* keys written this session (dedup)       */
@@ -145,6 +128,10 @@ struct State {
         int      origin_u = 0, origin_v = 0; /* upload origin in the page */
         bool     tried = false;
         bool     mask = false;        /* single ink colour: safe to recolour */
+        int      ink_index = -1;      /* palette index this image inks        */
+        uint8_t  img_max = 0;         /* full-ink max channel, 1..255         */
+        int      dec_shift = 0;       /* depth shift it was analysed at       */
+        int      ana_src_w = 0, ana_src_h = 0; /* texel grid it was analysed at */
         std::vector<uint8_t> pixels;  /* RGBA8, w*h*4                     */
         uint32_t gl_handle = 0;       /* backend-owned; 0 = not uploaded  */
     };
@@ -189,6 +176,21 @@ bool rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int b
 
 bool key_set_contains(const std::vector<uint64_t> &s, uint64_t k) {
     return std::binary_search(s.begin(), s.end(), k);
+}
+
+/* Lowest pack key for this texture hash, or 0.
+ *
+ * pack_key puts the texture hash in the HIGH 32 bits and g.known is sorted
+ * ascending, so a texture's palette variants form one contiguous run and this
+ * lands on the lowest palette hash. That determinism is the point: the first
+ * cut picked whichever filename directory_iterator happened to yield first,
+ * and that order is unspecified -- so which variant donated a texture's shape
+ * could differ between runs and between machines. */
+uint64_t key_set_first_tex(const std::vector<uint64_t> &s, uint32_t hash) {
+    const uint64_t lo = (uint64_t)hash << 32;
+    auto it = std::lower_bound(s.begin(), s.end(), lo);
+    if (it == s.end() || (uint32_t)(*it >> 32) != hash) return 0;
+    return *it;
 }
 
 /* Returns true if the key was newly inserted. */
@@ -358,7 +360,6 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     g.uploads.clear();
     g.pal_memo.clear();
     g.known.clear();
-    g.by_tex.clear();
     g.dumped.clear();
     g.matched.clear();
     g.dump_dir_ready = false;
@@ -392,9 +393,6 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
             if (std::sscanf(fn.c_str(), "%x-%x.%15s", &h, &p, ext) != 3) continue;
             if (std::strcmp(ext, "png") != 0) continue;   /* v1 decodes PNG only */
             key_set_insert(g.known, pack_key(h, p));
-            /* First file wins: any palette variant of a texture is an equally
-             * good SHAPE source, since only the CLUT differs between them. */
-            g.by_tex.emplace((uint32_t)h, pack_key(h, p));
         }
 
         /* Optional per-pack exclusions. */
@@ -513,7 +511,7 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
  * a pixel only counts as ink once it is past the same threshold the shader
  * discards on. Anti-aliased edges keep the ink colour and vary alpha, so they
  * do not make an image look multi-coloured. */
-static bool image_is_mask(const std::vector<uint8_t> &px) {
+static bool image_is_mask(const std::vector<uint8_t> &px, uint8_t *out_max) {
     bool seen = false;
     uint8_t r0 = 0, g0 = 0, b0 = 0;
     for (size_t i = 0; i + 3 < px.size(); i += 4) {
@@ -521,7 +519,41 @@ static bool image_is_mask(const std::vector<uint8_t> &px) {
         if (!seen) { r0 = px[i]; g0 = px[i + 1]; b0 = px[i + 2]; seen = true; continue; }
         if (px[i] != r0 || px[i + 1] != g0 || px[i + 2] != b0) return false;
     }
-    return seen;
+    if (!seen) return false;
+    /* The shader divides the pack pixel's intensity by this to recover the
+     * antialiasing ramp, so a black ink would divide by zero. expand_texel
+     * writes alpha 127 for an STP-set texel BEFORE testing for black, so a
+     * black semi-transparent ink really can reach here. */
+    uint8_t mx = r0 > g0 ? r0 : g0;
+    if (b0 > mx) mx = b0;
+    if (mx == 0) return false;
+    *out_max = mx;
+    return true;
+}
+
+/* The palette index this image inks, taken from the source texels rather than
+ * assumed to be 1. Majority vote over texels whose image centre is inked, so a
+ * stray hand-drawn pixel cannot swing it. -1 when nothing qualifies. */
+static int mask_ink_index(const State::Repl &r, const Upload &up, int shift) {
+    if (r.src_w <= 0 || r.src_h <= 0) return -1;
+    const int k = r.w / (r.src_w > 0 ? r.src_w : 1);
+    if (k <= 0 || r.w != k * r.src_w || r.h != k * r.src_h) return -1;
+    const int per = 1 << shift, bpp = 16 >> shift, m = (1 << bpp) - 1;
+    uint32_t cnt[256] = {0};
+    for (int tv = 0; tv < r.src_h; tv++) {
+        for (int tu = 0; tu < r.src_w; tu++) {
+            const size_t si = (size_t)tv * up.w + (size_t)(tu >> shift);
+            if (si >= up.pixels.size()) continue;
+            const int idx = (up.pixels[si] >> ((tu & (per - 1)) * bpp)) & m;
+            const size_t c = (((size_t)(tv * k + k / 2) * r.w)
+                              + (size_t)(tu * k + k / 2)) * 4 + 3;
+            if (c < r.pixels.size() && r.pixels[c]) cnt[idx]++;
+        }
+    }
+    int best = -1;
+    uint32_t bestn = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i] > bestn) { bestn = cnt[i]; best = i; }
+    return bestn ? best : -1;
 }
 
 /* Decode a pack entry on first use. Caller holds g.mu. Returns null when there
@@ -567,7 +599,14 @@ State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
     if (px && w > 0 && h > 0) {
         r.w = w; r.h = h;
         r.pixels.assign(px, px + (size_t)w * h * 4);
-        r.mask = image_is_mask(r.pixels);
+        r.mask = image_is_mask(r.pixels, &r.img_max);
+        if (r.mask) {
+            r.ink_index = mask_ink_index(r, up, shift);
+            if (r.ink_index < 0) r.mask = false;
+        }
+        r.dec_shift = shift;
+        r.ana_src_w = r.src_w;
+        r.ana_src_h = r.src_h;
         g.n_repl_decoded++;
     } else {
         g.n_repl_failed++;
@@ -625,15 +664,25 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         int recolour = 0;
         if (!key_set_contains(g.known, key)) {
             /* No file for this exact CLUT. We still know WHICH image this is --
-             * the texture hash says so -- we just do not know its colour, so
-             * borrow any variant's shape and take the colour from the live CLUT
-             * in the shader. Gated on that variant being a single-colour mask,
-             * where there is no colour structure to destroy. Without this, the
-             * game's own colour animation silently disables the pack: on the
-             * title screen 153 of 348 CLUTs in use ship no file. */
-            auto it = g.by_tex.find(up.hash);
-            if (it == g.by_tex.end()) { g.n_repl_notex++; continue; }
-            key = it->second;
+             * the texture hash identifies it -- we just do not know its colour.
+             * So borrow the texture's lowest-keyed variant for its SHAPE and
+             * resolve the colour from the live CLUT in the shader.
+             *
+             * A pack entry is keyed (texture, palette), but a game that
+             * recolours by swapping the CLUT -- fading text, flashing a
+             * selection, drawing a glyph once per outline offset -- walks
+             * through far more palettes than any pack ships, and every one of
+             * those draws would otherwise fall back to the original low-res
+             * texture. Gated on the borrowed image being a single-colour mask,
+             * where there is no colour structure to destroy. */
+            /* Palettised draws only. A 15bpp primitive has pal_n == 0 and hence
+             * pal == 0, so its exact key never matches and it would otherwise
+             * fall through to a 4bpp-dumped image whose src_w is four times
+             * wrong. There is also no CLUT to recolour from. */
+            if (pal_n == 0) continue;
+            const uint64_t donor = key_set_first_tex(g.known, up.hash);
+            if (!donor) { g.n_repl_notex++; continue; }
+            key = donor;
             recolour = 1;
         }
         bool skip = false;
@@ -643,7 +692,16 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         State::Repl *r = repl_get_locked(key, up, shift, base_x, base_y);
         if (!r) { g.n_repl_miss++; return 0; }
         if (recolour) {
-            if (!r->mask) { g.n_repl_multicol++; return 0; }
+            /* continue, not return: the neighbouring key and exclude tests both
+             * fall through to the next upload, and a newer non-mask upload must
+             * not block an older one that matches on its exact key. */
+            const int sw = up.w << shift;
+            if (!r->mask || r->ink_index < 0 ||
+                r->dec_shift != shift ||                    /* same texel depth */
+                r->ana_src_w != sw || r->ana_src_h != up.h  /* same texel grid  */) {
+                g.n_repl_multicol++;
+                continue;
+            }
             g.n_repl_recolour++;
         }
 
@@ -656,7 +714,11 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         out->origin_v = r->origin_v;
         out->id       = r->key;
         out->gl_handle = &r->gl_handle;
-        out->recolour = recolour;
+        out->recolour  = recolour;
+        /* Written on EVERY success path: TexPackRepl is uninitialised stack
+         * in tex_pack_arm and glb_set_replacement reads it directly. */
+        out->ink_index = recolour ? r->ink_index : 0;
+        out->ref_max   = recolour ? (float)r->img_max / 255.0f : 1.0f;
         g.n_repl_hit++;
         return 1;
     }

@@ -381,7 +381,9 @@ static GLint  s_uReplTex = -1, s_uReplOrigin = -1, s_uReplSrc = -1;
 static GLint  s_uReplMaskset = -1, s_uReplSemipass = -1, s_uReplSemimode = -1;
 static GLint  s_uReplDebug = -1;
 static GLint  s_uReplVram = -1, s_uReplRecolour = -1;
-static int    s_repl_recolour = 0;   /* armed alongside s_repl_tex */
+static GLint  s_uReplInk = -1, s_uReplRefMax = -1;
+static int    s_repl_recolour = 0, s_repl_ink = 0;   /* armed alongside s_repl_tex */
+static float  s_repl_ref_max = 1.0f;
 int g_repl_debug = 0;               /* tex_pack repl_debug=1 */
 /* TEX_VS's projection uniforms, for the REPLACEMENT program's own copy.
  *
@@ -1120,27 +1122,35 @@ static const char *REPL_FS =
     "uniform int u_maskset;\n"
     "uniform usampler2D u_vram;\n"
     "uniform int u_recolour;  /* 1 = take colour from the live CLUT */\n"
+    "uniform int u_ink;       /* dominant ink index; valid iff u_recolour */\n"
+    "uniform float u_ref_max; /* image's own full-ink max channel, 0..1  */\n"
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
     "vec3 col5(int raw){\n"
     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
     "}\n"
-    /* The palette this draw is actually using, as a 15-bit texel.
+    "int clut_at(int i){ return vram_at(v_clut.x + i, v_clut.y); }\n"
+    /* This fragment's PALETTE INDEX, read out of the game's own texel plane.
      *
-     * Index 0 is the cutout hole, so the ink is the first entry after it that
-     * is not fully transparent black. That is exact for the two-entry palettes
-     * these masks are drawn with, which is the only case u_recolour is ever set
-     * for (tex_pack gates on the image having a single colour). Returns 0 if
-     * the palette is empty, and the caller then keeps the image's own colour
-     * rather than painting the glyph black. */
-    "int clut_ink(){\n"
-    "  int n = (v_depth == 1) ? 256 : 16;\n"
-    "  for (int i = 1; i < n; i++) {\n"
-    "    int raw = vram_at(v_clut.x + i, v_clut.y);\n"
-    "    if (raw != 0) return raw;\n"
+     * Arithmetic identical to TEX_FS's fetch_texel, but with the index and the
+     * CLUT lookup SPLIT, because an HD ink pixel sitting over a hole texel has
+     * to resolve a different entry than the one directly under it.
+     *
+     * This replaces a first cut that scanned the CLUT for "the first non-zero
+     * entry after index 0" and called it the ink. That guessed: it assumed the
+     * hole is always index 0, applied one colour to the whole primitive, and at
+     * 8bpp could run 255 dependent texelFetches per fragment. Reading the index
+     * the hardware would have read costs one fetch and needs no assumption
+     * about which entry a given font inks. */
+    "int index_at(int u, int v){\n"
+    "  u &= 255; v &= 255;\n"
+    "  if (v_depth == 0) {\n"
+    "    int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);\n"
+    "    return (px >> ((u & 3) * 4)) & 0xF;\n"
     "  }\n"
-    "  return 0;\n"
+    "  int px = vram_at(v_tpage.x + (u >> 1), v_tpage.y + v);\n"
+    "  return (px >> ((u & 1) * 8)) & 0xFF;\n"
     "}\n"
     /* Diagnostic: paint every replaced fragment solid magenta with no discard.
      * Splits "the draw never reaches the framebuffer" from "it reaches it and
@@ -1167,15 +1177,39 @@ static const char *REPL_FS =
     "  if (u_debug == 0 && t.a < 0.5/255.0) discard;\n"
     "  int stp = (u_debug != 0) ? 0 : ((t.a > 0.75) ? 0 : 1);\n"
     "  vec3 rgb = (u_debug != 0) ? vec3(1.0, 0.0, 1.0) : t.rgb;\n"
-    /* Palette-agnostic substitution: shape from the pack, colour from the game.
-     * The image's own RGB is whichever variant happened to be on disk, so it is
-     * discarded; alpha still decides the cutout, because that is the SHAPE and
-     * the pack is the authority on it. STP comes from the live entry too -- a
-     * different CLUT may set the bit differently, and reading it off the stale
-     * image would blend the glyph wrongly. */
-    "  if (u_debug == 0 && u_recolour != 0) {\n"
-    "    int ink = clut_ink();\n"
-    "    if (ink != 0) { rgb = col5(ink); stp = (ink >> 15) & 1; }\n"
+    /* Palette-agnostic substitution: SHAPE from the pack, COLOUR from the game.
+     *
+     * The image was matched on the texture hash alone, so its RGB is whichever
+     * palette variant happened to be on disk and is discarded. The colour is
+     * re-derived the way the hardware derives it: read this fragment's palette
+     * INDEX out of the game's own texel plane and resolve it through THIS
+     * draw's CLUT. Nothing here guesses which entry is the ink, so a font that
+     * inks index 7, or one using two ink indices, works with no configuration.
+     *
+     * Three tiers, worst case = vanilla:
+     *   live entry     -- the exact texel the unreplaced draw would use;
+     *   clut_at(u_ink) -- HD ink overhanging a hole texel, which happens along
+     *                     EVERY glyph edge, because the whole point is that the
+     *                     pack shape is finer than the texel grid. Without it
+     *                     those pixels would be black; with a discard the shape
+     *                     would re-quantise back to the texel grid;
+     *   discard        -- the ink itself has been blanked (a CLUT fade).
+     *                     Vanilla draws nothing there either, so this
+     *                     reproduces it rather than leaving stale-coloured text.
+     *
+     * k rescales by the pack pixel's own intensity against the image's full-ink
+     * maximum. Under the mono gate that is exactly 1.0 in the interior, so it is
+     * a no-op there; at an edge LINEAR has blended the pack RGB toward the
+     * hole, and k carries that ramp onto the live colour -- so the fallback
+     * antialiases like the exact-key path instead of hardening into a dilated
+     * silhouette. STP comes from the live entry: bit 15 belongs to the CLUT, and
+     * the borrowed image's 0/127/255 tier was baked from a different one. */
+    "  if (u_debug == 0 && u_recolour != 0 && v_depth <= 1) {\n"
+    "    int e = clut_at(index_at(int(floor(uv.x)), int(floor(uv.y))));\n"
+    "    if (e == 0) e = clut_at(u_ink);\n"
+    "    if (e == 0) discard;\n"
+    "    rgb = col5(e) * clamp(max(max(t.r, t.g), t.b) / u_ref_max, 0.0, 1.0);\n"
+    "    stp = (e >> 15) & 1;\n"
     "  }\n"
     /* u_debug is kept, not removed: painting replaced fragments solid magenta
      * with no discard is what finally separated "the draw never lands" from
@@ -2113,6 +2147,8 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glActiveTexture(PSXGL_TEXTURE0);
     p_glUniform1i(s_uReplVram, 1);
     p_glUniform1i(s_uReplRecolour, s_repl_recolour);
+    p_glUniform1i(s_uReplInk, s_repl_ink);
+    p_glUniform1f(s_uReplRefMax, s_repl_ref_max);
     s_depth_armed = s_pgxp_depth && s_pq_valid;
     p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
 
@@ -2142,6 +2178,12 @@ static void draw_repl_prim(const float *verts, int semi) {
         wide_target_end(s_repl_uXoff, s_repl_uXhalf);
         gl_perf_mirror_end();
     }
+    /* Do not leave the VRAM mirror bound to a sampler: pack_flush renders INTO
+     * s_raw_fbo, whose colour attachment is this same texture, and a texture
+     * bound for reading while it is the draw target is undefined. */
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
     hr_end();
 }
 
@@ -2648,19 +2690,29 @@ static void glb_set_precise_triangle(int enabled,
  * original texel grid, where a level is the box-average of one source pixel,
  * i.e. the original bitmap; so this is never worse than vanilla and gets
  * sharper as the internal resolution goes up. */
+/* A cleared slot must clear the recolour state with it. Leaving it armed lets
+ * the next primitive that DOES get a replacement inherit the previous one's
+ * palette treatment -- the same one-shot contract the tex slot already has. */
+static void repl_flags_reset(void) {
+    s_repl_recolour = 0;
+    s_repl_ink = 0;
+    s_repl_ref_max = 1.0f;
+}
+
 static void glb_set_replacement(const void *repl) {
-    if (!repl) { s_repl_tex = 0; return; }
+    if (!repl) { s_repl_tex = 0; repl_flags_reset(); return; }
     const TexPackRepl *r = (const TexPackRepl *)repl;
     if (!r->pixels || r->width <= 0 || r->height <= 0 ||
         r->src_w <= 0 || r->src_h <= 0) {
         s_repl_tex = 0;
+        repl_flags_reset();
         return;
     }
 
     GLuint tex = r->gl_handle ? (GLuint)*r->gl_handle : 0;
     if (!tex) {
         glGenTextures(1, &tex);
-        if (!tex) { s_repl_tex = 0; return; }
+        if (!tex) { s_repl_tex = 0; repl_flags_reset(); return; }
         p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2676,6 +2728,8 @@ static void glb_set_replacement(const void *repl) {
 
     s_repl_tex = tex;
     s_repl_recolour = r->recolour ? 1 : 0;
+    s_repl_ink      = r->ink_index;
+    s_repl_ref_max  = (r->ref_max > 0.0f) ? r->ref_max : 1.0f;
     s_repl_origin[0] = (float)r->origin_u;
     s_repl_origin[1] = (float)r->origin_v;
     s_repl_src[0]    = (float)r->src_w;
@@ -3110,6 +3164,8 @@ static int init_gpu_raster(void) {
     s_uReplDebug    = p_glGetUniformLocation(s_repl_prog, "u_debug");
     s_uReplVram     = p_glGetUniformLocation(s_repl_prog, "u_vram");
     s_uReplRecolour = p_glGetUniformLocation(s_repl_prog, "u_recolour");
+    s_uReplInk      = p_glGetUniformLocation(s_repl_prog, "u_ink");
+    s_uReplRefMax   = p_glGetUniformLocation(s_repl_prog, "u_ref_max");
     s_repl_uXoff    = p_glGetUniformLocation(s_repl_prog, "u_xoff");
     s_repl_uXhalf   = p_glGetUniformLocation(s_repl_prog, "u_xhalf");
     s_repl_uXscale  = p_glGetUniformLocation(s_repl_prog, "u_xscale");

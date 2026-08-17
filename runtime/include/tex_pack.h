@@ -99,6 +99,12 @@ typedef struct {
      * right but the colour is whatever palette variant happened to be on disk;
      * the renderer must take the colour from the live CLUT instead. */
     int recolour;
+    /* Valid only when recolour is set. ink_index is the palette entry this
+     * image inks, used for HD ink that overhangs a hole texel; ref_max is the
+     * image's own full-ink max channel in 0..1, which the shader divides by to
+     * recover the antialiasing ramp. */
+    int   ink_index;
+    float ref_max;
 } TexPackRepl;
 
 /* 1 when this primitive has a replacement (decoding it on first use), 0
