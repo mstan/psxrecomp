@@ -1568,6 +1568,11 @@ extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
 static bool          g_ws_engaged = true;
+/* Fill the pillarbox margins of a 4:3-pinned present with the frame's own edge
+ * columns instead of black (gl_renderer_set_pillarbox_edge_fill). Game-facing
+ * look for 2D screens on a very wide display; live-toggled by the
+ * ws_menu_edge_fill debug command for A/B. */
+extern "C" { int g_ws_menu_edge_fill_flag = 1; }   /* ws_menu_edge_fill command */
 /* Wide-aspect strategy: native-wide (render the wider FOV into a wider frame,
  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
@@ -7025,6 +7030,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * locked: we squash IFF we stretch. depth24 always classifies as FMV
          * even if the ws layer is not engaged yet (4:3 titles). */
         fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* 2D screens (title, menus, loading) are deliberately kept at 4:3 by the
+         * 3D-gated widescreen layer, which on a 32:9 display leaves them as a
+         * small island in a mostly black window. Extend their own edge columns
+         * across the margins instead. Never for MDEC video: those edge pixels
+         * are real picture content and smear.
+         *
+         * Deliberately NOT gated on g_ws_engaged. Engagement means "the GTE
+         * squash is running on gameplay frames", and it is false during boot,
+         * the memory-card load and the title screen -- precisely the screens
+         * this is for. gl_renderer_present only fills when the present is
+         * actually pillarboxed, so a 4:3 window has no margins to fill and this
+         * costs nothing there. */
+        if (g_gl_active)
+            gl_renderer_set_pillarbox_edge_fill(
+                g_ws_menu_edge_fill_flag && !di.depth24);
         /* MDEC movies are already decoded at their authored cadence and are
          * CPU/upload heavy. High-refresh crossfades only contend with decoding
          * and can starve audio, so present native-4:3/MDEC phases directly.

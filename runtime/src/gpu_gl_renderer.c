@@ -321,6 +321,12 @@ static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
 static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
 static GLint         s_present_uSharp = -1;
 static GLuint        s_interp_prog = 0, s_interp_tex[3];
+/* Extend the frame's edge columns into the pillarbox margins of a 4:3-pinned
+ * present instead of leaving them black. Off unless a game asks for it: it is
+ * a deliberate look, and it is wrong for content whose edge pixels are busy. */
+static int           s_pillarbox_edge_fill = 0;
+static GLsync        s_interp_fence[3];
+static GLsync        s_interp_draw_fence = NULL;
 static GLint         s_interp_uPrev = -1, s_interp_uCurr = -1;
 static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
 static GLint         s_interp_uBlendMode = -1;
@@ -3037,6 +3043,40 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
         p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
     }
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    /* Pillarbox edge fill. A 4:3-pinned frame on a wide window leaves black
+     * bars either side; on a 32:9 display that is most of the screen, and a
+     * menu whose backdrop is a flat gradient reads as a small floating island.
+     *
+     * Extend the frame's own edge columns outward instead. The present vertex
+     * shader interpolates v_uv.x as mix(u_uv_rect.x, u_uv_rect.z, p.x), so
+     * passing the SAME u for both makes the quad sample one texture column
+     * across its whole width -- clamp-to-edge, which is what the present
+     * texture is already set to. The 4:3 content is untouched and undistorted;
+     * only the margins change.
+     *
+     * Deliberately not applied when cropping (content_w): that path leaves
+     * black on the right on purpose, and smearing a known-garbage trailing
+     * column across the margin is the opposite of what it is for. */
+    if (s_pillarbox_edge_fill && force_4_3 && !crop &&
+        src_w > 0 && src_h > 0 && lh > 0) {
+        const float v0 = 0.5f / (float)src_h, v1 = 1.f - v0;
+        const float ul = 0.5f / (float)src_w;    /* leftmost texel centre  */
+        const float ur = 1.f - ul;               /* rightmost texel centre */
+        if (lx > 0) {
+            glViewport(0, ly, lx, lh);
+            p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        const int right_w = ww - (lx + lw);
+        if (right_w > 0) {
+            glViewport(lx + lw, ly, right_w, lh);
+            p_glUniform4f(s_present_uUvRect, ur, v0, ur, v1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glViewport(lx, ly, lw, lh);
+    }
+
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     hold_capture_drawable();
@@ -3047,6 +3087,12 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
 }
+
+void gl_renderer_set_pillarbox_edge_fill(int enabled) {
+    s_pillarbox_edge_fill = enabled ? 1 : 0;
+}
+
+int gl_renderer_pillarbox_edge_fill(void) { return s_pillarbox_edge_fill; }
 
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
@@ -4145,6 +4191,51 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     p_glUseProgram(0);
 }
 
+
+/* Pillarbox edge fill for the FBO present path — the same look as in
+ * gl_renderer_present, but this is the path that actually runs at internal
+ * scale > 1, where the renderer presents from its own high-resolution FBO
+ * instead of a CPU readback. Call AFTER present_target_quad; restores the
+ * viewport it found. See gl_renderer_set_pillarbox_edge_fill. */
+static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
+                              int x, int y, int w, int h, int linear,
+                              int lx, int ly, int lw, int lh, int v_flip,
+                              int ww) {
+    if (!s_pillarbox_edge_fill || lh <= 0 || w <= 0 || h <= 0) return;
+    const int right_w = ww - (lx + lw);
+    if (lx <= 0 && right_w <= 0) return;   /* no margins to fill */
+
+    float v0 = ((float)y + 0.5f) / (float)tex_h;
+    float v1 = ((float)(y + h) - 0.5f) / (float)tex_h;
+    if (!v_flip) { float t = v0; v0 = v1; v1 = t; }
+    /* Equal u for both ends makes PRESENT_VS's mix() constant across the quad,
+     * so it samples one texture column: clamp-to-edge by construction. */
+    const float ul = ((float)x + 0.5f) / (float)tex_w;
+    const float ur = ((float)(x + w) - 0.5f) / (float)tex_w;
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glBindVertexArray(s_present_vao);
+    if (lx > 0) {
+        glViewport(0, ly, lx, lh);
+        p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (right_w > 0) {
+        glViewport(lx + lw, ly, right_w, lh);
+        p_glUniform4f(s_present_uUvRect, ur, v0, ur, v1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    glViewport(lx, ly, lw, lh);
+}
+
 int gl_renderer_present_hold_last(void) {
     int ww = 0, wh = 0;
     int lx, ly, lw, lh;
@@ -4256,6 +4347,9 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     present_bezel(ww, wh, lx, ly, lw, lh);
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
+    if (force_4_3)
+        present_edge_fill(s_hr_tex, VRAM_W, VRAM_H, disp_x, disp_y, w, h,
+                          linear, lx, ly, lw, lh, 1, ww);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);

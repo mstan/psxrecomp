@@ -7887,6 +7887,22 @@ static void handle_ws_ui_groups(int id, const char *json)
     free(buf);
 }
 
+/* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
+ *
+ * The 3D-gated widescreen layer keeps 2D screens (title, menus, loading) at
+ * 4:3, which on a very wide display leaves them as an island in a black
+ * window. With this on, the frame's own edge columns are extended across the
+ * margins instead. It is a look, not a correctness fix — it smears where the
+ * edge pixels are busy — so it needs a live A/B rather than a rebuild.
+ * No args = report. */
+static void handle_ws_menu_edge_fill(int id, const char *json)
+{
+    extern int g_ws_menu_edge_fill_flag;
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) g_ws_menu_edge_fill_flag = on ? 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, g_ws_menu_edge_fill_flag);
+}
+
 /* tex_pack [sub=stats|uploads|dumped|missing]: HD texture replacement state.
  *
  * tex_pack.cpp has carried tex_pack_debug_json since it was written, but it was
@@ -13565,6 +13581,7 @@ static const CmdEntry s_commands[] = {
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_ui_groups",      handle_ws_ui_groups },
     { "tex_pack",          handle_tex_pack },
+    { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },

@@ -53,6 +53,18 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
  * Returns 0 only if a texture could not be created. */
 int  gl_renderer_set_bezel(const void *rgba, int w, int h);
 int  gl_renderer_has_bezel(void);
+/* Pillarbox edge fill: on a 4:3-pinned present, extend the frame's own left and
+ * right edge columns across the black margins instead of leaving them black.
+ *
+ * The 4:3 content stays exactly where it is, at its own scale, undistorted --
+ * only the margins change. It exists for wide displays showing 2D screens
+ * (menus, title, loading) that a 3D-gated widescreen layer deliberately keeps
+ * at 4:3: on 32:9 those margins are most of the screen, and a flat-gradient
+ * backdrop reads as a small floating island. It is a look, not a correctness
+ * fix, and it is wrong where the edge pixels are busy, so it is opt-in and the
+ * crop path (content_w) is excluded. */
+void gl_renderer_set_pillarbox_edge_fill(int enabled);
+int  gl_renderer_pillarbox_edge_fill(void);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
