@@ -409,12 +409,41 @@ extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
     }
 }
 
+/* A filesystem path is not a JSON string. On Windows every separator in
+ * "C:\Users\..." reads as an escape, and "\U" is not a legal one, so a raw %s
+ * of a path produced a response no JSON parser would accept -- which is why
+ * this whole surface silently could not be read from the wire. */
+static std::string json_escape(const std::string &s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\\': o += "\\\\"; break;
+            case '"':  o += "\\\""; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", (unsigned)(unsigned char)c);
+                    o += b;
+                } else {
+                    o += c;
+                }
+        }
+    }
+    return o;
+}
+
 extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
     if (!out || cap <= 0) return 0;
     std::lock_guard<std::mutex> lk(g.mu);
     int n = 0;
 
     if (!subcmd || !std::strcmp(subcmd, "stats")) {
+        const std::string pack_dir = json_escape(g.pack_dir.string());
+        const std::string dump_dir = json_escape(g.dump_dir.string());
         n = std::snprintf(out, (size_t)cap,
             "{\"replace\":%d,\"dump\":%d,\"pack_dir\":\"%s\",\"dump_dir\":\"%s\","
             "\"pack_entries\":%zu,\"pack_matched\":%zu,\"live_uploads\":%zu,"
@@ -422,7 +451,7 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
             "\"pal_hash\":%llu,\"pal_memo_hit\":%llu,\"dumped\":%zu,"
             "\"dump_written\":%llu,\"dump_failed\":%llu}",
             (int)g.replace_on, (int)g.dump_on,
-            g.pack_dir.string().c_str(), g.dump_dir.string().c_str(),
+            pack_dir.c_str(), dump_dir.c_str(),
             g.known.size(), g.matched.size(), g.uploads.size(),
             (unsigned long long)g.n_uploads, (unsigned long long)g.n_upload_dedup,
             (unsigned long long)g.n_kills, (unsigned long long)g.n_prims,

@@ -28,6 +28,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "tex_pack.h"     /* HD texture replacement state (tex_pack command) */
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
@@ -7886,6 +7887,37 @@ static void handle_ws_ui_groups(int id, const char *json)
     free(buf);
 }
 
+/* tex_pack [sub=stats|uploads|dumped|missing]: HD texture replacement state.
+ *
+ * tex_pack.cpp has carried tex_pack_debug_json since it was written, but it was
+ * never reachable from the wire -- so "is the pack actually matching?" could
+ * only be answered by looking at the screen and guessing. That is precisely the
+ * question that decides whether a Beetle-authored pack is compatible at all,
+ * and "missing" (pack entries no draw has claimed yet) is the authoring aid for
+ * building a new one. Defaults to stats. */
+static void handle_tex_pack(int id, const char *json)
+{
+    char sub[32];
+    if (!json_get_str(json, "sub", sub, sizeof(sub)))
+        strncpy(sub, "stats", sizeof(sub) - 1);
+    sub[sizeof(sub) - 1] = '\0';
+
+    const int cap = 1 << 16;
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    /* tex_pack_debug_json emits a complete JSON VALUE — an object for "stats",
+     * an array for the others — so it has to be given a key, not spliced in as
+     * bare fields. */
+    int hdr = snprintf(buf, (size_t)cap,
+                       "{\"id\":%d,\"ok\":true,\"active\":%d,\"%s\":",
+                       id, tex_pack_active(), sub);
+    int body = tex_pack_debug_json(sub, buf + hdr, cap - hdr - 4);
+    if (body <= 0) { free(buf); send_err(id, "unknown sub"); return; }
+    snprintf(buf + hdr + body, 4, "}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 /* ws_backdrop_margin [m=<N>]: live-tune the far-backdrop widen strategy without
  * a rebuild. m<0 = whole-row preload, m=0 = off, m>0 = widen N columns each side.
  * No m= just reports the current value. */
@@ -13532,6 +13564,7 @@ static const CmdEntry s_commands[] = {
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_ui_groups",      handle_ws_ui_groups },
+    { "tex_pack",          handle_tex_pack },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
