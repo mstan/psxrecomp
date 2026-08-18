@@ -164,6 +164,20 @@ struct State {
      * has no image for this texture" from "no upload backs this primitive",
      * and those want opposite fixes. */
     uint64_t n_repl_calls = 0, n_repl_nocontain = 0, n_repl_notex = 0;
+    /* Why containment fails, not just how often. Records the sample rect and
+     * the upload that overlapped it MOST, so the two candidate causes can be
+     * told apart: a rect spanning several uploads (best overlap is a strict
+     * subset on one axis) versus a stale or re-uploaded record (best overlap
+     * tiny or absent). Diagnostic only -- nothing in the replace path reads
+     * it, and it is capped so a race cannot grow it without bound. */
+    struct NoContain {
+        int32_t  rx, ry, rw, rh;   /* the primitive's sample rect     */
+        int32_t  ux, uy, uw, uh;   /* best-overlapping upload, or 0s  */
+        uint32_t hash;             /* that upload's texture hash      */
+        int32_t  ov;               /* overlap area, texels            */
+        uint32_t hits;
+    };
+    std::vector<NoContain> nocontain;
     uint64_t n_uploads = 0, n_upload_dedup = 0, n_kills = 0;
     uint64_t n_prims = 0, n_pal_hash = 0, n_pal_memo_hit = 0;
     uint64_t n_dump_written = 0, n_dump_failed = 0;
@@ -781,7 +795,39 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         g.n_repl_hit++;
         return 1;
     }
-    if (!contained) g.n_repl_nocontain++;
+    if (!contained) {
+        g.n_repl_nocontain++;
+        /* Record WHY, capped. Find the upload that overlapped this sample
+         * rect most; its shape against the rect distinguishes "the rect spans
+         * several uploads" from "no live record covers it any more". */
+        if (g.nocontain.size() < 64) {
+            int best = -1, best_ov = 0;
+            for (size_t k = 0; k < g.uploads.size(); k++) {
+                const Upload &u = g.uploads[k];
+                const int ox = std::min(rx + rw, u.x + u.w) - std::max(rx, u.x);
+                const int oy = std::min(ry + rh, u.y + u.h) - std::max(ry, u.y);
+                if (ox <= 0 || oy <= 0) continue;
+                if (ox * oy > best_ov) { best_ov = ox * oy; best = (int)k; }
+            }
+            bool seen = false;
+            for (State::NoContain &nc : g.nocontain) {
+                if (nc.rx == rx && nc.ry == ry && nc.rw == rw && nc.rh == rh) {
+                    nc.hits++; seen = true; break;
+                }
+            }
+            if (!seen) {
+                State::NoContain nc {};
+                nc.rx = rx; nc.ry = ry; nc.rw = rw; nc.rh = rh;
+                if (best >= 0) {
+                    const Upload &u = g.uploads[(size_t)best];
+                    nc.ux = u.x; nc.uy = u.y; nc.uw = u.w; nc.uh = u.h;
+                    nc.hash = u.hash; nc.ov = best_ov;
+                }
+                nc.hits = 1;
+                g.nocontain.push_back(nc);
+            }
+        }
+    }
     g.n_repl_miss++;
     return 0;
 }
@@ -953,6 +999,21 @@ extern "C" int tex_pack_debug_json(const char *subcmd, char *out, int cap) {
                 (unsigned)(r.key >> 32), (unsigned)(r.key & 0xFFFFFFFFu),
                 r.w, r.h, r.src_w, r.src_h, r.origin_u, r.origin_v,
                 r.pixels.empty() ? "false" : "true");
+        }
+        n += std::snprintf(out + n, (size_t)(cap - n), "]");
+    } else if (!std::strcmp(subcmd, "nocontain")) {
+        /* Sample rects that no tracked upload contained, with the upload that
+         * overlapped each one most. If ov is a large fraction of the rect and
+         * the upload is short on one axis, the rect spans several uploads; if
+         * ov is 0 or tiny, no live record covers it at all. */
+        n = std::snprintf(out, (size_t)cap, "[");
+        for (size_t i = 0; i < g.nocontain.size() && n < cap - 200; i++) {
+            const State::NoContain &c = g.nocontain[i];
+            n += std::snprintf(out + n, (size_t)(cap - n),
+                "%s{\"rect\":[%d,%d,%d,%d],\"best\":[%d,%d,%d,%d],"
+                "\"hash\":\"%x\",\"ov\":%d,\"hits\":%u}",
+                i ? "," : "", c.rx, c.ry, c.rw, c.rh,
+                c.ux, c.uy, c.uw, c.uh, c.hash, c.ov, c.hits);
         }
         n += std::snprintf(out + n, (size_t)(cap - n), "]");
     } else if (!std::strcmp(subcmd, "armed")) {
