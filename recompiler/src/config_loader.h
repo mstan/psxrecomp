@@ -504,7 +504,7 @@ struct RuntimeConfig {
     // anything the provenance test rejects) must not participate at all, or it
     // depth-tests against garbage and disappears. Opt-in per game with
     // [video] pgxp_depth = true.
-    bool                  video_pgxp_depth = true;
+    bool                  video_pgxp_depth = false;
 
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —

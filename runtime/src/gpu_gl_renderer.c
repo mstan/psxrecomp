@@ -403,12 +403,20 @@ static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
 static int   s_pgxp_depth = 0;         /* configured */
 static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
 static int   s_zdebug = 0;             /* paint depth as greyscale       */
-/* GTE screen-Z full scale. NOT 65535: the register is 16-bit but this title
- * emits values under ~4000, and dividing by the register range crushed every
- * projected vertex onto the near plane -- measured, 95% of the frame landed in
- * the first 6% of the depth range. Tunable from the wire because the value is
- * a property of a title's projection distance, not a constant. */
-static float s_pgxp_zscale = 128.0f;
+static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
+/* Near plane in GTE Z units for the reciprocal depth map.
+ *
+ * MUST sit at or below the smallest Z the scene produces, because the map
+ * clamps with max(a_z, zn): anything nearer collapses onto the near plane and
+ * then occludes everything drawn after it. At 128 that swallowed the track
+ * under the camera, which in turn hid the ship completely.
+ *
+ * A sweep that scored 'distinct depth levels used' picked 128 and was
+ * exactly backwards -- clamping the near field concentrates the remainder
+ * into more visible levels, so the broken value scored best. 1 clamps
+ * nothing (Z is at least 1) and only costs far-field precision, which a
+ * 24-bit buffer still resolves. */
+static float s_pgxp_zscale = 1.0f;
 static GLint s_tex_uZscale = -1, s_repl_uZscale = -1;
 static GLint s_tex_uZdebug = -1, s_repl_uZdebug = -1;
 static GLint s_tex_uDepthOn = -1, s_repl_uDepthOn = -1;
@@ -1520,10 +1528,17 @@ static void hr_begin(int clip_to_draw_area) {
      * feature exists. Scissor is enabled but not yet set for the draw area, so
      * the clear covers the whole surface. */
     if (s_pgxp_depth) {
-        extern uint64_t s_frame_count;
-        static uint64_t s_depth_frame = (uint64_t)-1;
-        if (s_frame_count != s_depth_frame) {
-            s_depth_frame = s_frame_count;
+        /* Armed at Swap by this file, NOT keyed on the debug server's
+         * s_frame_count. That counter is incremented from two different places
+         * depending on whether PSX_DEBUG_TOOLS is compiled in, so a Release
+         * build could clear the depth buffer once and never again -- depth then
+         * accumulates across every frame until nearly all geometry is rejected,
+         * which on a race track reads as the ground vanishing and the ship
+         * flying through the floor. Worse, a savestate A/B cannot see it: that
+         * only ever compares single frames. Swap is the real frame boundary and
+         * it is right here in this file. */
+        if (s_depth_needs_clear) {
+            s_depth_needs_clear = 0;
             glDisable(GL_SCISSOR_TEST);
             glDepthMask(GL_TRUE);
             glClearDepth(1.0);
@@ -4598,6 +4613,10 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
+    /* A frame is ending, so the next draw must start from a cleared depth
+     * buffer. Set here rather than inferred from a counter another
+     * translation unit owns -- see hr_begin. */
+    s_depth_needs_clear = 1;
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
