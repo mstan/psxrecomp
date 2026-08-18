@@ -66,6 +66,20 @@ int  gl_renderer_has_bezel(void);
 void gl_renderer_set_pillarbox_edge_fill(int enabled);
 int  gl_renderer_pillarbox_edge_fill(void);
 
+/* PGXP depth ([video] pgxp_depth): depth-test polygons using the per-vertex W
+ * PGXP recovered, instead of relying solely on the ordering table.
+ *
+ * The PS1 sorts per PRIMITIVE, by one averaged depth quantised into buckets, so
+ * interpenetrating or near-coplanar polygons resolve by submission order — an
+ * answer the hardware cannot get right. Only primitives whose W provenance is
+ * proven participate; everything else (2D, UI, anything the provenance test
+ * rejects) neither tests nor writes, since it has no meaningful depth.
+ *
+ * Off is bit-identical to a build without the feature: the vertex program's z
+ * term is 0, the test stays disabled, and the buffer is never cleared. */
+void gl_renderer_set_pgxp_depth(int enabled);
+int  gl_renderer_pgxp_depth(void);
+
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 

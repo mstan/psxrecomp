@@ -1178,6 +1178,9 @@ static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
  * SXY readback are untouched. Default off = the faithful floor. */
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
+/* [video] pgxp_depth — depth-test using PGXP's recovered W instead of relying
+ * solely on the ordering table. See gl_renderer_set_pgxp_depth. */
+static int           g_video_pgxp_depth = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -11289,6 +11292,7 @@ int main(int argc, char** argv) {
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
+            g_video_pgxp_depth = gc.runtime.video_pgxp_depth ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
@@ -13268,6 +13272,10 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
+    if (g_video_pgxp_depth)
+        std::fprintf(stdout, "psxrecomp: PGXP depth buffer on (ordering-table "
+                             "sort augmented by recovered per-vertex W)\n");
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
