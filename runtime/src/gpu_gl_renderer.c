@@ -408,6 +408,7 @@ static float  s_zc_min = 1e30f, s_zc_max = 0.0f;
 static double s_zc_sum = 0.0;
 static uint64_t s_zc_n = 0, s_zc_hist[ZC_BUCKETS];
 static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
+static int   s_wide_depth_clear = 1;   /* same, for the native-wide mirror */
 /* Near plane in GTE Z units for the reciprocal depth map.
  *
  * MUST sit at or below the smallest Z the scene produces, because the map
@@ -1832,6 +1833,17 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    /* Per-frame depth clear for THIS surface. The allocation-time clear only
+     * covers the first frame, and hr_begin clears the hr FBO only -- so with
+     * PGXP depth on, the wide margins would accumulate depth forever and
+     * progressively reject their own geometry. Armed at Swap, like hr_begin. */
+    if (s_pgxp_depth && s_wide_depth_clear) {
+        s_wide_depth_clear = 0;
+        glDisable(GL_SCISSOR_TEST);
+        glDepthMask(GL_TRUE);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+    }
     glEnable(GL_SCISSOR_TEST);
     {
         int sy = s_area_y1, sh = s_area_y2 - s_area_y1 + 1;
@@ -3937,7 +3949,13 @@ static GLuint wide_fbo_for(int base_x) {
             glClearColor(0, 0, 0, 0);
             glClearStencil(0);
             glStencilMask(0xFF);
-            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            glClearDepth(1.0);
+            glDepthMask(GL_TRUE);
+            /* Depth as well as colour and stencil. This surface carries its own
+             * depth attachment, and hr_begin only ever clears the hr FBO -- so with
+             * PGXP depth on, the wide margins would test against depth written
+             * before this allocation and never cleared again. */
+            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
             s_wide_base[i] = base_x;
             return s_wide_fbo[i];
@@ -4652,6 +4670,7 @@ static void gl_swap_with_osd(void) {
      * buffer. Set here rather than inferred from a counter another
      * translation unit owns -- see hr_begin. */
     s_depth_needs_clear = 1;
+    s_wide_depth_clear = 1;
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
