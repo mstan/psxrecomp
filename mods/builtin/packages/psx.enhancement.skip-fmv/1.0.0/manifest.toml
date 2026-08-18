@@ -15,9 +15,9 @@ game_id = "*"
 [[feature]]
 id = "skip_fmv"
 name = "Skip FMVs"
-description = "Off by default, matching the faithful floor: the intro is part of the original experience and skipping it is a deliberate choice. Turning it on affects presentation only -- no game state, no timing the game can observe, and save compatibility is unchanged."
+description = "On by default. This is presentation, not simulation: skipping a video changes no game state and no timing the game can observe, and save compatibility is unchanged. Turn it off to watch the intro and the attract sequence as shipped."
 group = "Quality of life"
-default_enabled = false
+default_enabled = true
 
 [[plugin]]
 feature = "skip_fmv"
