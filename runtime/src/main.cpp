@@ -1116,6 +1116,7 @@ static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderle
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
+static bool          g_video_win_w_explicit = false; /* user chose a width */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_audio_freq     = 44100; /* host device request */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
@@ -11019,6 +11020,7 @@ int main(int argc, char** argv) {
 #endif
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
+        if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_geometry_correction)
@@ -12765,6 +12767,22 @@ session_reboot:
         return 1;
     }
     psx_apply_window_icon(sdl_window, argv[0]);
+
+    /* Maximise instead of computing the frame size ourselves.
+     *
+     * clamp_window_aspect fits the CLIENT area to the usable bounds, but a
+     * window is client plus title bar and borders, so fitting the client to a
+     * full-height display produced a window taller than the screen that hung
+     * off the top. Deriving the decoration size first does not work either:
+     * SDL_GetWindowBordersSize reports nothing useful before the window is
+     * shown, so the correction silently did not apply.
+     *
+     * The window manager already solves this exactly. Maximise and let it fit
+     * the work area, decorations and taskbar included. Only when the request
+     * was "fit the display" (window_width unset) -- an explicit width is a
+     * deliberate choice and is left alone. */
+    if (!g_fullscreen && !g_video_win_w_explicit)
+        SDL_MaximizeWindow(sdl_window);
 
     /* Host refresh: if the panel is within ~2% of 60 Hz, record it so driver
      * vsync can own cadence (pacer skipped). Non-~60 Hz and unknown refresh
