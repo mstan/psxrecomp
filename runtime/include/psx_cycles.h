@@ -125,7 +125,6 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         }
     }
 #endif
-    cycles = psx_oc_apply(cycles);
     if (cycles == 0u) return;
 #if defined(PSX_COSIM)
     psx_advance_cycles_slow(cycles);
@@ -140,9 +139,20 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         return;
     }
     if (psx_in_device_service) {
+        /* RAW, not overclocked. Charges made while servicing a device are the
+         * device's own time, not CPU instruction retirement. Scaling them too
+         * compresses DMA and peripheral work by the same factor, which is not
+         * an overclock but a speed hack on the whole machine -- and it broke
+         * boot outright at 10x while 3x survived.
+         *
+         * DuckStation overclocks the CPU alone: device delays keep their
+         * real-world duration. Same intent here. */
         psx_cycle_count += (uint64_t)cycles;
         return;
     }
+    /* CPU instruction retirement: this is the only charge an overclock scales. */
+    cycles = psx_oc_apply(cycles);
+    if (cycles == 0u) return;
     psx_cycle_count += (uint64_t)cycles;
     if (psx_next_service_cycle == 0u ||
         psx_cycle_count >= psx_next_service_cycle) {
