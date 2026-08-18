@@ -797,9 +797,24 @@ static void hold_ensure_tex(int w, int h) {
 
 /* Snapshot the just-drawn default backbuffer (letterbox + content) before Swap.
  * Hold-last can then redraw this exact image without touching guest VRAM. */
+/* Cadence for the hold snapshot. The held frame is only ever shown while the
+ * emulator is STALLED or PAUSED (see gl_renderer_present_hold_last callers:
+ * the stall tick and the rewind pause), where it is a still image. Capturing
+ * it every frame meant a full-drawable glCopyTexSubImage2D on the present
+ * path -- at 7680x4039 that is ~31M pixels, about 124 MB of copy per frame,
+ * and it measured as ~18ms of the ~23ms present cost at 8K.
+ *
+ * Every Nth frame instead: worst case the held image is N frames stale, which
+ * at 60-100 fps is tens of milliseconds and imperceptible on a frozen frame,
+ * and the cost drops by N. */
+#define HOLD_CAPTURE_EVERY 8
+static unsigned s_hold_capture_tick = 0;
+
 static void hold_capture_drawable(void) {
     int ww = 0, wh = 0;
     if (!s_ctx || !s_win)
+        return;
+    if ((s_hold_capture_tick++ % HOLD_CAPTURE_EVERY) != 0u && s_hold_kind != HOLD_NONE)
         return;
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (ww < 1 || wh < 1)
