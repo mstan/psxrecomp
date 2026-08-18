@@ -103,6 +103,11 @@ enum {
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
     BS_SEC_TEXPACK = 0x11, /* HD texture pack upload tracker (rects+hashes)      */
+    BS_SEC_MODSET  = 0x12, /* resolved mod-plan fingerprint (load guard):
+                            * loading a state into a session whose enabled mod
+                            * set differs poisons the machine (null-PC spin was
+                            * observed live) -- refuse BEFORE any apply instead.
+                            * Written FIRST so the reject precedes mutation.    */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */
