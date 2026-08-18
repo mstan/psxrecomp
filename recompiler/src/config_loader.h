@@ -484,6 +484,28 @@ struct RuntimeConfig {
     // [video] perspective_texturing = true.
     bool                  video_perspective_texturing = false;
 
+    // pgxp_depth: depth-test polygons using PGXP's recovered per-vertex W
+    // instead of relying solely on the ordering table.
+    //
+    // The PS1 has no depth buffer. Primitives are linked into an ordering table
+    // indexed by ONE averaged depth per primitive (AVSZ3/AVSZ4), quantised into
+    // a fixed number of buckets, and drawn back to front. Two polygons that
+    // interpenetrate — or sit near-coplanar in the same bucket — therefore
+    // resolve by submission order. The hardware cannot express the right
+    // answer, so no amount of faithful emulation produces one; WipEout 3's
+    // trackside scenery shows it as pipes sorting through walls.
+    //
+    // PGXP already recovers a precise per-vertex W, and the textured path
+    // already carries it to the shader as a_q, so this writes a real depth
+    // buffer from data that is present rather than deriving anything new.
+    //
+    // Default OFF, and for a stronger reason than perspective_texturing: this
+    // one CHANGES WHICH PIXELS SURVIVE. A primitive without valid W (2D, UI,
+    // anything the provenance test rejects) must not participate at all, or it
+    // depth-tests against garbage and disappears. Opt-in per game with
+    // [video] pgxp_depth = true.
+    bool                  video_pgxp_depth = true;
+
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
     // the same default as the reference implementations — because some games

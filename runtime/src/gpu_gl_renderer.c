@@ -408,7 +408,7 @@ static int   s_zdebug = 0;             /* paint depth as greyscale       */
  * projected vertex onto the near plane -- measured, 95% of the frame landed in
  * the first 6% of the depth range. Tunable from the wire because the value is
  * a property of a title's projection distance, not a constant. */
-static float s_pgxp_zscale = 4096.0f;
+static float s_pgxp_zscale = 128.0f;
 static GLint s_tex_uZscale = -1, s_repl_uZscale = -1;
 static GLint s_tex_uZdebug = -1, s_repl_uZdebug = -1;
 static GLint s_tex_uDepthOn = -1, s_repl_uDepthOn = -1;
