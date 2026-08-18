@@ -2853,6 +2853,28 @@ static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
 void gl_renderer_set_depth_always(int on) { s_depth_always = on ? 1 : 0; }
 int  gl_renderer_depth_always(void) { return s_depth_always; }
 
+/* Read back the real DEPTH BUFFER over the display rect.
+ *
+ * Not the same thing as the zdebug colour view, and the difference is the
+ * whole point: zdebug paints every fragment its own computed depth, including
+ * semi-transparent ones that set glDepthMask(GL_FALSE) and therefore never
+ * contribute. Sampling that view by colour cannot tell a mis-projected hull
+ * triangle from the craft's own glow sitting over empty sky. The buffer holds
+ * only what was actually WRITTEN, so it answers the question the colour view
+ * cannot. Returns pixels written, or 0. */
+int gl_renderer_read_depth(float *out, int dx, int dy, int dw, int dh) {
+    const int S = s_scale;
+    if (!s_ctx || !s_raster_ok || !s_hr_fbo || !out || dw <= 0 || dh <= 0) return 0;
+    flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+    const int ow = dw * S, oh = dh * S;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(dx * S, dy * S, ow, oh, GL_DEPTH_COMPONENT, GL_FLOAT, out);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    return ow * oh;
+}
+
 void gl_renderer_pgxp_zstats(float *mn, float *mx, double *mean,
                              unsigned long long *n, unsigned long long *hist,
                              int hist_len) {

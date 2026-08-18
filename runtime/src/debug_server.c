@@ -7891,6 +7891,38 @@ static void handle_ws_ui_groups(int id, const char *json)
  *
  * Live, because this one changes WHICH PIXELS SURVIVE and the only honest test
  * is flipping it on the same scene. No args = report. */
+/* zbuf <path>: dump the real depth buffer over the display rect as a 16-bit
+ * greyscale PNG. Distinct from pgxp_depth zdebug, which paints every fragment
+ * its own depth including semi-transparent ones that never write. */
+static void handle_zbuf(int id, const char *json)
+{
+    extern int gl_renderer_read_depth(float *, int, int, int, int);
+    extern int gr_scale(void);
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    if (di.disabled || !di.width || !di.height) { send_err(id, "display disabled"); return; }
+    if (di.depth24) { send_err(id, "24bpp scanout"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    int S = gr_scale(); if (S < 1) S = 1;
+    uint32_t w = di.width > 640 ? 640 : di.width;
+    uint32_t h = di.height > 512 ? 512 : di.height;
+    uint32_t ow = w * (uint32_t)S, oh = h * (uint32_t)S;
+    float *f = (float *)malloc((size_t)ow * oh * sizeof(float));
+    if (!f) { send_err(id, "alloc failed"); return; }
+    int got = gl_renderer_read_depth(f, (int)di.display_x, (int)di.display_y, (int)w, (int)h);
+    if (got <= 0) { free(f); send_err(id, "no depth surface"); return; }
+    /* Raw float32, row-major, bottom-up as GL returns it. No PNG: the consumer
+     * is a histogram, and quantising to 8 or 16 bits would throw away exactly
+     * the resolution this is being read to measure. */
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(f); send_err(id, "open failed"); return; }
+    const size_t wrote = fwrite(f, sizeof(float), (size_t)ow * oh, fp);
+    fclose(fp); free(f);
+    if (wrote != (size_t)ow * oh) { send_err(id, "short write"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"w\":%u,\"h\":%u,\"scale\":%d}",
+             id, path, ow, oh, S);
+}
+
 static void handle_pgxp_depth(int id, const char *json)
 {
     const int on = json_get_int(json, "on", -1);
@@ -13634,6 +13666,7 @@ static const CmdEntry s_commands[] = {
     { "tex_pack",          handle_tex_pack },
     { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
     { "pgxp_depth",        handle_pgxp_depth },
+    { "zbuf",              handle_zbuf },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
