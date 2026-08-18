@@ -1109,9 +1109,16 @@ static const char *TEX_VS =
      * private 0..1 range and shattered the scene. The GTE's 16-bit screen Z is
      * a single global scale, so map it straight to NDC. Multiplied by w because
      * the pipeline divides by it. */
-    "  float zn = clamp(a_z / u_zscale, 0.0, 1.0);\n"
+    /* Reciprocal (perspective) depth, not linear. A linear map has to pick a
+     * far value and CLAMP past it, and everything beyond collapses onto the far
+     * plane with no ordering left among it -- which is most of a race track.
+     * 1 - 2*zn/z is monotonic over the whole 1..65535 range with no clamp, and
+     * spends its precision near the camera where overlaps actually happen,
+     * exactly as a hardware perspective depth buffer does. u_zscale is the near
+     * plane in GTE Z units. */
+    "  float zn = 1.0 - 2.0 * u_zscale / max(a_z, u_zscale);\n"
     "  float zc = (u_depth_on == 0) ? 0.0\n"
-    "           : ((a_z > 0.0) ? (zn * 2.0 - 1.0) * w : -w);\n"
+    "           : ((a_z > 0.0) ? zn * w : -w);\n"
     "  gl_Position = vec4(ndc * w, zc, w); }\n";
 /* HD replacement fragment program. Shares TEX_VS, so position handling — the
  * u_shift grid alignment, the native-wide x transforms, the perspective w
