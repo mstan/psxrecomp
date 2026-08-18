@@ -1,0 +1,24 @@
+format_version = 5
+id = "psx.enhancement.skip-fmv"
+version = "1.0.0"
+name = "Skip FMVs"
+author = "psxrecomp"
+description = "Skip full-motion video the moment it starts, so a launch goes straight to the game instead of sitting through logos and the attract intro. Detection is the documented signature of a streaming FMV (XA audio feeding the SPU while the MDEC produces frames), not a per-title frame count or address, so it applies to any disc without knowing anything about it. Presentation-only: the game still runs the sequence, it is simply not waited on."
+resolver = "declarative"
+save_compatibility = "shared"
+
+# FMV playback is a property of the emulated CD/MDEC/SPU path rather than of any
+# particular disc, so this ships with the framework and targets every game.
+[[target]]
+game_id = "*"
+
+[[feature]]
+id = "skip_fmv"
+name = "Skip FMVs"
+description = "Off by default, matching the faithful floor: the intro is part of the original experience and skipping it is a deliberate choice. Turning it on affects presentation only -- no game state, no timing the game can observe, and save compatibility is unchanged."
+group = "Quality of life"
+default_enabled = false
+
+[[plugin]]
+feature = "skip_fmv"
+id = "psx.skip_fmv"
