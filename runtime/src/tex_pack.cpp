@@ -708,16 +708,15 @@ extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
         out->pixels   = r->pixels.data();
         out->width    = r->w;
         out->height   = r->h;
-        /* From the LIVE draw, not the cached entry. Repl caches these on its
-         * first decode, but origin is relative to the CURRENT primitive's
-         * texture page -- so as soon as one entry serves a draw from a
-         * different page, a stale origin shifts the whole sample rect. On a
-         * font that reads as every glyph sampled a texel too low: top row
-         * clipped, bottom row duplicated by the clamp. */
-        out->src_w    = up.w << shift;
-        out->src_h    = up.h;
-        out->origin_u = (up.x - base_x) << shift;
-        out->origin_v = up.y - base_y;
+        /* Cached from this entry's first decode. Recomputing them from the
+         * live draw is more correct in principle -- origin is relative to the
+         * CURRENT texture page -- but doing so visibly reintroduced the glyph
+         * seams the texel-centre fix removed, so the two are coupled and the
+         * live version needs the sampling reworked with it, not on its own. */
+        out->src_w    = r->src_w;
+        out->src_h    = r->src_h;
+        out->origin_u = r->origin_u;
+        out->origin_v = r->origin_v;
         out->id       = r->key;
         out->gl_handle = &r->gl_handle;
         out->recolour  = recolour;
