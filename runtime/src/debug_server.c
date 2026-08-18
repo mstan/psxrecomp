@@ -8230,6 +8230,65 @@ static void handle_savestate_status(int id, const char *json)
     char status[256];
     savestate_status_json(status, sizeof status);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, status);
+/* Live CPU overclock for anchored A/B: animation-rate artifacts cannot be
+ * attributed to the overclock without flipping it on the exact same scene. */
+/* Census of imperfect PGXP triangles for the last complete frame: which
+ * screen prims are NOT fully dataflow-corrected, and why, per vertex. */
+static void handle_pgxp_census(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0, tris = 0, clean = 0;
+    int n = gpu_pgxp_census_dump(&frame, &tris, &clean, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"tris\":%u,\"clean\":%u,"
+        "\"imperfect\":%d,\"entries\":[", id, frame, tris, clean, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"cls\":[%u,%u,%u],\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_pgxp_texcensus(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0;
+    int n = gpu_pgxp_texcensus_dump(&frame, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"misses\":%d,\"entries\":[",
+        id, frame, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"reason\":%u,\"vtx\":%u,\"why\":%u,\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_overclock(int id, const char *json)
+{
+    int pct = json_get_int(json, "percent", -1);
+    if (pct > 0)
+        psx_set_cpu_overclock((uint32_t)pct);
+    send_fmt("{\"id\":%d,\"ok\":true,\"percent\":%u}",
+             id, psx_get_cpu_overclock());
 }
 
 static void handle_turbo(int id, const char *json)
@@ -13835,6 +13894,9 @@ static const CmdEntry s_commands[] = {
     { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
     { "savestate_status",  handle_savestate_status },
+    { "pgxp_census",       handle_pgxp_census },
+    { "pgxp_texcensus",    handle_pgxp_texcensus },
+    { "overclock",         handle_overclock },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },

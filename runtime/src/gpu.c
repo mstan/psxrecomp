@@ -3426,6 +3426,31 @@ uint32_t gpu_texture_correction_hits(void) {
  * it, so shared edges between neighbouring triangles cannot disagree by more
  * than the sub-pixel fraction. The integer delta folds in draw offsets and
  * any widescreen adjustment already applied by the caller. */
+/* PGXP resolution census (G1 coverage gap). Double-buffered by frame parity
+ * so the debug thread can read the completed frame while this one builds.
+ * Only imperfect triangles get entries; totals give the denominator. */
+#define PGXP_CENSUS_CAP 8192
+static PgxpCensusEnt s_pgxp_census[2][PGXP_CENSUS_CAP];
+static uint32_t s_pgxp_census_n[2], s_pgxp_census_frame[2];
+static uint32_t s_pgxp_census_tris[2], s_pgxp_census_clean[2];
+
+int gpu_pgxp_census_dump(uint32_t *frame_out, uint32_t *tris, uint32_t *clean,
+                         PgxpCensusEnt *out, int max_out) {
+    /* newest COMPLETE frame: never the one still building, else the fresher */
+    uint32_t cur = (uint32_t)s_frame_count;
+    int slot;
+    if (s_pgxp_census_frame[0] == cur)      slot = 1;
+    else if (s_pgxp_census_frame[1] == cur) slot = 0;
+    else slot = (s_pgxp_census_frame[0] > s_pgxp_census_frame[1]) ? 0 : 1;
+    if (frame_out) *frame_out = s_pgxp_census_frame[slot];
+    if (tris)      *tris      = s_pgxp_census_tris[slot];
+    if (clean)     *clean     = s_pgxp_census_clean[slot];
+    int n = (int)s_pgxp_census_n[slot];
+    if (n > max_out) n = max_out;
+    for (int i = 0; i < n; i++) out[i] = s_pgxp_census[slot][i];
+    return n;
+}
+
 static void prepare_precise_triangle(int i0, int i1, int i2,
                                      const int32_t vx[3], const int32_t vy[3]) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
@@ -3436,6 +3461,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
     const int idx[3] = { i0, i1, i2 };
     int32_t fx[3], fy[3];
     int any_precise = 0;
+    uint8_t cls[3];
     for (int i = 0; i < 3; i++) {
         uint32_t word = gp0_cmd_buf[idx[i]];
         int32_t raw_x, raw_y;
@@ -3445,11 +3471,43 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
                             : gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
         int32_t px, py;
         uint16_t sz;
-        if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
-                                    &px, &py, &sz) != PGXP_SRC_NATIVE)
+        int src = pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
+                                          &px, &py, &sz);
+        if (src != PGXP_SRC_NATIVE)
             any_precise = 1;
+        cls[i] = (src == PGXP_SRC_NATIVE && addr == 0xFFFFFFFFu) ? 3u
+                                                                 : (uint8_t)src;
         fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
         fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
+    }
+    {
+        uint32_t f = (uint32_t)s_frame_count;
+        int slot = (int)(f & 1);
+        if (s_pgxp_census_frame[slot] != f) {
+            s_pgxp_census_frame[slot] = f;
+            s_pgxp_census_n[slot] = 0;
+            s_pgxp_census_tris[slot] = 0;
+            s_pgxp_census_clean[slot] = 0;
+        }
+        s_pgxp_census_tris[slot]++;
+        if (cls[0] == 2 && cls[1] == 2 && cls[2] == 2) {
+            s_pgxp_census_clean[slot]++;
+        } else if (s_pgxp_census_n[slot] < PGXP_CENSUS_CAP) {
+            PgxpCensusEnt *e = &s_pgxp_census[slot][s_pgxp_census_n[slot]++];
+            int32_t x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
+            for (int i = 1; i < 3; i++) {
+                if (vx[i] < x0) x0 = vx[i];
+                if (vx[i] > x1) x1 = vx[i];
+                if (vy[i] < y0) y0 = vy[i];
+                if (vy[i] > y1) y1 = vy[i];
+            }
+            e->x0 = (int16_t)x0; e->y0 = (int16_t)y0;
+            e->x1 = (int16_t)x1; e->y1 = (int16_t)y1;
+            e->cls[0] = cls[0]; e->cls[1] = cls[1]; e->cls[2] = cls[2];
+            e->_pad = 0;
+            e->src = gp0_cmd_source_addr;
+            e->frame = f;
+        }
     }
     if (!any_precise) {
         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
@@ -3473,6 +3531,7 @@ static struct {
     uint64_t no_correction; /* texture correction off                       */
     uint64_t no_source;     /* CPU-built primitive, no packet address       */
     uint64_t no_depth;      /* a vertex had no recorded Z, or Z == 0        */
+    uint64_t z_interp;      /* armed with mean-filled Z for clipped vertices */
 } s_texcorr;
 
 void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
@@ -3488,21 +3547,100 @@ void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
 /* Enable perspective UVs only when every position word came from an exact
  * SWC2 projection store at that same DMA packet address. This preserves the
  * association through ordering-table reordering and rejects CPU-built UI. */
+static PgxpCensusEnt s_pgxp_texcensus[2][PGXP_CENSUS_CAP];
+static uint32_t s_pgxp_texcensus_n[2], s_pgxp_texcensus_frame[2];
+
+/* Record a texture-UV correction miss with the prim's rough screen bbox
+ * (raw packet coords + draw offset; close enough to localize the surface). */
+static void pgxp_texcensus_note(const int *indices, uint8_t reason, uint8_t vtx,
+                                uint8_t why) {
+    uint32_t f = (uint32_t)s_frame_count;
+    int slot = (int)(f & 1);
+    if (s_pgxp_texcensus_frame[slot] != f) {
+        s_pgxp_texcensus_frame[slot] = f;
+        s_pgxp_texcensus_n[slot] = 0;
+    }
+    if (s_pgxp_texcensus_n[slot] >= PGXP_CENSUS_CAP) return;
+    PgxpCensusEnt *e = &s_pgxp_texcensus[slot][s_pgxp_texcensus_n[slot]++];
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (int i = 0; i < 3; i++) {
+        int32_t rx, ry;
+        parse_vertex(gp0_cmd_buf[indices[i]], &rx, &ry);
+        rx += draw_offset_x; ry += draw_offset_y;
+        if (i == 0) { x0 = x1 = rx; y0 = y1 = ry; }
+        else {
+            if (rx < x0) x0 = rx;
+            if (rx > x1) x1 = rx;
+            if (ry < y0) y0 = ry;
+            if (ry > y1) y1 = ry;
+        }
+    }
+    e->x0 = (int16_t)x0; e->y0 = (int16_t)y0;
+    e->x1 = (int16_t)x1; e->y1 = (int16_t)y1;
+    e->cls[0] = reason; e->cls[1] = vtx; e->cls[2] = why; e->_pad = 0;
+    e->src = gp0_cmd_source_addr;
+    e->frame = f;
+}
+
+int gpu_pgxp_texcensus_dump(uint32_t *frame_out, PgxpCensusEnt *out, int max_out) {
+    uint32_t cur = (uint32_t)s_frame_count;
+    int slot; /* prefer the newest COMPLETE frame, not merely opposite parity */
+    if (s_pgxp_texcensus_frame[0] == cur)      slot = 1;
+    else if (s_pgxp_texcensus_frame[1] == cur) slot = 0;
+    else slot = (s_pgxp_texcensus_frame[0] > s_pgxp_texcensus_frame[1]) ? 0 : 1;
+    if (frame_out) *frame_out = s_pgxp_texcensus_frame[slot];
+    int n = (int)s_pgxp_texcensus_n[slot];
+    if (n > max_out) n = max_out;
+    for (int i = 0; i < n; i++) out[i] = s_pgxp_texcensus[slot][i];
+    return n;
+}
+
 static void prepare_texture_triangle(int i0, int i1, int i2) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
     gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
     s_texcorr.attempts++;
     if (!s_texture_correction_enabled) { s_texcorr.no_correction++; return; }
-    if (gp0_cmd_source_addr == 0xFFFFFFFFu) { s_texcorr.no_source++; return; }
     int indices[3] = { i0, i1, i2 };
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) {
+        s_texcorr.no_source++;
+        pgxp_texcensus_note(indices, 0u, 0u, 0u);
+        return;
+    }
     uint16_t z[3];
+    int have_z[3];
+    int n_have = 0;
+    int noted = 0;
     for (int i = 0; i < 3; i++) {
-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
-        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
-            z[i] == 0) {
-            s_texcorr.no_depth++;
-            return;
+        uint32_t addr = psx_ram_map_read((gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFFFFu) & ~3u;
+        have_z[i] = gte_precision_load_word(addr, gp0_cmd_buf[indices[i]],
+                                            NULL, NULL, &z[i]) && z[i] != 0;
+        if (have_z[i]) n_have++;
+        else if (!noted) {
+            noted = 1;
+            pgxp_texcensus_note(indices, 1u, (uint8_t)indices[i],
+                (uint8_t)pgxp_debug_shadow_class(addr, gp0_cmd_buf[indices[i]]));
         }
+    }
+    if (n_have == 0) {
+        /* No depth anywhere: affine is the only honest option. */
+        s_texcorr.no_depth++;
+        return;
+    }
+    if (n_have < 3) {
+        /* Clip-generated vertices: the game's near/edge clipper computes new
+         * screen coords with mult/div interpolation, which no exact-provenance
+         * shadow can follow, so their depth is unknowable here. Their TRUE
+         * view depth lies between the polygon's surviving projected vertices,
+         * so the mean of the known depths is a bounded approximation — and
+         * perspective UVs with an approximate q beat the affine fallback,
+         * whose error is what reads as texture swimming on every large
+         * clipped wall (the class lives on near-field walls/pillars). */
+        uint32_t sum = 0;
+        for (int i = 0; i < 3; i++) if (have_z[i]) sum += z[i];
+        uint16_t fill = (uint16_t)(sum / (uint32_t)n_have);
+        if (fill == 0) fill = 1;
+        for (int i = 0; i < 3; i++) if (!have_z[i]) z[i] = fill;
+        s_texcorr.z_interp++;
     }
     float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
     float qmax = q[0];

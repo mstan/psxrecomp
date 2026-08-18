@@ -147,6 +147,27 @@ uint64_t gpu_gp0_ring_total(void);
 uint32_t gpu_gp0_ring_capacity(void);
 uint32_t gpu_gp0_ring_max_words(void);
 int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
+
+/* PGXP per-prim resolution census: one entry per prepared precise triangle
+ * whose vertices did NOT all resolve through the dataflow shadow. cls[] is
+ * per-vertex: 0 = shadow miss (addr known, no valid entry), 1 = geometry-cache
+ * fallback, 2 = dataflow, 3 = no packet address (CPU-built submission path).
+ * Draw-space bbox, so it overlays the display half directly. */
+typedef struct {
+    int16_t  x0, y0, x1, y1;
+    uint8_t  cls[3];
+    uint8_t  _pad;
+    uint32_t src;
+    uint32_t frame;
+} PgxpCensusEnt;
+/* Copies the census of the most recent COMPLETE frame; returns entry count.
+ * tris/clean report that frame's totals (all triangles vs all-dataflow). */
+int gpu_pgxp_census_dump(uint32_t *frame_out, uint32_t *tris, uint32_t *clean,
+                         PgxpCensusEnt *out, int max_out);
+/* Same shape for texture-UV correction misses: cls[0] carries the reason
+ * (0 = no_source, 1 = no_depth), cls[1] the offending vertex index. */
+int gpu_pgxp_texcensus_dump(uint32_t *frame_out, PgxpCensusEnt *out, int max_out);
+
 void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
 
 /* Vblank presentation callback — called from gpu_vblank_tick().

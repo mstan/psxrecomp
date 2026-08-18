@@ -1219,19 +1219,26 @@ static const char *REPL_FS =
     "uniform int u_debug;\n"
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
-    "  uv = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
-    /* +0.5 is texel CENTRE, and it is load-bearing here in a way it never was
-     * on the PS1 path. An integer u addresses texel u, whose span in the
-     * replacement is [u, u+1); sampling at u alone lands on its left EDGE. With
-     * NEAREST that still resolves to the right texel, so the omission was
-     * invisible — but this path is LINEAR (a pack image carries detail the
-     * texel grid does not), and there a half-texel shift blends in whatever
-     * sits one texel over. On a font atlas that neighbour is the adjacent
-     * glyph's cell, so every glyph quad drew a hairline of its neighbour along
-     * its own edge: background-coloured slivers cutting through letters and
-     * ink-coloured ones in the gaps. Clamp to v_limits.zw (not +0.999) so the
-     * far edge lands on the last texel's centre rather than past it. */
-    "  vec4 t = texture(u_repl, (uv - u_origin + vec2(0.5)) / u_src);\n"
+    /* Continuous source-space sampling with a half-IMAGE-pixel interior clamp.
+     *
+     * The interpolated uv is already a CONTINUOUS texel-space position (a
+     * fragment in the middle of texel u carries uv ~ u+0.5), so adding a
+     * blanket +0.5 texel here double-shifted every sample by half a source
+     * texel. Invisible on big art; fatal on the segment-atlas strips, whose
+     * source rows are ONE texel tall: half a texel is half the image, so the
+     * strip drew with its top half cut off and the wrapped top row appended
+     * at the bottom (the press-start/further-information offset). At glyph
+     * edges the same shift pushed LINEAR samples into the neighbouring atlas
+     * cell (the stray marks below G / right of O and E on loading text).
+     *
+     * The sliver bug the +0.5 originally fixed is handled the right way: the
+     * clamp keeps samples half an IMAGE pixel inside the prim UV cell
+     * ([lo, hi] inclusive texels => continuous cell edge at hi+1), so LINEAR
+     * can never blend across the cell boundary no matter the pack scale. */
+    "  vec2 halfimg = 0.5 * u_src / vec2(textureSize(u_repl, 0));\n"
+    "  uv = clamp(uv, vec2(v_limits.xy) + halfimg,\n"
+    "             vec2(v_limits.zw) + vec2(1.0) - halfimg);\n"
+    "  vec4 t = texture(u_repl, (uv - u_origin) / u_src);\n"
     /* Alpha carries the texel's meaning as the dumper wrote it: 0 = colour
      * index 0, the cutout hole; 127 = opaque with STP set; 255 = opaque with
      * STP clear. It is not coverage. */

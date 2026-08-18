@@ -1181,6 +1181,7 @@ static int           g_video_perspective_texturing = 0;
 /* [video] pgxp_depth — depth-test using PGXP's recovered W instead of relying
  * solely on the ordering table. See gl_renderer_set_pgxp_depth. */
 static int           g_video_pgxp_depth = 0;
+extern "C" void gl_renderer_set_depth_always(int on);
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -13297,6 +13298,13 @@ session_reboot:
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
+    if (g_video_pgxp_depth) {
+        /* Unarmed prims (no recovered depth: ship model, HUD, CPU-built
+         * effects) must ALWAYS PASS, or the depth test culls them against
+         * world Z they never took part in — measured live: the player ship
+         * and trackside monitors vanish without this. */
+        gl_renderer_set_depth_always(1);
+    }
     if (g_video_pgxp_depth)
         std::fprintf(stdout, "psxrecomp: PGXP depth buffer on (ordering-table "
                              "sort augmented by recovered per-vertex W)\n");
