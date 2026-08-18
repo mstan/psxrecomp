@@ -7887,6 +7887,24 @@ static void handle_ws_ui_groups(int id, const char *json)
     free(buf);
 }
 
+/* pgxp_depth [on=0/1]: depth-test using PGXP's recovered per-vertex W.
+ *
+ * Live, because this one changes WHICH PIXELS SURVIVE and the only honest test
+ * is flipping it on the same scene. No args = report. */
+static void handle_pgxp_depth(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", -1);
+    extern void  gl_renderer_set_pgxp_zscale(float s);
+    extern float gl_renderer_pgxp_zscale(void);
+    const int zs = json_get_int(json, "zscale", -1);
+    if (zs > 0) gl_renderer_set_pgxp_zscale((float)zs);
+    extern void gl_renderer_set_zdebug(int on);
+    const int zdbg = json_get_int(json, "zdebug", -1);
+    if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
+    if (on >= 0) gl_renderer_set_pgxp_depth(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_pgxp_depth());
+}
+
 /* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
  *
  * The 3D-gated widescreen layer keeps 2D screens (title, menus, loading) at
@@ -13598,6 +13616,7 @@ static const CmdEntry s_commands[] = {
     { "ws_ui_groups",      handle_ws_ui_groups },
     { "tex_pack",          handle_tex_pack },
     { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
+    { "pgxp_depth",        handle_pgxp_depth },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },

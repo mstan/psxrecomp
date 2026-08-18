@@ -402,6 +402,15 @@ static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
  * depth test stays disabled, and the buffer is never cleared. */
 static int   s_pgxp_depth = 0;         /* configured */
 static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
+static int   s_zdebug = 0;             /* paint depth as greyscale       */
+/* GTE screen-Z full scale. NOT 65535: the register is 16-bit but this title
+ * emits values under ~4000, and dividing by the register range crushed every
+ * projected vertex onto the near plane -- measured, 95% of the frame landed in
+ * the first 6% of the depth range. Tunable from the wire because the value is
+ * a property of a title's projection distance, not a constant. */
+static float s_pgxp_zscale = 4096.0f;
+static GLint s_tex_uZscale = -1, s_repl_uZscale = -1;
+static GLint s_tex_uZdebug = -1, s_repl_uZdebug = -1;
 static GLint s_tex_uDepthOn = -1, s_repl_uDepthOn = -1;
 static GLuint s_repl_tex = 0;                       /* armed for the next prim */
 static float  s_repl_origin[2] = {0, 0}, s_repl_src[2] = {1, 1};
@@ -1063,6 +1072,7 @@ static const char *TEX_VS =
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "uniform int   u_depth_on;/* PGXP depth: write z from a_q; 0 = flat */\n"
+    "uniform float u_zscale; /* GTE screen-Z full scale; see gl_renderer_set_pgxp_zscale */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
     "flat out int v_persp;\n"
@@ -1099,8 +1109,9 @@ static const char *TEX_VS =
      * private 0..1 range and shattered the scene. The GTE's 16-bit screen Z is
      * a single global scale, so map it straight to NDC. Multiplied by w because
      * the pipeline divides by it. */
-    "  float zc = (u_depth_on != 0 && a_z > 0.0)\n"
-    "               ? ((a_z / 65535.0) * 2.0 - 1.0) * w : 0.0;\n"
+    "  float zn = clamp(a_z / u_zscale, 0.0, 1.0);\n"
+    "  float zc = (u_depth_on == 0) ? 0.0\n"
+    "           : ((a_z > 0.0) ? (zn * 2.0 - 1.0) * w : -w);\n"
     "  gl_Position = vec4(ndc * w, zc, w); }\n";
 /* HD replacement fragment program. Shares TEX_VS, so position handling — the
  * u_shift grid alignment, the native-wide x transforms, the perspective w
@@ -1130,6 +1141,7 @@ static const char *REPL_FS =
     "uniform int u_semipass;\n"
     "uniform int u_semimode;\n"
     "uniform int u_maskset;\n"
+    "uniform int u_zdebug;    /* 1 = paint depth as greyscale */\n"
     "uniform usampler2D u_vram;\n"
     "uniform int u_recolour;  /* 1 = take colour from the live CLUT */\n"
     "uniform int u_ink;       /* dominant ink index; valid iff u_recolour */\n"
@@ -1233,6 +1245,14 @@ static const char *REPL_FS =
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
     "  }\n"
+    /* Depth readout (pgxp_depth zdebug=1). Paints window-space depth as
+     * greyscale -- near black, far white -- so the PGXP z distribution can be
+     * SEEN rather than inferred from which geometry went missing. Lives in the
+     * FRAGMENT shader deliberately: TEX_VS is shared by several programs, and a
+     * uniform added there is unset for whichever program forgets it, which
+     * silently divides by zero. gl_FragCoord.z needs no new varying. */
+    "  if (u_zdebug != 0) { frag = vec4(vec3(gl_FragCoord.z), 1.0);\n"
+    "                       blend_factor = vec4(0.0); return; }\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
@@ -1252,6 +1272,7 @@ static const char *TEX_FS =
     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
+    "uniform int u_zdebug;    /* 1 = paint depth as greyscale */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
     "uniform float u_shift;\n"
     "int vram_at(int x, int y){\n"
@@ -1325,6 +1346,14 @@ static const char *TEX_FS =
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
     "  }\n"
+    /* Depth readout (pgxp_depth zdebug=1). Paints window-space depth as
+     * greyscale -- near black, far white -- so the PGXP z distribution can be
+     * SEEN rather than inferred from which geometry went missing. Lives in the
+     * FRAGMENT shader deliberately: TEX_VS is shared by several programs, and a
+     * uniform added there is unset for whichever program forgets it, which
+     * silently divides by zero. gl_FragCoord.z needs no new varying. */
+    "  if (u_zdebug != 0) { frag = vec4(vec3(gl_FragCoord.z), 1.0);\n"
+    "                       blend_factor = vec4(0.0); return; }\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
@@ -2047,6 +2076,8 @@ static void flush_tex_batch(void) {
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
     p_glUniform1i(s_tex_uDepthOn, s_tb_depth);
+    p_glUniform1i(s_tex_uZdebug, s_zdebug);
+    p_glUniform1f(s_tex_uZscale, s_pgxp_zscale);
     s_depth_armed = s_tb_depth;
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
@@ -2161,6 +2192,8 @@ static void draw_repl_prim(const float *verts, int semi) {
     p_glUniform1f(s_uReplRefMax, s_repl_ref_max);
     s_depth_armed = s_pgxp_depth && s_pz_valid;
     p_glUniform1i(s_repl_uDepthOn, s_depth_armed);
+    p_glUniform1i(s_repl_uZdebug, s_zdebug);
+    p_glUniform1f(s_repl_uZscale, s_pgxp_zscale);
 
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
@@ -3191,6 +3224,8 @@ static int init_gpu_raster(void) {
     s_repl_uXcenter = p_glGetUniformLocation(s_repl_prog, "u_xcenter");
     s_repl_uShift   = p_glGetUniformLocation(s_repl_prog, "u_shift");
     s_repl_uDepthOn = p_glGetUniformLocation(s_repl_prog, "u_depth_on");
+    s_repl_uZdebug  = p_glGetUniformLocation(s_repl_prog, "u_zdebug");
+    s_repl_uZscale  = p_glGetUniformLocation(s_repl_prog, "u_zscale");
 
     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
     if (!s_conv) return 0;
@@ -3252,6 +3287,8 @@ static int init_gpu_raster(void) {
     s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
     s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
     s_tex_uDepthOn = p_glGetUniformLocation(s_tex_prog, "u_depth_on");
+    s_tex_uZdebug  = p_glGetUniformLocation(s_tex_prog, "u_zdebug");
+    s_tex_uZscale  = p_glGetUniformLocation(s_tex_prog, "u_zscale");
     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
@@ -3600,6 +3637,10 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     s_last_present_path = GL_PRES_CPU;
 }
 
+void gl_renderer_set_pgxp_zscale(float s) { if (s > 0.0f) s_pgxp_zscale = s; }
+float gl_renderer_pgxp_zscale(void) { return s_pgxp_zscale; }
+void gl_renderer_set_zdebug(int on) { s_zdebug = on ? 1 : 0; }
+int  gl_renderer_zdebug(void) { return s_zdebug; }
 void gl_renderer_set_pgxp_depth(int enabled) {
     s_pgxp_depth = enabled ? 1 : 0;
     if (!s_pgxp_depth) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
