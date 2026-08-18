@@ -20,6 +20,26 @@
 #include "cosim_state.h"
 #endif
 
+/* CPU overclock state; the model is documented at psx_oc_apply in the header. */
+uint32_t g_psx_oc_scale_q16 = 65536u;   /* 1.0 = stock */
+uint32_t g_psx_oc_accum     = 0u;
+
+/* percent: 100 = stock, 1000 = 10x. Floor 100 because UNDERclocking would
+ * starve the guest of cycles the game assumes it has; ceiling 6400 because
+ * beyond that a single instruction charges 0 for long runs and the deadline
+ * model loses resolution against device schedules. */
+void psx_set_cpu_overclock(uint32_t percent) {
+    if (percent < 100u)  percent = 100u;
+    if (percent > 6400u) percent = 6400u;
+    g_psx_oc_scale_q16 = (uint32_t)((65536ull * 100ull) / (uint64_t)percent);
+    if (g_psx_oc_scale_q16 == 0u) g_psx_oc_scale_q16 = 1u;
+    g_psx_oc_accum = 0u;
+}
+
+uint32_t psx_get_cpu_overclock(void) {
+    if (g_psx_oc_scale_q16 == 0u) return 100u;
+    return (uint32_t)((65536ull * 100ull) / (uint64_t)g_psx_oc_scale_q16);
+}
 uint64_t psx_cycle_count = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
