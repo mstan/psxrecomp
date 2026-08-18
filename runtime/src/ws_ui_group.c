@@ -167,5 +167,48 @@ void ws_ui_group_assign(WsUiGroupItem *items, size_t count,
             ws_ui_anchor_for_bounds(min_x, max_x - min_x, display_width);
         items[i].root = (uint32_t)root;
     }
+
+    /* Temporal anchor hysteresis. A run's anchor derives from its CURRENT
+     * members' bounds, so a widget whose parts blink (the sub-10s countdown
+     * hides its digits every other beat but keeps drawing "check") changes
+     * runs frame to frame and lurches between thirds anchors at the blink
+     * rate. Positions are stable across the blink even though membership is
+     * not, so remember the anchor each PRIM was squashed about, keyed by its
+     * texture key and quantized position, and let any remembered member pin
+     * its whole run to last frame's anchor. Entries age out after ~2.5 s and
+     * the identity folds in display_width, so a moved element, a relayout, or
+     * a window resize re-derives fresh anchors instead of pinning stale ones. */
+    {
+        enum { AMEM_SLOTS = 256, AMEM_TTL = 64 };
+        typedef struct { uint32_t id; int32_t anchor; uint32_t tick; } AnchorMem;
+        static AnchorMem mem[AMEM_SLOTS];
+        static uint32_t tick;
+        tick++;
+        for (size_t i = 0; i < count; i++) {
+            size_t root = root_of(parent, i);
+            if (root != i) continue;           /* one pass per run */
+            int32_t remembered = -1;
+            for (size_t j = 0; j < count && remembered < 0; j++) {
+                if (root_of(parent, j) != root) continue;
+                uint32_t id = items[j].key ^
+                              ((uint32_t)(items[j].x >> 3) * 0x9E3779B9u) ^
+                              ((uint32_t)(items[j].y >> 3) << 7) ^
+                              ((uint32_t)display_width << 1);
+                AnchorMem *m = &mem[id % AMEM_SLOTS];
+                if (m->id == id && tick - m->tick <= AMEM_TTL)
+                    remembered = m->anchor;
+            }
+            for (size_t j = 0; j < count; j++) {
+                if (root_of(parent, j) != root) continue;
+                if (remembered >= 0) items[j].anchor = remembered;
+                uint32_t id = items[j].key ^
+                              ((uint32_t)(items[j].x >> 3) * 0x9E3779B9u) ^
+                              ((uint32_t)(items[j].y >> 3) << 7) ^
+                              ((uint32_t)display_width << 1);
+                AnchorMem *m = &mem[id % AMEM_SLOTS];
+                m->id = id; m->anchor = items[j].anchor; m->tick = tick;
+            }
+        }
+    }
     free(parent);
 }
