@@ -7901,6 +7901,9 @@ static void handle_pgxp_depth(int id, const char *json)
     extern void gl_renderer_set_zdebug(int on);
     const int zdbg = json_get_int(json, "zdebug", -1);
     if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
+    extern void gl_renderer_set_depth_always(int on);
+    const int always = json_get_int(json, "always", -1);
+    if (always >= 0) gl_renderer_set_depth_always(always);
     if (on >= 0) gl_renderer_set_pgxp_depth(on);
     /* Report the Z distribution alongside the flag: choosing znear without it
      * is guesswork, and guessing it wrong is what broke this twice. */

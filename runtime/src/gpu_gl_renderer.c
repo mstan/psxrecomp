@@ -409,6 +409,10 @@ static double s_zc_sum = 0.0;
 static uint64_t s_zc_n = 0, s_zc_hist[ZC_BUCKETS];
 static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
 static int   s_wide_depth_clear = 1;   /* same, for the native-wide mirror */
+/* Diagnostic: GL_ALWAYS keeps depth WRITES but never rejects. Separates "the
+ * test is discarding this geometry" from "this geometry never got drawn",
+ * which no amount of staring at a depth readout settles. */
+static int   s_depth_always = 0;
 /* Near plane in GTE Z units for the reciprocal depth map.
  *
  * MUST sit at or below the smallest Z the scene produces, because the map
@@ -2011,7 +2015,7 @@ static void depth_state(int armed, int semi) {
     if (!s_pgxp_depth) return;
     if (!armed) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); return; }
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
+    glDepthFunc(s_depth_always ? GL_ALWAYS : GL_LEQUAL);
     glDepthMask(semi >= 0 ? GL_FALSE : GL_TRUE);
 }
 
@@ -2846,6 +2850,9 @@ static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
 
 /* Z census readout (pgxp_depth). Resets on read so a sweep measures one scene
  * at a time. */
+void gl_renderer_set_depth_always(int on) { s_depth_always = on ? 1 : 0; }
+int  gl_renderer_depth_always(void) { return s_depth_always; }
+
 void gl_renderer_pgxp_zstats(float *mn, float *mx, double *mean,
                              unsigned long long *n, unsigned long long *hist,
                              int hist_len) {
