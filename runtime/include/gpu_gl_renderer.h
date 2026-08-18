@@ -63,6 +63,12 @@ int  gl_renderer_has_bezel(void);
  * backdrop reads as a small floating island. It is a look, not a correctness
  * fix, and it is wrong where the edge pixels are busy, so it is opt-in and the
  * crop path (content_w) is excluded. */
+
+/* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
+ * caller owns them and may free them on return. Passing NULL clears it.
+ * Returns 0 only if a texture could not be created. */
+int  gl_renderer_set_bezel(const void *rgba, int w, int h);
+int  gl_renderer_has_bezel(void);
 void gl_renderer_set_pillarbox_edge_fill(int enabled);
 int  gl_renderer_pillarbox_edge_fill(void);
 
