@@ -403,6 +403,10 @@ static GLint s_repl_uXscale = -1, s_repl_uXcenter = -1, s_repl_uShift = -1;
 static int   s_pgxp_depth = 0;         /* configured */
 static int   s_depth_armed = 0;        /* this batch/prim may depth-test */
 static int   s_zdebug = 0;             /* paint depth as greyscale       */
+#define ZC_BUCKETS 20
+static float  s_zc_min = 1e30f, s_zc_max = 0.0f;
+static double s_zc_sum = 0.0;
+static uint64_t s_zc_n = 0, s_zc_hist[ZC_BUCKETS];
 static int   s_depth_needs_clear = 1;  /* armed at Swap; see hr_begin    */
 /* Near plane in GTE Z units for the reciprocal depth map.
  *
@@ -2809,6 +2813,37 @@ static void glb_set_replacement(const void *repl) {
 static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
     s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
     s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
+    /* Census of the Z this title actually emits. znear must sit just under the
+     * scene minimum: too high and the near field clamps onto one plane and
+     * occludes everything behind it; too low and the reciprocal crushes the
+     * whole scene into the last percent of the range, where the test between
+     * two objects is decided by float noise. Both failures were shipped before
+     * this counter existed, because both were guessed at, not measured. */
+    if (s_pz_valid) {
+        for (int i = 0; i < 3; i++) {
+            const float z = s_pz[i];
+            if (z < s_zc_min) s_zc_min = z;
+            if (z > s_zc_max) s_zc_max = z;
+            s_zc_sum += (double)z; s_zc_n++;
+            unsigned b = 0; float t = z;   /* log2 buckets: shape, not mean */
+            while (t >= 2.0f && b < ZC_BUCKETS - 1) { t *= 0.5f; b++; }
+            s_zc_hist[b]++;
+        }
+    }
+}
+
+/* Z census readout (pgxp_depth). Resets on read so a sweep measures one scene
+ * at a time. */
+void gl_renderer_pgxp_zstats(float *mn, float *mx, double *mean,
+                             unsigned long long *n, unsigned long long *hist,
+                             int hist_len) {
+    if (mn) *mn = (s_zc_n ? s_zc_min : 0.0f);
+    if (mx) *mx = s_zc_max;
+    if (mean) *mean = (s_zc_n ? s_zc_sum / (double)s_zc_n : 0.0);
+    if (n) *n = s_zc_n;
+    for (int i = 0; i < hist_len && i < ZC_BUCKETS; i++) hist[i] = s_zc_hist[i];
+    s_zc_min = 1e30f; s_zc_max = 0.0f; s_zc_sum = 0.0; s_zc_n = 0;
+    for (int i = 0; i < ZC_BUCKETS; i++) s_zc_hist[i] = 0;
 }
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;

@@ -7902,7 +7902,21 @@ static void handle_pgxp_depth(int id, const char *json)
     const int zdbg = json_get_int(json, "zdebug", -1);
     if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
     if (on >= 0) gl_renderer_set_pgxp_depth(on);
-    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_pgxp_depth());
+    /* Report the Z distribution alongside the flag: choosing znear without it
+     * is guesswork, and guessing it wrong is what broke this twice. */
+    extern void gl_renderer_pgxp_zstats(float *, float *, double *,
+                                        unsigned long long *,
+                                        unsigned long long *, int);
+    float zmn = 0.0f, zmx = 0.0f; double zmean = 0.0;
+    unsigned long long zn = 0, hist[20] = {0};
+    gl_renderer_pgxp_zstats(&zmn, &zmx, &zmean, &zn, hist, 20);
+    char hb[256]; int ho = 0;
+    for (int i = 0; i < 20 && ho < (int)sizeof(hb) - 24; i++)
+        ho += snprintf(hb + ho, sizeof(hb) - (size_t)ho, "%s%llu",
+                       i ? "," : "", hist[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"zmin\":%.1f,\"zmax\":%.1f,"
+             "\"zmean\":%.1f,\"zn\":%llu,\"zhist\":[%s]}",
+             id, gl_renderer_pgxp_depth(), zmn, zmx, zmean, zn, hb);
 }
 
 /* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
