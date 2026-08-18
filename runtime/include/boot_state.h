@@ -102,6 +102,7 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    BS_SEC_TEXPACK = 0x11, /* HD texture pack upload tracker (rects+hashes)      */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

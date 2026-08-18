@@ -55,6 +55,13 @@ void tex_pack_init(const char *disc_path, int enable_replace, int enable_dump,
                    const char *dir_override, const char *pack_dir);
 void tex_pack_shutdown(void);
 
+/* Savestate section: rects+hashes of tracked uploads (pixels rebuilt from the
+ * restored VRAM and hash-verified at apply). Apply AFTER VRAM is restored. */
+uint32_t tex_pack_state_bytes(void);
+void     tex_pack_state_write(uint8_t *p);
+void     tex_pack_state_apply(const uint8_t *p, uint64_t len,
+                              const uint16_t *vram /* NULL = CPU mirror */);
+
 /* Write <pack dir>/coverage.json: how much of the active pack the session
  * actually drew, plus the entries it never asked for. Safe to call from
  * std::atexit and safe to call more than once; a no-op when no pack is active.
