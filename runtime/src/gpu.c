@@ -3451,10 +3451,62 @@ int gpu_pgxp_census_dump(uint32_t *frame_out, uint32_t *tris, uint32_t *clean,
     return n;
 }
 
+/* Clamp rescue (widescreen precision, rides the precise-NCLIP opt-in): a
+ * vertex parked exactly on a GTE saturation rail (+/-1024 screen units) is
+ * hardware-mangled — its true projection is somewhere far off-frame, and
+ * rasterizing the clamped position folds that error INTO the frame as the
+ * classic PS1 "polygon spike" (a sliver streaking across the screen). 4:3
+ * framing plus CRT overscan hid most of these; a wide aspect stares right at
+ * them. When the address-keyed dataflow shadow knows the true sub-pixel
+ * position (clamped to +/-4096 px at the producer), substitute it for railed
+ * vertices only — every in-range vertex stays native, so normal geometry is
+ * bit-identical and shared edges cannot crack. */
+static int ws_clamp_rescue_vertex(uint32_t addr, uint32_t word,
+                                  int32_t raw_x, int32_t raw_y,
+                                  int32_t *px, int32_t *py) {
+    if (raw_x != -1024 && raw_x != 1023 && raw_y != -1024 && raw_y != 1023)
+        return 0;
+    uint16_t sz;
+    if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y, px, py, &sz)
+            != PGXP_SRC_DATAFLOW)
+        return 0;
+    /* Only substitute when the shadow actually differs — a legit vertex that
+     * genuinely sits on the rail keeps its native position. */
+    return ((*px >> 16) != raw_x) || ((*py >> 16) != raw_y);
+}
+
 static void prepare_precise_triangle(int i0, int i1, int i2,
                                      const int32_t vx[3], const int32_t vy[3]) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
     if (!gte_geometry_correction_enabled()) {
+        if (gpu_ws_precise_nclip_enabled() &&
+            gp0_cmd_source_addr != 0xFFFFFFFFu) {
+            const int idx[3] = { i0, i1, i2 };
+            int32_t fx[3], fy[3];
+            int any_rescued = 0;
+            for (int i = 0; i < 3; i++) {
+                uint32_t word = gp0_cmd_buf[idx[i]];
+                int32_t raw_x, raw_y;
+                parse_vertex(word, &raw_x, &raw_y);
+                uint32_t addr = gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
+                int32_t px, py;
+                if (ws_clamp_rescue_vertex(addr, word, raw_x, raw_y, &px, &py)) {
+                    any_rescued = 1;
+                    fx[i] = (int32_t)((int64_t)px +
+                                      (int64_t)(vx[i] - raw_x) * 65536);
+                    fy[i] = (int32_t)((int64_t)py +
+                                      (int64_t)(vy[i] - raw_y) * 65536);
+                } else {
+                    fx[i] = vx[i] << 16;
+                    fy[i] = vy[i] << 16;
+                }
+            }
+            if (any_rescued) {
+                gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1],
+                                        fx[2],fy[2]);
+                return;
+            }
+        }
         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
         return;
     }
