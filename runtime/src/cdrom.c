@@ -3282,7 +3282,13 @@ static void cdrom_apply_savestate_delay_caps(int log_clamps) {
 void cdrom_accelerate_after_savestate(void) {
     const char *probe = getenv("PSX_POST_LOAD_PROBE");
     const int log_probe = (probe && probe[0] == '1');
-    s_savestate_cd_boost_vblanks = CDROM_SAVESTATE_BOOST_VBLANKS;
+    /* Counted per SIM vblank: scale by the CRTC multiplier so the boost
+     * window keeps its intended ~3s of wall time at NTSC x2. */
+    {
+        extern uint32_t gpu_get_crtc_refresh_multiplier(void);
+        s_savestate_cd_boost_vblanks = CDROM_SAVESTATE_BOOST_VBLANKS *
+                                       (int)gpu_get_crtc_refresh_multiplier();
+    }
     cdrom_apply_savestate_delay_caps(/*log_clamps*/log_probe);
     if (log_probe)
         fprintf(stderr,

@@ -425,7 +425,13 @@ static int sio_txn_open = 0;
 static void sio_arm_card_ct_defer_guard(void) {
     extern uint64_t psx_get_cycle_count(void);
     uint64_t now = psx_get_cycle_count();
-    uint64_t until = now + (uint64_t)gpu_vblank_period_cycles() * 2ull;
+    /* The libcard A6C10/B4E38 handshake this covers is CYCLE-fixed, so the
+     * window must be stock-period relative: at CRTC x2 the raw period halves
+     * and "~2 VBlank periods" would silently mean half the intended cover
+     * (audited 2026-08-19, finding #6). */
+    extern uint32_t gpu_get_crtc_refresh_multiplier(void);
+    uint64_t until = now + (uint64_t)gpu_vblank_period_cycles() *
+                     (uint64_t)gpu_get_crtc_refresh_multiplier() * 2ull;
     if (until > s_card_ct_defer_until_cyc)
         s_card_ct_defer_until_cyc = until;
 }
