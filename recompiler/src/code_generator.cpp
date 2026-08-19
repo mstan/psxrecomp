@@ -2566,7 +2566,22 @@ std::string CodeGenerator::translate_basic_block(
                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS fallthrough past unit edge */\n",
                               next_addr);
         } else {
+            // No successor block and no known function owns the next PC —
+            // the block runs off the region/image edge. Emitting only the
+            // interrupt check here let execution FALL OFF the C function with
+            // the entry-switch's consumed pc==0: the dispatcher returned
+            // "handled" with a null PC and the top-level trampoline read it
+            // as "program ended" (WipEout 3 static bake: the 0xD5000 region
+            // variant's truncated block_800D7FC0, continuation 0x800D8004,
+            // died the moment CD streaming loaded content matching that
+            // variant — the deterministic boot exit at ~frame 1221). Publish
+            // the continuation instead: the dispatcher routes it to whoever
+            // owns it (a neighboring region variant, AOT text, or the
+            // interpreter).
             ss << emit_interrupt_check(next_addr, config_.indent);
+            ss << config_.indent
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                              next_addr);
         }
     }
 
