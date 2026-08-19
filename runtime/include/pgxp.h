@@ -103,6 +103,7 @@ typedef struct PGXPStats {
     uint64_t w_valid;            /* lookups that also carried a usable depth */
     uint64_t produced;           /* RTPS/RTPT projections pushed into shadows */
     uint64_t swc2_stores;        /* GTE reg shadows copied to RAM shadows     */
+    uint64_t invalidations;      /* generation bumps (each kills all shadows) */
 } PGXPStats;
 
 void pgxp_get_stats(PGXPStats *out);
