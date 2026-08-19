@@ -171,17 +171,25 @@ bool FullFunctionEmitter::emit_function(
         const char* e = std::getenv("PSX_CPS");
         return e == nullptr || e[0] != '0';
     }();
+    /* Redirect-honoring checks — see CodeGenerator::emit_interrupt_check:
+     * an exception epilogue that publishes a resume PC different from this
+     * site's static continuation must surface to the trampoline, never be
+     * overwritten by the static transfer (the dropped-continuation class
+     * behind the WipEout 3 static-bake top-level PC=0 exit). */
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
+        uint32_t rt = bios_runtime_pc(resume_pc);
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
-                           bios_runtime_pc(resume_pc));
+               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", rt) + indent +
+               fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n", rt);
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+               fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ ({})) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+                           resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -1239,9 +1247,10 @@ bool FullFunctionEmitter::emit_function(
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
                 "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
+                "        if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally — unless this load's successor reads

@@ -14428,6 +14428,24 @@ session_reboot:
                    (unsigned long long)g_dirty_ram_insns_run, g_slice_exit_pc, g_slice_exit_reason,
                    g_slice_exit_iter, g_slice_exit_dispatchable, g_slice_exit_dirty,
                    g_slice_exit_in_text, g_slice_exit_want); }
+    /* pc=0 escape journal tail: names the exact runtime site that published
+     * (or rescued) each recent null PC, with frame/depth/ra/epc context —
+     * the play-build replacement for the debug-only fntrace ring, which is
+     * compiled out here (the exit trace JSON was blind: fntrace_seq=0). */
+    {
+        uint64_t n = g_pc0j_seq < PSX_PC0J_CAP ? g_pc0j_seq : PSX_PC0J_CAP;
+        std::fprintf(stdout, "psxrecomp runtime: [pc0 journal] %llu total, last %llu:\n",
+                     (unsigned long long)g_pc0j_seq, (unsigned long long)n);
+        for (uint64_t i = 0; i < n; i++) {
+            const Pc0JournalEntry *e =
+                &g_pc0j_ring[(g_pc0j_seq - n + i) % PSX_PC0J_CAP];
+            std::fprintf(stdout,
+                         "  seq=%llu site=%u frame=%u depth=%d a=0x%08X "
+                         "ra=0x%08X epc=0x%08X d=0x%08X\n",
+                         (unsigned long long)e->seq, e->site, e->frame,
+                         e->depth, e->a, e->b, e->c, e->d);
+        }
+    }
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();

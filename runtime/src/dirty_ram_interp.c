@@ -2756,6 +2756,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         g_sentinel_reach_dirty++;
         if (!psx_get_in_exception()) g_sentinel_reach_traps++; /* reuse: in_exc==0 dirty reaches */
         g_sentinel_reach_async = g_async_rfe_resume_pc;
+        psx_pc0_journal_note(PSX_PC0J_DIRTY_SENTINEL, cpu, addr,
+                             (psx_get_in_exception() ? 1u : 0u) |
+                             (g_async_rfe_resume_pc ? 2u : 0u));
         cpu->pc = 0;
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
@@ -3109,6 +3112,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             g_dirty_ram_last_unsupported_pc     = g_unsupported_pc;
             g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
             g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
+            psx_pc0_journal_note(PSX_PC0J_DIRTY_UNSUPPORTED, cpu,
+                                 g_unsupported_pc, g_unsupported_insn);
             cpu->pc = 0;
             OV_FPLOG_RET1();
         }

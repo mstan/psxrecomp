@@ -167,18 +167,34 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
     return ss.str();
 }
 
+/* Both check emitters honor an exception REDIRECT: when the delivery's
+ * epilogue publishes a resume PC different from this site's static
+ * continuation (guest RFE to a non-EPC target — longjmp-style handlers,
+ * SetCustomExitFromException, thread switch), the compiled code must
+ * surface it to the trampoline instead of overwriting it with the static
+ * transfer. This is the compiled analogue of the dirty interpreter's
+ * "Handler resumed elsewhere — surface to dispatch" contract; without it a
+ * baked/compiled leader silently drops the guest's continuation (WipEout 3
+ * static bake: deterministic top-level "execution completed, PC=0" ~10 s
+ * into boot, root-caused to redirects dropped at compiled leaders). A
+ * published pc equal to the static continuation falls through (same-thread
+ * restore publishes 0; the depth-guard rescue publishes the site PC). */
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
                                                 const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc) + indent +
+           fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+                       resume_pc);
 }
 
 std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
                                                      const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+           fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ ({})) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+                       resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {

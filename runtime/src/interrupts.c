@@ -1591,6 +1591,8 @@ irq_deliver_eval:
      * disarms the RFE-flag escape). */
     g_rfe_escape_pending = 0;
     {
+        extern uint32_t g_async_rfe_resume_pc;   /* dirty_ram_interp.c */
+        extern uint64_t g_async_rfe_set_count;
         uint32_t real_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                   : s_compiled_interrupt_resume_pc;
         /* Top-level flush_resume / savestate: resync cleared the latches and
@@ -1634,6 +1636,15 @@ irq_deliver_eval:
             cpu->cop0[COP0_EPC]  = real_pc;     /* architectural: the real resume PC */
             g_exception_real_epc = real_pc;
             g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE; /* set at the actual RFE/SYSCALL return */
+            /* Async-RFE latch (Tomba 2 frame-1997 fix): persist the most
+             * recent real interruption PC so a game-driven asynchronous
+             * ReturnFromException (sentinel RFE with in_exception==0, e.g. a
+             * card-ISR longjmp installed via HookEntryInt) resumes the guest
+             * here instead of resolving to pc=0 (abnormal top-level exit).
+             * The latch was documented but never assigned — the whole rescue
+             * in the traps/dirty sentinel gates was inert. */
+            g_async_rfe_resume_pc = real_pc;
+            g_async_rfe_set_count++;
         } else {
             uint32_t sentinel = PSX_EXC_SENTINEL_PC;
             cpu->write_word(sentinel, 0x00000000u); /* NOP, read by the handler's BD check */
@@ -1982,7 +1993,12 @@ irq_deliver_eval:
                 if (resume != 0u)
                     cpu->pc = resume;
                 /* else keep post-RFE cpu->pc — never publish 0 */
+                psx_pc0_journal_note(PSX_PC0J_IRQ_RESCUE, cpu, resume,
+                                     g_exc_escape_reason);
             } else {
+                psx_pc0_journal_note(PSX_PC0J_IRQ_SAME_THREAD, cpu,
+                                     s_compiled_interrupt_resume_pc,
+                                     g_exc_escape_reason);
                 cpu->pc = 0;   /* continue the interrupted live chain */
             }
         }

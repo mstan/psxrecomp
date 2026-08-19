@@ -240,6 +240,24 @@ enum {
 };
 uint32_t g_pc0_reason = PSX_PC0_GUEST_RETURN;
 
+/* pc=0 escape journal — see cpu_state.h for the site enum and rationale. */
+Pc0JournalEntry g_pc0j_ring[PSX_PC0J_CAP];
+uint64_t g_pc0j_seq = 0;
+void psx_pc0_journal_note(uint32_t site, CPUState *cpu, uint32_t a, uint32_t d)
+{
+    extern int g_psx_dispatch_depth;
+    extern uint64_t s_frame_count;   /* present frame counter (debug_server.c) */
+    Pc0JournalEntry *e = &g_pc0j_ring[g_pc0j_seq % PSX_PC0J_CAP];
+    e->seq   = g_pc0j_seq++;
+    e->site  = site;
+    e->frame = (uint32_t)s_frame_count;
+    e->depth = g_psx_dispatch_depth;
+    e->a = a;
+    e->b = cpu->gpr[31];
+    e->c = cpu->cop0[14];
+    e->d = d;
+}
+
 static uint32_t psx_current_tcb_ptr(CPUState* cpu)
 {
     uint32_t tcbh = cpu->read_word(0x00000108u);
@@ -555,6 +573,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     if (current_tcb == target_tcb) {
         debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
         g_pc0_reason = PSX_PC0_CHANGE_SELF;
+        psx_pc0_journal_note(PSX_PC0J_TRAP_CHANGE_SELF, cpu, target_tcb, 0);
         cpu->pc = 0;
         return 1;
     }
@@ -625,6 +644,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 
     debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
     g_pc0_reason = PSX_PC0_FIBER_SWITCH;
+    psx_pc0_journal_note(PSX_PC0J_TRAP_FIBER_SWITCH, cpu, 0, 0);
     cpu->pc = 0;
     return 1;
 }
@@ -943,6 +963,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
             cpu->gpr[2] = sr & 1u; /* return old IEc */
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_CRIT_ENTER, cpu, sr, 0);
             cpu->pc = 0;
             /* Directly handled "void" syscall. Return 0: under CPS the caller
              * (`if (psx_syscall(...)) return;`) falls through to the inline
@@ -955,6 +976,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_CRIT_EXIT, cpu, sr, 0);
             cpu->pc = 0;
             return 0;
 
@@ -1106,6 +1128,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * or uninitialized callback slot is dispatched. */
     if (addr == 0) {
         g_pc0_reason = PSX_PC0_DISPATCH_MISS; /* guest jumped/returned to a null (0) target */
+        psx_pc0_journal_note(PSX_PC0J_TRAP_NULL_TARGET, cpu, addr, 0);
         cpu->pc = 0;
         return;
     }
@@ -1117,6 +1140,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * the exception handler, longjmp back to psx_check_interrupts to
      * properly unwind the handler call tree. */
     if (addr == 0x80000048u && psx_get_in_exception()) {
+        psx_pc0_journal_note(PSX_PC0J_TRAP_SENTINEL, cpu, addr, 1);
         cpu->pc = 0;
         psx_exception_longjmp(); /* does not return */
     }
@@ -1136,6 +1160,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         g_sentinel_reach_async = g_async_rfe_resume_pc;
         if (g_async_rfe_resume_pc != 0u) {
             g_async_rfe_fire_count++;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_ASYNC_RFE, cpu,
+                                 g_async_rfe_resume_pc, 0);
             cpu->pc = g_async_rfe_resume_pc;
             return;
         }
@@ -1151,6 +1177,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * the psx_dispatch tail-call loop picking up $ra), it's a no-op — the
      * continuation was already handled by the merged function. */
     if (phys == 0x00000E10u) {
+        psx_pc0_journal_note(PSX_PC0J_TRAP_E10_NOOP, cpu, addr, 0);
         cpu->pc = 0;
         return;
     }
@@ -1422,6 +1449,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
          * ring-recorded above. Stale registers WILL corrupt the caller —
          * diagnostic use only. */
         g_pc0_reason = PSX_PC0_DISPATCH_MISS;
+        psx_pc0_journal_note(PSX_PC0J_TRAP_STALE_MISS, cpu, addr, 0);
         cpu->pc = 0;
     }
 }
