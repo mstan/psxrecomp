@@ -5259,6 +5259,19 @@ def main():
         if _env_cap != args.captures:
             print(f'[cache] PSX_OVERLAY_CAPTURES overrides --captures: {_env_cap}')
         args.captures = _env_cap
+    # Flavor is pinned by the spawning runtime the same way as the cache
+    # locations: --flavor defaults to 0 (play), so an instrumented (flavor 2)
+    # runtime used to spawn compiles whose shards its loader then rejected —
+    # every overlay ran interpreted on debug builds, silently.
+    _env_flavor = os.environ.get('PSX_OVERLAY_FLAVOR')
+    if _env_flavor:
+        try:
+            _fl = int(_env_flavor, 0)
+        except ValueError:
+            _fl = None
+        if _fl is not None and _fl != args.flavor:
+            print(f'[cache] PSX_OVERLAY_FLAVOR overrides --flavor: {_fl}')
+            args.flavor = _fl
     if not args.captures:
         ap.error('no captures file: set PSX_OVERLAY_CAPTURES (runtime injects it) '
                  'or pass --captures for manual/offline use')
