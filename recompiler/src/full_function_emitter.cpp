@@ -181,14 +181,14 @@ bool FullFunctionEmitter::emit_function(
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
                fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", rt) + indent +
-               fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n", rt);
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n", rt);
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
                fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
-               fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ ({})) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
                            resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
@@ -1247,7 +1247,7 @@ bool FullFunctionEmitter::emit_function(
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
                 "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
-                "        if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n"
+                "        if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume */\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
                 addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc, ram_pc);

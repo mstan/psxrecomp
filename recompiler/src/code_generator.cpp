@@ -184,7 +184,7 @@ std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
            fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc) + indent +
-           fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
                        resume_pc);
 }
 
@@ -193,7 +193,7 @@ std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_p
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
            fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
-           fmt::format("if (cpu->pc != 0u && ((cpu->pc ^ ({})) & 0x1FFFFFFFu)) return;  /* IRQ redirect */\n",
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
                        resume_pc_expr);
 }
 
