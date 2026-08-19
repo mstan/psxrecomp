@@ -109,6 +109,8 @@ uint64_t sio_get_advance_with_work(void);
  * Bulk 0x80 responses follow the real TAP/REQ latch (psx-spx): REQ=1 in the
  * third command byte arms the *next* transfer; empty tap slots are fine. */
 void sio_set_multitap(int enabled);
+/* [runtime] ape_card_unstick config default (env PSX_APE_CARD_UNSTICK overrides). */
+void sio_set_ape_card_unstick(int on);
 int  sio_get_multitap(void);
 /* phys_port: 0 = console Port 1, 1 = console Port 2. Default 0. */
 void sio_set_multitap_port(int phys_port);

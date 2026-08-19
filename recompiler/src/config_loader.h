@@ -243,6 +243,14 @@ struct RuntimeConfig {
     // Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
 
+    // Ape Escape LOAD card-IRQ unstick pump ([runtime] ape_card_unstick).
+    // A per-game kernel-nest repair that force-re-edges I_MASK.7/IRQ7 after a
+    // LOAD-style probe abort. OPT-IN: on WipEout 3 under the x2 CRTC the
+    // arming detector misfires and the forced IRQ storm wedges the kernel
+    // card driver (completion events never deliver -> memcard screen hangs).
+    // Env PSX_APE_CARD_UNSTICK=0/1 still overrides either way.
+    bool                  ape_card_unstick = false;
+
     // bios_hle: High-Level Emulation tier for BIOS kernel services
     // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). DEFAULT ON as of
     // 2026-07-06 (user-directed player default: instant boot-skip for every

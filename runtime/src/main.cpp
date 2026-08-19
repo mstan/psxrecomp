@@ -11587,6 +11587,7 @@ int main(int argc, char** argv) {
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            sio_set_ape_card_unstick(gc.runtime.ape_card_unstick ? 1 : 0);
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
             /* Developer compatibility finding, applied before BIOS selection.

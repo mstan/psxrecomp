@@ -495,15 +495,24 @@ static int s_ape_unstick_pending = 0;
 static uint64_t s_ape_unstick_cool_cyc = 0;
 static int s_ape_torn_pulses = 0;
 
+/* Config default ([runtime] ape_card_unstick), set at boot. OFF unless the
+ * game opts in: this pump force-re-edges I_MASK.7/IRQ7, and a misfired arm
+ * (WipEout 3 under the x2 CRTC) storms the kernel card ISR so completion
+ * events never deliver and the memcard screen hangs forever. */
+static int s_ape_unstick_cfg = 0;
+void sio_set_ape_card_unstick(int on) { s_ape_unstick_cfg = on ? 1 : 0; }
+
 static int ape_unstick_enabled(void) {
     if (s_ape_unstick_env < 0) {
         const char *e = getenv("PSX_APE_CARD_UNSTICK");
-        if (e && e[0] == '0')
-            s_ape_unstick_env = 0;
+        if (e && e[0])
+            s_ape_unstick_env = (e[0] == '0') ? 0 : 1;
         else
-            s_ape_unstick_env = 1;
+            s_ape_unstick_env = -2;   /* no env: fall through to config */
     }
-    return s_ape_unstick_env;
+    if (s_ape_unstick_env >= 0)
+        return s_ape_unstick_env;
+    return s_ape_unstick_cfg;
 }
 
 /* Defined later; sio_tick calls the pump. */

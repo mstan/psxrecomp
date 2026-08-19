@@ -466,6 +466,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
+    if (runtime.contains("ape_card_unstick")) {
+        rt.ape_card_unstick = toml::find<bool>(runtime, "ape_card_unstick");
+    }
     if (runtime.contains("openbios")) {
         rt.openbios = toml::find<bool>(runtime, "openbios");
     }
