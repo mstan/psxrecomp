@@ -131,6 +131,10 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <map>
+#ifdef _WIN32
+#include <psapi.h>   /* GetModuleInformation (self-profile sampler) */
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -10954,6 +10958,62 @@ namespace {
 }  // namespace
 #endif
 
+/* PSX_SELF_PROFILE=<seconds>: 1 kHz instruction-pointer sampler over the main
+ * (emu) thread, histogrammed by exe-relative offset and dumped to
+ * psx_self_profile.txt at the end of the window. Play-build-safe hot-spot
+ * attribution without WPA/ETL symbolization: feed the offsets (plus the PE
+ * link base 0x140000000) to llvm-addr2line -e <exe>. Env-gated diagnostic —
+ * zero cost when unset. */
+#ifdef _WIN32
+struct SelfProfArgs { HANDLE thread; int seconds; };
+static DWORD WINAPI self_profile_thread(LPVOID param) {
+    SelfProfArgs *a = (SelfProfArgs *)param;
+    const int n = a->seconds * 1000;
+    static uintptr_t rips[600000];
+    int count = 0;
+    HMODULE exe = GetModuleHandleA(NULL);
+    MODULEINFO mi; memset(&mi, 0, sizeof(mi));
+    GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof(mi));
+    uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
+    uintptr_t size = (uintptr_t)mi.SizeOfImage;
+    for (int i = 0; i < n && count < 600000; i++) {
+        Sleep(1);
+        if (SuspendThread(a->thread) == (DWORD)-1) continue;
+        CONTEXT ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(a->thread, &ctx)) rips[count++] = (uintptr_t)ctx.Rip;
+        ResumeThread(a->thread);
+    }
+    /* Bucket by 64-byte line inside the exe; everything else = external. */
+    std::map<uintptr_t, int> hist;
+    int external = 0;
+    for (int i = 0; i < count; i++) {
+        if (rips[i] >= base && rips[i] < base + size)
+            hist[(rips[i] - base) & ~63ull]++;
+        else external++;
+    }
+    std::vector<std::pair<int, uintptr_t>> top;
+    for (auto &kv : hist) top.push_back({kv.second, kv.first});
+    std::sort(top.rbegin(), top.rend());
+    FILE *f = fopen("psx_self_profile.txt", "wb");
+    if (f) {
+        fprintf(f, "samples=%d external=%d (exe base offsets, 64B buckets; "
+                   "addr2line VA = 0x140000000 + offset)
+", count, external);
+        for (size_t i = 0; i < top.size() && i < 120; i++)
+            fprintf(f, "%6d  0x%llx
+", top[i].first,
+                    (unsigned long long)top[i].second);
+        fclose(f);
+    }
+    fprintf(stdout, "psxrecomp: [self-profile] %d samples (%d external) -> psx_self_profile.txt
+",
+            count, external);
+    fflush(stdout);
+    return 0;
+}
+#endif
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
@@ -11960,6 +12020,20 @@ int main(int argc, char** argv) {
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+#ifdef _WIN32
+    if (const char *e = std::getenv("PSX_SELF_PROFILE")) {
+        int secs = atoi(e);
+        if (secs > 0) {
+            static SelfProfArgs spa;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                            GetCurrentProcess(), &spa.thread,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+            spa.seconds = secs;
+            CreateThread(NULL, 0, self_profile_thread, &spa, 0, NULL);
+            std::fprintf(stdout, "psxrecomp: [self-profile] armed for %d s\n", secs);
+        }
+    }
+#endif
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))

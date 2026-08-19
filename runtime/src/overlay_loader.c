@@ -638,6 +638,57 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     return matches;
 }
 
+/* Memoized per-variant matcher — the static bake emits one private
+ * state[2] per variant and passes it here, replacing the shared 4096-slot
+ * cache above for baked identities. That cache serviced 80k+ variants with
+ * no eviction: the first ~4096 tuples dispatched owned it forever and every
+ * other variant paid a full-table probe plus a full code-CRC on EVERY
+ * dispatch (measured as the boot-order-dependent 0.83-1.02x fps seesaw).
+ * Here a repeat call is the gen-sum loop plus one compare; the CRC runs only
+ * on first sight or after a real write to a covered page. Invalidation
+ * semantics are identical (overlay_watch_pagegen_sum).
+ * state[0] = gen_sum at last verify; state[1] = bit0 valid, bit1 verdict. */
+int psx_overlay_static_code_matches_memo(const uint32_t *lo_len_pairs,
+                                         uint32_t count,
+                                         uint32_t expected_crc,
+                                         uint32_t state[2]) {
+    const uint8_t *ram = memory_get_ram_ptr();
+    if (!ram || !lo_len_pairs || count == 0u || count > 4096u) {
+        s_static_match_crc_misses++;
+        return 0;
+    }
+    uint32_t gen_sum = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0u || lo >= 8u * 1024u * 1024u ||
+            len > 8u * 1024u * 1024u - lo) {
+            s_static_match_crc_misses++;
+            return 0;
+        }
+        gen_sum += overlay_watch_pagegen_sum(lo, len);
+    }
+    if ((state[1] & 1u) && state[0] == gen_sum) {
+        s_static_match_gen_fastpath++;
+        return (int)((state[1] >> 1) & 1u);
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        crc = crc32_update(crc, ram + lo, len);
+    }
+    crc ^= 0xFFFFFFFFu;
+    {
+        int matches = (crc == expected_crc) ? 1 : 0;
+        s_static_match_rehashes++;
+        if (!matches) s_static_match_crc_misses++;
+        state[0] = gen_sum;
+        state[1] = 1u | (matches ? 2u : 0u);
+        return matches;
+    }
+}
+
 void overlay_loader_static_match_stats(uint64_t *rehashes,
                                        uint64_t *crc_misses,
                                        uint64_t *gen_fastpath) {

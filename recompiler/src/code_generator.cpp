@@ -1868,7 +1868,7 @@ std::string CodeGenerator::translate_basic_block(
         if (!(insn_addr == block.start_addr || (insn_addr & 0xCu) == 0 ||
               extra_labels_.count(insn_addr))) return;
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", insn_addr);
+        ss << indent << fmt::format("PSX_ICACHE_FETCH(cpu, 0x{:08X}u);\n", insn_addr);
         ss << "#endif\n";
     };
     auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {
@@ -2582,6 +2582,11 @@ std::string CodeGenerator::translate_basic_block(
             ss << config_.indent
                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
                               next_addr);
+        } else {
+            // Non-CPS legacy: the check-only fall-through remains valid (the
+            // function nests; a C return continues the caller). Same split as
+            // upstream PR #161.
+            ss << emit_interrupt_check(next_addr, config_.indent);
         }
     }
 
@@ -3486,6 +3491,17 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
+    // Per-instruction i-cache fetch: in-process builds (static bake / AOT)
+    // use the inline tag-hit (psx_icache.h) — the out-of-line call per
+    // instruction was a measured steady-state tax. DLL shards cannot touch
+    // host globals directly and keep the exported slow entry (identical
+    // cache evolution; the inline's miss path IS that entry).
+    ss << "#ifdef PSX_OVERLAY_DLL_BUILD\n"
+          "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch((c),(a))\n"
+          "#else\n"
+          "#include \"psx_icache.h\"\n"
+          "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+          "#endif\n\n";
     emit_runtime_externs(ss);
     emit_unaligned_helpers(ss, /*as_inline=*/false);
 

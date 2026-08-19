@@ -758,7 +758,7 @@ bool FullFunctionEmitter::emit_function(
     auto emit_icache_fetch = [&](uint32_t rom_addr) {
         if (!per_insn_cycles) return;
         if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_interp(cpu, 0x{:08X}u);\n#endif\n",
                            relocate_ra(rom_addr));
     };
 
@@ -1708,6 +1708,10 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
     out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
+    out += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
+    out += "#ifndef PSX_ICACHE_FETCH\n"
+           "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+           "#endif\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
@@ -1984,7 +1988,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        (w1 & 0xFFFF0000u) != 0x25080000u ||\n";
     out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    out += "    psx_icache_fetch(cpu, addr);\n";
+    out += "    psx_icache_fetch_interp(cpu, addr);\n";
     out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
                        psx_cyc_dep_res_mask(0x3C080000u));
     out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
@@ -2394,6 +2398,10 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
     full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
+    full_c += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
+    full_c += "#ifndef PSX_ICACHE_FETCH\n"
+              "#define PSX_ICACHE_FETCH(c,a) psx_icache_fetch_interp((c),(a))\n"
+              "#endif\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";

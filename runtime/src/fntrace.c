@@ -133,6 +133,13 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     /* The BIOS has completed the PS-X EXE load by the time it dispatches the
      * entry point. Apply the validated plan before the first guest instruction. */
     mod_runtime_on_dispatch(target);
+    /* Play builds (PSX_NO_DEBUG_TOOLS): the tail/SP-domain rings have no
+     * reader — the TCP server that dumps them is compiled out — so their
+     * per-dispatch writes (incl. a psx_get_cycle_count() call each) are pure
+     * tax at ~1M dispatches/s. Post-mortem forensics in play builds is
+     * carried by the pc0 escape journal (traps.c), which records only the
+     * rare events. Debug builds keep both rings always-on, as designed. */
+#ifndef PSX_NO_DEBUG_TOOLS
     {
         extern uint64_t psx_get_cycle_count(void);
         DispTailEntry *t = &g_disp_tail[g_disp_tail_seq % DISP_TAIL_CAP];
@@ -163,6 +170,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             s_spdom_prev_sp = sp_now;
         }
     }
+#endif /* !PSX_NO_DEBUG_TOOLS */
 
     /* On-the-fly string translation (framework feature — text_xlate.cpp). The
      * generated psx_dispatch_impl calls us at the top of each dispatch iteration
