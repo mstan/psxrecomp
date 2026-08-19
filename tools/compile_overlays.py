@@ -2283,6 +2283,13 @@ def generate_overlay_dispatch(variants: list) -> str:
         'extern int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,',
         '                                           uint32_t count,',
         '                                           uint32_t expected_crc);',
+        '/* Memoized variant (overlay_loader.c): one private state[2] per',
+        ' * variant kills the shared match cache (4096 slots for 80k+ variants',
+        ' * = permanent eviction = full CRC per dispatch for the losers). */',
+        'extern int psx_overlay_static_code_matches_memo(const uint32_t *lo_len_pairs,',
+        '                                                uint32_t count,',
+        '                                                uint32_t expected_crc,',
+        '                                                uint32_t state[2]);',
         'static uint64_t psx_ov_static_checks = 0;',
         'static uint64_t psx_ov_static_hits = 0;',
         'static uint64_t psx_ov_static_variant_misses = 0;',
@@ -2296,6 +2303,8 @@ def generate_overlay_dispatch(variants: list) -> str:
         lines.append(
             f'static const uint32_t {variant["range_symbol"]}[] = '
             '{ ' + ', '.join(flat) + ' };')
+        lines.append(
+            f'static uint32_t {variant["range_symbol"]}_st[2];')
 
     lines += [
         '',
@@ -2318,9 +2327,9 @@ def generate_overlay_dispatch(variants: list) -> str:
             count = len(variant['ranges'])
             lines += [
                 '            psx_ov_static_checks++;',
-                f'            if (psx_overlay_static_code_matches('
+                f'            if (psx_overlay_static_code_matches_memo('
                 f'{variant["range_symbol"]}, {count}u, '
-                f'0x{variant["crc"]:08X}u)) {{',
+                f'0x{variant["crc"]:08X}u, {variant["range_symbol"]}_st)) {{',
                 '                psx_ov_static_hits++;',
                 f'                {variant["symbol"]}(cpu);',
                 '                return 1;',
