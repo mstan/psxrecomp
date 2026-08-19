@@ -2923,8 +2923,16 @@ static int present_should_wall_pace(void) {
 static void apply_present_cadence(void) {
 #ifndef PSX_SDL_NO_RENDER
     const int interval = present_effective_swap_interval();
-    if (g_gl_active)
+    if (g_gl_active) {
         gl_renderer_set_swap_interval(interval);
+        /* Swap-is-the-clock: with a nonzero interval and vsync owning
+         * cadence, every vblank MUST swap — an unchanged-frame present skip
+         * would silently unpace that frame (the "fps readout off makes it
+         * stupid fast" bug: the readout's OSD line forced per-frame swaps
+         * and masked the hole). */
+        gl_renderer_set_swap_paces(interval != 0 &&
+                                   present_vsync_owns_cadence());
+    }
     if (g_vk_active)
         vk_renderer_set_present_mode(interval);
     if (sdl_renderer)

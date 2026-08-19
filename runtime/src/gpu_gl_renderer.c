@@ -3832,6 +3832,16 @@ int gl_renderer_cpu_auth_dual(void) {
     return s_cpu_auth_dual;
 }
 
+/* When driver vsync owns the frame cadence, the blocking Swap IS the game's
+ * clock: skipping the swap on an unchanged frame silently unpaces that frame
+ * and the sim sprints (WipEout 3 at 30 Hz sim: every other vblank renders
+ * nothing new, so "fps readout off" ran the game at a fluctuating ~2x — the
+ * readout's persistent OSD line forced a swap per frame and masked it).
+ * Real hardware scans out every vblank regardless of change; when the swap
+ * paces, so do we. Set from apply_present_cadence(). */
+static int s_swap_paces = 0;
+void gl_renderer_set_swap_paces(int on) { s_swap_paces = on ? 1 : 0; }
+
 void gl_renderer_present_probe_reset(void) {
     s_probe_skip = 0;
     s_probe_swap = 0;
@@ -4930,59 +4940,6 @@ int gl_renderer_set_bezel(const void *rgba, int w, int h) {
 
 int gl_renderer_has_bezel(void) { return s_bezel_tex != 0; }
 
-/* Draw the bezel into ONE viewport, cover-cropped to that viewport's aspect.
- *
- * Cover, not stretch: scale to fill and crop the overflow, centred. Stretching
- * distorts any artwork whose aspect does not match, and a margin rarely does --
- * a portrait poster squeezed across a 7680-wide window is unrecognisable, while
- * the same poster cover-cropped into a tall narrow margin fits it naturally. */
-/* Tile the bezel down one margin, preserving the logo's aspect.
- *
- * A margin is tall and narrow; a single logo stretched to fill it would be
- * grotesque and cover-cropping one would show a sliver. Tiling keeps every
- * copy at its authored proportions and fills any margin size, which is what a
- * repeating mark is for. The count is derived from the margin width so the
- * logo reads at a consistent size regardless of resolution or window shape. */
-static void bezel_draw_rect(int vx, int vy, int vw, int vh) {
-    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
-    const float img = (float)s_bezel_w / (float)s_bezel_h;
-    /* One logo spans the margin width, with a little air either side. */
-    const float tile_w = 1.0f / 0.78f;
-    /* Repeats needed vertically for each tile to keep the logo's own aspect:
-     * a tile is (vw/tile_w) wide on screen, so it must be (vw/tile_w)/img tall,
-     * and vh divided by that is the count. Previously this DIVIDED by img
-     * instead of multiplying, squashing every mark by img^2 -- 1.7x on the
-     * 1024x778 marks, which is the stretched look. */
-    const float tile_h = img * tile_w * (float)vh / (float)vw;
-    glViewport(vx, vy, vw, vh);
-    p_glUniform4f(s_present_uUvRect,
-                  -(tile_w - 1.0f) * 0.5f, 0.0f,
-                   (tile_w + 1.0f) * 0.5f, tile_h);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-}
-
-/* Tile the bezel along a letterbox BAND (top/bottom margin): the transpose of
- * bezel_draw_rect. A band is short and wide, so one logo spans the band
- * HEIGHT (same air factor as the margins use for width) and repeats across,
- * each copy at its authored aspect -- the marks read at the same size in the
- * bands as in the side margins, which is what makes the frame look like one
- * bezel instead of two different treatments. */
-static void bezel_draw_band(int vx, int vy, int vw, int vh) {
-    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
-    const float img = (float)s_bezel_w / (float)s_bezel_h;
-    /* One logo spans the band height, with a little air above and below. */
-    const float tile_h = 1.0f / 0.78f;
-    /* Horizontal repeats so each tile keeps the logo's own aspect: a tile is
-     * (vh/tile_h) tall on screen, so it must be (vh/tile_h)*img wide, and vw
-     * divided by that is the count. */
-    const float tile_w = tile_h * (float)vw / ((float)vh * img);
-    glViewport(vx, vy, vw, vh);
-    p_glUniform4f(s_present_uUvRect,
-                  0.0f, -(tile_h - 1.0f) * 0.5f,
-                  tile_w, (tile_h + 1.0f) * 0.5f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-}
-
 /* Padding shade: a procedural darkening gradient drawn OVER the bezel layer,
  * derived from the live viewport rectangle. The area adjacent to the game is
  * near-black and low-contrast; the pattern re-emerges gradually toward the
@@ -4998,31 +4955,85 @@ static void bezel_draw_band(int vx, int vy, int vw, int vh) {
 static const char *BEZEL_SHADE_FS =
     "#version 330\n"
     "in vec2 v_uv; out vec4 frag;\n"
-    "uniform int  u_axis;\n"   /* 0: gradient along X, 1: along Y */
-    "uniform vec2 u_a;\n"      /* black alpha at t=0 / t=1 */
+    "uniform sampler2D u_tex;\n"
+    "uniform int   u_tex_on;\n"  /* 1: dimmed artwork; 0: SDF black shade    */
+    "uniform vec4  u_view;\n"    /* game viewport rect, window px: x,y,w,h   */
+    "uniform vec4  u_rgba;\n"    /* shade color (rgb); .a = art dim factor   */
+    "uniform vec2  u_a;\n"       /* alpha at dist 0 / at dist >= u_fall      */
+    "uniform float u_fall;\n"    /* falloff length in px                     */
     "void main(){\n"
-    "  float t = (u_axis == 1) ? v_uv.y : v_uv.x;\n"
-    "  float a = mix(u_a.x, u_a.y, smoothstep(0.0, 1.0, t));\n"
-    "  frag = vec4(0.0, 0.0, 0.0, a);\n"
+    "  if (u_tex_on == 1) {\n"
+    "    vec4 t = texture(u_tex, v_uv);\n"
+    "    frag = vec4(t.rgb, t.a * u_rgba.a);\n"
+    "    return;\n"
+    "  }\n"
+    "  vec2 p  = gl_FragCoord.xy;\n"
+    "  vec2 mn = u_view.xy;\n"
+    "  vec2 mx = u_view.xy + u_view.zw;\n"
+    "  vec2 dv = max(vec2(0.0), max(mn - p, p - mx));\n"
+    "  float d = clamp(length(dv) / max(u_fall, 1.0), 0.0, 1.0);\n"
+    "  float a = mix(u_a.x, u_a.y, smoothstep(0.0, 1.0, d));\n"
+    "  frag = vec4(u_rgba.rgb, a);\n"
     "}\n";
 static GLuint s_bezel_shade_prog = 0;
-static GLint  s_bezel_shade_uAxis = -1, s_bezel_shade_uA = -1,
+static GLint  s_bezel_shade_uTex = -1, s_bezel_shade_uTexOn = -1,
+              s_bezel_shade_uView = -1, s_bezel_shade_uRgba = -1,
+              s_bezel_shade_uA = -1, s_bezel_shade_uFall = -1,
               s_bezel_shade_uRect = -1;
 /* Fade-in state: restarted whenever the viewport rect moves. */
 static int      s_bezel_prev_rect[4] = { -1, -1, -1, -1 };
 static uint64_t s_bezel_fade_start_ms = 0;
-#define BEZEL_FADE_MS      200.0f
-#define BEZEL_SHADE_NEAR   0.94f   /* padding beside the game: near-black   */
-#define BEZEL_SHADE_FAR    0.72f   /* outer screen edge: pattern stays faint */
+#define BEZEL_FADE_MS       200.0f
+#define BEZEL_SHADE_NEAR    0.92f  /* beside the game: near-black ground    */
+#define BEZEL_SHADE_FAR     0.40f  /* outer screen edge: ground shows most  */
+#define BEZEL_WATERMARK_A   0.22f  /* single mark, pre-shade                */
+#define BEZEL_SEAM_A        0.32f  /* hairline at the viewport boundary     */
 
 extern uint64_t psx_host_mono_ms(void);
 
-static void bezel_shade_rect(int vx, int vy, int vw, int vh,
-                             int axis, float a0, float a1) {
+/* SDF shade / seam quad: alpha follows distance-to-viewport (u_tex_on=0). */
+static void bezel_sdf_rect(int vx, int vy, int vw, int vh,
+                           float r, float g, float b,
+                           float a0, float a1,
+                           const float view[4], float fall) {
     if (vw <= 0 || vh <= 0) return;
     glViewport(vx, vy, vw, vh);
-    p_glUniform1i(s_bezel_shade_uAxis, axis);
+    p_glUniform1i(s_bezel_shade_uTexOn, 0);
+    p_glUniform4f(s_bezel_shade_uView, view[0], view[1], view[2], view[3]);
+    p_glUniform4f(s_bezel_shade_uRgba, r, g, b, 0.0f);
     p_glUniform2f(s_bezel_shade_uA, a0, a1);
+    p_glUniform1f(s_bezel_shade_uFall, fall);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* Tiled marks down a column / across a band, drawn through the shade
+ * program's texture mode so the whole pattern carries one dim factor. Same
+ * authored-aspect tiling math as the original bezel: one mark spans the
+ * margin's short dimension (with a little air), repeats along the long one. */
+static void bezel_tiles_col(int vx, int vy, int vw, int vh, float alpha) {
+    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
+    const float img = (float)s_bezel_w / (float)s_bezel_h;
+    const float tile_w = 1.0f / 0.78f;
+    const float tile_h = img * tile_w * (float)vh / (float)vw;
+    glViewport(vx, vy, vw, vh);
+    p_glUniform1i(s_bezel_shade_uTexOn, 1);
+    p_glUniform4f(s_bezel_shade_uRgba, 0.0f, 0.0f, 0.0f, alpha);
+    p_glUniform4f(s_bezel_shade_uRect,
+                  -(tile_w - 1.0f) * 0.5f, 0.0f,
+                   (tile_w + 1.0f) * 0.5f, tile_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+static void bezel_tiles_band(int vx, int vy, int vw, int vh, float alpha) {
+    if (vw <= 0 || vh <= 0 || s_bezel_w <= 0 || s_bezel_h <= 0) return;
+    const float img = (float)s_bezel_w / (float)s_bezel_h;
+    const float tile_h = 1.0f / 0.78f;
+    const float tile_w = tile_h * (float)vw / ((float)vh * img);
+    glViewport(vx, vy, vw, vh);
+    p_glUniform1i(s_bezel_shade_uTexOn, 1);
+    p_glUniform4f(s_bezel_shade_uRgba, 0.0f, 0.0f, 0.0f, alpha);
+    p_glUniform4f(s_bezel_shade_uRect,
+                  0.0f, -(tile_h - 1.0f) * 0.5f,
+                  tile_w, (tile_h + 1.0f) * 0.5f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -5067,22 +5078,28 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
                           GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    if (lx > 0)      bezel_draw_rect(0, 0, lx, wh);
-    if (right_w > 0) bezel_draw_rect(right_x, 0, right_w, wh);
-    if (top_h > 0)   bezel_draw_band(band_x, top_y, band_w, top_h);
-    if (bot_h > 0)   bezel_draw_band(band_x, 0, band_w, bot_h);
-
-    /* Shade the padding: near-black beside the viewport, easing out to a
-     * faint pattern at the screen edges; the whole layer fades in from black
-     * for ~200 ms after the viewport rect moves. Drawn over backdrop+tiles,
-     * never over the game rect. */
+    /* "Mounted screen" treatment: the game sits on a deep-tinted ground (the
+     * scissor clears above already laid s_bezel_bg over every padding rect).
+     * One large watermark mark per padding region — no tiling, so the
+     * padding can never turn into wallpaper — then a distance-field shade
+     * that darkens toward the viewport from every direction at once, and a
+     * hairline seam that terminates the game rect cleanly. The whole layer
+     * fades in from black for ~200 ms after the viewport rect moves. */
     if (!s_bezel_shade_prog) {
         s_bezel_shade_prog = build_program(PRESENT_VS, BEZEL_SHADE_FS);
         if (s_bezel_shade_prog) {
-            s_bezel_shade_uAxis =
-                p_glGetUniformLocation(s_bezel_shade_prog, "u_axis");
+            s_bezel_shade_uTex =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_tex");
+            s_bezel_shade_uTexOn =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_tex_on");
+            s_bezel_shade_uView =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_view");
+            s_bezel_shade_uRgba =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_rgba");
             s_bezel_shade_uA =
                 p_glGetUniformLocation(s_bezel_shade_prog, "u_a");
+            s_bezel_shade_uFall =
+                p_glGetUniformLocation(s_bezel_shade_prog, "u_fall");
             s_bezel_shade_uRect =
                 p_glGetUniformLocation(s_bezel_shade_prog, "u_uv_rect");
         }
@@ -5099,22 +5116,63 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
         if (fade < 0.0f) fade = 0.0f;
         if (fade > 1.0f) fade = 1.0f;
         fade = fade * fade * (3.0f - 2.0f * fade);
-        /* At fade=0 the padding is solid black; at fade=1 the resting
-         * gradient (near/far) stands. Affine per endpoint, so folding the
-         * fade into the endpoints is exact. */
-        const float a_near = 1.0f - fade * (1.0f - BEZEL_SHADE_NEAR);
-        const float a_far  = 1.0f - fade * (1.0f - BEZEL_SHADE_FAR);
+
         p_glUseProgram(s_bezel_shade_prog);
         p_glUniform4f(s_bezel_shade_uRect, 0.0f, 0.0f, 1.0f, 1.0f);
-        /* v_uv.y is 1 at the BOTTOM of the drawn rect (PRESENT_VS V-flip). */
-        if (lx > 0)                       /* near edge = right side (t=1)   */
-            bezel_shade_rect(0, 0, lx, wh, 0, a_far, a_near);
-        if (right_w > 0)                  /* near edge = left side (t=0)    */
-            bezel_shade_rect(right_x, 0, right_w, wh, 0, a_near, a_far);
-        if (top_h > 0)                    /* near edge = band bottom (t=1)  */
-            bezel_shade_rect(band_x, top_y, band_w, top_h, 1, a_far, a_near);
-        if (bot_h > 0)                    /* near edge = band top (t=0)     */
-            bezel_shade_rect(band_x, 0, band_w, bot_h, 1, a_near, a_far);
+        p_glUniform1i(s_bezel_shade_uTex, 0);
+
+        /* Tiled pattern per padding region, drawn at watermark subtlety —
+         * the SDF shade below then recedes it further toward the game. */
+        const float wm_a = BEZEL_WATERMARK_A * fade;
+        const float min_dim = (float)(ww < wh ? ww : wh);
+        if (wm_a > 0.003f) {
+            if (lx > 0)      bezel_tiles_col(0, 0, lx, wh, wm_a);
+            if (right_w > 0) bezel_tiles_col(right_x, 0, right_w, wh, wm_a);
+            if (top_h > 0)   bezel_tiles_band(band_x, top_y, band_w, top_h,
+                                              wm_a);
+            if (bot_h > 0)   bezel_tiles_band(band_x, 0, band_w, bot_h, wm_a);
+        }
+
+        /* Distance-field shade over ground + watermark: near-black beside
+         * the game, easing out over a wide falloff. At fade=0 both endpoints
+         * are 1.0 (solid black) — the transition state. */
+        const float a_near = 1.0f - fade * (1.0f - BEZEL_SHADE_NEAR);
+        const float a_far  = 1.0f - fade * (1.0f - BEZEL_SHADE_FAR);
+        const float fall = min_dim * 0.30f;
+        const float view[4] = { (float)lx, (float)ly, (float)lw, (float)lh };
+        if (lx > 0)
+            bezel_sdf_rect(0, 0, lx, wh, 0.0f, 0.0f, 0.0f,
+                           a_near, a_far, view, fall);
+        if (right_w > 0)
+            bezel_sdf_rect(right_x, 0, right_w, wh, 0.0f, 0.0f, 0.0f,
+                           a_near, a_far, view, fall);
+        if (top_h > 0)
+            bezel_sdf_rect(band_x, top_y, band_w, top_h, 0.0f, 0.0f, 0.0f,
+                           a_near, a_far, view, fall);
+        if (bot_h > 0)
+            bezel_sdf_rect(band_x, 0, band_w, bot_h, 0.0f, 0.0f, 0.0f,
+                           a_near, a_far, view, fall);
+
+        /* Hairline seam: a light terminator where the game meets the
+         * padding, so the viewport reads as mounted. Constant alpha (both
+         * endpoints equal), scaled with resolution so it survives 4K/8K. */
+        const float seam_a = BEZEL_SEAM_A * fade;
+        if (seam_a > 0.003f) {
+            int t = (int)(min_dim / 720.0f + 0.5f);
+            if (t < 1) t = 1;
+            if (lx > 0)
+                bezel_sdf_rect(lx - t, ly, t, lh, 0.62f, 0.62f, 0.66f,
+                               seam_a, seam_a, view, 1.0f);
+            if (right_w > 0)
+                bezel_sdf_rect(right_x, ly, t, lh, 0.62f, 0.62f, 0.66f,
+                               seam_a, seam_a, view, 1.0f);
+            if (top_h > 0)
+                bezel_sdf_rect(lx - t, top_y, lw + 2 * t, t,
+                               0.62f, 0.62f, 0.66f, seam_a, seam_a, view, 1.0f);
+            if (bot_h > 0)
+                bezel_sdf_rect(lx - t, ly - t, lw + 2 * t, t,
+                               0.62f, 0.62f, 0.66f, seam_a, seam_a, view, 1.0f);
+        }
     }
     glDisable(GL_BLEND);
     p_glBindVertexArray(0);
