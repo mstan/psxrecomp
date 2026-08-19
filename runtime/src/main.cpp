@@ -1192,6 +1192,7 @@ static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
 static int           g_hd_textures    = 0;
 static int           g_hd_texture_dump = 0;
 static std::string   g_hd_texture_dir;   /* relocates the whole convention (dev knob) */
+static std::vector<std::string> g_hd_texture_exclude; /* [video] hd_texture_exclude */
 static std::string   g_hd_texture_pack;  /* the active pack folder itself (manager) */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
@@ -11343,6 +11344,7 @@ int main(int argc, char** argv) {
             g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
+            g_hd_texture_exclude = gc.runtime.video_hd_texture_exclude;
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -13148,6 +13150,14 @@ int main(int argc, char** argv) {
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
                   g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
+    /* Config-owned exclusions survive pack-directory regeneration (the pack
+     * dir is gitignored game content; losing its exclude.txt silently
+     * re-enabled font-atlas substitution - the doubled-glyph defect). */
+    for (const std::string &hx : g_hd_texture_exclude) {
+        unsigned h = 0;
+        if (std::sscanf(hx.c_str(), "%x", &h) == 1)
+            tex_pack_add_excluded((uint32_t)h);
+    }
     /* Coverage report for the launcher's per-pack stats. atexit alongside the
      * other end-of-session flushes; a no-op when no pack is active. */
     std::atexit(tex_pack_write_coverage);

@@ -471,6 +471,13 @@ struct RuntimeConfig {
     // authored for RetroArch already expects to sit.
     std::string           video_hd_texture_dir;
 
+    // hd_texture_exclude: texture hashes (hex) never substituted from the HD
+    // pack, merged with the pack dir's optional exclude.txt. Config-owned so
+    // the exclusions survive pack-directory regeneration - the pack dir is
+    // game content (gitignored), and losing its exclude.txt silently
+    // re-enabled font-atlas substitution (the doubled-glyph defect).
+    std::vector<std::string> video_hd_texture_exclude;
+
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
     // fraction away when it saturates SXY to integer screen pixels; vertices of

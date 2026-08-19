@@ -651,6 +651,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("hd_texture_dir")) {
             rt.video_hd_texture_dir = toml::find<std::string>(video, "hd_texture_dir");
         }
+        if (video.contains("hd_texture_exclude")) {
+            rt.video_hd_texture_exclude =
+                toml::find<std::vector<std::string>>(video, "hd_texture_exclude");
+        }
         if (video.contains("geometry_correction")) {
             rt.video_geometry_correction =
                 toml::find<bool>(video, "geometry_correction");

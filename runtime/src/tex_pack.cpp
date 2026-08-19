@@ -371,6 +371,12 @@ void dump_upload(const Upload &up, int depth, int clut_x, int clut_y, uint32_t p
 
 /* ---- public API -------------------------------------------------------- */
 
+/* Config-owned exclusions ([video] hd_texture_exclude): merged with the pack
+ * dir's optional exclude.txt so exclusions survive pack regeneration. */
+extern "C" void tex_pack_add_excluded(uint32_t hash) {
+    g.excluded.push_back(hash);
+}
+
 extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
                               int enable_dump, const char *dir_override,
                               const char *pack_dir) {

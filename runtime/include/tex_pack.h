@@ -51,6 +51,8 @@ extern "C" {
  * still just works. The dump folder always follows the disc-stem convention.
  *
  * Cheap no-op (and tex_pack_active() stays 0) when both flags are 0. */
+/* Add a config-owned exclusion (call after tex_pack_init). */
+void tex_pack_add_excluded(uint32_t hash);
 void tex_pack_init(const char *disc_path, int enable_replace, int enable_dump,
                    const char *dir_override, const char *pack_dir);
 void tex_pack_shutdown(void);
