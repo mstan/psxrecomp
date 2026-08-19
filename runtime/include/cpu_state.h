@@ -247,6 +247,8 @@ enum {
     PSX_PC0J_IRQ_RESCUE        = 11, /* a: published resume; d: reason       */
     PSX_PC0J_DIRTY_SENTINEL    = 12, /* d: bit0 in_exception, bit1 async-armed */
     PSX_PC0J_DIRTY_UNSUPPORTED = 13, /* a: unsupported pc; d: reason         */
+    PSX_PC0J_TOP_EXIT          = 14, /* trampoline top-level pc==0 exit;
+                                      * a: last dispatched target; d: $sp    */
 };
 typedef struct Pc0JournalEntry {
     uint64_t seq;

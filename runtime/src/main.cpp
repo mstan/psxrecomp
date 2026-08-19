@@ -14428,6 +14428,11 @@ session_reboot:
                    (unsigned long long)g_dirty_ram_insns_run, g_slice_exit_pc, g_slice_exit_reason,
                    g_slice_exit_iter, g_slice_exit_dispatchable, g_slice_exit_dirty,
                    g_slice_exit_in_text, g_slice_exit_want); }
+    { extern int g_pczero_latched; extern uint32_t g_pczero_addr, g_pczero_ra, g_pczero_in_exc;
+      extern uint64_t g_pczero_count;
+      std::fprintf(stdout, "psxrecomp runtime: [pczero tripwire] latched=%u count=%llu addr=0x%08X ra=0x%08X in_exc=%u\n",
+                   g_pczero_latched, (unsigned long long)g_pczero_count,
+                   g_pczero_addr, g_pczero_ra, g_pczero_in_exc); }
     /* pc=0 escape journal tail: names the exact runtime site that published
      * (or rescued) each recent null PC, with frame/depth/ra/epc context —
      * the play-build replacement for the debug-only fntrace ring, which is

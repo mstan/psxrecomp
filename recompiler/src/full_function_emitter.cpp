@@ -2223,6 +2223,12 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            if (outermost) {\n";
     out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
+    out += "            /* Top-level pc==0 exit is the abnormal-run terminator: name the\n";
+    out += "             * last dispatched target in the pc0 journal before surfacing. */\n";
+    out += "            if (stop_addr == 0u) {\n";
+    out += "                extern void psx_pc0_trampoline_exit(CPUState* cpu, uint32_t last_target);\n";
+    out += "                psx_pc0_trampoline_exit(cpu, addr);\n";
+    out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
     out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";

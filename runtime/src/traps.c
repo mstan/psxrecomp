@@ -258,6 +258,16 @@ void psx_pc0_journal_note(uint32_t site, CPUState *cpu, uint32_t a, uint32_t d)
     e->d = d;
 }
 
+/* Called by the emitted trampoline when a top-level dispatch loop exits on
+ * pc==0 (the abnormal-run terminator): journals the LAST dispatched target,
+ * which no runtime site can otherwise see (the fatal 0 is published inside
+ * generated code — a null jr or a plain C-return). site 14; a=last target,
+ * d=$sp. */
+void psx_pc0_trampoline_exit(CPUState *cpu, uint32_t last_target)
+{
+    psx_pc0_journal_note(14u, cpu, last_target, cpu->gpr[29]);
+}
+
 static uint32_t psx_current_tcb_ptr(CPUState* cpu)
 {
     uint32_t tcbh = cpu->read_word(0x00000108u);
