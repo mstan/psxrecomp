@@ -1388,10 +1388,27 @@ extern "C" int psx_mod_set_native_vblank_rate(
     /*
      * Above the physical panel rate (and in uncapped mode), swap-interval
      * blocking would silently replace the requested guest cadence with the
-     * display cadence. The frame pacer owns fixed-rate timing here.
-     */
-    if (frames_per_second == 0 || frames_per_second > 60)
+     * display cadence. The frame pacer owns fixed-rate timing here — UNLESS
+     * the panel actually runs at the requested rate: then driver vsync is
+     * the better cadence owner (it absorbs sub-frame jitter that the wall
+     * pacer converts into debt/catch-up oscillation — the 99.7-122.5 fps
+     * seesaw measured on the 120 Hz mod with a 120.0 Hz panel). The
+     * present-cadence policy (present_vsync_owns_cadence) already contains
+     * the matching band check and keeps the pacer/vsync XOR intact; only
+     * force vsync off when the panel genuinely cannot match. */
+    if (frames_per_second == 0)
         g_video_vsync = 0;
+    /* fps > 60 no longer forces vsync off: the present-cadence policy is
+     * already an XOR — present_effective_swap_interval() returns the
+     * configured vsync ONLY when present_vsync_owns_cadence() (which
+     * requires the panel to match the CRTC rate within 2%), and 0
+     * otherwise, with the wall pacer engaged exactly when vsync does not
+     * own. On a panel that matches the modded rate (120 Hz mod on a
+     * 120.0 Hz display) driver vsync then owns cadence and absorbs the
+     * sub-frame jitter the wall pacer converts into debt/catch-up
+     * oscillation (measured: 99.7-122.5 fps seesaw). On a non-matching
+     * panel the swap interval resolves to 0 and the pacer owns, same as
+     * the old forced-off behavior. */
     if (frames_per_second) {
         std::fprintf(stdout,
             "psxrecomp: mod selected native guest VBlank pacing at %u FPS "

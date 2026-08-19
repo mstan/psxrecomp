@@ -540,6 +540,16 @@ void psx_rewind_note_frame(void)
     else if (iv >= 2 && s_frame - s_last_capture_frame == iv - 1u &&
              !s_zpend.active && !s_vram_prearmed)
         s_vram_prearmed = gl_renderer_vram_readback_begin();
+    /* Degraded-mode fix: a capture DEFERRED past its interval (previous
+     * snapshot still compressing at capture time) used to retry with no
+     * prearm and fall into the synchronous full-pipeline VRAM readback
+     * (measured 8-17 ms on the emu thread — the 0.4x dip class during
+     * load-heavy windows, which delay the compression pump and make the
+     * degraded mode self-selecting exactly where frames are already long).
+     * Arm the async PBO whenever a capture is pending and no compression is
+     * in flight, so every capture consumes an async copy. */
+    if (s_capture_due && !s_zpend.active && !s_vram_prearmed)
+        s_vram_prearmed = gl_renderer_vram_readback_begin();
 }
 
 /* ---- Amortized snapshot compression --------------------------------------
