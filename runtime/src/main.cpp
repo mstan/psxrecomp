@@ -14396,6 +14396,20 @@ session_reboot:
     }
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
+    /* The PC=0 top-level exit is an abnormal-boot class (see interrupts.c:
+     * approximate exception-resume PCs severing the live native chain). The
+     * registers at exit name the culprit without needing a debug-tools build:
+     * ra = who returned/jumped here, epc = the last exception context. */
+    {
+        extern uint32_t g_debug_current_func_addr, g_debug_last_store_pc;
+        std::fprintf(stdout,
+                     "psxrecomp runtime: [exit regs] ra=0x%08X sp=0x%08X "
+                     "epc=0x%08X sr=0x%08X func=0x%08X last_store_pc=0x%08X "
+                     "v0=0x%08X a0=0x%08X t9=0x%08X\n",
+                     cpu.gpr[31], cpu.gpr[29], cpu.cop0[14], cpu.cop0[12],
+                     g_debug_current_func_addr, g_debug_last_store_pc,
+                     cpu.gpr[2], cpu.gpr[4], cpu.gpr[25]);
+    }
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
       extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
       extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;

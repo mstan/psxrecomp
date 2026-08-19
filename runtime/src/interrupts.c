@@ -1964,7 +1964,18 @@ irq_deliver_eval:
         same_thread_resume = 1;
         {
             extern int psx_scheduler_top_level_resume_active(void);
-            if (psx_scheduler_top_level_resume_active()) {
+            /* pc=0 means "the interrupted native frame is still on the host
+             * stack below us — return and it continues". That contract also
+             * breaks whenever dispatch has already collapsed to TOP LEVEL
+             * (depth 0): statically-baked overlay functions cross into AOT
+             * text via CPS returns, so the interrupted chain may hold no
+             * host frames at all, and a published 0 reaches the main loop
+             * as a bogus GUEST_EXIT (WipEout 3 ntsc120full8 static bake:
+             * deterministic "execution completed, PC=0" ~10 s into boot,
+             * ra=0x800D7FC0 epc=0x8015FAEC). Same remedy as the scheduler
+             * case: prefer the compiled interrupt resume PC. */
+            if (psx_scheduler_top_level_resume_active() ||
+                g_psx_dispatch_depth <= 0) {
                 uint32_t resume = s_compiled_interrupt_resume_pc;
                 if (resume == 0u)
                     resume = s_last_interrupt_check_pc;
