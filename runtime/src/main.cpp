@@ -1685,6 +1685,7 @@ static int g_ws_projection_num = 4;
 static int g_ws_projection_den = 3;
 static int g_ws_projection_mode = -1;
 extern "C" int psx_ws_scene_wide_active(void);  /* gpu.c: ws scene gate */
+extern "C" uint64_t psx_gpu_display_flip_count(void);  /* gpu.c: internal fps */
 
 static void refresh_widescreen_projection() {
     if (!g_ws_engaged) return;
@@ -6425,7 +6426,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
-            const double speed = fps / 59.94;
+            const double speed = fps / psx_crtc_frame_hz();
+            /* Internal rendered-frame rate (display-origin flips): the game
+             * actually finishing frames, as distinct from the vblank rate —
+             * the two diverge under load and users need both on screen. */
+            static uint64_t s_fps_last_flips = 0;
+            const uint64_t flips_now = psx_gpu_display_flip_count();
+            const double render_fps =
+                (double)(flips_now - s_fps_last_flips) / seconds;
+            s_fps_last_flips = flips_now;
             double display_fps = 0.0;
             if (g_frame_interpolation && g_gl_active) {
                 display_fps = g_frame_interpolation_fps > 0
@@ -6436,11 +6445,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char title[256];
                 if (display_fps > 0.0) {
                     snprintf(title, sizeof(title),
-                             "%s  [Game %.0f fps %.2fx | Display %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, display_fps);
+                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps | Display %.0f fps]",
+                             s_fps_base_title.c_str(), fps, speed, render_fps,
+                             display_fps);
                 } else {
-                    snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
-                             s_fps_base_title.c_str(), fps, speed);
+                    snprintf(title, sizeof(title),
+                             "%s  [VBlank %.0f/s %.2fx | Render %.0f fps]",
+                             s_fps_base_title.c_str(), fps, speed, render_fps);
                 }
                 SDL_SetWindowTitle(sdl_window, title);
             }
@@ -6448,11 +6459,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 char osd[96];
                 if (display_fps > 0.0) {
                     snprintf(osd, sizeof(osd),
-                             "Game %.0f FPS  %.2fx | Display %.0f FPS",
-                             fps, speed, display_fps);
+                             "VBl %.0f/s %.2fx  Render %.0f FPS  Disp %.0f",
+                             fps, speed, render_fps, display_fps);
                 } else {
-                    snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
-                             fps, speed);
+                    snprintf(osd, sizeof(osd),
+                             "VBl %.0f/s %.2fx  Render %.0f FPS",
+                             fps, speed, render_fps);
                 }
                 host_osd_set_status(osd);
             }
@@ -6475,10 +6487,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * than replay%. Pass: post-settle present_gap_p95 ≤ 33ms. */
                 netplay_present_gap_stats(&gap_p95, &gap_max);
                 std::fprintf(stderr,
-                    "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
+                    "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu | "
                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
                     "present_gap_p95=%u ms max=%u ms (n=%llu)\n",
-                    fps, speed, (unsigned long long)s_frame_count,
+                    fps, speed, render_fps, (unsigned long long)s_frame_count,
                     guest_ms, admit_ms, replay_pct,
                     (unsigned)gap_p95, (unsigned)gap_max,
                     (unsigned long long)s_np_timing_frames);
@@ -6486,8 +6498,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_np_guest_ticks = 0;
                 s_np_timing_frames = 0;
             } else {
-                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                             fps, speed, (unsigned long long)s_frame_count);
+                std::fprintf(stderr,
+                             "[FPS] game: %.1f fps (%.2fx) render: %.1f | frames: %llu\n",
+                             fps, speed, render_fps,
+                             (unsigned long long)s_frame_count);
             }
             std::fflush(stderr);
             s_fps_last_time = now;
@@ -6993,21 +7007,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         }
     } else {
         refresh_widescreen_projection();
-    }
-
-    /* Present-aspect scene switch: menus/2D (widescreen scene gate inactive)
-     * present at the game's own 4:3 so its NATURAL black bars stay, framed by
-     * the bezels; gameplay presents at the mod aspect. The gpu.c gate carries
-     * the 45-frame hysteresis and the bezel fade covers the transition. */
-    if (g_ws_engaged) {
-        static int s_last_present_wide = -1;
-        int wide_now = psx_ws_scene_wide_active() ? 1 : 0;
-        if (wide_now != s_last_present_wide) {
-            s_last_present_wide = wide_now;
-            gl_renderer_set_display_aspect(
-                wide_now ? g_video_aspect_num : 4,
-                wide_now ? g_video_aspect_den : 3);
-        }
     }
 
     /* Rollback resim (§33/§47): short catch-up keeps hold-last; long catch-up

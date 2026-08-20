@@ -5842,12 +5842,21 @@ static void gp1_dma_direction(uint32_t val) {
     dma_direction = val & 3;
 }
 
+/* Internal rendered-frame counter: the game finishing a frame = it flips the
+ * display origin to the other buffer (GP1(05h) with a CHANGED address). This
+ * is the "internal FPS" every mainstream emulator reports, distinct from the
+ * vblank rate — under load the two diverge and both matter. */
+static uint64_t s_display_flips = 0;
+uint64_t psx_gpu_display_flip_count(void) { return s_display_flips; }
 static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
-    display_area_x = val & 0x3FF;
-    display_area_y = (val >> 10) & 0x1FF;
+    uint32_t nx = val & 0x3FF;
+    uint32_t ny = (val >> 10) & 0x1FF;
+    if (nx != display_area_x || ny != display_area_y) s_display_flips++;
+    display_area_x = nx;
+    display_area_y = ny;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
 }
 
