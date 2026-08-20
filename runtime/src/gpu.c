@@ -368,6 +368,10 @@ int gpu_ws_present_native_43(void) {
 
 /* Squash applies only when configured AND the frame is being stretched. */
 static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
+/* Exported scene gate for the present-aspect switch (main.cpp): menus/2D and
+ * FMV present at the game's own 4:3 (its natural bars intact, bezels around);
+ * gameplay presents at the mod aspect. */
+int psx_ws_scene_wide_active(void) { return ws_active() && ws_game_mode(); }
 
 /* ----- Native-wide (mode 2) ------------------------------------------------
  * Render the wider FOV into an actually wider frame instead of squashing it.

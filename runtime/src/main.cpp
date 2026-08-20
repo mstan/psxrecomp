@@ -6734,69 +6734,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     load_transition_note(cdrom_data_read_active(), logical_load_active,
                          turbo_loads_active, load_run_value);
 
-    /* Adaptive overclock: pin GUEST TIME to 1.0x wall. The configured
-     * cpu_overclock is a CEILING; when the emu thread cannot retire that many
-     * scaled cycles per wall vblank the guest timeline dilates — CD audio,
-     * SIO pad exchange, and every guest timer slow together while per-vblank
-     * game logic runs on whatever vblanks do arrive (measured live: CDDA at
-     * 0.4x with gameplay 1.6x fast). Trading overclock DOWN in heavy scenes
-     * keeps guest time (and so vblank cadence, CDDA, inputs) at wall rate;
-     * headroom brings it back up toward the ceiling. Proportional controller
-     * on an EMA of the wall vblank period, adjusted at most every 8 vblanks,
-     * frozen during intentional unpaced windows (turbo loads / HLE boot).
-     * PSX_ADAPTIVE_OC=0 disables; =N sets the floor percent (default 200). */
-    {
-        static int      aoc_enabled = -1;
-        static uint32_t aoc_floor = 200, aoc_ceiling = 0;
-        static double   aoc_ema = 0.0;
-        static Uint64   aoc_last_pc = 0;
-        static int      aoc_cool = 0;
-        if (aoc_enabled < 0) {
-            const char *e = std::getenv("PSX_ADAPTIVE_OC");
-            aoc_enabled = 1;
-            if (e && *e) {
-                int v = atoi(e);
-                if (v == 0) aoc_enabled = 0;
-                else if (v >= 100) aoc_floor = (uint32_t)v;
-            }
-            aoc_ceiling = psx_get_cpu_overclock();
-            if (aoc_ceiling <= aoc_floor) aoc_enabled = 0;
-            if (aoc_enabled)
-                std::fprintf(stdout,
-                    "psxrecomp: adaptive overclock armed (floor %u%%, ceiling %u%%)\n",
-                    aoc_floor, aoc_ceiling);
-        }
-        if (aoc_enabled && g_frame_period_ms > 0.0 && !turbo_loads_active &&
-            !psx_netplay_active()) {
-            Uint64 pc_now = SDL_GetPerformanceCounter();
-            if (aoc_last_pc) {
-                double dt = (double)(pc_now - aoc_last_pc) * 1000.0 /
-                            (double)SDL_GetPerformanceFrequency();
-                if (dt > 0.0 && dt < 250.0) {
-                    aoc_ema = (aoc_ema > 0.0) ? aoc_ema * 0.85 + dt * 0.15 : dt;
-                    if (++aoc_cool >= 8 && aoc_ema > 0.0) {
-                        aoc_cool = 0;
-                        double r = aoc_ema / g_frame_period_ms;
-                        uint32_t cur = psx_get_cpu_overclock();
-                        if (r > 1.04) {
-                            uint32_t n = (uint32_t)((double)cur / r);
-                            if (n < aoc_floor) n = aoc_floor;
-                            if (n < cur) psx_set_cpu_overclock(n);
-                        } else if (r < 0.99 && cur < aoc_ceiling) {
-                            uint32_t n = cur + (aoc_ceiling - cur + 9u) / 10u;
-                            if (n > aoc_ceiling) n = aoc_ceiling;
-                            psx_set_cpu_overclock(n);
-                        }
-                    }
-                } else {
-                    aoc_ema = 0.0;   /* pause/hitch: relearn */
-                }
-            }
-            aoc_last_pc = pc_now;
-        } else {
-            aoc_last_pc = 0;   /* frozen window: do not learn across it */
-        }
-    }
+
 
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
      * video together. Detect "MDEC produced a frame since the last vblank AND XA
@@ -7053,6 +6991,22 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         }
     } else {
         refresh_widescreen_projection();
+    }
+
+    /* Present-aspect scene switch: menus/2D (widescreen scene gate inactive)
+     * present at the game's own 4:3 so its NATURAL black bars stay, framed by
+     * the bezels; gameplay presents at the mod aspect. The gpu.c gate carries
+     * the 45-frame hysteresis and the bezel fade covers the transition. */
+    if (g_ws_engaged) {
+        extern int psx_ws_scene_wide_active(void);
+        static int s_last_present_wide = -1;
+        int wide_now = psx_ws_scene_wide_active() ? 1 : 0;
+        if (wide_now != s_last_present_wide) {
+            s_last_present_wide = wide_now;
+            gl_renderer_set_display_aspect(
+                wide_now ? g_video_aspect_num : 4,
+                wide_now ? g_video_aspect_den : 3);
+        }
     }
 
     /* Rollback resim (§33/§47): short catch-up keeps hold-last; long catch-up
