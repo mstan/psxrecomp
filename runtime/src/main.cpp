@@ -6998,7 +6998,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * the bezels; gameplay presents at the mod aspect. The gpu.c gate carries
      * the 45-frame hysteresis and the bezel fade covers the transition. */
     if (g_ws_engaged) {
-        extern int psx_ws_scene_wide_active(void);
+        extern "C" int psx_ws_scene_wide_active(void);
         static int s_last_present_wide = -1;
         int wide_now = psx_ws_scene_wide_active() ? 1 : 0;
         if (wide_now != s_last_present_wide) {
