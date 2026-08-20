@@ -419,6 +419,7 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
+std::atomic<bool>     g_string_table_nonempty{false}; // any STRING entries (not vram/glyph fixes)
 std::atomic<bool>     g_capture_on{false};    // inventory capture DEFAULT OFF:
     // the always-on Shift-JIS string-inventory scan costs 26-35% of
     // whole-lane throughput on streaming-heavy titles (measured across
@@ -595,6 +596,8 @@ void load_tables_locked() {
                                       !g_vram_patches.empty() || !g_msg_inplace.empty() ||
                                       !g_msg_seps.empty()),
                         std::memory_order_relaxed);
+    g_string_table_nonempty.store(!lang_off && !g_table.empty(),
+                                  std::memory_order_relaxed);
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
         kv.second.translated = (g_table.find(kv.first) != g_table.end());
@@ -851,6 +854,15 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         std::lock_guard<std::mutex> lk(g_mtx);
         msg_seps_patch_locked(ram);
     }
+
+    /* The a0..a3 record scan below serves CAPTURE (inventory) and STRING
+     * substitution (g_table). A fixes-only load (vram patches / glyph labels /
+     * in-place messages — all handled by the throttled blocks above) has an
+     * EMPTY string table, and with capture off the scan can never do anything
+     * — yet it cost 4.2% of the emu thread on the WipEout 3 120 Hz profile
+     * (4x per dispatch: RAM-range check, first-byte load, record read). */
+    if (!cap && !g_string_table_nonempty.load(std::memory_order_relaxed))
+        return;
 
     const uint32_t sp = cpu->gpr[29];
     // Scan the argument registers a0..a3 for source-text pointers. KV-gated

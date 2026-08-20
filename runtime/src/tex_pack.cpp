@@ -990,6 +990,14 @@ extern "C" void tex_pack_note_armed(unsigned long long id,
 extern "C" void tex_pack_on_textured_prim(const int lim[4], uint16_t clut_x,
                                           uint16_t clut_y, uint16_t texpage) {
     if (!tex_pack_active() || !lim) return;
+#ifdef PSX_NO_DEBUG_TOOLS
+    /* Play build: everything this hook computes — the matched-key set and the
+     * dump/census bookkeeping — is a debug-server / authoring surface with no
+     * reader (substitution itself lives in tex_pack_lookup_replacement). The
+     * per-prim mutex + CLUT hash + linear scan over up to 8192 uploads cost
+     * 7.4% of the emu thread on the WipEout 3 120 Hz profile. */
+    if (!g.dump_on) return;
+#endif
 
     int depth = (texpage >> 7) & 3;
     if (depth > 2) depth = 2;

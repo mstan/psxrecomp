@@ -73,10 +73,17 @@ typedef struct PGXPHooks {
 } PGXPHooks;
 
 #if defined(PSX_PGXP) && PSX_PGXP
+/* ALU/MULDIV hooks matter only under tier-2 cpu_mode or the correction
+ * consumers' dataflow chains; an NCLIP-only arm leaves them idle. Their hook
+ * bodies already early-out, but at ~100M ALU/s the CALL ITSELF was 3.4% of
+ * the emu thread (WipEout 3 120 Hz profile) — gate inline on a flag pgxp.cpp
+ * maintains (g_pgxp_alu_armed = active && (cpu_mode || full_hooks)). LOAD/
+ * STORE/COP2 stay direct: they carry the SXY provenance chain. */
+extern int g_pgxp_alu_armed;
 #define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
 #define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
-#define PGXP_ALU(instr, res, s1, s2)             psx_pgxp_alu(cpu, (instr), (res), (s1), (s2))
-#define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
+#define PGXP_ALU(instr, res, s1, s2)             do { if (g_pgxp_alu_armed) psx_pgxp_alu(cpu, (instr), (res), (s1), (s2)); } while (0)
+#define PGXP_MULDIV(instr, hi, lo, s1, s2)       do { if (g_pgxp_alu_armed) psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2)); } while (0)
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
 #else
 #define PGXP_LOAD(instr, addr, val)              ((void)0)

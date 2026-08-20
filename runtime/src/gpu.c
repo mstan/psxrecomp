@@ -3402,6 +3402,11 @@ void gpu_pgxp_rederive_enable(void) {
     pgxp_set_enabled(s_texture_correction_enabled ||
                      gte_geometry_correction_enabled() ||
                      ws_precise_nclip_cfg);
+    /* ALU/MULDIV hooks feed only the correction consumers' dataflow chains
+     * (and tier-2 cpu_mode, gated inside pgxp.cpp); an NCLIP-only arm skips
+     * their per-instruction bodies (LOAD/STORE/COP2 carry the SXY chain). */
+    pgxp_set_full_hooks(s_texture_correction_enabled ||
+                        gte_geometry_correction_enabled());
 }
 
 void gpu_texture_correction_set(int enabled) {

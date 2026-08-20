@@ -34,6 +34,12 @@ int  pgxp_enabled(void);
 void pgxp_set_cpu_mode(int enabled);
 int  pgxp_cpu_mode(void);
 
+/* ALU/MULDIV hook bodies run only when tier-2 cpu_mode OR this flag is set
+ * (texture/geometry correction dataflow chains). NCLIP-only arms leave it 0:
+ * the SXY chain is LOAD/STORE/COP2. Stale shadows from the gated period are
+ * dropped by pv_validate at every consumer (the single safety invariant). */
+void pgxp_set_full_hooks(int on);
+
 /* Reject a precise position whose sub-pixel offset from the native integer
  * position exceeds this many pixels. < 0 disables the clamp (default). */
 void  pgxp_set_tolerance(float pixels);
