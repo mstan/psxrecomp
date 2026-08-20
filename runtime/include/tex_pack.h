@@ -80,8 +80,28 @@ int tex_pack_active(void);
  * w*h halfword rectangle — exactly the buffer whose CRC32 is the texture hash. */
 void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *pixels);
 
-/* Any other write to VRAM (fill, VRAM→VRAM copy, rendered-to region). Kills
- * every tracked upload the rect touches and drops stale CLUT hashes. */
+/* A VRAM→VRAM copy destination. Call before the backend mutates VRAM: this
+ * preserves the ordinary destination-invalidation ordering, then leaves a
+ * cheap unresolved candidate. The first textured draw that touches the copied
+ * rectangle asks for one exact backend readback through the two functions
+ * below, so copies that are never sampled as textures are never hashed. */
+void tex_pack_on_copy(int src_x, int src_y, int dst_x, int dst_y,
+                      int w, int h, int content_preserved);
+
+/* Return one unresolved copy rectangle touched by this primitive, or 0. The
+ * caller reads that exact rectangle from the authoritative renderer backend
+ * and passes it to tex_pack_resolve_copy(). Once the first readback has made
+ * the backend's CPU mirror current, tex_pack_next_pending_copy() lets the
+ * caller drain the rest of the batch without another GPU synchronization. */
+int  tex_pack_pending_copy_for_prim(const int lim[4], uint16_t texpage,
+                                    int out_rect[4]);
+int  tex_pack_next_pending_copy(int out_rect[4]);
+void tex_pack_resolve_copy(int x, int y, int w, int h,
+                           const uint16_t *pixels);
+
+/* Any non-upload/non-copy write to VRAM (fill or direct poke). Kills every
+ * tracked upload or unresolved copy the rect touches and drops stale CLUT
+ * hashes. */
 void tex_pack_invalidate(int x, int y, int w, int h);
 
 /* GP0(E2h) texture window, raw 20-bit parameter. */

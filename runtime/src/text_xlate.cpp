@@ -426,7 +426,20 @@ std::atomic<bool>     g_capture_on{false};    // inventory capture DEFAULT OFF:
     // three GT2 race lanes; reproduced fleet-wide). Substitution (table +
     // language armed) is unaffected; PSX_XLATE_CAPTURE=1 re-enables the
     // scan for translation authoring.
-std::atomic<uint64_t> g_calls{0};
+/* Dispatch hook aggregate gate. VRAM-only translations use the upload hook and
+ * do not need to touch every CPU dispatch once RAM patches have settled. */
+std::atomic<bool>     g_dispatch_armed{false};
+void refresh_dispatch_armed() {
+    const bool app = g_apply_armed.load(std::memory_order_relaxed);
+    const bool pending_ram_patch =
+        g_glyph_pending.load(std::memory_order_relaxed) > 0 ||
+        g_msg_inplace_pending.load(std::memory_order_relaxed) > 0 ||
+        g_msg_sep_pending.load(std::memory_order_relaxed) > 0;
+    const bool armed = g_capture_on.load(std::memory_order_relaxed) ||
+        (app && (g_string_table_nonempty.load(std::memory_order_relaxed) ||
+                 pending_ram_patch));
+    g_dispatch_armed.store(armed, std::memory_order_release);
+}std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
 std::string           g_dir;                  // translations/ directory (for reload)
@@ -477,6 +490,7 @@ std::vector<uint16_t> hex_to_halfwords(const std::string& hex) {
 }
 
 void load_tables_locked() {
+    g_dispatch_armed.store(false, std::memory_order_release);
     g_table.clear();
     g_glyph_labels.clear();
     g_glyph_pending.store(0, std::memory_order_relaxed);
@@ -487,7 +501,12 @@ void load_tables_locked() {
     g_msg_seps.clear();
     g_msg_sep_pending.store(0, std::memory_order_relaxed);
     for (auto& kv : g_inv) kv.second.translated = false;
-    if (g_dir.empty() || !fs::exists(g_dir)) { g_apply_armed.store(false); return; }
+    if (g_dir.empty() || !fs::exists(g_dir)) {
+        g_apply_armed.store(false, std::memory_order_relaxed);
+        g_string_table_nonempty.store(false, std::memory_order_relaxed);
+        refresh_dispatch_armed();
+        return;
+    }
     const bool lang_off = g_lang.empty() || g_lang == "jp" || g_lang == "off";
     size_t files = 0, entries = 0, glyphs = 0, vpatches = 0;
     std::error_code ec;
@@ -598,6 +617,7 @@ void load_tables_locked() {
                         std::memory_order_relaxed);
     g_string_table_nonempty.store(!lang_off && !g_table.empty(),
                                   std::memory_order_relaxed);
+    refresh_dispatch_armed();
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
         kv.second.translated = (g_table.find(kv.first) != g_table.end());
@@ -652,6 +672,7 @@ void glyph_labels_patch_locked(uint8_t* ram) {
         gl.patched = true;
     }
     g_glyph_pending.store(pending, std::memory_order_relaxed);
+    refresh_dispatch_armed();
 }
 
 // Build a message body: little-endian fullwidth-Shift-JIS (as the message-table
@@ -729,6 +750,7 @@ void msg_inplace_patch_locked(uint8_t* ram) {
         m.patched = true;
     }
     g_msg_inplace_pending.store(pending, std::memory_order_relaxed);
+    refresh_dispatch_armed();
 }
 
 // Drop an end-of-message terminator (0xFFFF) at each inter-message separator VA
@@ -752,6 +774,7 @@ void msg_seps_patch_locked(uint8_t* ram) {
         s.patched = true;
     }
     g_msg_sep_pending.store(pending, std::memory_order_relaxed);
+    refresh_dispatch_armed();
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +846,10 @@ bool apply_to_reg(uint8_t* ram, CPUState* cpu, uint32_t sp, uint32_t* reg,
 // ===========================================================================
 // Public API
 // ===========================================================================
+extern "C" int text_xlate_dispatch_armed(void) {
+    return g_dispatch_armed.load(std::memory_order_acquire) ? 1 : 0;
+}
+
 extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
     const bool cap = g_capture_on.load(std::memory_order_relaxed);
     const bool app = g_apply_armed.load(std::memory_order_relaxed);
@@ -859,7 +886,7 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
      * substitution (g_table). A fixes-only load (vram patches / glyph labels /
      * in-place messages — all handled by the throttled blocks above) has an
      * EMPTY string table, and with capture off the scan can never do anything
-     * — yet it cost 4.2% of the emu thread on the WipEout 3 120 Hz profile
+     * — yet it cost 4.2% of the emulation thread under a high-refresh workload
      * (4x per dispatch: RAM-range check, first-byte load, record read). */
     if (!cap && !g_string_table_nonempty.load(std::memory_order_relaxed))
         return;

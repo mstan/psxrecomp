@@ -337,6 +337,65 @@ def check_static_dispatch_provenance():
         raise AssertionError('static dispatch superset accepted')
 
 
+def check_incoherent_variant_dispatch_root():
+    data = bytearray(0x80)
+    entry = LOAD + 0x20
+    orphan = LOAD + 0x40
+    put(data, 0x20, 0x27BDFFF0)  # unchanged old-variant prologue
+    put(data, 0x24, 0xAFBF000C)
+    put(data, 0x28, 0x00000001)  # replacement data, reserved instruction
+    put(data, 0x2C, 0x00000028)  # replacement data, reserved instruction
+    put(data, 0x40, 0x00621823)  # unchanged mid-function instruction
+    put(data, 0x44, 0x00000001)  # replacement data, reserved instruction
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'executed_pcs': [f'0x{entry:08X}', f'0x{entry + 4:08X}',
+                         f'0x{orphan:08X}'],
+        'dispatch_entry_pcs': [f'0x{entry:08X}', f'0x{entry + 4:08X}',
+                               f'0x{orphan:08X}'],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert entry not in audit['included_reasons']
+    assert entry + 4 not in audit['included_reasons']
+    assert audit['excluded_reasons'][entry] == 'INCOHERENT_VARIANT_BYTES'
+    assert audit['excluded_reasons'][orphan] == 'INCOHERENT_VARIANT_BYTES'
+    assert not seeds
+
+
+def check_static_requests_are_variant_scoped():
+    data_a = bytes.fromhex('0800E00300000000')  # jr ra; nop
+    data_b = bytes.fromhex('0100000028000000')  # data / reserved words
+    ranges = [(LOAD, len(data_a))]
+    crc_a = MOD.binascii.crc32(data_a) & 0xFFFFFFFF
+    parts = [{
+        'variants': [{
+            'addr': LOAD,
+            'crc': crc_a,
+            'ranges': ranges,
+        }],
+    }]
+    requests = {}
+    MOD.add_static_variant_request(
+        requests, {LOAD}, data_a, LOAD, len(data_a), LOAD & 0x1FFFFFFF)
+    MOD.add_static_variant_request(
+        requests, {LOAD}, data_b, LOAD, len(data_b), LOAD & 0x1FFFFFFF)
+    unresolved = MOD.unresolved_static_variant_requests(requests, parts)
+    assert len(unresolved) == 1
+    assert unresolved[0][0] == LOAD
+    assert unresolved[0][1]['data'] == data_b
+
+    audit = {
+        'dispatch_entry_pcs': {LOAD, LOAD + 4, LOAD + 8},
+        'function_entry_pcs': {LOAD},
+        'excluded_reasons': {
+            LOAD + 4: 'OBSERVED_PC_ONLY',
+            LOAD + 8: 'INCOHERENT_VARIANT_BYTES',
+        },
+    }
+    assert MOD.static_capture_request_entries(audit) == {LOAD, LOAD + 4}
+
+
 def check_owned_direct_call_is_interior():
     data = bytearray(0x200)
     host = LOAD + 0x100
@@ -3651,6 +3710,8 @@ def main():
     check_bounded_jump_table_discovery()
     check_static_discovery_provenance()
     check_static_dispatch_provenance()
+    check_incoherent_variant_dispatch_root()
+    check_static_requests_are_variant_scoped()
     check_owned_direct_call_is_interior()
     check_discovered_host_owns_same_round_call_target()
     check_later_discovered_host_retracts_interior_root()

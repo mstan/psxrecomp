@@ -245,9 +245,9 @@ struct RuntimeConfig {
 
     // Ape Escape LOAD card-IRQ unstick pump ([runtime] ape_card_unstick).
     // A per-game kernel-nest repair that force-re-edges I_MASK.7/IRQ7 after a
-    // LOAD-style probe abort. OPT-IN: on WipEout 3 under the x2 CRTC the
-    // arming detector misfires and the forced IRQ storm wedges the kernel
-    // card driver (completion events never deliver -> memcard screen hangs).
+    // LOAD-style probe abort. OPT-IN: at non-stock device timing an unrelated
+    // title can satisfy the arming detector accidentally, and repeated forced
+    // IRQs can wedge its kernel card driver instead of unsticking it.
     // Env PSX_APE_CARD_UNSTICK=0/1 still overrides either way.
     bool                  ape_card_unstick = false;
 
@@ -411,6 +411,9 @@ struct RuntimeConfig {
     // Optional initial window width declared by the title profile. Zero keeps
     // the historical fit-to-display behavior; player settings may override it.
     int                   video_window_width = 0;
+    // crtc_refresh_multiplier: divide the guest CRTC VBlank period by this
+    // factor. 1 = stock timing; valid range is 1..8.
+    uint32_t              video_crtc_refresh_multiplier = 1;
 
     // antialiasing: when true the present path uses linear filtering when
     // scaling the framebuffer to the window (smooths the supersample
@@ -454,7 +457,7 @@ struct RuntimeConfig {
     // The guest runs as native code, so this scales the per-instruction cycle
     // CHARGE down: the CPU completes more work inside the same CRTC period
     // while timers, SPU, CDROM and refresh keep their real rates.
-    // hueponik's pal100full8 patch requires >900%.
+    // Raise this only when a title-specific timing profile needs more CPU headroom.
     uint32_t              runtime_cpu_overclock = 100;
 
     // [video] bezel — a still image drawn behind the frame, filling whatever
@@ -500,15 +503,10 @@ struct RuntimeConfig {
     // position words was written to that DMA packet address by a projection
     // store — so CPU-built UI and 2D sprites are never touched.
     //
-    // Default OFF (faithful floor), same as geometry_correction above — but for a
-    // different reason. geometry_correction is off because it is BROKEN at the
-    // coverage we can reach (it moves vertices and splits shared edges); this one
-    // is off because it is a deliberate departure from hardware output that has
-    // only been validated on one title and one renderer. It is structurally safe
-    // — it never moves a vertex, only alters UV interpolation inside a polygon
-    // whose provenance is already proven, so a non-qualifying polygon simply keeps
-    // the PS1's affine interpolation and neighbours can never disagree about a
-    // shared edge. Safe is not the same as validated, so it stays opt-in.
+    // Default OFF (faithful floor), because this is a deliberate departure from
+    // hardware output and must be opted into per title. It never changes the
+    // primitive boundary: a qualifying polygon uses coherent projection depth
+    // for UV interpolation, while a non-qualifying polygon stays PS1-affine.
     //
     // Players opt in from the launcher's Display panel (unlike
     // geometry_correction, which has no control at all); per-game with
@@ -540,19 +538,20 @@ struct RuntimeConfig {
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
     // the same default as the reference implementations — because some games
-    // deliberately rely on integer truncation in their own math; value
-    // validation keeps it SAFE either way, this only trades coverage.
+    // deliberately rely on integer truncation in their own math. Packed-value
+    // validation, projection-component identity, and destructive-write
+    // invalidation keep this fail-closed; enabling it changes coverage only.
     // Meaningful only in a pgxp-flavour build; live-tunable over TCP.
     bool                  video_pgxp_cpu_mode = false;
 
     // pgxp_tolerance: reject a corrected vertex whose sub-pixel offset from
     // the native integer position exceeds this many pixels (the truncation-
     // agreement check already bounds offsets to < 1px; this narrows them
-    // further). Default 0.5 — user-validated on Ape Escape (2026-08-15):
-    // unclamped, sparse hairline background-bleed seams appear where a
-    // corrected triangle borders an uncorrected one; at 0.5 the seams are
-    // gone and only sub-half-pixel misalignment remains. Negative disables
-    // the clamp. Live-tunable over TCP (pgxp verb).
+    // further). Default 0.5 remains a conservative cross-title default. The
+    // GPU's frame-local canonical endpoint table now owns shared-edge identity,
+    // so a title can use 1.0 for full same-cell coverage without reviving the
+    // old corrected/native boundary seam. Negative disables the clamp.
+    // Live-tunable over TCP (pgxp verb).
     double                video_pgxp_tolerance = 0.5;
 
     // offer_vulkan: expose the experimental Vulkan renderer in the launcher.
@@ -1121,11 +1120,18 @@ struct GameConfig {
     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
     bool ws_gte_game_mode = false;
 
-    // [widescreen] precise_nclip — use the runtime's unsaturated GTE projection
-    // provenance for NCLIP/backface tests while classic adaptive widescreen is
-    // active. This is for 3D titles whose wide side geometry otherwise hits the
-    // PS1 SXY +/-1024 clamp and then disappears from game-side visibility tests.
-    // Runtime-only; off by default.
+    // [widescreen] fixed_outer_aspect - separate the user-selected outer
+    // presentation canvas from scene-dependent content correction. Menus and
+    // FMV remain centered, undistorted 4:3 content inside the configured wide
+    // canvas, while gameplay fills that same canvas. Runtime-only; off by
+    // default to preserve existing presentation policy for other titles.
+    bool ws_fixed_outer_aspect = false;
+
+    // [widescreen] precise_nclip — audit the exact 16.16 determinant whenever
+    // all three projected SXY shadows are coherent and word-validated. The
+    // guest-visible integer MAC0 is always retained, including on a sign
+    // disagreement, so this cannot change face visibility. Runtime-only; off
+    // by default.
     bool ws_precise_nclip = false;
 
     // Optional authoritative game-state gate for titles whose menus also

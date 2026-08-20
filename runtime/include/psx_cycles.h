@@ -95,7 +95,7 @@ void psx_advance_cycles(uint32_t cycles);
 extern uint32_t g_psx_oc_scale_q16;
 extern uint32_t g_psx_oc_accum;
 
-/* percent: 100 = stock. hueponik's pal100full8 needs >900%. */
+/* percent: 100 = stock; larger values provide more guest CPU work per device interval. */
 void     psx_set_cpu_overclock(uint32_t percent);
 uint32_t psx_get_cpu_overclock(void);
 
@@ -106,6 +106,31 @@ static inline uint32_t psx_oc_apply(uint32_t cycles) {
     g_psx_oc_accum = (uint32_t)(t & 0xFFFFu);
     return (uint32_t)(t >> 16);
 }
+
+/* Production-only exact pre-deadline charge. The fast limit is strictly below
+ * the next device event, so a successful charge cannot owe device service.
+ * Preview the overclock transform and commit its carried remainder only on a
+ * hit; a miss falls through to psx_advance_cycles and applies it once there. */
+#if !defined(PSX_OVERLAY_DLL_BUILD)
+extern uint64_t g_psx_cycle_fast_limit;
+static inline int psx_cycles_try_fast_charge(uint32_t cycles) {
+    if (cycles == 0u) return 1;
+    if (g_ls_replay_active || g_event_step_conservative ||
+        psx_in_device_service || g_psx_cycle_fast_limit == 0u ||
+        g_psx_cyc_batch != 0u ||
+        (g_psx_cyc_local_acc && *g_psx_cyc_local_acc != 0u))
+        return 0;
+    uint64_t scaled = (uint64_t)cycles * (uint64_t)g_psx_oc_scale_q16
+                    + (uint64_t)g_psx_oc_accum;
+    uint32_t applied = (uint32_t)(scaled >> 16);
+    uint64_t next = psx_cycle_count + (uint64_t)applied;
+    if (next < psx_cycle_count || next > g_psx_cycle_fast_limit)
+        return 0;
+    g_psx_oc_accum = (uint32_t)(scaled & 0xFFFFu);
+    psx_cycle_count = next;
+    return 1;
+}
+#endif
 
 static inline void psx_advance_cycles(uint32_t cycles) {
 #if !defined(PSX_COSIM)
@@ -165,6 +190,9 @@ static inline void psx_advance_cycles(uint32_t cycles) {
 /* Publish deferred charges (IRQ edge / MMIO / savestate). Overlay DLLs keep
  * their pending total in the callback shim rather than these host globals. */
 #if defined(PSX_OVERLAY_DLL_BUILD)
+#  ifdef _WIN32
+__declspec(dllexport)
+#  endif
 void overlay_flush_cycles(void);
 static inline void psx_cyc_local_publish(void) { }
 static inline void psx_cyc_batch_flush(void) { overlay_flush_cycles(); }

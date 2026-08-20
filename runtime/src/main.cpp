@@ -506,6 +506,11 @@ static uint64_t s_fps_last_frame = 0;
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
+/* Last CRTC timing applied to the host presenter. Kept as exact guest-cycle
+ * state so the 2% panel-match test cannot flap on floating-point rounding. */
+static uint32_t s_present_crtc_period_cycles = 0;
+static int      s_present_crtc_is_pal = 0;
+static bool     s_present_crtc_banner_logged = false;
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
 /* Netplay + depth24: present every other vblank (admit still every tick). */
@@ -542,6 +547,9 @@ static void present_session_reset(void) {
     s_fps_last_frame = 0;
     s_fps_base_title.clear();
     s_frame_pacer = FramePacer{ 0 };
+    s_present_crtc_period_cycles = 0;
+    s_present_crtc_is_pal = 0;
+    s_present_crtc_banner_logged = false;
     s_turbo_present_skip = 0;
     s_fmv_skip_present_skip = 0;
     s_netplay_depth24_present_skip = 0;
@@ -1345,6 +1353,8 @@ extern "C" int psx_mod_set_fixed_display_aspect(
     }
     g_video_aspect_num = (int)numerator;
     g_video_aspect_den = (int)denominator;
+    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     g_ws_adaptive_view = false;
     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
                  (unsigned)numerator, (unsigned)denominator);
@@ -1393,8 +1403,8 @@ extern "C" int psx_mod_set_native_vblank_rate(
      * display cadence. The frame pacer owns fixed-rate timing here — UNLESS
      * the panel actually runs at the requested rate: then driver vsync is
      * the better cadence owner (it absorbs sub-frame jitter that the wall
-     * pacer converts into debt/catch-up oscillation — the 99.7-122.5 fps
-     * seesaw measured on the 120 Hz mod with a 120.0 Hz panel). The
+     * pacer converts into debt/catch-up oscillation — for example, a
+     * 99.7-122.5 fps seesaw at a 120 Hz guest and display cadence). The
      * present-cadence policy (present_vsync_owns_cadence) already contains
      * the matching band check and keeps the pacer/vsync XOR intact; only
      * force vsync off when the panel genuinely cannot match. */
@@ -1405,9 +1415,9 @@ extern "C" int psx_mod_set_native_vblank_rate(
      * configured vsync ONLY when present_vsync_owns_cadence() (which
      * requires the panel to match the CRTC rate within 2%), and 0
      * otherwise, with the wall pacer engaged exactly when vsync does not
-     * own. On a panel that matches the modded rate (120 Hz mod on a
-     * 120.0 Hz display) driver vsync then owns cadence and absorbs the
-     * sub-frame jitter the wall pacer converts into debt/catch-up
+     * own. On a panel that matches a non-stock guest rate (for example,
+     * a 120 Hz guest on a 120.0 Hz display), driver vsync owns cadence and
+     * absorbs the sub-frame jitter the wall pacer converts into debt/catch-up
      * oscillation (measured: 99.7-122.5 fps seesaw). On a non-matching
      * panel the swap interval resolves to 0 and the pacer owns, same as
      * the old forced-off behavior. */
@@ -1420,6 +1430,42 @@ extern "C" int psx_mod_set_native_vblank_rate(
         std::fprintf(stdout,
             "psxrecomp: mod selected uncapped native guest VBlank pacing\n");
     }
+    return 1;
+}
+
+extern "C" int psx_mod_set_crtc_refresh_multiplier(
+    uint32_t multiplier) {
+    if (multiplier < 1u || multiplier > 8u) {
+        std::fprintf(stderr,
+            "psxrecomp: mod rejected invalid CRTC refresh multiplier %u\n",
+            (unsigned)multiplier);
+        return 0;
+    }
+    gpu_set_crtc_refresh_multiplier(multiplier);
+    return 1;
+}
+
+extern "C" int psx_mod_set_crtc_vblank_hz(uint32_t hz) {
+    if (hz == 0u) {
+        gpu_set_crtc_vblank_period_override(0u);
+        std::fprintf(stdout,
+            "psxrecomp: mod cleared CRTC VBlank period override "
+            "(follow GP1 video mode)\n");
+        return 1;
+    }
+    if (hz != 50u && hz != 60u) {
+        std::fprintf(stderr,
+            "psxrecomp: mod rejected invalid CRTC VBlank rate %u Hz "
+            "(use 50, 60, or 0)\n",
+            (unsigned)hz);
+        return 0;
+    }
+    const uint32_t cycles =
+        (hz == 50u) ? PSX_VBLANK_CYCLES_PAL : PSX_VBLANK_CYCLES_NTSC;
+    gpu_set_crtc_vblank_period_override(cycles);
+    std::fprintf(stdout,
+        "psxrecomp: mod forced CRTC VBlank to %u Hz (%u guest cycles)\n",
+        (unsigned)hz, (unsigned)cycles);
     return 1;
 }
 
@@ -1589,9 +1635,9 @@ extern "C" int gpu_ws_netplay_local_viewport_base_x(void);
 extern "C" int gpu_ws_netplay_local_viewport_width(void);
 extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
 extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
-/* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
- * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
- * Starts true when the configured aspect is already 4:3 (nothing to engage). */
+/* Widescreen content correction engages at game entry (fntrace_is_game_started):
+ * the BIOS boot remains authentic 4:3 content with no GTE squash. A fixed outer
+ * canvas, when configured, is already wide around that content. */
 static bool          g_ws_engaged = true;
 /* Fill the pillarbox margins of a 4:3-pinned present with the frame's own edge
  * columns instead of black (gl_renderer_set_pillarbox_edge_fill). Game-facing
@@ -1602,6 +1648,9 @@ extern "C" { int g_ws_menu_edge_fill_flag = 1; }   /* ws_menu_edge_fill command 
  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
 static int           g_ws_native_wide = 1;
+/* [widescreen] fixed_outer_aspect: the configured aspect owns one stable outer
+ * canvas while classification selects only the content transform inside it. */
+static bool          g_ws_fixed_outer_aspect = false;
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -1684,7 +1733,6 @@ static void netplay_local_viewport_projection_aspect(
 static int g_ws_projection_num = 4;
 static int g_ws_projection_den = 3;
 static int g_ws_projection_mode = -1;
-extern "C" int psx_ws_scene_wide_active(void);  /* gpu.c: ws scene gate */
 extern "C" uint64_t psx_gpu_display_flip_count(void);  /* gpu.c: internal fps */
 
 static void refresh_widescreen_projection() {
@@ -1751,6 +1799,7 @@ static void update_adaptive_widescreen() {
     g_video_aspect_num = num;
     g_video_aspect_den = den;
     gl_renderer_set_display_aspect(num, den);
+    vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
         g_logical_w = 480 * num * g_video_scale / den;
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
@@ -3002,6 +3051,45 @@ static void log_present_cadence(void) {
     } else {
         std::printf("psxrecomp: present cadence: uncapped "
                     "(no pacer, no vsync)\n");
+    }
+}
+
+/* GP1(08h) changes the GPU's live VBlank period before the next VBlank edge is
+ * raised. Reconcile the host side at that edge, before either the wall pacer or
+ * SwapWindow can wait. The exact integer period is the transition key: stable
+ * modes are no-ops, while PAL/NTSC, a restored mode, or a plugin timing change
+ * is applied once. An explicit native-VBlank mod remains the pacing authority. */
+static void refresh_live_crtc_cadence(void) {
+    const uint32_t period = gpu_vblank_period_cycles();
+    const int is_pal = gpu_display_is_pal() ? 1 : 0;
+    const bool period_changed = period != s_present_crtc_period_cycles;
+    const bool standard_changed = is_pal != s_present_crtc_is_pal;
+
+    if (period_changed) {
+        s_present_crtc_period_cycles = period;
+        if (!g_mod_native_vblank_rate) {
+            refresh_frame_pacer_period();
+            /* A new period must not inherit debt from the old clock. */
+            s_frame_pacer = FramePacer{ 0 };
+        }
+        /* Reapply the same live policy used by the pacing query so the
+         * renderer's actual swap interval cannot remain startup-latched.
+         * This is still required when a mod explicitly owns the wall target:
+         * that override does not own or alter the live CRTC period. */
+        apply_present_cadence();
+    }
+    s_present_crtc_is_pal = is_pal;
+
+    if (gpu_display_mode_is_programmed() &&
+        (!s_present_crtc_banner_logged || period_changed || standard_changed)) {
+        std::printf("psxrecomp: CRTC mode %s: %s x%u = %.3f Hz\n",
+                    s_present_crtc_banner_logged ? "changed" : "programmed",
+                    is_pal ? "PAL" : "NTSC",
+                    (unsigned)gpu_get_crtc_refresh_multiplier(),
+                    psx_crtc_frame_hz());
+        log_present_cadence();
+        std::fflush(stdout);
+        s_present_crtc_banner_logged = true;
     }
 }
 
@@ -6376,6 +6464,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
      * next tick has a live native chain under its dispatch again. */
     psx_scheduler_top_level_resume_clear();
+    refresh_live_crtc_cadence();
     int probe_turbo = 0;
     int probe_reached = 0;
     struct PostLoadProbeScope {
@@ -7057,9 +7146,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     uint32_t w = 0, h = 0;
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
-    bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
-    bool pin_43    = false;  /* pillarbox this present (FMV, or a native-wide
-                                game frame that could not present wide) */
+    bool scene_content_4_3 = false; /* menu/FMV/boot: native content correction */
+    bool content_4_3 = false;       /* final inner-content policy after fallback */
     bool depth24_frame = false;
     bool local_viewport_crop_applied = false;
     if (s_force_present_after_load && g_gl_active)
@@ -7101,13 +7189,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         s_disabled_frame_presented = false;
         s_force_present_after_load = false;
         w = di.width; h = di.height;
-        /* 4:3-pinned frames: the pre-game BIOS boot, plus (once engaged) every
-         * frame the widescreen layer presents native — FMV video and full-2D
-         * menu/title screens. gpu_ws_present_native_43() is the single source
-         * of truth, shared with the GTE/GPU squash so content and present stay
-         * locked: we squash IFF we stretch. depth24 always classifies as FMV
-         * even if the ws layer is not engaged yet (4:3 titles). */
-        fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* Scene classification controls content correction only. BIOS, FMV and
+         * full-2D screens retain an undistorted 4:3 safe area; it must never
+         * override the user-configured outer presentation canvas. */
+        scene_content_4_3 = di.depth24 || !g_ws_engaged ||
+                            gpu_ws_content_native_43() != 0;
         /* 2D screens (title, menus, loading) are deliberately kept at 4:3 by the
          * 3D-gated widescreen layer, which on a 32:9 display leaves them as a
          * small island in a mostly black window. Extend their own edge columns
@@ -7130,7 +7216,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * decode; the activity stamp also covers authentic 4:3 configurations. */
         if (g_gl_active)
             gl_renderer_set_interpolation_suspended(
-                fmv_frame || mdec_recently_active(2));
+                scene_content_4_3 || mdec_recently_active(2));
         const int local_viewport_slot = netplay_local_viewport_slot();
         const bool local_viewport_crop = local_viewport_slot >= 0;
         bool local_viewport_wide =
@@ -7145,7 +7231,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Native-wide present: on a game frame, if the active backend has the
          * wide compositor, present the wider surface (canonical width + EXTRA)
          * from the displayed buffer's surface. FMV/menu frames stay 4:3. */
-        bool wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&
+        bool wide_present = (!scene_content_4_3 && !di.depth24 && g_ws_engaged &&
                              ws_native_wide_active() && gr_wide_supported() &&
                              (!local_viewport_crop || local_viewport_wide));
         if (wide_present) {
@@ -7159,13 +7245,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * wide (compositor unsupported, or the surface fallback below)
          * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
          * stretch: its canonical content is pre-squashed FOR the stretch. */
-        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+        const bool nw_requires_safe_fallback =
+            g_ws_engaged && g_ws_native_wide;
+        content_4_3 = scene_content_4_3 ||
+                      (nw_requires_safe_fallback && !wide_present);
 
         /* Ring the classification now that it's final (only the software/CPU
          * wide path below can still fall back — it amends this entry). A
          * CANONICAL game frame on a widescreen window IS the stretch. */
         PresRingEntry* pres_entry = present_ring_commit(
-            fmv_frame ? PRES_PATH_NATIVE_43
+            scene_content_4_3 ? PRES_PATH_CONTENT_43
                       : (wide_present ? PRES_PATH_WIDE : PRES_PATH_CANONICAL),
             (uint16_t)w, (uint16_t)h, (uint16_t)present_w);
 
@@ -7195,7 +7284,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             } else {
                 gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         (fmv_frame || nw_pin) ? 1 : 0);
+                                         content_4_3 ? 1 : 0);
                 netplay_note_present();
                 return ep;
             }
@@ -7219,7 +7308,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
                                              di.display_x);
                 vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
-                                        0 /* nearest */, fmv_frame ? 1 : 0);
+                                        0 /* nearest */, content_4_3 ? 1 : 0);
             } else if (wide_present &&
                        vk_renderer_present_wide((int)di.display_x, (int)di.display_y,
                                                 (int)h, g_video_aa ? 1 : 0)) {
@@ -7227,7 +7316,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             } else {
                 vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         (fmv_frame || nw_pin) ? 1 : 0);
+                                         (content_4_3 ||
+                                          nw_requires_safe_fallback) ? 1 : 0);
             }
             netplay_note_present();
             return ep;
@@ -7271,9 +7361,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 pres_entry->present_w     = (uint16_t)present_w;
             }
         }
-        /* depth24 (MotK crawl is 128 lines): pin short bands for letterbox even
-         * when fmv_frame is false on a plain 4:3 window (ws layer not engaged). */
-        pin_43 = fmv_frame || di.depth24 || (nw_pin && !wide_present);
+        /* Re-evaluate after a CPU wide-surface fallback. The outer canvas is
+         * unchanged; only the inner source becomes the centered 4:3 fallback. */
+        content_4_3 = scene_content_4_3 || di.depth24 ||
+                      (nw_requires_safe_fallback && !wide_present);
         if (!wide_present) {
             /* Never hires-present under netplay CPU-auth (even if settings say
              * 4× — that preference is offline-only). */
@@ -7311,14 +7402,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             crop_present_to_netplay_local_viewport(sdl_pixel_buf,
                                                    &present_px_w,
                                                    present_px_h)) {
-            pin_43 = false;
+            content_4_3 = false;
             local_viewport_crop_applied = true;
         }
 
         smooth_60_present(sdl_pixel_buf,
                           (uint32_t)present_px_w,
                           (uint32_t)present_px_h,
-                          !g_gl_active && !g_vk_active && !di.depth24 && !fmv_frame);
+                          !g_gl_active && !g_vk_active && !di.depth24 &&
+                              !scene_content_4_3);
 
         /* Frame blending (CRT-persistence masker for 30fps double-buffered
          * content). Some games (e.g. Crash Bash menus/characters) leave a
@@ -7390,7 +7482,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         gl_renderer_set_fmv_filter(g_video_fmv_filter);
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
                             g_video_aa ? 1 : 0,
-                            pin_43 ? 1 : 0, 0 /* full width */);
+                            content_4_3 ? 1 : 0, 0 /* full width */);
         netplay_note_present();
     } else {
     if ((!sdl_renderer || !sdl_texture) && ensure_sw_sdl_present() != 0)
@@ -7417,15 +7509,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                           (int)(pad_w * sizeof(uint32_t)));
     }
 
-    /* FMV (24-bit) frames are authored 4:3 with no GTE squash to compensate
-     * the widescreen stretch — pillarbox them at native 4:3 instead. Same for
-     * native-wide game frames that could not present wide (pin_43): canonical
-     * content is never stretched across the wide window. */
-    int dst_w = pin_43 ? 640 * tex_scale : g_logical_w;
+    /* Native 4:3 content is centered inside the configured SDL logical canvas;
+     * the logical canvas itself always keeps the selected outer aspect. */
+    int dst_w = content_4_3 ? 640 * tex_scale : g_logical_w;
     int dst_h = 480 * tex_scale;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, dst_h };
     /* Match GL: short display bands letterbox inside the 4:3 rect. */
-    if (pin_43 && h > 0 && h < 240) {
+    if (content_4_3 && h > 0 && h < 240) {
         int content_h = (dst_h * (int)h) / 240;
         if (content_h < 1) content_h = 1;
         dst.y = (dst_h - content_h) / 2;
@@ -11420,6 +11510,10 @@ int main(int argc, char** argv) {
                 g_video_win_w = gc.runtime.video_window_width;
                 g_video_win_w_explicit = true;
             }
+            /* Config is the baseline. Activation plugins run later and may
+             * override it; config must not be re-applied after activation. */
+            (void)psx_mod_set_crtc_refresh_multiplier(
+                gc.runtime.video_crtc_refresh_multiplier);
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_texfilter  = gc.runtime.video_texture_filter;
             g_video_fmv_filter = gc.runtime.video_fmv_filter;
@@ -11467,6 +11561,7 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            g_ws_fixed_outer_aspect = gc.ws_fixed_outer_aspect;
             gpu_ws_set_precise_nclip(gc.ws_precise_nclip ? 1 : 0);
             gpu_ws_set_gameplay_state_gate(
                 gc.ws_gameplay_state_addr,
@@ -13447,6 +13542,9 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    gl_renderer_set_fixed_outer_aspect(g_ws_fixed_outer_aspect ? 1 : 0);
+    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    vk_renderer_set_fixed_outer_aspect(g_ws_fixed_outer_aspect ? 1 : 0);
     gl_renderer_set_pgxp_depth(g_video_pgxp_depth);
     if (g_video_pgxp_depth) {
         /* Unarmed prims (no recovered depth: ship model, HUD, CPU-built
@@ -13819,20 +13917,33 @@ session_reboot:
     {
         SDL_DisplayMode dm;
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
-        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
-            double host_hz = (double)dm.refresh_rate;
-            g_host_refresh_hz = host_hz;
-            if (host_refresh_matches_guest_cadence()) {
-                g_frame_period_ms = 1000.0 / host_hz;
-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %.1f Hz panel "
-                            "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
-            } else {
-                std::printf("psxrecomp: host panel %.1f Hz does not match guest "
-                            "cadence; keeping %.2f Hz pacing\n",
-                            host_hz,
-                            g_frame_period_ms > 0.0 ? 1000.0 / g_frame_period_ms : 0.0);
+        const char *reject_why = nullptr;
+        double raw_hz = 0.0;
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0) {
+            const double float_hz = (double)dm.refresh_rate;
+            raw_hz = float_hz;
+#if defined(PSX_SDL3)
+            if (dm.refresh_rate_numerator > 0 && dm.refresh_rate_denominator > 0) {
+                raw_hz = (double)dm.refresh_rate_numerator /
+                         (double)dm.refresh_rate_denominator;
+            }
+#endif
+            g_host_refresh_hz = display_mode_refresh_hz(dm, &reject_why);
+            if (reject_why) {
+                std::printf("psxrecomp: ignoring bogus host refresh %.0f Hz "
+                            "(%s; mode %dx%d, sdl float %.0f); treating as unknown\n",
+                            raw_hz, reject_why, dm.w, dm.h, float_hz);
             }
         }
+        refresh_frame_pacer_period();
+        s_present_crtc_period_cycles = gpu_vblank_period_cycles();
+        s_present_crtc_is_pal = gpu_display_is_pal() ? 1 : 0;
+        if (g_host_refresh_hz > 0.0)
+            std::printf("psxrecomp: host panel %.0f Hz; cadence pending guest "
+                        "GP1(08h) display mode\n", g_host_refresh_hz);
+        else
+            std::printf("psxrecomp: host refresh unknown; cadence pending guest "
+                        "GP1(08h) display mode\n");
     }
 
     /* OpenGL backend: create the GL context now. On failure, relabel the
@@ -13999,7 +14110,6 @@ session_reboot:
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
   }
-    log_present_cadence();
   }
 
     /* Register vblank presentation callback. */

@@ -39,6 +39,10 @@ void interrupts_log_last_vblank_irqctx(const char *tag);
  * through here so the device-timing audit sees every event from one place.
  * `detail` is source-specific (DMA channel, timer index) or 0. */
 void psx_irq_raise(uint32_t bit, uint32_t detail);
+/* Single writer for the cached INTC output line and COP0 Cause.IP2 mirror.
+ * Call after every direct I_STAT/I_MASK mutation. */
+extern uint32_t g_psx_irq_hw_pending;
+void psx_irq_refresh_cause_ip2(void);
 
 /* Called from the dispatch loop after each function returns.
  * Services due scheduled edges, checks (i_stat & i_mask), and if pending + COP0

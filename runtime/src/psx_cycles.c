@@ -200,6 +200,12 @@ static void psx_devices_recompute_deadline(void) {
     psx_next_service_cycle = psx_cycle_count + (uint64_t)next;
 }
 
+static void psx_cycles_publish_fast_limit(void) {
+    g_psx_cycle_fast_limit =
+        psx_next_service_cycle > psx_cycle_count
+            ? psx_next_service_cycle - 1u : 0u;
+}
+
 void psx_devices_service_to_now(void) {
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
     if (g_plp_cycle_diag) g_plp_svc_calls++;
@@ -253,6 +259,7 @@ void psx_devices_service_to_now(void) {
         s_next_pc_sample = target + 1048576ull;
         psx_cycles_pc_sample_fire();
     }
+    psx_cycles_publish_fast_limit();
 }
 
 /* memory.c hook: called at the top of every device-MMIO read/write wrapper.
@@ -268,12 +275,17 @@ void psx_devices_mmio_sync(void) {
     } else {
         psx_devices_recompute_deadline();
     }
+    /* The MMIO operation runs after this entry hook and can re-arm an earlier
+     * event. Force the next nonzero CPU charge to recompute that deadline. */
+    s_next_service_cycle = 0;
+    g_psx_cycle_fast_limit = 0;
 }
 
 /* Exact per-charge path (legacy semantics). Used by PSX_COSIM builds and the
  * g_event_step_conservative diagnostic; also keeps the deadline-path state
  * coherent so the two can interleave (the runtime toggle flips mid-run). */
 static void psx_advance_cycles_exact(uint32_t cycles) {
+    g_psx_cycle_fast_limit = 0;
 #ifdef PSX_COSIM
     /* First-divergence oracle: the guest-cycle counter is the ONLY clock both backends
      * share identically, so it is the alignment point for the full-state hash. */
@@ -599,6 +611,7 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     s_devices_synced_cycle = psx_cycle_count;
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
+    g_psx_cycle_fast_limit = 0;
     /* Idle-skip detector latches absolute cycle/store counters from the
      * pre-load timeline; drop them so a rewound clock cannot false-train. */
     s_idle_pc = 0;
@@ -694,10 +707,13 @@ uint32_t psx_mult_latency_u(uint32_t rs) {  /* MULTU (unsigned) */
 /* DIV/DIVU latency is the fixed constant 37 — emitted directly at the op site. */
 
 void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
+    /* The completion timestamp is a guest-visible cycle observation. */
+    psx_cyc_batch_flush();
     cpu->muldiv_ts_done = psx_cycle_count + (uint64_t)latency;
 }
 
 void psx_muldiv_stall(CPUState* cpu) {
+    psx_cyc_batch_flush();
     /* MFLO/MFHI stall to the mult/div completion deadline (Beetle cpu.cpp:1723-1736).
      * While stalling it CONSUMES a pending load-delay give-back (read_absorb) — each
      * stalled cycle decrements read_absorb[read_absorb_which] — so cycles that would
@@ -723,6 +739,7 @@ void psx_muldiv_stall(CPUState* cpu) {
  * §1+DO_LDS that bracket this ran in the instruction's psx_cyc_step (COP2 is non-load).
  * MTC2/CTC2 (writes) use psx_gte_stall (stall only, no give-back). */
 void psx_gte_read(CPUState* cpu, uint32_t rt) {
+    psx_cyc_batch_flush();
     if (cpu->gte_ts_done > psx_cycle_count) {
         uint32_t stall = (uint32_t)(cpu->gte_ts_done - psx_cycle_count);
         cpu->ld_absorb = stall;
@@ -780,6 +797,7 @@ uint32_t psx_gte_cmd_latency(uint32_t cmd) {
 }
 
 void psx_gte_set(CPUState* cpu, uint32_t latency) {
+    psx_cyc_batch_flush();
     /* Back-to-back GTE ops serialize: finish the prior op first. */
     if (cpu->gte_ts_done > psx_cycle_count) {
         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
@@ -788,6 +806,7 @@ void psx_gte_set(CPUState* cpu, uint32_t latency) {
 }
 
 void psx_gte_stall(CPUState* cpu) {
+    psx_cyc_batch_flush();
     if (cpu->gte_ts_done > psx_cycle_count) {
         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
     }

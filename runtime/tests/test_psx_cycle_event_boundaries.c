@@ -5,6 +5,7 @@
  */
 
 #include "psx_cycles.h"
+#include "cpu_state.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -87,6 +88,55 @@ int main(void) {
                 "FAIL retroactive DMA credit: expected 1 boundary cycle got %u\n",
                 s_dma_ready_cycles);
         return 1;
+    }
+    if (g_psx_cycle_fast_limit <= psx_cycle_count) {
+        fprintf(stderr, "FAIL device service did not publish a safe fast limit\n");
+        return 1;
+    }
+    psx_devices_mmio_sync();
+    if (g_psx_cycle_fast_limit != 0u || psx_next_service_cycle != 0u) {
+        fprintf(stderr, "FAIL MMIO boundary retained a pre-write deadline\n");
+        return 1;
+    }
+
+    /* GTE/muldiv deadline helpers read the absolute guest clock. A generated
+     * block may have deferred its preceding instructions; each observer must
+     * publish them before setting or comparing a completion timestamp. */
+    {
+        CPUState cpu = {0};
+        g_psx_cyc_batch = 7u;
+        psx_muldiv_set(&cpu, 3u);
+        if (psx_cycle_count != 12u || cpu.muldiv_ts_done != 15u) {
+            fprintf(stderr, "FAIL muldiv set observed a deferred clock\n");
+            return 1;
+        }
+        g_psx_cyc_batch = 2u;
+        psx_muldiv_stall(&cpu);
+        if (psx_cycle_count != 14u || cpu.muldiv_ts_done != 14u) {
+            fprintf(stderr, "FAIL muldiv stall lost exact +1 ownership\n");
+            return 1;
+        }
+
+        g_psx_cyc_batch = 4u;
+        psx_gte_set(&cpu, 5u);
+        if (psx_cycle_count != 18u || cpu.gte_ts_done != 23u) {
+            fprintf(stderr, "FAIL GTE set observed a deferred clock\n");
+            return 1;
+        }
+        g_psx_cyc_batch = 2u;
+        psx_gte_read(&cpu, 9u);
+        if (psx_cycle_count != 23u || cpu.ld_absorb != 3u ||
+            cpu.ld_which_t != 9u) {
+            fprintf(stderr, "FAIL GTE read delay-slot ownership changed\n");
+            return 1;
+        }
+        cpu.gte_ts_done = 30u;
+        g_psx_cyc_batch = 2u;
+        psx_gte_stall(&cpu);
+        if (psx_cycle_count != 30u) {
+            fprintf(stderr, "FAIL GTE stall observed a deferred clock\n");
+            return 1;
+        }
     }
 
     /* Idle-skip observation boundary vs the SPU sample scheduler (mstan/psxrecomp#239

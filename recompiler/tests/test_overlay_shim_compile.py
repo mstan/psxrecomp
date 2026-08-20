@@ -41,6 +41,8 @@ void func_80010000(CPUState *cpu) {
     psx_cyc_bb_defer_end();
     if (psx_slice_block(cpu, 0x80010000u, 1u, 0)) return;
     debug_server_log_call_entry(0x80010000u);
+    PGXP_ALU(0u, cpu->gpr[2], cpu->gpr[3], cpu->gpr[4]);
+    PGXP_MULDIV(0u, cpu->hi, cpu->lo, cpu->gpr[3], cpu->gpr[4]);
 }
 '''
     gcc = find_gcc()
@@ -55,7 +57,8 @@ void func_80010000(CPUState *cpu) {
             "-DPSX_OVERLAY_DLL_BUILD",
             "-DPSX_NO_DEBUG_TOOLS",
             "-DPSX_ENABLE_BLOCK_CYCLES=1",
-            "-DPSX_OVERLAY_FLAVOR=0",
+            "-DPSX_OVERLAY_FLAVOR=2",
+            "-DPSX_PGXP=1",
             "-Werror=implicit-function-declaration",
         ]
         if os.name != "nt":

@@ -42,6 +42,9 @@ namespace PSXRecomp {
 " + indent instead of a space when this returns true. */
 bool emission_ends_on_preprocessor_directive(const std::string& code);
 
+ * Destructive GPR writes emit PGXP_GPR_WRITE. Numeric equality cannot prove a
+ * new value came from the old projection, so even byte-identical results must
+ * invalidate provenance. */
 void append_pgxp_hooks(uint32_t instr, std::string& code);
 
 } // namespace PSXRecomp

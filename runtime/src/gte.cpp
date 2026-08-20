@@ -188,7 +188,7 @@ static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
 // stay aligned with the visible frame.
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
-extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
+extern "C" int gpu_ws_content_native_43(void);  /* gpu.c: scene correction policy */
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 static int s_gte_replay_sandbox = 0;
 
@@ -845,11 +845,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     // Step 3: Perspective division
     int32_t h_div_sz = gte_divide(gte->H, gte->SZ[3], gte->FLAG);
 
-    // Step 4: Project to screen coordinates. Squash X only when configured AND
-    // this frame is being stretched — never on a 4:3-presented frame (FMV /
-    // full-2D screen), so content and present stay locked.
+    // Step 4: Project to screen coordinates. Squash X only for wide gameplay
+    // content. FMV/full-2D frames keep native projection for their centered
+    // 4:3 safe area; outer-canvas selection is independent of this decision.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
-    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_content_native_43();
     const bool dome_call = ws_dome_call_matches();
     // Curved backdrops are authored to cover the original 4:3 projection.
     // In classic widescreen, leave that projection intact and let the normal
@@ -873,7 +873,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
         xterm = xterm * s_ws_xnum / s_ws_xden;
     // Native-wide dome expansion remains a diagnostic-only depth probe.
     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
-             !gpu_ws_present_native_43()) {
+             !gpu_ws_content_native_43()) {
         int32_t sz = gte->SZ[3];
         if (!s_gte_replay_sandbox) {
             if (sz < s_ws_sz_min) s_ws_sz_min = sz;
@@ -1699,13 +1699,10 @@ static void gte_export_cpu_state(CPUState* cpu,
     uint32_t* d = cpu->gte_data;
     uint32_t* c = cpu->gte_ctrl;
 
-    d[0] = gte_pack_s16_pair(gte->V0[0], gte->V0[1]);
-    d[1] = static_cast<uint16_t>(gte->V0[2]);
-    d[2] = gte_pack_s16_pair(gte->V1[0], gte->V1[1]);
-    d[3] = static_cast<uint16_t>(gte->V1[2]);
-    d[4] = gte_pack_s16_pair(gte->V2[0], gte->V2[1]);
-    d[5] = static_cast<uint16_t>(gte->V2[2]);
-    d[6] = gte->RGBC;
+    /* Commands cannot mutate input vectors/RGBC, LZCS/LZCR, or control
+     * registers 0..30.  Their canonical CPU backing is therefore already the
+     * exact post-command value.  Export only architectural command results;
+     * this removes forty redundant stores from every COP2 command bridge. */
     d[7] = gte->OTZ;
     d[8] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR0));
     d[9] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR1));
@@ -1723,34 +1720,6 @@ static void gte_export_cpu_state(CPUState* cpu,
     d[26] = static_cast<uint32_t>(gte->MAC2);
     d[27] = static_cast<uint32_t>(gte->MAC3);
     d[28] = d[29] = gte_state_pack_irgb(gte);
-    d[30] = static_cast<uint32_t>(gte->LZCS);
-    d[31] = static_cast<uint32_t>(gte->LZCR);
-
-    c[0] = gte_pack_s16_pair(gte->RT[0][0], gte->RT[0][1]);
-    c[1] = gte_pack_s16_pair(gte->RT[0][2], gte->RT[1][0]);
-    c[2] = gte_pack_s16_pair(gte->RT[1][1], gte->RT[1][2]);
-    c[3] = gte_pack_s16_pair(gte->RT[2][0], gte->RT[2][1]);
-    c[4] = static_cast<uint16_t>(gte->RT[2][2]);
-    for (int i = 0; i < 3; ++i) c[5 + i] = static_cast<uint32_t>(gte->TR[i]);
-    c[8] = gte_pack_s16_pair(gte->L[0][0], gte->L[0][1]);
-    c[9] = gte_pack_s16_pair(gte->L[0][2], gte->L[1][0]);
-    c[10] = gte_pack_s16_pair(gte->L[1][1], gte->L[1][2]);
-    c[11] = gte_pack_s16_pair(gte->L[2][0], gte->L[2][1]);
-    c[12] = static_cast<uint16_t>(gte->L[2][2]);
-    for (int i = 0; i < 3; ++i) c[13 + i] = static_cast<uint32_t>(gte->BK[i]);
-    c[16] = gte_pack_s16_pair(gte->LC[0][0], gte->LC[0][1]);
-    c[17] = gte_pack_s16_pair(gte->LC[0][2], gte->LC[1][0]);
-    c[18] = gte_pack_s16_pair(gte->LC[1][1], gte->LC[1][2]);
-    c[19] = gte_pack_s16_pair(gte->LC[2][0], gte->LC[2][1]);
-    c[20] = static_cast<uint16_t>(gte->LC[2][2]);
-    for (int i = 0; i < 3; ++i) c[21 + i] = static_cast<uint32_t>(gte->FC[i]);
-    c[24] = static_cast<uint32_t>(gte->OFX);
-    c[25] = static_cast<uint32_t>(gte->OFY);
-    c[26] = gte->H;
-    c[27] = static_cast<uint32_t>(static_cast<int32_t>(gte->DQA));
-    c[28] = static_cast<uint32_t>(gte->DQB);
-    c[29] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF3));
-    c[30] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF4));
     c[31] = gte->FLAG;
 }
 
@@ -1978,9 +1947,11 @@ static uint32_t gte_sign_extend_16(uint32_t value) {
         static_cast<int16_t>(value & 0xFFFFu)));
 }
 
-/* Normalize only the guest-visible backing words. This deliberately does not
- * invalidate host precision caches: it is also the compatibility boundary for
- * committed AOT C emitted before all masked/aliased writes used helpers. */
+/* Normalize only the guest-visible backing words after a raw state import.
+ * Normal execution maintains these invariants incrementally: the shared
+ * register classification routes every masked, aliased, read-only, or derived
+ * write through the helpers below, while bit-transparent registers use direct
+ * array stores. */
 static void gte_cpu_canonicalize_backing(CPUState* cpu) {
     static const uint8_t data_u16[] = {1, 3, 5, 7, 16, 17, 18, 19};
     static const uint8_t data_s16[] = {8, 9, 10, 11};
@@ -2035,7 +2006,6 @@ extern "C" uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg) {
 
 extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
     if (reg >= 32) return;
-    gte_cpu_canonicalize_backing(cpu);
     switch (reg) {
         case 1: case 3: case 5: case 7:
         case 16: case 17: case 18: case 19:
@@ -2049,10 +2019,9 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
                 cpu->gte_data[29] = packed;
             }
             break;
-        /* Guest writes to the SXY FIFO drop the affected register shadows:
-         * we never model FIFO side effects on shadows — the shifted regs 12/13
-         * now describe words their shadows no longer match, and validation
-         * drops those on next use. */
+        /* Guest writes to the SXY FIFO update the shadow aliases in lockstep.
+         * In particular SXYP shifts SXY0/SXY1 before installing SXY2/SXYP;
+         * retaining the old 12/13 shadows can feed a false NCLIP winding. */
         case 12: case 13:
             cpu->gte_data[reg] = val;
             if (!PSXRecomp::GTE::s_gte_replay_sandbox)
@@ -2061,20 +2030,16 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
         case 14:
             cpu->gte_data[14] = val;
             cpu->gte_data[15] = val;
-            if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
                 pgxp_gte_reg_written(14, val);
-                pgxp_gte_reg_written(15, val);
-            }
             break;
         case 15:
             cpu->gte_data[12] = cpu->gte_data[13];
             cpu->gte_data[13] = cpu->gte_data[14];
             cpu->gte_data[14] = val;
             cpu->gte_data[15] = val;
-            if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
-                pgxp_gte_reg_written(14, val);
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
                 pgxp_gte_reg_written(15, val);
-            }
             break;
         case 23:
             cpu->gte_data[23] = 0;
@@ -2109,7 +2074,6 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
 
 extern "C" void gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val) {
     if (reg >= 32) return;
-    gte_cpu_canonicalize_backing(cpu);
     switch (reg) {
         case 4: case 12: case 20: case 26:
             cpu->gte_ctrl[reg] = val & 0xFFFFu;

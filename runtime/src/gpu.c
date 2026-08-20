@@ -12,6 +12,7 @@
 
 #include "gpu.h"
 #include "pgxp.h"
+#include "pgxp_vertex_cache.h"
 #include "mod_memory.h"
 #include "gpu_primitive_reject.h"
 #include "gpu_sw_renderer.h"
@@ -320,21 +321,21 @@ static int ws_game_mode(void) {
     return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
 }
 
-/* True when the current frame is presented at native 4:3 (NOT stretched), so
- * ALL squash must be suppressed and the content rendered pixel-native:
+/* True when the current frame needs native 4:3 content correction, so ALL
+ * squash must be suppressed and the content rendered pixel-native:
  *   - FMV video (24-bit, or streamed 15-bit colour MDEC), and
  *   - full-2D screens (menus/title/save — no character billboards this frame).
- * Coupling squash to this exact predicate keeps content and present in lock-
- * step: we squash IFF we stretch. Per-prim center-squash mangles composite 2D
- * UI (dialog boxes built from tiled cap/middle pieces), so such screens get
- * zero squash + a 4:3 pillarbox instead. The FMV check is cached per frame;
- * game_mode is a cheap live check. */
+ * Per-prim center-squash mangles composite 2D UI (dialog boxes built from
+ * tiled cap/middle pieces), so such screens get zero squash and are placed in
+ * a centered 4:3 safe area. The presentation layer independently decides
+ * whether that safe area lives inside a fixed configured outer canvas. The
+ * FMV check is cached per frame; game_mode is a cheap live check. */
 /* 2D-only gameplay scenes (sprite-tag titles). A room interior or a sky-only
  * fall is gameplay-classified (the character prims tag every frame) but has
  * no world-scale GTE projection — there is no 3D world and nothing beyond
  * the canonical frame to reveal, so wide presents can only stretch flat art
  * (the backdrop stretch fires wholesale because the background phase never
- * ends). Present those scenes native 4:3 instead: the canonical buffer is
+ * ends). Keep those scenes as native 4:3 content: the canonical buffer is
  * always faithful. The signal is natural polygon OVERHANG past the canonical
  * window (ws_sust_ovh_stamp) — content that would actually be revealed.
  * Shaded-prim presence and GTE projection volume both proved to be false
@@ -353,7 +354,7 @@ static int ws_2d_only_scene(void) {
 static uint32_t s_ws_fmv_frame_cache = 0xFFFFFFFFu;
 static int      s_ws_fmv_cached = 0;
 
-int gpu_ws_present_native_43(void) {
+int gpu_ws_content_native_43(void) {
     if (!ws_engaged()) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
     if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
@@ -366,16 +367,13 @@ int gpu_ws_present_native_43(void) {
     return s_ws_fmv_cached;
 }
 
-/* Squash applies only when configured AND the frame is being stretched. */
-static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
-/* Exported scene gate for the present-aspect switch (main.cpp): menus/2D and
- * FMV present at the game's own 4:3 (its natural bars intact, bezels around);
- * gameplay presents at the mod aspect. */
-int psx_ws_scene_wide_active(void) { return ws_active() && ws_game_mode(); }
+/* Scene classification controls only content correction. The presentation
+ * layer independently owns the configured outer canvas. */
+static int ws_active(void) { return ws_configured() && !gpu_ws_content_native_43(); }
 
 /* ----- Native-wide (mode 2) ------------------------------------------------
  * Render the wider FOV into an actually wider frame instead of squashing it.
- * Engaged on game frames only (FMV/menu frames pillarbox 4:3 like squash). The
+ * Engaged on game frames only (FMV/menu frames retain 4:3-safe content). The
  * frame grows symmetrically: each side by OFFSET display-pixels, total by
  * EXTRA = 2*OFFSET. OFFSET = round(W*(3*num-4*den)/(8*den)) where W is the live
  * display width — derived from the aspect so it generalises past 16:9 and
@@ -386,7 +384,7 @@ int psx_ws_scene_wide_active(void) { return ws_active() && ws_game_mode(); }
  * on the right, and the present widens the display read by EXTRA. 0 when
  * native-wide is inactive (4:3 / boot / squash mode / FMV / full-2D). */
 int ws_native_wide_active(void) {
-    return ws_mode == 2 && !gpu_ws_present_native_43();
+    return ws_mode == 2 && !gpu_ws_content_native_43();
 }
 /* Cull/spawn setup often runs while a scene is loading, before the first GTE
  * frame can classify it as gameplay.  Keep that pre-render setup aware of the
@@ -1787,7 +1785,7 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->configured        = ws_configured();
     out->active            = ws_active();
     out->game_mode         = ws_game_mode();
-    out->present_native_43 = gpu_ws_present_native_43();
+    out->present_native_43 = gpu_ws_content_native_43();
     out->x_margin          = psx_ws_x_margin();
     out->activation_margin = psx_ws_activation_margin();
     out->xnum              = ws_xnum;
@@ -2489,6 +2487,9 @@ static uint32_t hres2;            /* bit 16: horizontal resolution 2 (368 mode) 
 static uint32_t hres1;            /* bits 17-18: horizontal resolution 1 */
 static uint32_t vres;             /* bit 19: vertical resolution (0=240, 1=480) */
 static uint32_t video_mode;       /* bit 20: 0=NTSC, 1=PAL */
+/* Host presentation defers its authoritative CRTC banner until the guest has
+ * actually issued GP1(08h). This is host-observation state, not guest state. */
+static uint32_t display_mode_programmed;
 static uint32_t display_depth;    /* bit 21: 0=15bit, 1=24bit */
 static uint32_t vertical_interlace; /* bit 22 */
 
@@ -2752,6 +2753,8 @@ static void gpu_reset_state(int clear_vram) {
     hres1 = 0;
     vres = 0;
     video_mode = 0;
+    if (clear_vram)
+        display_mode_programmed = 0;
     display_depth = 0;
     vertical_interlace = 0;
 
@@ -3275,6 +3278,10 @@ int gpu_display_is_pal(void) {
     return (int)(video_mode & 1u);
 }
 
+int gpu_display_mode_is_programmed(void) {
+    return display_mode_programmed ? 1 : 0;
+}
+
 /* Opt-in Nx CRTC (mod plugins). 1 = stock; 2 = half-period VBlank. */
 static uint32_t s_crtc_refresh_multiplier = 1u;
 /* 0 = derive from GP1 video_mode; else absolute period before Nx divide. */
@@ -3426,18 +3433,187 @@ uint32_t gpu_texture_correction_hits(void) {
     return sw_perspective_triangle_count();
 }
 
-/* Per-vertex precise positions (PGXP, ENHANCEMENTS.md G1). Each of the three
- * packet words is resolved independently: the address-keyed dataflow shadow
- * first (validated against the actual word — exact provenance, survives
- * ordering-table reordering), the ambiguity-gated position cache second, the
- * parsed integers last. Mixing precise and native vertices in one triangle
- * is correct — a native vertex is exactly where the uncorrected pipeline put
- * it, so shared edges between neighbouring triangles cannot disagree by more
- * than the sub-pixel fraction. The integer delta folds in draw offsets and
- * any widescreen adjustment already applied by the caller. */
+/* PGXP correction is decided once for the complete GP0 source primitive. A
+ * quad therefore resolves all four packet vertices before either of its two
+ * renderer triangles is submitted. The renderer-facing helpers below may only
+ * arm from this immutable decision; they never resolve or repair one vertex in
+ * isolation. */
+#define PGXP_PRIMITIVE_MAX_VERTICES 4
+typedef struct {
+    int count;
+    int indices[PGXP_PRIMITIVE_MAX_VERTICES];
+
+    int position_requested;
+    int position_armed;
+    int32_t raw_x[PGXP_PRIMITIVE_MAX_VERTICES];
+    int32_t raw_y[PGXP_PRIMITIVE_MAX_VERTICES];
+    int32_t precise_x[PGXP_PRIMITIVE_MAX_VERTICES];
+    int32_t precise_y[PGXP_PRIMITIVE_MAX_VERTICES];
+    uint8_t cls[PGXP_PRIMITIVE_MAX_VERTICES];
+
+    int depth_requested;
+    int depth_armed;
+    int depth_reject_reason; /* 0 = none, 1 = no source, 2 = incomplete Z */
+    int depth_miss_slot;
+    uint8_t depth_miss_why;
+    uint16_t z[PGXP_PRIMITIVE_MAX_VERTICES];
+    float q[PGXP_PRIMITIVE_MAX_VERTICES];
+} PgxpPrimitiveDecision;
+
+static struct {
+    uint64_t primitives_armed;
+    uint64_t primitives_rejected_incomplete_position;
+    uint64_t primitives_rejected_incomplete_depth;
+    uint64_t primitives_mixed_position;
+    uint64_t vertices_promoted_from_native;
+    uint64_t vertices_demoted_to_native;
+    uint64_t vertex_cache_overflow;
+} s_pgxp_primitive_stats;
+
+static PgxpVertexCache s_pgxp_vertex_cache;
+
+void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
+                              uint64_t *rejected_incomplete_position,
+                              uint64_t *rejected_incomplete_depth,
+                              uint64_t *mixed_position,
+                              uint64_t *promoted_from_native,
+                              uint64_t *demoted_to_native,
+                              uint64_t *cache_overflow) {
+    if (primitives_armed)
+        *primitives_armed = s_pgxp_primitive_stats.primitives_armed;
+    if (rejected_incomplete_position)
+        *rejected_incomplete_position =
+            s_pgxp_primitive_stats.primitives_rejected_incomplete_position;
+    if (rejected_incomplete_depth)
+        *rejected_incomplete_depth =
+            s_pgxp_primitive_stats.primitives_rejected_incomplete_depth;
+    if (mixed_position)
+        *mixed_position = s_pgxp_primitive_stats.primitives_mixed_position;
+    if (promoted_from_native)
+        *promoted_from_native =
+            s_pgxp_primitive_stats.vertices_promoted_from_native;
+    if (demoted_to_native)
+        *demoted_to_native =
+            s_pgxp_primitive_stats.vertices_demoted_to_native;
+    if (cache_overflow)
+        *cache_overflow = s_pgxp_primitive_stats.vertex_cache_overflow;
+}
+
+static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
+                                   const int *indices, int count,
+                                   int textured, const int32_t *vx,
+                                   const int32_t *vy) {
+    memset(decision, 0, sizeof(*decision));
+    decision->count = count;
+    for (int i = 0; i < count; i++)
+        decision->indices[i] = indices[i];
+
+    decision->position_requested = gte_geometry_correction_enabled();
+    if (decision->position_requested) {
+        for (int i = 0; i < count; i++) {
+            const int index = indices[i];
+            const uint32_t word = gp0_cmd_buf[index];
+            const uint32_t addr = (gp0_cmd_source_addr == 0xFFFFFFFFu)
+                                      ? 0xFFFFFFFFu
+                                      : gp0_cmd_source_addr +
+                                            (uint32_t)index * 4u;
+            uint16_t sz;
+            parse_vertex(word, &decision->raw_x[i], &decision->raw_y[i]);
+            const int src = pgxp_get_precise_vertex(
+                addr, word, decision->raw_x[i], decision->raw_y[i],
+                &decision->precise_x[i], &decision->precise_y[i], &sz);
+            decision->cls[i] =
+                (src == PGXP_SRC_NATIVE && addr == 0xFFFFFFFFu)
+                    ? 3u
+                    : (uint8_t)src;
+        }
+        int canonical_precise_count = 0;
+        for (int i = 0; i < count; i++) {
+            const int candidate_precise =
+                decision->cls[i] != PGXP_SRC_NATIVE && decision->cls[i] != 3u;
+            int32_t candidate_x16 =
+                (int32_t)((int64_t)vx[i] * 65536);
+            int32_t candidate_y16 =
+                (int32_t)((int64_t)vy[i] * 65536);
+            if (candidate_precise) {
+                candidate_x16 = (int32_t)(
+                    (int64_t)decision->precise_x[i] +
+                    (int64_t)(vx[i] - decision->raw_x[i]) * 65536);
+                candidate_y16 = (int32_t)(
+                    (int64_t)decision->precise_y[i] +
+                    (int64_t)(vy[i] - decision->raw_y[i]) * 65536);
+            }
+            int canonical_precise = 0;
+            const int cache_result = pgxp_vertex_cache_resolve(
+                &s_pgxp_vertex_cache, s_frame_count,
+                vx[i], vy[i], candidate_precise,
+                candidate_x16, candidate_y16, &decision->precise_x[i],
+                &decision->precise_y[i], &canonical_precise);
+            if (cache_result == PGXP_VERTEX_CACHE_OVERFLOW)
+                s_pgxp_primitive_stats.vertex_cache_overflow++;
+            if (canonical_precise) canonical_precise_count++;
+            if (!candidate_precise && canonical_precise)
+                s_pgxp_primitive_stats.vertices_promoted_from_native++;
+            if (candidate_precise && !canonical_precise)
+                s_pgxp_primitive_stats.vertices_demoted_to_native++;
+        }
+        decision->position_armed = canonical_precise_count != 0;
+        if (canonical_precise_count != count)
+            s_pgxp_primitive_stats
+                .primitives_rejected_incomplete_position++;
+        if (canonical_precise_count != 0 &&
+            canonical_precise_count != count)
+            s_pgxp_primitive_stats.primitives_mixed_position++;
+    }
+
+    decision->depth_requested = textured && s_texture_correction_enabled;
+    if (decision->depth_requested) {
+        if (gp0_cmd_source_addr == 0xFFFFFFFFu) {
+            decision->depth_reject_reason = 1;
+            s_pgxp_primitive_stats.primitives_rejected_incomplete_depth++;
+        } else {
+            int depth_count = 0;
+            for (int i = 0; i < count; i++) {
+                const int index = indices[i];
+                const uint32_t addr = psx_ram_map_read(
+                    (gp0_cmd_source_addr + (uint32_t)index * 4u) &
+                    0x1FFFFFFFu) & ~3u;
+                const int have_depth = gte_precision_load_word(
+                    addr, gp0_cmd_buf[index], NULL, NULL, &decision->z[i]) &&
+                    decision->z[i] != 0;
+                if (have_depth) {
+                    depth_count++;
+                } else if (decision->depth_reject_reason == 0) {
+                    decision->depth_reject_reason = 2;
+                    decision->depth_miss_slot = i;
+                    decision->depth_miss_why = (uint8_t)
+                        pgxp_debug_shadow_class(addr, gp0_cmd_buf[index]);
+                }
+            }
+            decision->depth_armed = (depth_count == count);
+            if (decision->depth_armed) {
+                float qmax = 0.0f;
+                for (int i = 0; i < count; i++) {
+                    decision->q[i] = 1.0f / (float)decision->z[i];
+                    if (decision->q[i] > qmax) qmax = decision->q[i];
+                }
+                for (int i = 0; i < count; i++)
+                    decision->q[i] /= qmax;
+            } else {
+                s_pgxp_primitive_stats
+                    .primitives_rejected_incomplete_depth++;
+            }
+        }
+    }
+
+    if (decision->position_armed || decision->depth_armed)
+        s_pgxp_primitive_stats.primitives_armed++;
+}
+
 /* PGXP resolution census (G1 coverage gap). Double-buffered by frame parity
  * so the debug thread can read the completed frame while this one builds.
- * Only imperfect triangles get entries; totals give the denominator. */
+ * Only triangles from imperfect source decisions get entries; totals give the
+ * denominator. */
 #define PGXP_CENSUS_CAP 8192
 static PgxpCensusEnt s_pgxp_census[2][PGXP_CENSUS_CAP];
 static uint32_t s_pgxp_census_n[2], s_pgxp_census_frame[2];
@@ -3460,86 +3636,19 @@ int gpu_pgxp_census_dump(uint32_t *frame_out, uint32_t *tris, uint32_t *clean,
     return n;
 }
 
-/* Clamp rescue (widescreen precision, rides the precise-NCLIP opt-in): a
- * vertex parked exactly on a GTE saturation rail (+/-1024 screen units) is
- * hardware-mangled — its true projection is somewhere far off-frame, and
- * rasterizing the clamped position folds that error INTO the frame as the
- * classic PS1 "polygon spike" (a sliver streaking across the screen). 4:3
- * framing plus CRT overscan hid most of these; a wide aspect stares right at
- * them. When the address-keyed dataflow shadow knows the true sub-pixel
- * position (clamped to +/-4096 px at the producer), substitute it for railed
- * vertices only — every in-range vertex stays native, so normal geometry is
- * bit-identical and shared edges cannot crack. */
-static int ws_clamp_rescue_vertex(uint32_t addr, uint32_t word,
-                                  int32_t raw_x, int32_t raw_y,
-                                  int32_t *px, int32_t *py) {
-    if (raw_x != -1024 && raw_x != 1023 && raw_y != -1024 && raw_y != 1023)
-        return 0;
-    uint16_t sz;
-    if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y, px, py, &sz)
-            != PGXP_SRC_DATAFLOW)
-        return 0;
-    /* Only substitute when the shadow actually differs — a legit vertex that
-     * genuinely sits on the rail keeps its native position. */
-    return ((*px >> 16) != raw_x) || ((*py >> 16) != raw_y);
-}
-
-static void prepare_precise_triangle(int i0, int i1, int i2,
-                                     const int32_t vx[3], const int32_t vy[3]) {
+static void prepare_precise_triangle(const PgxpPrimitiveDecision *decision,
+                                     int v0, int v1, int v2,
+                                     const int32_t vx[3],
+                                     const int32_t vy[3]) {
+    const int slots[3] = { v0, v1, v2 };
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
-    if (!gte_geometry_correction_enabled()) {
-        if (gpu_ws_precise_nclip_enabled() &&
-            gp0_cmd_source_addr != 0xFFFFFFFFu) {
-            const int idx[3] = { i0, i1, i2 };
-            int32_t fx[3], fy[3];
-            int any_rescued = 0;
-            for (int i = 0; i < 3; i++) {
-                uint32_t word = gp0_cmd_buf[idx[i]];
-                int32_t raw_x, raw_y;
-                parse_vertex(word, &raw_x, &raw_y);
-                uint32_t addr = gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
-                int32_t px, py;
-                if (ws_clamp_rescue_vertex(addr, word, raw_x, raw_y, &px, &py)) {
-                    any_rescued = 1;
-                    fx[i] = (int32_t)((int64_t)px +
-                                      (int64_t)(vx[i] - raw_x) * 65536);
-                    fy[i] = (int32_t)((int64_t)py +
-                                      (int64_t)(vy[i] - raw_y) * 65536);
-                } else {
-                    fx[i] = vx[i] << 16;
-                    fy[i] = vy[i] << 16;
-                }
-            }
-            if (any_rescued) {
-                gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1],
-                                        fx[2],fy[2]);
-                return;
-            }
-        }
+    if (!decision->position_requested) {
+        /* Precise NCLIP is a GTE-side sign audit. It must never smuggle the
+         * unclamped +/-4096 projection into a GPU primitive: saturation-rail
+         * replacement is outside PGXP's same-cell contract and is a direct
+         * route to full-screen polygon spikes. */
         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
         return;
-    }
-    const int idx[3] = { i0, i1, i2 };
-    int32_t fx[3], fy[3];
-    int any_precise = 0;
-    uint8_t cls[3];
-    for (int i = 0; i < 3; i++) {
-        uint32_t word = gp0_cmd_buf[idx[i]];
-        int32_t raw_x, raw_y;
-        parse_vertex(word, &raw_x, &raw_y);
-        uint32_t addr = (gp0_cmd_source_addr == 0xFFFFFFFFu)
-                            ? 0xFFFFFFFFu
-                            : gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
-        int32_t px, py;
-        uint16_t sz;
-        int src = pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
-                                          &px, &py, &sz);
-        if (src != PGXP_SRC_NATIVE)
-            any_precise = 1;
-        cls[i] = (src == PGXP_SRC_NATIVE && addr == 0xFFFFFFFFu) ? 3u
-                                                                 : (uint8_t)src;
-        fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
-        fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
     }
     {
         uint32_t f = (uint32_t)s_frame_count;
@@ -3551,7 +3660,9 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
             s_pgxp_census_clean[slot] = 0;
         }
         s_pgxp_census_tris[slot]++;
-        if (cls[0] == 2 && cls[1] == 2 && cls[2] == 2) {
+        if (decision->position_armed &&
+            decision->cls[v0] == 2 && decision->cls[v1] == 2 &&
+            decision->cls[v2] == 2) {
             s_pgxp_census_clean[slot]++;
         } else if (s_pgxp_census_n[slot] < PGXP_CENSUS_CAP) {
             PgxpCensusEnt *e = &s_pgxp_census[slot][s_pgxp_census_n[slot]++];
@@ -3564,15 +3675,23 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
             }
             e->x0 = (int16_t)x0; e->y0 = (int16_t)y0;
             e->x1 = (int16_t)x1; e->y1 = (int16_t)y1;
-            e->cls[0] = cls[0]; e->cls[1] = cls[1]; e->cls[2] = cls[2];
+            e->cls[0] = decision->cls[v0];
+            e->cls[1] = decision->cls[v1];
+            e->cls[2] = decision->cls[v2];
             e->_pad = 0;
             e->src = gp0_cmd_source_addr;
             e->frame = f;
         }
     }
-    if (!any_precise) {
+    if (!decision->position_armed) {
         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
         return;
+    }
+    int32_t fx[3], fy[3];
+    for (int i = 0; i < 3; i++) {
+        const int vertex = slots[i];
+        fx[i] = decision->precise_x[vertex];
+        fy[i] = decision->precise_y[vertex];
     }
     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
 }
@@ -3592,7 +3711,6 @@ static struct {
     uint64_t no_correction; /* texture correction off                       */
     uint64_t no_source;     /* CPU-built primitive, no packet address       */
     uint64_t no_depth;      /* a vertex had no recorded Z, or Z == 0        */
-    uint64_t z_interp;      /* armed with mean-filled Z for clipped vertices */
 } s_texcorr;
 
 void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
@@ -3656,66 +3774,41 @@ int gpu_pgxp_texcensus_dump(uint32_t *frame_out, PgxpCensusEnt *out, int max_out
     return n;
 }
 
-static void prepare_texture_triangle(int i0, int i1, int i2) {
+static void prepare_texture_triangle(const PgxpPrimitiveDecision *decision,
+                                     int v0, int v1, int v2) {
+    const int slots[3] = { v0, v1, v2 };
+    int indices[3];
+    for (int i = 0; i < 3; i++)
+        indices[i] = decision->indices[slots[i]];
+
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
     gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
     s_texcorr.attempts++;
-    if (!s_texture_correction_enabled) { s_texcorr.no_correction++; return; }
-    int indices[3] = { i0, i1, i2 };
-    if (gp0_cmd_source_addr == 0xFFFFFFFFu) {
+    if (!decision->depth_requested) {
+        s_texcorr.no_correction++;
+        return;
+    }
+    if (decision->depth_reject_reason == 1) {
         s_texcorr.no_source++;
         pgxp_texcensus_note(indices, 0u, 0u, 0u);
         return;
     }
-    uint16_t z[3];
-    int have_z[3];
-    int n_have = 0;
-    int noted = 0;
-    for (int i = 0; i < 3; i++) {
-        uint32_t addr = psx_ram_map_read((gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFFFFu) & ~3u;
-        have_z[i] = gte_precision_load_word(addr, gp0_cmd_buf[indices[i]],
-                                            NULL, NULL, &z[i]) && z[i] != 0;
-        if (have_z[i]) n_have++;
-        else if (!noted) {
-            noted = 1;
-            pgxp_texcensus_note(indices, 1u, (uint8_t)indices[i],
-                (uint8_t)pgxp_debug_shadow_class(addr, gp0_cmd_buf[indices[i]]));
-        }
-    }
-    if (n_have == 0) {
-        /* No depth anywhere: affine is the only honest option. */
+    if (!decision->depth_armed) {
         s_texcorr.no_depth++;
+        pgxp_texcensus_note(
+            indices, 1u,
+            (uint8_t)decision->indices[decision->depth_miss_slot],
+            decision->depth_miss_why);
         return;
     }
-    if (n_have < 3) {
-        /* Clip-generated vertices: the game's near/edge clipper computes new
-         * screen coords with mult/div interpolation, which no exact-provenance
-         * shadow can follow, so their depth is unknowable here. Their TRUE
-         * view depth lies between the polygon's surviving projected vertices,
-         * so the mean of the known depths is a bounded approximation — and
-         * perspective UVs with an approximate q beat the affine fallback,
-         * whose error is what reads as texture swimming on every large
-         * clipped wall (the class lives on near-field walls/pillars). */
-        uint32_t sum = 0;
-        for (int i = 0; i < 3; i++) if (have_z[i]) sum += z[i];
-        uint16_t fill = (uint16_t)(sum / (uint32_t)n_have);
-        if (fill == 0) fill = 1;
-        for (int i = 0; i < 3; i++) if (!have_z[i]) z[i] = fill;
-        s_texcorr.z_interp++;
-    }
-    float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
-    float qmax = q[0];
-    if (q[1] > qmax) qmax = q[1];
-    if (q[2] > qmax) qmax = q[2];
-    if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
     s_texcorr.armed++;
-    gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
-    /* The magnitude the line above normalises away. q/qmax is a per-triangle
-     * relative weight -- correct for UV correction, and meaningless as a depth,
-     * because it cannot say where this triangle sits against any other. The
-     * real GTE screen Z is right here, so hand it over unscaled and let the
-     * backend map it to NDC. */
-    gr_set_depth_triangle(1, (float)z[0], (float)z[1], (float)z[2]);
+    gr_set_perspective_triangle(1, decision->q[v0], decision->q[v1],
+                                decision->q[v2]);
+    /* q was normalized once across the source primitive. Absolute GTE screen Z
+     * remains separate so cross-primitive depth ordering is meaningful. */
+    gr_set_depth_triangle(1, (float)decision->z[v0],
+                          (float)decision->z[v1],
+                          (float)decision->z[v2]);
 }
 
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
@@ -3905,8 +3998,11 @@ static void gp0_exec_mono_tri(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
+    const int pgxp_indices[3] = { 1, 2, 3 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 3, 0, vx, vy);
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    prepare_precise_triangle(1, 2, 3,
+    prepare_precise_triangle(&pgxp, 0, 1, 2,
                              vx, vy);
     gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
 }
@@ -3921,7 +4017,6 @@ static void gp0_exec_mono_quad(void) {
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
-
     /* Full-screen filters are commonly encoded as an axis-aligned quad. Drawing
      * a semi-transparent quad as two independent triangles blends their shared
      * diagonal twice; render the equivalent rectangle once to avoid that seam.
@@ -3931,7 +4026,8 @@ static void gp0_exec_mono_quad(void) {
         vy[0] == vy[1] && vy[2] == vy[3] &&
         vx[1] > vx[0] && vy[2] > vy[0] &&
         vx[0] <= 0 && vx[1] >= ws_disp_w() &&
-        vy[0] <= 0 && vy[2] >= ws_disp_h()) {
+        vy[0] <= 0 && vy[2] >= ws_disp_h() &&
+        !gte_geometry_correction_enabled()) {
         int32_t x = vx[0];
         int32_t y = vy[0];
         int w = (int)(vx[1] - vx[0]);
@@ -3950,11 +4046,14 @@ static void gp0_exec_mono_quad(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 4)) return;
+    const int pgxp_indices[4] = { 1, 2, 3, 4 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 4, 0, vx, vy);
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     /* Semi axis-aligned mono quads (UI boxes/borders): one rect, not two tris.
      * Thin semi borders (e.g. CTR name-entry OT-1144 teal 3×H) otherwise double-
      * blend their shared diagonal — nearly the whole strip — and overpaint 3D. */
-    if (semi_trans && ws_axis_aligned_quad(vx, vy)) {
+    if (semi_trans && !pgxp.position_armed && ws_axis_aligned_quad(vx, vy)) {
         int32_t min_x = vx[0], max_x = vx[0], min_y = vy[0], max_y = vy[0];
         for (int i = 1; i < 4; i++) {
             if (vx[i] < min_x) min_x = vx[i];
@@ -3972,13 +4071,13 @@ static void gp0_exec_mono_quad(void) {
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
-        prepare_precise_triangle(1, 2, 3, tx, ty);
+        prepare_precise_triangle(&pgxp, 0, 1, 2, tx, ty);
         gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
     }
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
-        prepare_precise_triangle(3, 2, 4, tx, ty);
+        prepare_precise_triangle(&pgxp, 2, 1, 3, tx, ty);
         gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
     }
 }
@@ -4000,8 +4099,11 @@ static void gp0_exec_shaded_tri(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
+    const int pgxp_indices[3] = { 1, 3, 5 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 3, 0, vx, vy);
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    prepare_precise_triangle(1, 3, 5,
+    prepare_precise_triangle(&pgxp, 0, 1, 2,
                              vx, vy);
     gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                              vx[1], vy[1], c[1],
@@ -4035,6 +4137,9 @@ static void gp0_exec_shaded_quad(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 4)) return;
+    const int pgxp_indices[4] = { 1, 3, 5, 7 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 4, 0, vx, vy);
     /* Capture vertex data when armed. */
     if (sq_cap_armed && sq_cap_count < SQ_CAP_MAX) {
         GpuSqCapEntry* e = &sq_cap_buf[sq_cap_count++];
@@ -4047,7 +4152,7 @@ static void gp0_exec_shaded_quad(void) {
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
-        prepare_precise_triangle(1, 3, 5, tx, ty);
+        prepare_precise_triangle(&pgxp, 0, 1, 2, tx, ty);
         gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                                  vx[1], vy[1], c[1],
                                  vx[2], vy[2], c[2]);
@@ -4055,7 +4160,7 @@ static void gp0_exec_shaded_quad(void) {
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
-        prepare_precise_triangle(5, 3, 7, tx, ty);
+        prepare_precise_triangle(&pgxp, 2, 1, 3, tx, ty);
         gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
                                  vx[1], vy[1], c[1],
                                  vx[3], vy[3], c[3]);
@@ -4125,10 +4230,13 @@ static void gp0_exec_textured_tri(void) {
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
 
+    const int pgxp_indices[3] = { 1, 3, 5 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 3, 1, vx, vy);
     setup_textured_draw(color24, semi_trans, raw_texture);
-    prepare_precise_triangle(1, 3, 5,
+    prepare_precise_triangle(&pgxp, 0, 1, 2,
                              vx, vy);
-    prepare_texture_triangle(1, 3, 5);
+    prepare_texture_triangle(&pgxp, 0, 1, 2);
     gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -4160,7 +4268,6 @@ static void gp0_exec_textured_quad(void) {
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
-
     /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
      * GTE squash never saw — re-squash every X around the prim's anchor. */
     {
@@ -4177,13 +4284,17 @@ static void gp0_exec_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 4)) return;
+    const int pgxp_indices[4] = { 1, 3, 5, 7 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 4, 1, vx, vy);
 
     setup_textured_draw(color24, semi_trans, raw_texture);
 
     if (vy[0] == vy[1] && vy[2] == vy[3] &&
         vx[0] == vx[2] && vx[1] == vx[3] &&
         u[0] == u[2] && u[1] == u[3] &&
-        v[0] == v[1] && v[2] == v[3]) {
+        v[0] == v[1] && v[2] == v[3] &&
+        !pgxp.position_armed && !pgxp.depth_armed) {
         int x = vx[0] < vx[1] ? vx[0] : vx[1];
         int y = vy[0] < vy[2] ? vy[0] : vy[2];
         int w = vx[0] < vx[1] ? vx[1] - vx[0] : vx[0] - vx[1];
@@ -4208,8 +4319,8 @@ static void gp0_exec_textured_quad(void) {
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
-        prepare_precise_triangle(1, 3, 5, tx, ty);
-        prepare_texture_triangle(1, 3, 5);
+        prepare_precise_triangle(&pgxp, 0, 1, 2, tx, ty);
+        prepare_texture_triangle(&pgxp, 0, 1, 2);
         gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                                   vx[1], vy[1], u[1], v[1],
                                   vx[2], vy[2], u[2], v[2],
@@ -4218,8 +4329,8 @@ static void gp0_exec_textured_quad(void) {
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
-        prepare_precise_triangle(5, 3, 7, tx, ty);
-        prepare_texture_triangle(5, 3, 7);
+        prepare_precise_triangle(&pgxp, 2, 1, 3, tx, ty);
+        prepare_texture_triangle(&pgxp, 2, 1, 3);
         gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
                                   vx[1], vy[1], u[1], v[1],
                                   vx[3], vy[3], u[3], v[3],
@@ -4259,10 +4370,13 @@ static void gp0_exec_shaded_textured_tri(void) {
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
 
+    const int pgxp_indices[3] = { 1, 4, 7 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 3, 1, vx, vy);
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    prepare_precise_triangle(1, 4, 7,
+    prepare_precise_triangle(&pgxp, 0, 1, 2,
                              vx, vy);
-    prepare_texture_triangle(1, 4, 7);
+    prepare_texture_triangle(&pgxp, 0, 1, 2);
     gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
@@ -4298,7 +4412,6 @@ static void gp0_exec_shaded_textured_quad(void) {
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
-
     ws_auto_ui_transform_quad(vx, vy);
     ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
@@ -4306,13 +4419,16 @@ static void gp0_exec_shaded_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
     if (draw_area_out_bbox(vx, vy, 4)) return;
+    const int pgxp_indices[4] = { 1, 4, 7, 10 };
+    PgxpPrimitiveDecision pgxp;
+    prepare_pgxp_primitive(&pgxp, pgxp_indices, 4, 1, vx, vy);
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
-        prepare_precise_triangle(1, 4, 7, tx, ty);
-        prepare_texture_triangle(1, 4, 7);
+        prepare_precise_triangle(&pgxp, 0, 1, 2, tx, ty);
+        prepare_texture_triangle(&pgxp, 0, 1, 2);
         gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                          vx[1], vy[1], u[1], v[1], c[1],
                                          vx[2], vy[2], u[2], v[2], c[2],
@@ -4321,8 +4437,8 @@ static void gp0_exec_shaded_textured_quad(void) {
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
-        prepare_precise_triangle(7, 4, 10, tx, ty);
-        prepare_texture_triangle(7, 4, 10);
+        prepare_precise_triangle(&pgxp, 2, 1, 3, tx, ty);
+        prepare_texture_triangle(&pgxp, 2, 1, 3);
         gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
                                          vx[1], vy[1], u[1], v[1], c[1],
                                          vx[3], vy[3], u[3], v[3], c[3],
@@ -5900,6 +6016,7 @@ static void gp1_display_mode(uint32_t val) {
     hres1 = val & 3;
     vres = (val >> 2) & 1;
     video_mode = (val >> 3) & 1;
+    display_mode_programmed = 1;
     if (new_depth != display_depth)
         s_d24_upload_x1 = 0; /* rising/falling: drop stale coverage */
     display_depth = new_depth;
@@ -6081,6 +6198,9 @@ static int gpu_snap_parse(PstR *r) {
 #undef RU
 #undef RI
 #undef RH
+    /* A restored GPU snapshot already contains an authoritative GP1(08h)
+     * display mode even though the host-only observation flag is not wired. */
+    display_mode_programmed = 1;
     return 1;
 }
 

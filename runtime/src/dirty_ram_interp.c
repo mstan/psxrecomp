@@ -90,21 +90,12 @@ extern int g_ls_replay_active;     /* defined in the lockstep section; used by e
  * generated overlay DLLs deliberately batch psx_advance_cycles() through a
  * DLL-local accumulator and must never bind directly to runtime cycle state. */
 #if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
-extern uint64_t g_psx_cycle_fast_limit;
-extern int g_event_step_conservative;
-
 static inline void interp_cyc_step(CPUState *cpu, uint32_t reg_mask) {
     uint8_t w = cpu->read_absorb_which;
     if (cpu->read_absorb[w]) {
         cpu->read_absorb[w]--;
-    } else if (!g_ls_replay_active) {
-        uint64_t next = psx_cycle_count + 1u;
-        if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
-            next <= g_psx_cycle_fast_limit) {
-            psx_cycle_count = next;
-        } else {
-            psx_advance_cycles(1u);
-        }
+    } else if (!psx_cycles_try_fast_charge(1u)) {
+        psx_advance_cycles(1u);
     }
     psx_cyc_deps(cpu, reg_mask);
     psx_cyc_lds(cpu);
@@ -1656,6 +1647,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             if (target & 3) return interp_exception(cpu, 4, target, pc);  /* LoadAddressError */
             uint32_t return_pc = pc + 8;
             cpu->gpr[rd ? rd : 31] = return_pc;
+            PGXP_GPR_WRITE(rd ? rd : 31);
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
             cosim_exec_one_transfer_hook(pc + 4);
@@ -1811,6 +1803,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         }
         case 0x24: /* AND */
             cpu->gpr[rd] = cpu->gpr[rs] & cpu->gpr[rt];
+            PGXP_GPR_WRITE(rd);
             cpu->gpr[0] = 0;
             return 0;
         case 0x25: { /* OR */
@@ -1822,10 +1815,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         }
         case 0x26: /* XOR */
             cpu->gpr[rd] = cpu->gpr[rs] ^ cpu->gpr[rt];
+            PGXP_GPR_WRITE(rd);
             cpu->gpr[0] = 0;
             return 0;
         case 0x27: /* NOR */
             cpu->gpr[rd] = ~(cpu->gpr[rs] | cpu->gpr[rt]);
+            PGXP_GPR_WRITE(rd);
             cpu->gpr[0] = 0;
             return 0;
         case 0x2A: /* SLT */
@@ -1842,6 +1837,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                                         0u, &kept))
                 (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
             cpu->gpr[rd] = kept;
+            PGXP_GPR_WRITE(rd);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -1851,6 +1847,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             uint32_t kept = vanilla;
             (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
             cpu->gpr[rd] = kept;
+            PGXP_GPR_WRITE(rd);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -1871,6 +1868,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
+        PGXP_GPR_WRITE(31);
         exec_delay_slot(cpu, pc + 4);
         cosim_exec_one_transfer_hook(pc + 4);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
@@ -1966,9 +1964,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             break;
         case 0x01: /* BGEZ */    taken = ((int32_t)cpu->gpr[rs] >= 0); break;
         case 0x10: /* BLTZAL */  taken = ((int32_t)cpu->gpr[rs] <  0);
-                                  cpu->gpr[31] = pc + 8; break;
+                                  cpu->gpr[31] = pc + 8;
+                                  PGXP_GPR_WRITE(31); break;
         case 0x11: /* BGEZAL */  taken = ((int32_t)cpu->gpr[rs] >= 0);
-                                  cpu->gpr[31] = pc + 8; break;
+                                  cpu->gpr[31] = pc + 8;
+                                  PGXP_GPR_WRITE(31); break;
         default: return abort_unsupported(pc, insn, "REGIMM rt");
         }
         exec_delay_slot(cpu, pc + 4);
@@ -2029,6 +2029,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+        PGXP_GPR_WRITE(rt);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2058,11 +2059,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+        PGXP_GPR_WRITE(rt);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x0C: /* ANDI */
         cpu->gpr[rt] = cpu->gpr[rs] & imm;
+        PGXP_GPR_WRITE(rt);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0D: { /* ORI */
@@ -2074,6 +2077,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x0E: /* XORI */
         cpu->gpr[rt] = cpu->gpr[rs] ^ imm;
+        PGXP_GPR_WRITE(rt);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0F: /* LUI rt, imm */
@@ -2092,6 +2096,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->ld_which_t = (uint8_t)rt;
 #endif
             cpu->gpr[rt] = cpu->cop0[rd];
+            PGXP_GPR_WRITE(rt);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2101,6 +2106,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->ld_which_t = (uint8_t)rt;
 #endif
             cpu->gpr[rt] = cpu->cop0[rd];
+            PGXP_GPR_WRITE(rt);
             cpu->gpr[0] = 0;
             return 0;
         }

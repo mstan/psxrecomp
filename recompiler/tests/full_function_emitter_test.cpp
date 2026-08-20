@@ -11,6 +11,7 @@
 #include "../src/config_loader.h"
 #include "../src/full_function_emitter.h"
 #include "../src/function_discovery.h"
+#include "../src/pgxp_hook_emitter.h"
 
 using PSXRecompV4::BiosAddressModel;
 using PSXRecompV4::BiosAddrCopy;
@@ -195,6 +196,39 @@ void complementary_lwl_lwr_stays_native() {
            "complementary LWL/LWR does not fall back");
     expect(result.stats.functions_emitted == 1,
            "complementary LWL/LWR remains native");
+    expect(result.dispatch.find("static int dispatch_find(uint32_t phys)") !=
+               std::string::npos,
+           "emitted dispatch uses the cached exact lookup helper");
+    expect(result.dispatch.find("dispatch_table[index_plus_one - 1u].addr == phys") !=
+               std::string::npos,
+           "dispatch cache hits revalidate the exact table address");
+}
+
+void destructive_pgxp_writes_are_emitted() {
+    std::string code = "cpu->gpr[2] = cpu->gpr[3] & cpu->gpr[4];";
+    PSXRecomp::append_pgxp_hooks(0x00641024u, code); /* and v0,v1,a0 */
+    expect(code.find("PGXP_GPR_WRITE(2u)") != std::string::npos,
+           "AND emits byte-identical-safe PGXP destination invalidation");
+
+    code = "cpu->gpr[2] = cpu->gpr[3] < 7;";
+    PSXRecomp::append_pgxp_hooks(0x28620007u, code); /* slti v0,v1,7 */
+    expect(code.find("PGXP_GPR_WRITE(2u)") != std::string::npos,
+           "SLTI emits PGXP destination invalidation");
+
+    code = "cpu->gpr[2] = cpu->gte_ctrl[3];";
+    PSXRecomp::append_pgxp_hooks(0x48421800u, code); /* cfc2 v0,c3 */
+    expect(code.find("PGXP_COP2") != std::string::npos,
+           "CFC2 updates the GPR shadow instead of leaving it stale");
+
+    code = "cpu->gpr[31] = 0x80012348u;";
+    PSXRecomp::append_pgxp_hooks(0x0C0048D2u, code); /* jal 0x80012348 */
+    expect(code.find("PGXP_GPR_WRITE(31u)") != std::string::npos,
+           "JAL invalidates byte-identical link-register provenance");
+
+    code = "cpu->gpr[2] = cpu->cop0[12];";
+    PSXRecomp::append_pgxp_hooks(0x40026000u, code); /* mfc0 v0,Status */
+    expect(code.find("PGXP_GPR_WRITE(2u)") != std::string::npos,
+           "MFC0 invalidates destination provenance");
 }
 
 }  // namespace
@@ -221,6 +255,7 @@ int main() {
     fragment_split_load_falls_back();
     noncomplementary_lwl_falls_back();
     complementary_lwl_lwr_stays_native();
+    destructive_pgxp_writes_are_emitted();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d full-function emitter test(s) failed\n", failures);

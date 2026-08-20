@@ -14,7 +14,9 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_uv.h"
 #include "tex_pack.h"
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const GpuRenderBackend SW_BACKEND = {
     .name                          = "software",
@@ -66,6 +68,8 @@ extern const GpuRenderBackend *vk_backend_get(void);
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
+static int                     g_mask_set;
+static int                     g_mask_check;
 
 void gr_set_backend(GrBackend backend) {
     if (backend == GR_BACKEND_OPENGL) {
@@ -102,7 +106,11 @@ int  gr_scale(void)                                  { return g_b->scale(); }
 void gr_set_texture_filter(int bilinear)             { g_b->set_texture_filter(bilinear); }
 int  gr_texture_filter(void)                         { return g_b->texture_filter(); }
 void gr_set_semi_transparency(int e, int m)          { g_b->set_semi_transparency(e, m); }
-void gr_set_mask_bits(int s, int c)                  { g_b->set_mask_bits(s, c); }
+void gr_set_mask_bits(int s, int c)                  {
+    g_mask_set = s != 0;
+    g_mask_check = c != 0;
+    g_b->set_mask_bits(s, c);
+}
 void gr_set_texture_window(uint32_t raw)             { tex_pack_set_texture_window(raw); g_b->set_texture_window(raw); }
 void gr_set_color_modulation(int r, int g, int b, int raw) { g_b->set_color_modulation(r, g, b, raw); }
 void gr_set_precise_triangle(int enabled, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
@@ -118,12 +126,33 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(enabled, q0, q1, q2);
 }
+/* Native GP0 rectangles provide one position and synthesize the other three
+ * corners, so they can never satisfy an all-vertices PGXP decision. Polygon
+ * fast paths reach the rect API only after their source decision armed neither
+ * feature. Clear every triangle-only override once at this boundary; any
+ * backend decomposition then emits both halves native, affine, and without
+ * PGXP Z. */
+static void gr_disarm_rect_correction(void) {
+    gr_set_precise_triangle(0, 0, 0, 0, 0, 0, 0);
+    gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+    gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
+}
 void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  {
     tex_pack_invalidate(x, y, w, h);
     g_b->fill_rect(x, y, w, h, c);
 }
 void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
-    tex_pack_invalidate(dx, dy, w, h);
+    /* Invalidate before the backend write exactly as before, but retain an
+     * unresolved copy candidate. It is read back only if a textured primitive
+     * actually samples this destination. */
+    const int wraps = sx < 0 || sy < 0 || dx < 0 || dy < 0 ||
+                      sx + w > 1024 || dx + w > 1024 ||
+                      sy + h > 512 || dy + h > 512;
+    const int overlaps = sx < dx + w && dx < sx + w &&
+                         sy < dy + h && dy < sy + h;
+    const int content_preserved = !g_mask_set && !g_mask_check &&
+                                  !wraps && !overlaps;
+    tex_pack_on_copy(sx, sy, dx, dy, w, h, content_preserved);
     g_b->copy_rect(sx, sy, dx, dy, w, h);
 }
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
@@ -157,6 +186,41 @@ static int tex_pack_arm(const int lim[4], uint16_t clut_x, uint16_t clut_y,
     return 1;
 }
 
+/* Resolve copied texture bytes lazily from the authoritative backend. This is
+ * deliberately on the first overlapping textured draw, not on every GP0(80h):
+ * framebuffer copies and copies with no pack/dumper consumer pay no readback,
+ * allocation, or CRC cost. The retained buffer is bounded by PS1 VRAM (1 MiB). */
+static void tex_pack_resolve_copies(const int lim[4], uint16_t texpage) {
+    static uint16_t *pixels;
+    static size_t capacity;
+    int r[4];
+    if (!tex_pack_pending_copy_for_prim(lim, texpage, r)) return;
+    for (;;) {
+        const size_t n = (size_t)r[2] * (size_t)r[3];
+        if (r[2] <= 0 || r[3] <= 0 ||
+            n > ((size_t)1024 * (size_t)512)) {
+            tex_pack_resolve_copy(r[0], r[1], r[2], r[3], NULL);
+        } else if (n > capacity) {
+            uint16_t *grown = (uint16_t *)realloc(pixels, n * sizeof(*pixels));
+            if (!grown) {
+                tex_pack_resolve_copy(r[0], r[1], r[2], r[3], NULL);
+            } else {
+                pixels = grown;
+                capacity = n;
+                g_b->vram_transfer_out(r[0], r[1], r[2], r[3], pixels);
+                tex_pack_resolve_copy(r[0], r[1], r[2], r[3], pixels);
+            }
+        } else {
+            g_b->vram_transfer_out(r[0], r[1], r[2], r[3], pixels);
+            tex_pack_resolve_copy(r[0], r[1], r[2], r[3], pixels);
+        }
+        /* GPU-authoritative backends synchronize their complete native VRAM on
+         * the first transfer_out. Resolve every candidate queued so far while
+         * that mirror is current, avoiding one GPU stall per texture. */
+        if (!tex_pack_next_pending_copy(r)) break;
+    }
+}
+
 static void tex_pack_disarm(int armed) {
     if (armed && g_b->set_replacement) g_b->set_replacement(NULL);
 }
@@ -170,6 +234,7 @@ static int tex_pack_note_tri(int x0, int y0, int u0, int v0,
     const int us[3] = { u0, u1, u2 }, vs[3] = { v0, v1, v2 };
     int lim[4];
     psx_uv_tri_limits(xs, ys, us, vs, lim);
+    tex_pack_resolve_copies(lim, texpage);
     tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
     int sx0 = xs[0], sx1 = xs[0], sy0 = ys[0], sy1 = ys[0];
     for (int i = 1; i < 3; i++) {
@@ -201,7 +266,10 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
     tex_pack_disarm(armed);
 }
-void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
+void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) {
+    gr_disarm_rect_correction();
+    g_b->draw_flat_rect(x, y, w, h, c);
+}
 /* Rect prims carry their uv corners directly; u1/v1 are the EXCLUSIVE corner,
  * which for the unscaled form is u+w / v+h (matching glb_draw_textured_rect). */
 static int tex_pack_note_rect(int u0, int v0, int u1, int v1,
@@ -210,12 +278,14 @@ static int tex_pack_note_rect(int u0, int v0, int u1, int v1,
     if (!tex_pack_active()) return 0;
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    tex_pack_resolve_copies(lim, texpage);
     tex_pack_on_textured_prim(lim, clut_x, clut_y, texpage);
     return tex_pack_arm(lim, clut_x, clut_y, texpage, sx, sy, sx + sw, sy + sh);
 }
 
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    gr_disarm_rect_correction();
     const int armed = tex_pack_note_rect(u, v, u + w, v + h, clut_x, clut_y, texpage,
                                          x, y, w, h);
     g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
@@ -223,6 +293,7 @@ void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    gr_disarm_rect_correction();
     const int armed = tex_pack_note_rect(u0, v0, u1, v1, clut_x, clut_y, texpage,
                                          x, y, w, h);
     g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);

@@ -9,7 +9,7 @@ extern "C" {
 
 /* Present-classification ring: one entry per present decision in
  * sdl_vblank_present, for EVERY backend (software, GL, Vulkan). Records how
- * the frame was classified (FMV/full-2D 4:3 pillarbox, native-wide, or the
+ * the content was classified (FMV/full-2D 4:3-safe, native-wide, or the
  * canonical read) and whether a native-wide present fell back to the
  * canonical width — the fallback is invisible on screen except as a
  * horizontal stretch, so it must be observable in data. Always-on; queried
@@ -17,7 +17,7 @@ extern "C" {
 
 typedef enum {
     PRES_PATH_BLANK     = 0,  /* display disabled — blank frame */
-    PRES_PATH_NATIVE_43 = 1,  /* FMV / full-2D frame, 4:3 pillarbox */
+    PRES_PATH_CONTENT_43 = 1, /* FMV / full-2D frame, 4:3-safe content */
     PRES_PATH_WIDE      = 2,  /* native-wide surface (canonical + EXTRA) */
     PRES_PATH_CANONICAL = 3,  /* canonical read; stretches when the window
                                  is wider than the display aspect */
@@ -31,7 +31,7 @@ typedef struct {
     uint8_t  path;          /* PresPath */
     uint8_t  wide_fellback; /* wide present attempted but surface missing */
     uint8_t  game_mode;     /* ws gameplay-vs-2D classification */
-    uint8_t  native_43;     /* gpu_ws_present_native_43() at present time */
+    uint8_t  native_43;     /* native-4:3 content policy at present time */
     int32_t  tag_delta;     /* frames since newest sprite tag (clamped) */
     uint16_t gte_verts;     /* RTPS/RTPT verts, last completed frame */
     uint16_t ovh_prims;     /* overhanging polys, last completed frame (the

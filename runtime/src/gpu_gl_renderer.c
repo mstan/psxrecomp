@@ -75,6 +75,7 @@
 #include "latency_ring.h"
 #include "frame_pacing.h"
 #include "psx_rewind.h"
+#include "ws_present_layout.h"
 
 #include "psx_sdl.h"
 #if defined(PSX_SDL3)
@@ -341,7 +342,7 @@ static int           s_interp_suspended = 0;
 static int           s_interp_blend_mode = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
-static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
+static int           s_interp_content_4_3 = 0, s_interp_source_path = -1;
 static uint64_t      s_interp_swaps = 0;
 static uint64_t      s_interp_captures = 0;
 static int           s_interp_diag = 0;
@@ -734,7 +735,7 @@ static int    s_hold_kind = HOLD_NONE;
 static GLuint s_hold_tex = 0;
 static GLuint s_hold_fbo = 0;
 static int    s_hold_tw = 0, s_hold_th = 0; /* texture size in texels */
-static int    s_hold_force_4_3 = 0;
+static int    s_hold_content_4_3 = 0;
 static int    s_hold_linear = 0;
 
 /* Post-load freeze probe (main.cpp): accumulate skip/swap/dirty marks. */
@@ -825,14 +826,14 @@ static void hold_capture_drawable(void) {
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
     glBindTexture(GL_TEXTURE_2D, 0);
     s_hold_kind = HOLD_DRAWABLE;
-    s_hold_force_4_3 = 0;
+    s_hold_content_4_3 = 0;
     s_hold_linear = 0;
 }
 
 /* Snapshot a native display band from an FBO when the main thread will not
  * Swap (interpolation owns the cadence). Scale-aware blit into hold tex. */
 static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int dh,
-                                    int force_4_3, int linear) {
+                                    int content_4_3, int linear) {
     int S = s_scale > 0 ? s_scale : 1;
     if (!s_ctx || !src_fbo || dw < 1 || dh < 1)
         return;
@@ -846,7 +847,7 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int 
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     s_hold_kind = HOLD_NATIVE;
-    s_hold_force_4_3 = force_4_3 ? 1 : 0;
+    s_hold_content_4_3 = content_4_3 ? 1 : 0;
     s_hold_linear = linear ? 1 : 0;
 }
 
@@ -3242,10 +3243,15 @@ static void present_set_sharp(int mode, int tex_w, int tex_h,
  * aspect is configured the 4:3 frame is stretched into it — paired with the
  * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
 static int s_aspect_num = 4, s_aspect_den = 3;
+static int s_fixed_outer_aspect = 0;
 
 void gl_renderer_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { num = 4; den = 3; }
     s_aspect_num = num; s_aspect_den = den;
+}
+
+void gl_renderer_set_fixed_outer_aspect(int enabled) {
+    s_fixed_outer_aspect = enabled ? 1 : 0;
 }
 
 /* Letterbox: largest num:den rect centered in the drawable. */
@@ -3259,6 +3265,13 @@ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
 }
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
+}
+
+static PsxPresentLayout present_layout(int ww, int wh, int content_4_3) {
+    PsxPresentLayout layout;
+    psx_present_layout_compute(ww, wh, s_aspect_num, s_aspect_den,
+                               s_fixed_outer_aspect, content_4_3, &layout);
+    return layout;
 }
 
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
@@ -3630,28 +3643,27 @@ void gl_renderer_shutdown(void) {
 }
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
- * diagnostic): full-window clear, then a quad into the letterbox rect.
- * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
- * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
- * widescreen presents them pillarboxed instead of distorted. */
+ * diagnostic): full-window clear, then a quad into the content rect. Authored
+ * 4:3 content is centered without distortion; in fixed-outer mode the target
+ * canvas remains unchanged around it. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
-                         int force_4_3, int content_w) {
+                         int content_4_3, int content_w) {
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
-    int lx, ly, lw, lh;
-    if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-    else
-        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    const PsxPresentLayout layout = present_layout(ww, wh, content_4_3);
+    int lx = layout.content.x;
+    int ly = layout.content.y;
+    int lw = layout.content.w;
+    int lh = layout.content.h;
     /* Short GP1(07h) bands (MotK FMV is 128 lines) only fill a fraction of
      * NTSC active height on hardware. Stretching them to the full letterbox
      * doubles vertical scale vs horizontal and makes the frame look too wide
      * with the right edge clipped. Letterbox within the present rect instead.
-     * Apply whenever the source is short — not only when force_4_3 — so a
+     * Apply whenever the source is short — not only for 4:3 content — so a
      * misclassified FMV frame still keeps correct pixel aspect. */
     /* Genuinely windowed video bands only (<80% of the 240-line field, e.g.
      * MotK's 128-line FMV). A game's native short display mode (216/224)
@@ -3727,17 +3739,22 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * Deliberately not applied when cropping (content_w): that path leaves
      * black on the right on purpose, and smearing a known-garbage trailing
      * column across the margin is the opposite of what it is for. */
-    if (s_pillarbox_edge_fill && force_4_3 && !crop &&
+    if (s_pillarbox_edge_fill && content_4_3 && !crop &&
         src_w > 0 && src_h > 0 && lh > 0) {
         const float v0 = 0.5f / (float)src_h, v1 = 1.f - v0;
         const float ul = 0.5f / (float)src_w;    /* leftmost texel centre  */
         const float ur = 1.f - ul;               /* rightmost texel centre */
-        if (lx > 0) {
-            glViewport(0, ly, lx, lh);
+        const int fill_x = s_fixed_outer_aspect ? layout.outer.x : 0;
+        const int fill_right = s_fixed_outer_aspect
+            ? layout.outer.x + layout.outer.w
+            : ww;
+        const int left_w = lx - fill_x;
+        if (left_w > 0) {
+            glViewport(fill_x, ly, left_w, lh);
             p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
             glDrawArrays(GL_TRIANGLES, 0, 3);
         }
-        const int right_w = ww - (lx + lw);
+        const int right_w = fill_right - (lx + lw);
         if (right_w > 0) {
             glViewport(lx + lw, ly, right_w, lh);
             p_glUniform4f(s_present_uUvRect, ur, v0, ur, v1);
@@ -4229,7 +4246,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
 /* THE present path for 15-bit frames: blit the display region from the
  * authoritative hr FBO into a letterboxed rect. Deterministic — runs
  * every 15-bit frame regardless of what mix of ops produced it.
- * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
+ * content_4_3 selects the centered native-content safe area. */
 /* ===================== frame_perf: per-frame GPU/CPU phase timing ============
  * Developer builds use two GL_TIME_ELAPSED queries per frame to bracket (a) the
  * scene draws (all GP0 raster issued between two presents) and (b) the present
@@ -4531,11 +4548,12 @@ void gl_renderer_interpolation_diag(int *enabled, int *suspended,
 /* Copy a stable display image out of the mutable VRAM/wide render target.
  * Returns true when temporal blending owns this source-frame interval. */
 static int interp_capture(GLuint fbo, int x, int y, int w, int h,
-                          int linear, int force_4_3, int source_path) {
+                          int linear, int content_4_3, int source_path) {
     if (!s_interp_enabled || s_interp_suspended || !fbo || w <= 0 || h <= 0) return 0;
     int pw = w * s_scale, ph = h * s_scale;
     if (pw != s_interp_w || ph != s_interp_h ||
-        source_path != s_interp_source_path || force_4_3 != s_interp_force_4_3) {
+        source_path != s_interp_source_path ||
+        content_4_3 != s_interp_content_4_3) {
         s_interp_valid = 0;
         s_interp_w = pw; s_interp_h = ph;
         s_interp_prev = s_interp_cur = 0;
@@ -4563,7 +4581,7 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
         s_interp_valid = 2;
     }
     s_interp_linear = linear;
-    s_interp_force_4_3 = force_4_3;
+    s_interp_content_4_3 = content_4_3;
     s_interp_source_path = source_path;
     s_interp_captures++;
     return 1;
@@ -4598,11 +4616,12 @@ static int interp_present(float alpha) {
     if (!s_ctx || !s_interp_enabled || s_interp_suspended || s_interp_valid < 1)
         return 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
-    int lx, ly, lw, lh;
-    if (s_interp_force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-    else
-        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    const PsxPresentLayout layout = present_layout(
+        ww, wh, s_interp_content_4_3);
+    const int lx = layout.content.x;
+    const int ly = layout.content.y;
+    const int lw = layout.content.w;
+    const int lh = layout.content.h;
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
@@ -5183,10 +5202,11 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
 static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
                               int x, int y, int w, int h, int linear,
                               int lx, int ly, int lw, int lh, int v_flip,
-                              int ww) {
+                              int fill_x, int fill_w) {
     if (!s_pillarbox_edge_fill || lh <= 0 || w <= 0 || h <= 0) return;
-    const int right_w = ww - (lx + lw);
-    if (lx <= 0 && right_w <= 0) return;   /* no margins to fill */
+    const int left_w = lx - fill_x;
+    const int right_w = fill_x + fill_w - (lx + lw);
+    if (left_w <= 0 && right_w <= 0) return;   /* no margins to fill */
 
     float v0 = ((float)y + 0.5f) / (float)tex_h;
     float v1 = ((float)(y + h) - 0.5f) / (float)tex_h;
@@ -5204,8 +5224,8 @@ static void present_edge_fill(GLuint tex, int tex_w, int tex_h,
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
     p_glBindVertexArray(s_present_vao);
-    if (lx > 0) {
-        glViewport(0, ly, lx, lh);
+    if (left_w > 0) {
+        glViewport(fill_x, ly, left_w, lh);
         p_glUniform4f(s_present_uUvRect, ul, v0, ul, v1);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
@@ -5258,10 +5278,12 @@ int gl_renderer_present_hold_last(void) {
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
                             0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0);
     } else {
-        if (s_hold_force_4_3)
-            letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-        else
-            letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+        const PsxPresentLayout layout = present_layout(
+            ww, wh, s_hold_content_4_3);
+        lx = layout.content.x;
+        ly = layout.content.y;
+        lw = layout.content.w;
+        lh = layout.content.h;
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
                             0, 0, s_hold_tw, s_hold_th, s_hold_linear,
                             lx, ly, lw, lh, 1);
@@ -5278,7 +5300,7 @@ int gl_renderer_present_hold_last(void) {
 }
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
-                              int force_4_3) {
+                              int content_4_3) {
     if (!s_ctx || !s_raster_ok) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5298,11 +5320,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
-    int lx, ly, lw, lh;
-    if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-    else
-        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    const PsxPresentLayout layout = present_layout(ww, wh, content_4_3);
+    const int lx = layout.content.x;
+    const int ly = layout.content.y;
+    const int lw = layout.content.w;
+    const int lh = layout.content.h;
     /* No short-band adjustment on the 15-bit FBO path: a game's native short
      * display mode (e.g. 216/224-line menus) must fill the rect as before.
      * The FMV band fix lives in the depth24/CPU present paths only. */
@@ -5314,11 +5336,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
     int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
-                                     linear, force_4_3, GL_PRES_VRAM);
+                                     linear, content_4_3, GL_PRES_VRAM);
     if (interp_pair) {
         /* Temporal blending owns this stock frame interval. Capture hold-last
          * before pacing; every blend and Swap remains on this context/thread. */
-        hold_capture_native_fbo(s_hr_fbo, disp_x, disp_y, w, h, force_4_3, linear);
+        hold_capture_native_fbo(s_hr_fbo, disp_x, disp_y, w, h, content_4_3, linear);
         interp_present_source_interval();
         gl_perf_present_exit(0);
         present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
@@ -5327,12 +5349,15 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
         return;
     }
-    present_bezel(ww, wh, lx, ly, lw, lh);
+    present_bezel(ww, wh, lx, ly, lw, lh);   /* behind the frame */
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
-    if (force_4_3)
+    if (content_4_3) {
+        const int fill_x = s_fixed_outer_aspect ? layout.outer.x : 0;
+        const int fill_w = s_fixed_outer_aspect ? layout.outer.w : ww;
         present_edge_fill(s_hr_tex, VRAM_W, VRAM_H, disp_x, disp_y, w, h,
-                          linear, lx, ly, lw, lh, 1, ww);
+                          linear, lx, ly, lw, lh, 1, fill_x, fill_w);
+    }
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);

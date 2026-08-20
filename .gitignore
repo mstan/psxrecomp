@@ -135,3 +135,6 @@ recompiler/build-*/
 # Project Studio GUI venv (customtkinter)
 tools/new_project_layout/.venv/
 tools/new_project_layout/project_studio_repos.json
+
+# Focused/experimental build trees (generated; never committed)
+build-*-focused/

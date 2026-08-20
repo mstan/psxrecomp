@@ -83,7 +83,23 @@ int main(void) {
     if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1] == 44u,
                 "replay preserves load give-back")) return 1;
 
+    psx_icache_reset();
+    g_psx_icache_active = 1;
+    test_cycles = 0;
+    psx_icache_fetch_interp(&cpu, 0x80010000u);
+    g_ls_replay_active = 1;
+    psx_icache_fetch_interp(&cpu, 0x80010000u);
+    psx_icache_fetch_interp(&cpu, 0x80011000u);
+    g_ls_replay_active = 0;
+    if (!expect(test_cycles == 7u,
+                "replay warmed hit and miss are cycle-free")) return 1;
+    if (!expect(g_psx_icache_tv[0] == 0x80010000u,
+                "replay warmed miss preserves resident tag")) return 1;
+
     g_psx_icache_active = 0;
+    test_cycles = 0;
+    cpu.read_absorb_which = 1;
+    cpu.read_absorb[1] = 44u;
     psx_icache_fetch_interp(&cpu, 0x80010000u);
     if (!expect(test_cycles == 0u, "disabled cache model is free")) return 1;
     if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1] == 44u,

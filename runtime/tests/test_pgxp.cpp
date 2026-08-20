@@ -34,6 +34,10 @@ extern "C" int gte_geometry_correction_lookup(uint32_t packed,
     return 1;
 }
 
+extern "C" uint32_t memory_get_ram_bytes(void) {
+    return 2u * 1024u * 1024u;
+}
+
 /* ---- MIPS encodings ------------------------------------------------------ */
 
 static uint32_t enc_i(uint32_t op, uint32_t rs, uint32_t rt, uint16_t imm) {
@@ -72,6 +76,7 @@ static const uint16_t SZ3     = 100;
 
 static const uint32_t ADDR_A  = 0x80100000u;   /* packet slot A (KSEG0)  */
 static const uint32_t ADDR_B  = 0x00100040u;   /* packet slot B (KUSEG)  */
+static const uint32_t ADDR_C  = 0x00100080u;   /* packet slot C (KUSEG)  */
 
 static void produce_at(uint32_t addr) {
     pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED);
@@ -95,6 +100,7 @@ int main(void) {
 
     /* --- SWC2 produce -> GPU consume (the perspective-texturing spine) --- */
     produce_at(ADDR_A);
+    CHECK(pgxp_memory_page_armed(ADDR_A & 0x1FFFFFFFu));
     {
         int32_t x, y; uint16_t z;
         CHECK(lookup(ADDR_A, PACKED, 160, 80, &x, &y, &z) == PGXP_SRC_DATAFLOW);
@@ -128,13 +134,39 @@ int main(void) {
     CHECK(lookup(ADDR_B, 0xDEADBEEFu, 0, 0, nullptr, nullptr, nullptr) ==
           PGXP_SRC_NATIVE);
 
+    /* A byte-identical destructive ALU result is still a new writer. The
+     * live-mask gate makes the invalidation call conditional, but equality
+     * must not let the old projection reach the following SW. */
+    produce_at(ADDR_A);
+    psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+    CHECK((g_pgxp_gpr_live_mask & (1u << 8)) != 0);
+    psx_pgxp_gpr_write(nullptr, 8);
+    CHECK((g_pgxp_gpr_live_mask & (1u << 8)) == 0);
+    psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, PACKED);
+    CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+          PGXP_SRC_NATIVE);
+
+    /* An unhooked/raw byte-identical RAM write also kills provenance. */
+    produce_at(ADDR_A);
+    CHECK(pgxp_memory_page_armed(ADDR_A & 0x1FFFFFFFu));
+    CHECK(!pgxp_memory_page_armed((ADDR_A & 0x1FFFFFFFu) + 0x1000u));
+    PGXPStats raw_before, raw_after;
+    pgxp_get_stats(&raw_before);
+    pgxp_memory_write(ADDR_A, 4u);
+    pgxp_get_stats(&raw_after);
+    CHECK(raw_after.memory_invalidations == raw_before.memory_invalidations + 1);
+    CHECK(lookup(ADDR_A, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+          PGXP_SRC_NATIVE);
+
     /* --- MOVE idiom (memory mode, no cpu_mode needed) --- */
+    pgxp_set_full_hooks(1);
     produce_at(ADDR_A);
     psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
     psx_pgxp_alu(nullptr, ADDU(8, 0, 10), PACKED, PACKED, 0);
     psx_pgxp_store(nullptr, SW(1, 10), ADDR_B, PACKED);
     CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
           PGXP_SRC_DATAFLOW);
+    pgxp_set_full_hooks(0);
 
     /* --- MFC2 -> SW (register transfer path) --- */
     pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED);
@@ -143,18 +175,49 @@ int main(void) {
     CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
           PGXP_SRC_DATAFLOW);
 
-    /* --- LH/SH: halves travel independently, depth does not survive --- */
+    /* --- LH/SH: halves from one projection rebuild coherent XY + depth --- */
     produce_at(ADDR_A);
     psx_pgxp_load(nullptr, LHU(1, 8), ADDR_A + 2u, PACKED >> 16);     /* Y   */
+    pgxp_memory_write(ADDR_B + 2u, 2u);
     psx_pgxp_store(nullptr, SH(1, 8), ADDR_B + 2u, PACKED >> 16);
     psx_pgxp_load(nullptr, LHU(1, 8), ADDR_A, PACKED & 0xFFFFu);     /* X   */
+    pgxp_memory_write(ADDR_B, 2u);
     psx_pgxp_store(nullptr, SH(1, 8), ADDR_B, PACKED & 0xFFFFu);
     {
         int32_t x, y; uint16_t z;
         CHECK(lookup(ADDR_B, PACKED, 160, 80, &x, &y, &z) == PGXP_SRC_DATAFLOW);
         CHECK(x == X16 && y == Y16);
-        CHECK(z == 0);                       /* SH killed the vertex depth   */
+        CHECK(z == SZ3);                     /* paired SH rebuild carries Z */
     }
+
+    /* X and Y from different projections may have identical packed integer
+     * halves and even the same Z. Their component IDs must still reject both
+     * geometry and perspective correction. */
+    pgxp_gte_push_sxy(X16 + 0x1000, Y16 + 0x2000, SZ3, PACKED);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_C);
+    pgxp_memory_write(ADDR_B, 4u);
+    psx_pgxp_load(nullptr, LHU(1, 8), ADDR_A, PACKED & 0xFFFFu);
+    pgxp_memory_write(ADDR_B, 2u);
+    psx_pgxp_store(nullptr, SH(1, 8), ADDR_B, PACKED & 0xFFFFu);
+    psx_pgxp_load(nullptr, LHU(1, 9), ADDR_C + 2u, PACKED >> 16);
+    pgxp_memory_write(ADDR_B + 2u, 2u);
+    psx_pgxp_store(nullptr, SH(1, 9), ADDR_B + 2u, PACKED >> 16);
+    PGXPStats mixed_before, mixed_after;
+    pgxp_get_stats(&mixed_before);
+    /* Even an addressless geometry-cache hit must not launder a known mixed
+     * dataflow value back into a correctable vertex. */
+    g_fb_valid = 1;
+    g_fb_packed = PACKED;
+    g_fb_x16 = X16;
+    g_fb_y16 = Y16;
+    CHECK(pgxp_debug_shadow_class(ADDR_B, PACKED) ==
+          PGXP_SHADOW_MIXED_PROJECTION);
+    CHECK(pgxp_load_precise_word(ADDR_B, PACKED, nullptr, nullptr, nullptr) == 0);
+    CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+          PGXP_SRC_NATIVE);
+    g_fb_valid = 0;
+    pgxp_get_stats(&mixed_after);
+    CHECK(mixed_after.mixed_depth_reject > mixed_before.mixed_depth_reject);
 
     /* --- SB destroys the touched half only --- */
     produce_at(ADDR_B);
@@ -205,6 +268,7 @@ int main(void) {
     pgxp_set_cpu_mode(0);
 
     /* --- cpu-mode OFF: the same repack must degrade to native, cleanly --- */
+    pgxp_invalidate_all();                    /* discard prior GPR shadows   */
     produce_at(ADDR_A);
     psx_pgxp_load(nullptr, LHU(1, 8), ADDR_A + 2u, PACKED >> 16);
     psx_pgxp_alu(nullptr, SLL(8, 9, 16), (PACKED >> 16) << 16,
@@ -262,6 +326,19 @@ int main(void) {
     pgxp_test_set_generation(0xFFFFFFFFu);
     pgxp_invalidate_all();
     CHECK(pgxp_test_generation() == 1u);
+
+    /* Disabled invalidation is a true no-op. Re-enable still advances the
+     * generation before any hook can observe an old shadow. */
+    pgxp_set_enabled(0);
+    const uint32_t disabled_gen = pgxp_test_generation();
+    PGXPStats disabled_before, disabled_after;
+    pgxp_get_stats(&disabled_before);
+    pgxp_invalidate_all();
+    pgxp_get_stats(&disabled_after);
+    CHECK(pgxp_test_generation() == disabled_gen);
+    CHECK(disabled_after.invalidations == disabled_before.invalidations);
+    pgxp_set_enabled(1);
+    CHECK(pgxp_test_generation() == disabled_gen + 1u);
 
     /* --- test accessors mirror the SXY FIFO shadows --- */
     pgxp_test_seed_gte_sxy(2, PACKED, X16, Y16, SZ3, 1);

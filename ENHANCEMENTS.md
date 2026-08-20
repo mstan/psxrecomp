@@ -867,3 +867,17 @@ tooling defect found on the way: `screenshot_hires` produces a tiled/black
 PNG at 768x480 scale-2 windowed (row-pitch bug in the hires readback) —
 the census + the player's own captures carried the session; fix it before
 the formal Crash/Tomba2 A/B.
+
+**Seam root cause fixed (2026-08-20).** The 0.5 tolerance was a successful
+workaround for the per-primitive decision above, not a safe general oracle: it
+removed cracks by rejecting the larger half of otherwise same-cell sub-pixel
+corrections. Polygon submission now resolves every final integer endpoint
+through a frame-stamped canonical vertex table. The first occurrence chooses
+either its proven 16.16 position or the native integer; every later occurrence
+of that raster endpoint reuses the exact same value, including the corrected
+then-native and native-then-corrected orders. The focused regression includes
+a 0.75-pixel candidate, so it fails under the old independent-primitive model
+and proves seam identity is no longer being purchased with the 0.5 clamp.
+`pgxp_tolerance = 1.0` is therefore valid for WipEout 3: integer agreement
+already bounds accepted coordinates to the same pixel cell, while the vertex
+table owns shared-edge identity.

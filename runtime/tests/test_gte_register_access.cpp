@@ -43,7 +43,7 @@ extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
 extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
-extern "C" int gpu_ws_present_native_43(void) { return 0; }
+extern "C" int gpu_ws_content_native_43(void) { return 0; }
 static int g_test_precise_nclip_enabled;
 extern "C" int gpu_ws_precise_nclip_enabled(void) {
     return g_test_precise_nclip_enabled;
@@ -279,10 +279,11 @@ int test_writes() {
     for (unsigned iteration = 0; iteration < 64; ++iteration) {
         CPUState seed;
         randomize_gte(seed);
+        oracle_canonicalize(seed);
 
-        /* Valid helper writes must also normalize unrelated backing words.
-         * This preserves the old bridge's behavior when falling back from
-         * committed AOT C that predates helper routing for masked registers. */
+        /* The raw-import boundary canonicalizes once. Thereafter helper writes
+         * update only their architectural register/aliases; unrelated backing
+         * words already satisfy the invariant and need no repeated sweep. */
         for (uint8_t reg = 0; reg < 32; ++reg) {
             for (uint32_t edge : kEdgeValues) {
                 const uint32_t value = edge ^ (iteration ? random_u32() : 0u);
@@ -387,7 +388,8 @@ int test_command_marshaling() {
     for (uint8_t function : kFunctions) {
         for (unsigned iteration = 0; iteration < 96; ++iteration) {
             CPUState seed;
-            randomize_gte(seed);  // deliberately raw/noncanonical legacy state
+            randomize_gte(seed);
+            oracle_canonicalize(seed);
             CPUState expected = seed;
             CPUState actual = seed;
             const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
@@ -415,6 +417,7 @@ int test_command_marshaling() {
                     for (uint32_t lm = 0; lm < 2; ++lm) {
                         CPUState seed;
                         randomize_gte(seed);
+                        oracle_canonicalize(seed);
                         CPUState expected = seed;
                         CPUState actual = seed;
                         const uint32_t cmd = 0x12u | (mx << 17) | (vv << 15) |
@@ -436,6 +439,7 @@ int test_command_marshaling() {
     for (unsigned iteration = 0; iteration < 64; ++iteration) {
         CPUState expected;
         randomize_gte(expected);
+        oracle_canonicalize(expected);
         CPUState actual = expected;
         for (unsigned step = 0; step < 128; ++step) {
             const uint8_t function = kFunctions[random_u32() % kFunctions.size()];
@@ -454,6 +458,7 @@ int test_command_marshaling() {
     for (uint8_t function : kFunctions) {
         CPUState seed;
         randomize_gte(seed);
+        oracle_canonicalize(seed);
         CPUState expected = seed;
         CPUState actual = seed;
         const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
@@ -491,15 +496,27 @@ int test_command_timing_hook() {
 
 int test_precise_sxy_invalidation() {
     CPUState cpu{};
+    gte_precision_tracking_set(1);
+
+    /* SXYP is a FIFO push, not two isolated alias writes. The shadows must
+     * shift 12<-13 and 13<-14 before the new 14/15 value is invalidated. */
+    seed_precise_snapshot();
+    const auto before_sxyp = precise_snapshot();
+    gte_write_data(&cpu, 15, 0x12345678u);
+    const auto after_sxyp = precise_snapshot();
+    if (!after_sxyp[0].valid || !after_sxyp[1].valid ||
+        after_sxyp[0].packed != before_sxyp[1].packed ||
+        after_sxyp[1].packed != before_sxyp[2].packed ||
+        after_sxyp[2].valid || after_sxyp[3].valid)
+        return fail_value("SXYP shifts precise FIFO", 0, 15, 0x12345678u,
+                          before_sxyp[1].packed, after_sxyp[0].packed);
+
     for (uint8_t reg = 0; reg < 32; ++reg) {
         gte_test_set_precise_valid_mask(0xFu);
         gte_write_data(&cpu, reg, 0x12345678u);
-        /* The PGXP shadow drops exactly the register(s) the guest wrote:
-         * SXY0/SXY1 clear their own slot; SXY2 and SXYP clear both mirrors
-         * (regs 14+15). The untouched slots stay live — their register
-         * values did not change (SXYP's hardware FIFO shift makes 12/13
-         * stale in VALUE, which validate-on-read handles at use; liveness
-         * alone is not a correctness claim). */
+        /* The PGXP shadow drops exactly the newly written register(s):
+         * SXY0/SXY1 clear their own slot; SXY2 clears both mirrors; SXYP
+         * shifts live 13/14 shadows into 12/13 and clears new 14/15. */
         uint32_t expected = 0xFu;
         if (reg == 12 || reg == 13) expected &= ~(1u << (reg - 12));
         else if (reg == 14 || reg == 15) expected &= ~0xCu;

@@ -179,7 +179,8 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
      * (b) repoint a string-arg at a translated replacement so the game's own
      * renderer draws it. Cheap no-op when uninitialised/disarmed. No BIOS regen
      * (runtime-side), works in Release. See docs/STRING_TRANSLATION.md. */
-    text_xlate_on_dispatch(cpu, target);
+    if (text_xlate_dispatch_armed())
+        text_xlate_on_dispatch(cpu, target);
 
     /* General parity ring: one DISPATCH row per leader while current_tcb matches
      * the watched thread. Gated by the cheap armed flag so disarmed runs pay only

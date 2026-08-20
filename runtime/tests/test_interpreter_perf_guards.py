@@ -34,6 +34,7 @@ def main():
     interrupts = (ROOT / "runtime/src/interrupts.c").read_text(encoding="utf-8")
     cycles = (ROOT / "runtime/src/psx_cycles.c").read_text(encoding="utf-8")
     cyc_header = (ROOT / "runtime/include/psx_cyc.h").read_text(encoding="utf-8")
+    cycles_header = (ROOT / "runtime/include/psx_cycles.h").read_text(encoding="utf-8")
     instr_cost = (ROOT / "runtime/include/psx_instr_cost.h").read_text(encoding="utf-8")
     starvation = (ROOT / "runtime/include/starvation_ring.h").read_text(encoding="utf-8")
 
@@ -207,6 +208,12 @@ def main():
     watched_write = body(memory, "overlay_watch_note_write")
     if "g_dirty_ram_exec_page_bitmap" not in watched_write:
         raise AssertionError("RAM writes do not clear stale per-page capture evidence")
+    for required in ("cleared |= g_dirty_ram_exec_pc_bitmap",
+                     "memset(&g_dirty_ram_exec_pc_bitmap[bw0]",
+                     "memset(&g_dirty_ram_dispatch_pc_bitmap[bw0]"):
+        if required not in watched_write:
+            raise AssertionError(
+                "code-word replacement does not retire the whole capture page epoch")
     if "overlay_capture_before_dma" in watched_write:
         raise AssertionError("universal RAM-write hook regressed to snapshot I/O")
     if "overlay_loader_note_code_write()" not in watched_write:
@@ -275,10 +282,18 @@ def main():
         raise AssertionError("ABI preflight can execute a legacy Windows DllMain")
 
     interp_step = body(interp, "interp_cyc_step")
-    if "g_psx_cycle_fast_limit" not in interp_step or "next <= g_psx_cycle_fast_limit" not in interp_step:
+    if "psx_cycles_try_fast_charge(1u)" not in interp_step:
         raise AssertionError("interpreter lost its exact pre-deadline one-cycle fast path")
-    if "g_ls_replay_active" not in interp_step or "g_event_step_conservative" not in interp_step:
-        raise AssertionError("interpreter cycle fast path does not guard exact diagnostic modes")
+    fast_charge = body(cycles_header, "psx_cycles_try_fast_charge")
+    for guard in ("g_ls_replay_active", "g_event_step_conservative",
+                  "psx_in_device_service", "next > g_psx_cycle_fast_limit"):
+        if guard not in fast_charge:
+            raise AssertionError(f"cycle fast path lost exactness guard: {guard}")
+    for overclock_state in ("g_psx_oc_scale_q16", "g_psx_oc_accum",
+                            "scaled >> 16", "scaled & 0xFFFFu"):
+        if overclock_state not in fast_charge:
+            raise AssertionError(
+                f"cycle fast path is not overclock-equivalent: {overclock_state}")
     if "g_psx_cycle_fast_limit" in cyc_header:
         raise AssertionError("runtime cycle fast path leaked into the overlay-DLL shared header")
     if "PSX_NO_DEBUG_TOOLS" not in starvation or "STARVATION_RING_ENABLED 0" not in starvation:
@@ -310,31 +325,45 @@ def main():
             mmio_sync.find("g_psx_cycle_fast_limit = 0")):
         raise AssertionError("MMIO catch-up can republish a stale inline cycle limit")
     service = body(cycles, "psx_devices_service_to_now")
+    service_exit = max(service.find("s_in_device_service = 0"),
+                       service.find("psx_in_device_service = 0"))
     if not (service.find("g_psx_cycle_fast_limit = 0") <
             service.find("s_in_device_service = 1") <
             service.find("psx_devices_recompute_deadline()") <
-            service.find("s_in_device_service = 0")):
+            service_exit < service.find("psx_cycles_publish_fast_limit()")):
         raise AssertionError("device-service reentrancy can observe a nonzero inline cycle limit")
     load_charge = body(memory, "psx_load_charge_cycles")
-    if "next <= g_psx_cycle_fast_limit" not in load_charge or "psx_advance_cycles(cycles)" not in load_charge:
+    if ("psx_cycles_try_fast_charge(cycles)" not in load_charge or
+            "psx_advance_cycles(cycles)" not in load_charge):
         raise AssertionError("runtime load timing lost its exact deadline fast/fallback paths")
-    for guard in ("g_ls_replay_active", "g_event_step_conservative", "next >= psx_cycle_count"):
-        if guard not in load_charge:
-            raise AssertionError(f"runtime load timing lost guard: {guard}")
     if "!defined(PSX_COSIM) && !STARVATION_RING_ENABLED" not in memory:
         raise AssertionError("runtime load fast path leaks into COSIM/diagnostic builds")
     load_timing = body(memory, "psx_cyc_load_timing")
-    if "psx_load_charge_cycles(1u)" not in load_timing or "psx_cyc_base(cpu)" in load_timing:
-        raise AssertionError("runtime loads still use the out-of-line one-cycle base charge")
+    if ("base_charge = 1u" not in load_timing or
+            "psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, size, 2u, rt, base_charge)" not in load_timing or
+            "psx_cyc_base(cpu)" in load_timing):
+        raise AssertionError("runtime loads do not combine base cost at the observation boundary")
+    readmem = body(memory, "psx_cyc_readmem")
+    for combined in ("psx_load_charge_cycles(base_charge);",
+                     "psx_load_charge_cycles(base_charge + fudge + cost);"):
+        if combined not in readmem:
+            raise AssertionError("load observation does not publish its exact combined charge")
     ram_fast = body(memory, "psx_cyc_main_ram_fast_addr")
     for guard in ("g_ls_mode != 0", "g_ls_replay_active", "g_ds_recording",
                   "g_ram_read_watch_active",
                   "g_dma_exec_depth > 0", "addr >= 0xC0000000u",
-                  "phys >= 0x00800000u", "RAM_SIZE - width"):
+                  "phys >= 0x00800000u", "g_psx_ram_size - width"):
         if guard not in ram_fast:
             raise AssertionError(f"main-RAM value fast path lost guard: {guard}")
-    for fn in ("psx_cyc_load_word", "psx_cyc_load_half", "psx_cyc_load_byte",
-               "psx_cyc_lwc2_read"):
+    for fn in ("psx_cyc_load_word", "psx_cyc_load_half"):
+        load_body = body(cyc_header, fn)
+        timing = load_body.find("psx_cyc_deps")
+        publish = load_body.find("psx_cyc_load_charge_exact")
+        value = load_body.find("memcpy")
+        fallback = load_body.find(f"{fn}_slow")
+        if min(timing, publish, value, fallback) < 0 or not timing < publish < value < fallback:
+            raise AssertionError(f"{fn} does not publish timing before its value read")
+    for fn in ("psx_cyc_load_byte", "psx_cyc_lwc2_read"):
         load_body = body(memory, fn)
         timing = load_body.find("psx_cyc_")
         fast = load_body.find("psx_cyc_main_ram_fast_addr")

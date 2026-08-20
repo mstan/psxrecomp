@@ -110,6 +110,11 @@ def main():
     first_barrier = source.find("psx_store_cycle_barrier();")
     if flush_definition < 0 or first_barrier < 0 or flush_definition > first_barrier:
         failures.append("DLL post-pass did not inject overlay_flush_cycles before generated code")
+    dll_build_guard = source.find("#ifdef PSX_OVERLAY_DLL_BUILD")
+    if dll_build_guard >= 0 and flush_definition > dll_build_guard:
+        failures.append(
+            "DLL callback shim was injected inside the generated "
+            "PSX_OVERLAY_DLL_BUILD conditional")
     for writer in ("write_byte", "write_half", "write_word"):
         if f"psx_store_cycle_barrier(); cpu->{writer}(" not in source:
             failures.append(f"generated {writer} has no preceding cycle barrier")

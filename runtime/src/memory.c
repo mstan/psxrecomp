@@ -25,6 +25,7 @@
 #include "psx_cycles.h"
 #include "starvation_ring.h"
 #include "psx_ram.h"
+#include "pgxp.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -569,6 +570,14 @@ static uint32_t g_text_exact_last_ref = 0;
  * PSX_TEXT_GUARD_MEMO=0 disables the memo (bisect switch: if a stale-native
  * class ever appears, this proves or clears the memo in one run). */
 static uint32_t g_text_guard_gen = 1u;
+/* Monotonic invalidation epoch for the overwhelmingly common no-write interval.
+ * A memo whose epoch matches can return after one compare; after any text
+ * mutation the existing page-local generation sum remains authoritative. */
+static uint64_t g_text_guard_epoch = 1u;
+static inline void text_guard_global_changed(void) {
+    g_text_guard_gen++;
+    g_text_guard_epoch++;
+}
 /* Page-granular guard generations: bumped only for the PAGE a diverging
  * guarded write touched. The native-ok memo keys on the SUM over a function's
  * own range pages (plus the global gen for image-registration/bless events),
@@ -598,6 +607,7 @@ typedef struct {
     uint32_t        exec_pc;
     uint32_t        count;
     uint32_t        gen;
+    uint64_t        epoch;
     int             ok;
 } TextOkMemo;
 static TextOkMemo s_text_ok_memo[TEXT_OK_MEMO_SLOTS];
@@ -620,6 +630,7 @@ static inline uint32_t text_ok_memo_slot(const uint32_t *key, uint32_t exec_pc) 
 
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
+    text_guard_global_changed();
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
     if (len > RAM_SIZE - phys_lo) len = RAM_SIZE - phys_lo;
     text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
@@ -654,6 +665,7 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
          * it can only flip a verdict no->yes, and keeping the stale "no" costs
          * interpretation, not correctness. */
         text_guard_page_gen[page]++;
+        g_text_guard_epoch++;
     }
 }
 
@@ -717,9 +729,15 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
     if (text_ok_memo_enabled()) {
         memo = &s_text_ok_memo[text_ok_memo_slot(lo_len_pairs, exec_pc)];
         if (memo->key == lo_len_pairs && memo->exec_pc == exec_pc &&
-            memo->count == count &&
-            memo->gen == text_guard_ranges_gen(lo_len_pairs, count))
-            return memo->ok;
+            memo->count == count) {
+            const uint64_t epoch = g_text_guard_epoch;
+            if (memo->epoch == epoch)
+                return memo->ok;
+            if (memo->gen == text_guard_ranges_gen(lo_len_pairs, count)) {
+                memo->epoch = epoch;
+                return memo->ok;
+            }
+        }
     }
 
     int ok = 0;
@@ -782,6 +800,7 @@ done:
         memo->exec_pc = exec_pc;
         memo->count   = count;
         memo->gen     = text_guard_ranges_gen(lo_len_pairs, count);
+        memo->epoch   = g_text_guard_epoch;
         memo->ok      = ok;
     }
     return ok;
@@ -825,6 +844,7 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
     memcpy(ref, src, hi - lo);
+    text_guard_global_changed(); /* reference image changed — drop memoized verdicts */
     /* Re-open the affected pages: clear the sticky diverged bit so the next
      * dispatch re-runs the compare against the now-updated reference. */
     uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
@@ -856,6 +876,9 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
         dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
     }
     g_dirty_ram_code_gen++;
+    /* DMA / mod-plan wrote new code bytes over this range (this is the path
+     * apply_main_write uses): live text may now differ from the reference. */
+    text_guard_global_changed();
 }
 
 /* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
@@ -947,6 +970,7 @@ static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
 void dirty_ram_reset_for_boot(void) {
+    text_guard_global_changed();
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
@@ -999,6 +1023,9 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
  * fast path and run native code against restored bytes they were not validated
  * for — hang / freeze after the restored frame presents. */
 void dirty_ram_text_guard_resync_after_restore(void) {
+    /* Restored RAM replaced live text wholesale — every memoized verdict was
+     * decided against the pre-load bytes. */
+    text_guard_global_changed();
     /* text_diverged_bitmap is sticky: once a page's entry bytes fail the
      * reference compare, native stays blocked forever. That is correct for
      * forward sim, but after a savestate/RB rewind the restored RAM may
@@ -1031,14 +1058,36 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
      * completely unknown/self-modifying code. This is deliberately a compact
      * page clear, not a capture: serializing snapshots from this universal
      * guest-store hook caused unbounded queues and multi-second stalls. CD DMA
-     * and periodic coherent capture remain the durable variant boundaries. */
+     * and periodic coherent capture remain the durable variant boundaries.
+     *
+     * Unrelated data writes on a mixed code/data page must preserve execution
+     * evidence (titles that stream a large payload into a page they also
+     * execute from depend on that). But once a store
+     * overwrites ANY word that was executed in the current epoch, every entry
+     * on the page belongs to the outgoing byte image. Keeping the other bits
+     * would splice its unchanged prologue PCs onto a new body/data layout. */
     if ((g_dirty_ram_exec_page_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
-        uint32_t bitmap_word = pg * (4096u / 4u / 32u);
-        memset(&g_dirty_ram_exec_pc_bitmap[bitmap_word], 0,
-               (4096u / 4u / 32u) * sizeof(uint32_t));
-        memset(&g_dirty_ram_dispatch_pc_bitmap[bitmap_word], 0,
-               (4096u / 4u / 32u) * sizeof(uint32_t));
-        g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+        uint32_t page_lo_w = pg * (4096u / 4u);
+        uint32_t page_hi_w = page_lo_w + (4096u / 4u) - 1u;
+        uint32_t lo_w = phys >> 2;
+        uint32_t hi_w = (phys + (size ? size - 1u : 0u)) >> 2;
+        uint32_t cleared = 0;
+        if (lo_w < page_lo_w) lo_w = page_lo_w;
+        if (hi_w > page_hi_w) hi_w = page_hi_w;
+        for (uint32_t w = lo_w; w <= hi_w; w++) {
+            uint32_t m = 1u << (w & 31u);
+            cleared |= g_dirty_ram_exec_pc_bitmap[w >> 5] & m;
+        }
+        /* A data-only write clears nothing. A code-word replacement retires the
+         * whole page epoch so no surviving entry can be paired with new bytes. */
+        if (cleared) {
+            uint32_t bw0 = pg * (4096u / 4u / 32u);
+            memset(&g_dirty_ram_exec_pc_bitmap[bw0], 0,
+                   (4096u / 4u / 32u) * sizeof(uint32_t));
+            memset(&g_dirty_ram_dispatch_pc_bitmap[bw0], 0,
+                   (4096u / 4u / 32u) * sizeof(uint32_t));
+            g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+        }
     }
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
         overlay_page_gen[pg]++;
@@ -1221,8 +1270,10 @@ static inline uint32_t effective_store_pc(void) {
                                                         : g_debug_last_store_pc;
 }
 
-/* Card-byte destination capture (Phase 3 audit). Always-on. */
+/* Card-byte destination capture is consumed only by the debug server. */
+#ifndef PSX_NO_DEBUG_TOOLS
 extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
+#endif
 
 static inline uint32_t read_ram_word(uint32_t phys) {
     return  (uint32_t)ram[phys]
@@ -1257,6 +1308,7 @@ void memory_init(const char* bios_path) {
     ram_size_reg = 0;
     i_stat = 0;
     i_mask = 0;
+    psx_irq_refresh_cause_ip2();
     /* Host dirty/text/overlay bitmaps survive memset(ram) and fork dig0. */
     dirty_ram_reset_for_boot();
     /* Re-latch kbless window from the newly activated psx_bios_image. */
@@ -1846,9 +1898,6 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
-    /* (pgxp) plain-store shadow invalidation retired: the PGXP engine
-     * validates tracked words against the actual packet word on read, so an
-     * overwritten word can never be believed (ENHANCEMENTS.md G1). */
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
     /* KSEG2 guard — see psx_read_word_raw. */
@@ -1891,6 +1940,8 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     }
 
     if (phys < RAM_SIZE) {
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 4u);
         /* Tomba 2 load-game card check: the BIOS card-manager cleanup helper
          * at kernel RAM 0x1C5C scans MARK events and re-arms any READY event
          * matching F0000011/{4,8000,100,200,2000}. In the recomp timing path it
@@ -1927,9 +1978,13 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
             }
         }
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+#endif
         parity_trace_note_write(phys, 4, effective_store_pc());
+#ifndef PSX_NO_DEBUG_TOOLS
         card_data_writes_check(phys, val, 4);
+#endif
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, val, 4);
         overlay_watch_note_write(phys, 4);
@@ -1960,12 +2015,16 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 4u);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off]
           | ((uint32_t)scratchpad[off + 1] << 8)
           | ((uint32_t)scratchpad[off + 2] << 16)
           | ((uint32_t)scratchpad[off + 3] << 24),
             val, 4);
+#endif
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         scratchpad[off + 2] = (uint8_t)(val >> 16);
@@ -2055,9 +2114,15 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     uint32_t phys = psx_phys_addr_store(addr, 2u);
 
     if (phys < RAM_SIZE) {
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 2u);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+#endif
         parity_trace_note_write(phys, 2, effective_store_pc());
+#ifndef PSX_NO_DEBUG_TOOLS
         card_data_writes_check(phys, (uint32_t)val, 2);
+#endif
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 2);
         overlay_watch_note_write(phys, 2);
@@ -2087,9 +2152,13 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 2u);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
             (uint32_t)val, 2);
+#endif
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         return;
@@ -2171,17 +2240,8 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * flush their local pending-cycle accumulator before entering these host
  * helpers, so this stays on the host side of that ABI boundary. */
 #if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
-extern uint64_t g_psx_cycle_fast_limit;
-extern int g_event_step_conservative;
-extern int g_ls_replay_active;
 static inline void psx_load_charge_cycles(uint32_t cycles) {
-    if (g_ls_replay_active || cycles == 0u) return;
-    uint64_t next = psx_cycle_count + (uint64_t)cycles;
-    if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
-        next >= psx_cycle_count && next <= g_psx_cycle_fast_limit) {
-        psx_cycle_count = next;
-        return;
-    }
+    if (psx_cycles_try_fast_charge(cycles)) return;
     psx_advance_cycles(cycles);
 }
 #else
@@ -2229,7 +2289,8 @@ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
  * compl_cost = 2 (CPU load) / 1 (LWC2); arm_rt = GPR to arm as pending load, or
  * 0x20 = none (LWC2, dest is a GTE reg). size = access width in bytes (1/2/4). */
 static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
-                                   uint32_t compl_cost, uint32_t arm_rt) {
+                                   uint32_t compl_cost, uint32_t arm_rt,
+                                   uint32_t base_charge) {
     /* ReadMemory start (369-370): clear the current give-back slot. */
     cpu->read_absorb[cpu->read_absorb_which] = 0u;
     cpu->read_absorb_which = 0u;
@@ -2237,6 +2298,7 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         cpu->ld_absorb = 0u;
         cpu->ld_which_t = (uint8_t)arm_rt;
+        psx_load_charge_cycles(base_charge);
         return;
     }
     /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20).
@@ -2246,7 +2308,7 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
     uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
     uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
     cpu->ld_absorb = cost;
-    psx_advance_cycles(fudge + cost);
+    psx_load_charge_cycles(base_charge + fudge + cost);
     cpu->ld_which_t = (uint8_t)arm_rt;
     /* PROOF GATE (PSX_POLL_PROOF=N, default 0/off): a FLAT, non-absorbed extra N
      * cycles per main-RAM data read — replicates the historical "+6 cyc/main-RAM
@@ -2284,11 +2346,16 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
         (void)addr; (void)size; (void)rt; (void)reg_mask;
         return;
     }
-    psx_cyc_base(cpu);
+    uint32_t base_charge = 0u;
+    {
+        uint8_t w = cpu->read_absorb_which;
+        if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+        else                     base_charge = 1u;
+    }
     psx_cyc_deps(cpu, reg_mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
     psx_cyc_lds(cpu);
-    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, size, 2u, rt);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, size, 2u, rt, base_charge);
 #else
     (void)cpu; (void)addr; (void)size; (void)rt; (void)reg_mask;
 #endif
@@ -2348,7 +2415,7 @@ uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t re
  * LDWhich arm. */
 uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u, 0u);
 #else
     (void)cpu;
 #endif
@@ -2390,9 +2457,15 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     uint32_t phys = psx_phys_addr_store(addr, 1u);
 
     if (phys < RAM_SIZE) {
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 1u);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+#endif
         parity_trace_note_write(phys, 1, effective_store_pc());
+#ifndef PSX_NO_DEBUG_TOOLS
         card_data_writes_check(phys, (uint32_t)val, 1);
+#endif
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 1);
         overlay_watch_note_write(phys, 1);
@@ -2418,8 +2491,12 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+        if (g_pgxp_memory_armed && pgxp_memory_page_armed(phys))
+            pgxp_memory_write(phys, 1u);
+#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
                                        (uint32_t)val, 1);
+#endif
         scratchpad[phys - 0x1F800000u] = val;
         return;
     }

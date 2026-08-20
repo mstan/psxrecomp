@@ -69,6 +69,9 @@ auto_ui_squash     = true              # pre-scan the current GPU linked list,
                                        # select its highest populated UI rank,
                                        # and share one anchor across each
                                        # complete glyph/icon run.
+fixed_outer_aspect = true              # keep the user-selected outer canvas
+                                       # for every scene; menus/FMV use a
+                                       # centered undistorted 4:3 safe area.
 clear_reveal       = true              # clear synthetic native-wide side margins
                                        # at opted-in scene/map boundaries (default false).
 nw_left_hud_packet_lo = "0x000E3400"  # optional targeted left-HUD packet range
@@ -93,8 +96,11 @@ updates the GTE/native-wide projection, cull margins, wide render target, and
 present aspect. The live ratio is clamped to 4:3 on the narrow side and to the
 widest mode the game offers (`16:9`, or `21:9` with `offer_ultrawide`). BIOS,
 FMV, menus, and other title-classified 2D frames retain their existing 4:3
-pillarbox policy. The user choice persists as `[video] adaptive_view` in
-`settings.toml`.
+content policy. With `fixed_outer_aspect = true`, that policy affects only the
+centered inner content and the configured/adaptive outer canvas does not change
+between scenes. The default is `false`, preserving the legacy scene-dependent
+outer viewport for other titles. The user choice persists as
+`[video] adaptive_view` in `settings.toml`.
 
 The native-wide draw-area early-out correction was independently identified
 and contributed by **OpokXeno** in

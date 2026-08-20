@@ -47,12 +47,24 @@ void gpu_get_display_info(GpuDisplayInfo* out);
 void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
                                   uint64_t *no_correction,
                                   uint64_t *no_source, uint64_t *no_depth);
+/* Frame-canonical PGXP decisions. primitives_armed counts a source primitive
+ * once when canonical precise positions and/or coherent per-vertex depth were
+ * armed. Mixed/promoted/demoted/overflow are observed events, not sentinels. */
+void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
+                              uint64_t *rejected_incomplete_position,
+                              uint64_t *rejected_incomplete_depth,
+                              uint64_t *mixed_position,
+                              uint64_t *promoted_from_native,
+                              uint64_t *demoted_to_native,
+                              uint64_t *cache_overflow);
 /* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
 int  gpu_display_is_depth24(void);
 /* GP1(08h) bit 3: 0 = NTSC, 1 = PAL. */
 int  gpu_display_is_pal(void);
+/* Nonzero after GP1(08h) has selected a display mode (or one was restored). */
+int  gpu_display_mode_is_programmed(void);
 /* Guest CPU cycles per CRTC frame (33.8688 MHz / 60 NTSC, / 50 PAL). */
 #define PSX_VBLANK_CYCLES_NTSC 564480u
 #define PSX_VBLANK_CYCLES_PAL  677376u
@@ -67,7 +79,8 @@ uint32_t gpu_get_crtc_vblank_period_override(void);
 /*
  * Experimental enhancement: GooseStation-style Nx video timing. Multiplier 2
  * halves the guest VBlank period (NTSC 120 Hz / PAL 100 Hz CRTC). Default 1.
- * Host wall-clock pacing is separate (psx_mod_set_native_vblank_rate).
+ * Host pacing follows the resulting live period unless a mod explicitly owns
+ * the wall target through psx_mod_set_native_vblank_rate().
  */
 void gpu_set_crtc_refresh_multiplier(uint32_t multiplier);
 uint32_t gpu_get_crtc_refresh_multiplier(void);
@@ -148,11 +161,13 @@ uint32_t gpu_gp0_ring_capacity(void);
 uint32_t gpu_gp0_ring_max_words(void);
 int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
 
-/* PGXP per-prim resolution census: one entry per prepared precise triangle
- * whose vertices did NOT all resolve through the dataflow shadow. cls[] is
- * per-vertex: 0 = shadow miss (addr known, no valid entry), 1 = geometry-cache
- * fallback, 2 = dataflow, 3 = no packet address (CPU-built submission path).
- * Draw-space bbox, so it overlays the display half directly. */
+/* PGXP per-prim resolution census: one entry per submitted triangle whose
+ * source primitive was not cleanly all-dataflow. cls[] describes the emitted
+ * triangle's vertices; all three may be 2 when an unlisted fourth quad vertex
+ * rejected the whole source primitive. 0 = shadow miss (addr known, no valid
+ * entry), 1 = geometry-cache fallback, 2 = dataflow, 3 = no packet address
+ * (CPU-built submission path). Draw-space bbox, so it overlays the display
+ * half directly. */
 typedef struct {
     int16_t  x0, y0, x1, y1;
     uint8_t  cls[3];
@@ -265,10 +280,10 @@ int  ws_nw_present_width(void);
 void gpu_ws_set_netplay_local_viewport(int enabled, int slot);
 int  gpu_ws_netplay_local_viewport_base_x(void);
 int  gpu_ws_netplay_local_viewport_width(void);
-/* True when the current frame must present at native 4:3 (FMV video or a
- * full-2D menu/title screen), so the squash is suppressed and content drawn
- * pixel-native. The present path uses the same predicate to pillarbox. */
-int  gpu_ws_present_native_43(void);
+/* True when scene classification requires native 4:3 content (FMV video or a
+ * full-2D menu/title screen). This suppresses GTE/UI widening and selects the
+ * centered content-safe transform; it does not select the outer viewport. */
+int  gpu_ws_content_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);

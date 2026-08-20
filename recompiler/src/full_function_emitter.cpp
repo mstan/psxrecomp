@@ -32,6 +32,27 @@ static bool bios_cycle_per_insn() {
     return true;
 }
 
+static std::string emit_cyc_step(uint32_t mask) {
+    uint32_t regs[3] = {};
+    uint32_t count = 0;
+    const uint32_t original = mask;
+    mask &= 0xFFFFFFFEu;
+    while (mask && count < 3u) {
+        uint32_t reg = 0;
+        while (((mask >> reg) & 1u) == 0u) reg++;
+        regs[count++] = reg;
+        mask &= mask - 1u;
+    }
+    if (mask != 0u)
+        return fmt::format("psx_cyc_step(cpu, 0x{:X}u);", original);
+    if (count == 0u) return "psx_cyc_step_0(cpu);";
+    if (count == 1u) return fmt::format("psx_cyc_step_1(cpu, {}u);", regs[0]);
+    if (count == 2u)
+        return fmt::format("psx_cyc_step_2(cpu, {}u, {}u);", regs[0], regs[1]);
+    return fmt::format("psx_cyc_step_3(cpu, {}u, {}u, {}u);",
+                       regs[0], regs[1], regs[2]);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -174,8 +195,8 @@ bool FullFunctionEmitter::emit_function(
     /* Redirect-honoring checks — see CodeGenerator::emit_interrupt_check:
      * an exception epilogue that publishes a resume PC different from this
      * site's static continuation must surface to the trampoline, never be
-     * overwritten by the static transfer (the dropped-continuation class
-     * behind the WipEout 3 static-bake top-level PC=0 exit). */
+     * overwritten by the static transfer; otherwise a dropped continuation
+     * can surface as a false top-level PC=0 exit. */
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
         uint32_t rt = bios_runtime_pc(resume_pc);
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
@@ -738,8 +759,8 @@ bool FullFunctionEmitter::emit_function(
         if (!per_insn_cycles) return;
         uint32_t op = w >> 26;
         if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_step(cpu, 0x{:X}u);\n#endif\n",
-                           psx_cyc_dep_res_mask(w));
+        out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    " +
+               emit_cyc_step(psx_cyc_dep_res_mask(w)) + "\n#endif\n";
     };
 
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
@@ -1871,6 +1892,38 @@ void FullFunctionEmitter::emit_dispatch(
     }
     out += "};\n\n";
 
+    /* Dispatch targets have strong temporal locality (BIOS services and small
+     * tail-call cycles), while a large BIOS can have tens of thousands of
+     * static entries.  Keep a tiny per-thread direct-mapped cache of table
+     * indices.  The table address is rechecked on every hit, so a collision can
+     * only fall back to the exact binary search below. */
+    out += "#define PSX_DISPATCH_CACHE_SIZE 256u\n";
+    out += "#if defined(_MSC_VER)\n";
+    out += "#define PSX_DISPATCH_THREAD_LOCAL __declspec(thread)\n";
+    out += "#else\n";
+    out += "#define PSX_DISPATCH_THREAD_LOCAL _Thread_local\n";
+    out += "#endif\n";
+    out += "static PSX_DISPATCH_THREAD_LOCAL uint32_t dispatch_cache[PSX_DISPATCH_CACHE_SIZE];\n\n";
+    out += "static int dispatch_find(uint32_t phys) {\n";
+    out += "    uint32_t slot = (((phys >> 2u) * 2654435761u) >> 24u);\n";
+    out += "    uint32_t index_plus_one = dispatch_cache[slot];\n";
+    out += fmt::format("    if (index_plus_one != 0u && index_plus_one <= {}u &&\n",
+                       total_entries);
+    out += "        dispatch_table[index_plus_one - 1u].addr == phys)\n";
+    out += "        return (int)(index_plus_one - 1u);\n";
+    out += fmt::format("    int lo = 0, hi = {} - 1;\n", total_entries);
+    out += "    while (lo <= hi) {\n";
+    out += "        int mid = lo + (hi - lo) / 2;\n";
+    out += "        if (dispatch_table[mid].addr == phys) {\n";
+    out += "            dispatch_cache[slot] = (uint32_t)mid + 1u;\n";
+    out += "            return mid;\n";
+    out += "        }\n";
+    out += "        if (dispatch_table[mid].addr < phys) lo = mid + 1;\n";
+    out += "        else hi = mid - 1;\n";
+    out += "    }\n";
+    out += "    return -1;\n";
+    out += "}\n\n";
+
     // --- Kernel body-extent table (runtime kernel-image bless) ---
     // The BIOS copies Kernel Part 2 from ROM [0x1FC10000,0x1FC18000) to RAM
     // [0x500,0x8500) at boot; the functions above with keys in that window
@@ -1989,14 +2042,10 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
     out += "    psx_icache_fetch_interp(cpu, addr);\n";
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x3C080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x25080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x01000008u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x00000000u));
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x3C080000u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x25080000u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x01000008u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x00000000u)) + "\n";
     out += "#endif\n";
     out += "    cpu->gpr[8] = ((w0 & 0xFFFFu) << 16) +\n";
     out += "                  (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
@@ -2041,7 +2090,6 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * reflect the args being passed for THIS iteration. */\n";
     out += "        fntrace_record(cpu, addr);\n";
     out += "        cpu->pc = 0;\n";
-    out += fmt::format("        int lo = 0, hi = {} - 1;\n", total_entries);
     out += "        int found = 0;\n";
     out += "        /* BIOS HLE tier: consult the hook FIRST, on the pre-normalize\n";
     out += "         * physical address. It must see (a) the A0/B0/C0 service vectors\n";
@@ -2121,9 +2169,8 @@ void FullFunctionEmitter::emit_dispatch(
     out += "#endif\n";
     out += "        uint32_t phys = normalize(addr);\n";
     out += "        if (!found) {\n";
-    out += "        while (lo <= hi) {\n";
-    out += "            int mid = (lo + hi) / 2;\n";
-    out += "            if (dispatch_table[mid].addr == phys) {\n";
+    out += "            int mid = dispatch_find(phys);\n";
+    out += "            if (mid >= 0) {\n";
     if (addr_model().has_kbless()) {
         out += fmt::format(
         "                /* Kernel-image bless guard (CLAUDE.md Rule 18). The keys in\n"
@@ -2143,20 +2190,16 @@ void FullFunctionEmitter::emit_dispatch(
             addr_model().kbless_ram_lo(),
             addr_model().kbless_ram_hi() - addr_model().kbless_ram_lo());
         out += "                    !psx_kernel_bless_dispatchable(phys))\n";
-        out += "                    break; /* found stays 0 -> dirty_ram_dispatch */\n";
+        out += "                    mid = -1; /* found stays 0 -> dirty_ram_dispatch */\n";
     }
+    out += "                if (mid >= 0) {\n";
     out += "                g_debug_current_func_addr = phys;\n";
     out += "                debug_server_trace_dispatch(phys);\n";
     out += "                dispatch_table[mid].func(cpu);\n";
     out += "                g_dispatch_static_hits++;\n";
     out += "                found = 1;\n";
-    out += "                break;\n";
-    out += "            } else if (dispatch_table[mid].addr < phys) {\n";
-    out += "                lo = mid + 1;\n";
-    out += "            } else {\n";
-    out += "                hi = mid - 1;\n";
+    out += "                }\n";
     out += "            }\n";
-    out += "        }\n";
     out += "        }\n";
     out += "        /* Static dispatch miss.  Self-modifying / install-at-runtime RAM\n";
     out += "         * (CLAUDE.md Rule 18): the BIOS writes dispatch stubs into kernel\n";

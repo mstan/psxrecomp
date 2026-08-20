@@ -36,13 +36,16 @@
  * disagree this test is the thing that should be updated last, not first. */
 uint32_t i_stat;
 uint32_t i_mask;
+uint32_t g_psx_irq_hw_pending;
 
 static uint32_t *s_cause_ptr;
 
 static void psx_irq_refresh_cause_ip2(void)
 {
+    const uint32_t pending = i_stat & i_mask;
+    g_psx_irq_hw_pending = pending;
     if (!s_cause_ptr) return;
-    if ((i_stat & i_mask & 0x7FFu) != 0u)
+    if ((pending & 0x7FFu) != 0u)
         *s_cause_ptr |= (1u << 10);
     else
         *s_cause_ptr &= ~(1u << 10);
@@ -90,6 +93,9 @@ static int failures;
 #define IRQ_VBLANK 0
 #define IRQ_SPU    9
 
+#define CHECK_PENDING(label) \
+    CHECK(g_psx_irq_hw_pending == (i_stat & i_mask), (label))
+
 int main(void)
 {
     uint32_t cause;
@@ -99,6 +105,7 @@ int main(void)
     cause = 0xFFFFFFFFu;   /* worst case: bit 10 already set from junk state */
     psx_irq_set_cause_ptr(&cause);
     CHECK(IP2(cause) == 0, "wiring the mirror recomputes IP2 at power-on");
+    CHECK_PENDING("power-on refresh initializes the cached INTC line");
 
     /* --- a raise on a MASKED source must not assert the line ------------- */
     i_stat = 0; i_mask = 0; cause = 0;
@@ -106,10 +113,12 @@ int main(void)
     psx_irq_raise(IRQ_VBLANK);
     CHECK(i_stat == 1u, "raise sets the I_STAT bit regardless of mask");
     CHECK(IP2(cause) == 0, "raise with the source masked leaves IP2 clear");
+    CHECK_PENDING("masked raise refreshes the cached INTC line");
 
     /* --- unmasking an already-pending source asserts the line ----------- */
     write_i_mask(0x0001u, 0xFFFFu);
     CHECK(IP2(cause) == 1, "unmasking a pending source raises IP2");
+    CHECK_PENDING("unmask refreshes the cached INTC line");
 
     /* --- re-masking drops it again, with I_STAT untouched ---------------- */
     write_i_mask(0x0000u, 0xFFFFu);
@@ -130,6 +139,7 @@ int main(void)
     write_i_stat(0x0000u, 0xFFFFu);
     CHECK(i_stat == 0u, "writing zero acks the pending bit");
     CHECK(IP2(cause) == 0, "acking the last pending source drops IP2");
+    CHECK_PENDING("ack refreshes the cached INTC line");
 
     /* --- a partial ack leaves the line up while anything remains --------- */
     i_stat = 0; i_mask = (1u << IRQ_VBLANK) | (1u << IRQ_SPU); cause = 0;
@@ -175,6 +185,14 @@ int main(void)
     i_mask = 0xF800u;
     psx_irq_refresh_cause_ip2();
     CHECK(IP2(cause) == 0, "out-of-range I_STAT/I_MASK bits do not assert IP2");
+    CHECK_PENDING("cache preserves the historical full-width pending value");
+
+    /* The pending cache remains authoritative before a CPU Cause pointer is
+     * installed (memory/interrupt init order can refresh in either order). */
+    s_cause_ptr = NULL;
+    i_stat = 0x44u; i_mask = 0x04u;
+    psx_irq_refresh_cause_ip2();
+    CHECK_PENDING("cache refresh does not depend on Cause pointer installation");
 
     if (failures) {
         fprintf(stderr, "FAILED (%d)\n", failures);

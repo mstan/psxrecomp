@@ -135,9 +135,9 @@ int psx_mod_set_native_vblank_rate(uint32_t frames_per_second);
 
 /*
  * GooseStation-style Nx CRTC: divide guest cycles per VBlank by `multiplier`
- * (1 = stock, 2 = NTSC 120 Hz / PAL 100 Hz). Pair with
- * psx_mod_set_native_vblank_rate(base_hz * multiplier) so wall-clock and
- * guest time stay aligned; otherwise audio and realtime speed drift.
+ * (1 = stock, 2 = NTSC 120 Hz / PAL 100 Hz). Host pacing follows the live
+ * resulting period automatically. psx_mod_set_native_vblank_rate() is a
+ * separate explicit override for mods that intentionally own the wall target.
  */
 int psx_mod_set_crtc_refresh_multiplier(uint32_t multiplier);
 /*

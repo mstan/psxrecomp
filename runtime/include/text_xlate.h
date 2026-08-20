@@ -56,6 +56,10 @@ struct CPUState;
  * args. Cheap no-op when the module is uninitialised or disarmed. */
 void text_xlate_on_dispatch(struct CPUState* cpu, uint32_t target);
 
+/* Aggregate hot-path gate for fntrace_record. True only while capture, string
+ * substitution, or an unsettled RAM text patch needs dispatch callbacks. */
+int text_xlate_dispatch_armed(void);
+
 /* One-time init. Loads every translations/ *.toml under project_root and
  * selects the active `language` column. language "jp"/"off"/"" (or no tables)
  * disables APPLY; CAPTURE still runs (always-on inventory). The PSX_LANG env

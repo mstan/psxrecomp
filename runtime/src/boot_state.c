@@ -626,6 +626,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         if (!pst_r_u32(&r, &st) || !pst_r_u32(&r, &mk)) return 0;
         i_stat = st;
         i_mask = mk;
+        psx_irq_refresh_cause_ip2();
         if (len == 12) {
             if (!pst_r_u32(&r, &csv)) return 0;
             interrupts_set_cycles_since_vblank(csv);

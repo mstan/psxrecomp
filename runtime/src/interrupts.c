@@ -147,11 +147,17 @@ extern uint32_t i_mask;
  * Derived from PR #102 by Alexandros Mandravillis; the mirror call sites and
  * the single-owner refactor are ours. */
 static uint32_t *s_cause_ptr;
+/* Exact cached INTC output line. Every writer of I_STAT/I_MASK calls the
+ * refresh owner below, so hot block-edge checks need one load instead of two
+ * loads plus an AND. Keep all 32 bits to match the historical predicates. */
+uint32_t g_psx_irq_hw_pending;
 
 void psx_irq_refresh_cause_ip2(void)
 {
+    const uint32_t pending = i_stat & i_mask;
+    g_psx_irq_hw_pending = pending;
     if (!s_cause_ptr) return;
-    if ((i_stat & i_mask & 0x7FFu) != 0u)
+    if ((pending & 0x7FFu) != 0u)
         *s_cause_ptr |= (1u << 10);
     else
         *s_cause_ptr &= ~(1u << 10);
@@ -845,6 +851,7 @@ void interrupts_init(void) {
      * netplay lockstep. Cold boot also wants zeros (BSS already is). */
     i_stat = 0;
     i_mask = 0;
+    psx_irq_refresh_cause_ip2();
     g_vblank_raise_count = 0;
     last_sio_seq_seen = sio_get_seq();
     last_sio_progress_cycle = psx_get_cycle_count();
@@ -1066,7 +1073,7 @@ void psx_interrupt_check_path_diag(uint64_t *entry, uint64_t *fast_sr,
 
 int psx_interrupt_delivery_needed(const CPUState* cpu) {
     if (s_defer_switch_pending) { s_need_defer++; return 1; }
-    if ((i_stat & i_mask) == 0) { s_skip_none++; return 0; }
+    if (g_psx_irq_hw_pending == 0) { s_skip_none++; return 0; }
 
     uint32_t sr = cpu->cop0[COP0_SR];
     if (!(sr & 0x01u) || !(sr & (1u << 10))) { s_skip_sr++; return 0; }
@@ -1153,11 +1160,15 @@ void psx_check_interrupts(CPUState* cpu) {
      * host-only state (not in the snap), so replay delivery timing forked
      * across peers. Edge PC + I_STAT are guest-deterministic; the wait
      * ping-pong reaches B a few instructions later, so no starvation. */
-    if (!in_exception && psx_netplay_active()) {
+    /* Nothing on the offline path can activate netplay between the entry query
+     * and this gate, so avoid its second out-of-line query at every block edge.
+     * When entry was online, retain the original re-query: the deferred-present
+     * callback above may tear down a live session. */
+    if (!in_exception && np_active && psx_netplay_active()) {
         const uint32_t wait_a = 0x8006CD54u;
         const uint32_t wait2_a = 0x800768C8u;
         uint32_t edge = s_last_interrupt_check_pc;
-        uint32_t pend = i_stat & i_mask;
+        uint32_t pend = g_psx_irq_hw_pending;
         if ((edge == wait_a || edge == wait2_a) && pend != 0u &&
             (pend & ~(1u << IRQ_VBLANK)) == 0u) {
             PSX_CHECK_INTERRUPTS_RETURN();
@@ -1165,13 +1176,17 @@ void psx_check_interrupts(CPUState* cpu) {
     }
 
     s_irq_path_entry++;
+    /* No device service occurs between here and the optional idle-skip call
+     * below. Keep one exact snapshot instead of repeatedly reloading both INTC
+     * registers; refresh it immediately if idle-skip advances guest time. */
+    uint32_t hw_pending = g_psx_irq_hw_pending;
 
     /* MotK VLC / FMV hot edge: sticky unmasked I_STAT (CD/VBlank) while
      * IEc or IM2 is clear — no architectural delivery possible. Skip the
      * mid-path bookkeeping / irq_deliver_eval that used to run every BB.
      * Guest-visible timing unchanged (same non-delivery). LTO can collapse
      * this into the VLC call sites. */
-    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+    if (!in_exception && !s_defer_switch_pending && hw_pending != 0) {
         uint32_t sr = cpu->cop0[COP0_SR];
         if (!(sr & 0x01u) || !(sr & (1u << 10))) {
             s_irq_path_fast_sr++;
@@ -1218,7 +1233,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * immediate sw-int to chain into its second stage; without it the CD INT3
      * ack never runs and the machine deadlocks with SR.IM2 stripped). */
     uint32_t sw_pending = cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u;
-    if (!in_exception && (i_stat & i_mask) == 0 && sw_pending == 0 &&
+    if (!in_exception && hw_pending == 0 && sw_pending == 0 &&
         !s_defer_switch_pending) {
         if (g_idle_skip_enabled > 0) {
             uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
@@ -1226,8 +1241,9 @@ void psx_check_interrupts(CPUState* cpu) {
             s_last_interrupt_check_pc = check_pc;
             s_last_interrupt_check_cycle = psx_get_cycle_count();
             psx_idle_note_check(cpu, check_pc);
+            hw_pending = g_psx_irq_hw_pending;
         }
-        if ((i_stat & i_mask) == 0 && sw_pending == 0) {
+        if (hw_pending == 0 && sw_pending == 0) {
             s_irq_path_fast_none++;
             if ((++s_fast_maintenance & 0x3FFFu) == 0) {
                 extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
@@ -1251,7 +1267,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * MotK VLC / FMV spend most BB edges here (sticky CD/VBlank bits).
      * Devices are already caught up via psx_advance_cycles, so skip
      * service/idle/savestate housekeeping and go straight to delivery. */
-    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+    if (!in_exception && !s_defer_switch_pending && hw_pending != 0) {
         uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                    : s_compiled_interrupt_resume_pc;
         s_last_interrupt_check_pc = check_pc;
@@ -1310,7 +1326,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * would have taken it. Skip when an unmasked IRQ is already pending —
      * that is not an idle poll (FMV/VLC edges with sticky CD/VBlank bits),
      * and the fast path already noted when I_STAT was clear. */
-    if ((i_stat & i_mask) == 0)
+    if (g_psx_irq_hw_pending == 0)
         psx_idle_note_check(cpu, s_last_interrupt_check_pc);
 
     /* User save states: this is a block-leader boundary with a known resume PC;
@@ -1419,7 +1435,7 @@ void psx_check_interrupts(CPUState* cpu) {
 irq_deliver_eval:
     s_irq_path_eval++;
     /* Check if any interrupts are pending (INTC hardware or COP0 software). */
-    if ((i_stat & i_mask) == 0 && sw_pending == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
+    if (g_psx_irq_hw_pending == 0 && sw_pending == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
     /* Nested delivery (hardware semantics). Real R3000A has no 'in exception'
      * gate — delivery is governed by SR alone. The handler normally runs with
      * IEc=0 (hardware bit-shift on entry), so the SR gates below block
@@ -1494,7 +1510,7 @@ irq_deliver_eval:
      * recomputed here against the CURRENT sr — the fast-path snapshot above
      * may predate an SR write earlier in this same check). */
     sw_pending = cpu->cop0[COP0_CAUSE] & sr & 0x0300u;
-    int hw_deliverable = ((i_stat & i_mask) != 0) && ((sr & (1 << 10)) != 0);
+    int hw_deliverable = (g_psx_irq_hw_pending != 0) && ((sr & (1 << 10)) != 0);
     if (!hw_deliverable && sw_pending == 0) {
         irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2, 0);
 #ifdef PSX_COSIM
@@ -1515,8 +1531,8 @@ irq_deliver_eval:
         irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
     }
     g_irq_deliver_count++;
-    if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
-    if ((i_stat & i_mask) & (1u << IRQ_CDROM))  g_cdrom_deliver_count++;
+    if (g_psx_irq_hw_pending & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
+    if (g_psx_irq_hw_pending & (1u << IRQ_CDROM))  g_cdrom_deliver_count++;
     /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt). Capture, at every IRQ
      * delivery, whether the kernel VSync callback-block word at 0x80079D44 is the
      * clobbered game value AND whether a CD DMA (ch3) is mid-transfer / a DMA is
@@ -1533,7 +1549,7 @@ irq_deliver_eval:
             .sr = cpu->cop0[COP0_SR], .d44 = cpu->read_word(0x80079D44u),
             .cdrom_active = (uint32_t)dma_cdrom_transfer_active(),
             .dma_depth = g_dma_exec_depth,
-            .is_vblank = (uint32_t)(((i_stat & i_mask) & (1u << IRQ_VBLANK)) != 0),
+            .is_vblank = (uint32_t)((g_psx_irq_hw_pending & (1u << IRQ_VBLANK)) != 0),
         };
         g_irqctx_seq++;
     }
@@ -1981,9 +1997,7 @@ irq_deliver_eval:
              * (depth 0): statically-baked overlay functions cross into AOT
              * text via CPS returns, so the interrupted chain may hold no
              * host frames at all, and a published 0 reaches the main loop
-             * as a bogus GUEST_EXIT (WipEout 3 ntsc120full8 static bake:
-             * deterministic "execution completed, PC=0" ~10 s into boot,
-             * ra=0x800D7FC0 epc=0x8015FAEC). Same remedy as the scheduler
+             * as a bogus GUEST_EXIT. Same remedy as the scheduler
              * case: prefer the compiled interrupt resume PC. */
             if (psx_scheduler_top_level_resume_active() ||
                 g_psx_dispatch_depth <= 0) {
@@ -2045,7 +2059,7 @@ irq_deliver_eval:
      * executes at least one instruction between exceptions; in our model
      * each "block" is many instructions, but the handler also consumes
      * hundreds of sub-dispatches per invocation. */
-    if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
+    if (g_psx_irq_hw_pending != 0 && i_stat == pre_handler_istat) {
         /* unclaimed: give main code guest-time to install handlers */
         post_exception_cooldown_until = psx_get_cycle_count() + POST_EXC_UNCLAIMED_COOLDOWN_CYCLES;
     } else {
@@ -2058,7 +2072,7 @@ irq_deliver_eval:
          *   - DMA/VBLANK/timer/etc: guarantee a few blocks of main-code
          *     progress between deliveries so a flood can't starve the loop. */
         uint32_t claimed = pre_handler_istat & ~i_stat;            /* bits handler cleared */
-        uint32_t sio_active = (claimed | (i_stat & i_mask)) & (1u << IRQ_SIO0);
+        uint32_t sio_active = (claimed | g_psx_irq_hw_pending) & (1u << IRQ_SIO0);
         post_exception_cooldown_until = sio_active
             ? 0  /* SIO: no cooldown — card reads need immediate back-to-back IRQs */
             : psx_get_cycle_count() + POST_EXC_CLAIMED_COOLDOWN_CYCLES;

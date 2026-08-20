@@ -74,6 +74,9 @@ typedef struct CPUState {
  * Static recompiled code and the interpreter share host cycle state directly,
  * so their barrier compiles to nothing. */
 #ifdef PSX_OVERLAY_DLL_BUILD
+#  ifdef _WIN32
+__declspec(dllexport)
+#  endif
 void overlay_flush_cycles(void);
 static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
 #else
@@ -220,11 +223,11 @@ extern uint32_t gte_geometry_correction_hits(void);
 extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
                                               uint32_t *miss_unrecorded,
                                               uint32_t *miss_ambiguous);
-/* Exact-sign NCLIP coverage: precise = all three SXY shadows live and
- * word-validated; fallback = integer sign decided (the widescreen thin-face
- * flicker regime); corrected = sign disagreements actually fixed. */
+/* Exact NCLIP audit coverage: precise = all three SXY shadows are coherent and
+ * word-validated; fallback = native integer-only; disagreements counts cases
+ * where sub-pixel and guest-visible integer signs differ. MAC0 stays native. */
 extern void     gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
-                                        uint64_t *corrected);
+                                        uint64_t *disagreements);
 
 /* pc=0 escape journal (traps.c). Every runtime site that publishes a null PC
  * (the "continue the native chain below" convention) or rescues one records

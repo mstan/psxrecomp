@@ -232,6 +232,7 @@ static void exec_one(CPUState* cpu) {
         case 0x09: { /* JALR */
             uint32_t target = rs_val;
             set_reg(cpu, rd, pc + 8);
+            PGXP_GPR_WRITE(rd);
             exec_one(cpu); /* delay slot */
             cpu->pc = target;
             return;
@@ -283,13 +284,18 @@ static void exec_one(CPUState* cpu) {
         }
         case 0x23: set_reg(cpu, rd, rs_val - rt_val);
                    psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break; /* SUBU */
-        case 0x24: set_reg(cpu, rd, rs_val & rt_val); break;       /* AND */
+        case 0x24: set_reg(cpu, rd, rs_val & rt_val);
+                   PGXP_GPR_WRITE(rd); break;                       /* AND */
         case 0x25: set_reg(cpu, rd, rs_val | rt_val);
                    psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break; /* OR */
-        case 0x26: set_reg(cpu, rd, rs_val ^ rt_val); break;       /* XOR */
-        case 0x27: set_reg(cpu, rd, ~(rs_val | rt_val)); break;    /* NOR */
-        case 0x2A: set_reg(cpu, rd, (int32_t)rs_val < (int32_t)rt_val ? 1 : 0); break; /* SLT */
-        case 0x2B: set_reg(cpu, rd, rs_val < rt_val ? 1 : 0); break; /* SLTU */
+        case 0x26: set_reg(cpu, rd, rs_val ^ rt_val);
+                   PGXP_GPR_WRITE(rd); break;                       /* XOR */
+        case 0x27: set_reg(cpu, rd, ~(rs_val | rt_val));
+                   PGXP_GPR_WRITE(rd); break;                       /* NOR */
+        case 0x2A: set_reg(cpu, rd, (int32_t)rs_val < (int32_t)rt_val ? 1 : 0);
+                   PGXP_GPR_WRITE(rd); break;                       /* SLT */
+        case 0x2B: set_reg(cpu, rd, rs_val < rt_val ? 1 : 0);
+                   PGXP_GPR_WRITE(rd); break;                       /* SLTU */
         default:
             /* R3000A ignores undefined SPECIAL encodings (no trap). */
             break;
@@ -301,7 +307,7 @@ static void exec_one(CPUState* cpu) {
         uint32_t rt = RT(insn);
         int link = (rt & 0x10) != 0;
         int cond = (rt & 0x01) ? ((int32_t)rs_val >= 0) : ((int32_t)rs_val < 0);
-        if (link) set_reg(cpu, 31, pc + 8);
+        if (link) { set_reg(cpu, 31, pc + 8); PGXP_GPR_WRITE(31); }
         if (cond) {
             uint32_t target = pc + 4 + (SIMM(insn) << 2);
             /* Execute delay slot, then branch. */
@@ -321,6 +327,7 @@ static void exec_one(CPUState* cpu) {
     case 0x03: { /* JAL */
         uint32_t target = JTARGET(insn, pc);
         set_reg(cpu, 31, pc + 8);
+        PGXP_GPR_WRITE(31);
         exec_one(cpu); /* delay slot */
         cpu->pc = target;
         return;
@@ -363,12 +370,16 @@ static void exec_one(CPUState* cpu) {
     }
     case 0x09: set_reg(cpu, RT(insn), rs_val + (uint32_t)SIMM(insn));
                psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], rs_val, (uint32_t)SIMM(insn)); break; /* ADDIU */
-    case 0x0A: set_reg(cpu, RT(insn), (int32_t)rs_val < SIMM(insn) ? 1 : 0); break; /* SLTI */
-    case 0x0B: set_reg(cpu, RT(insn), rs_val < (uint32_t)SIMM(insn) ? 1 : 0); break; /* SLTIU */
-    case 0x0C: set_reg(cpu, RT(insn), rs_val & IMM16(insn)); break; /* ANDI */
+    case 0x0A: set_reg(cpu, RT(insn), (int32_t)rs_val < SIMM(insn) ? 1 : 0);
+               PGXP_GPR_WRITE(RT(insn)); break; /* SLTI */
+    case 0x0B: set_reg(cpu, RT(insn), rs_val < (uint32_t)SIMM(insn) ? 1 : 0);
+               PGXP_GPR_WRITE(RT(insn)); break; /* SLTIU */
+    case 0x0C: set_reg(cpu, RT(insn), rs_val & IMM16(insn));
+               PGXP_GPR_WRITE(RT(insn)); break; /* ANDI */
     case 0x0D: set_reg(cpu, RT(insn), rs_val | IMM16(insn));
                psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], rs_val, IMM16(insn)); break; /* ORI */
-    case 0x0E: set_reg(cpu, RT(insn), rs_val ^ IMM16(insn)); break; /* XORI */
+    case 0x0E: set_reg(cpu, RT(insn), rs_val ^ IMM16(insn));
+               PGXP_GPR_WRITE(RT(insn)); break; /* XORI */
     case 0x0F: set_reg(cpu, RT(insn), (uint32_t)IMM16(insn) << 16);
                psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], 0, 0); break; /* LUI */
 
@@ -378,6 +389,10 @@ static void exec_one(CPUState* cpu) {
         switch (cop_op) {
         case 0x00: /* MFC0 */
             set_load_delay(RT(insn), cpu->cop0[RD(insn)]);
+            /* Conservative at issue time: the pending COP0 value has no
+             * projection provenance, even if its integer bits equal the
+             * register's old tracked value. */
+            PGXP_GPR_WRITE(RT(insn));
             break;
         case 0x04: /* MTC0 */
             cpu->cop0[RD(insn)] = rt_val;

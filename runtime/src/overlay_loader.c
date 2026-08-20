@@ -2198,7 +2198,7 @@ static void overlay_ci_wrapper(CPUState *cpu) {
      * block. Avoid entering the full scheduler/diagnostic path when COP0 could
      * not take the IRQ anyway. FMV polling loops can execute this edge millions
      * of times while an INTC bit is pending but IEc is deliberately clear. */
-    if ((i_stat & i_mask) == 0) { s_ci_skip_none++; return; }
+    if (g_psx_irq_hw_pending == 0) { s_ci_skip_none++; return; }
     if ((cpu->cop0[12] & ((1u << 10) | 1u)) != ((1u << 10) | 1u)) {
         s_ci_skip_sr++;
         return;
@@ -2208,8 +2208,10 @@ static void overlay_ci_wrapper(CPUState *cpu) {
     if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
         uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
         i_stat &= ~(1u << IRQ_CDROM);
+        psx_irq_refresh_cause_ip2();
         psx_check_interrupts(cpu);
         i_stat |= saved_cd;
+        psx_irq_refresh_cause_ip2();
         return;
     }
     psx_check_interrupts(cpu);
@@ -2234,7 +2236,7 @@ static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
      * dirty caller expects an atomic unit — the resume-desync bug. */
     if (g_call_unit_depth > 0) { s_ci_skip_unit++; return; }
     if (overlay_irq_suppressed_now()) { s_ci_skip_supp++; return; }
-    if ((i_stat & i_mask) == 0) { s_ci_skip_none++; return; }
+    if (g_psx_irq_hw_pending == 0) { s_ci_skip_none++; return; }
     if ((cpu->cop0[12] & ((1u << 10) | 1u)) != ((1u << 10) | 1u)) {
         s_ci_skip_sr++;
         return;
@@ -2247,8 +2249,10 @@ static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
     if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
         uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
         i_stat &= ~(1u << IRQ_CDROM);
+        psx_irq_refresh_cause_ip2();
         psx_check_interrupts_at(cpu, resume_pc);
         i_stat |= saved_cd;
+        psx_irq_refresh_cause_ip2();
         if (suppress_idle_note) g_idle_note_suppress--;
         return;
     }
@@ -2440,6 +2444,7 @@ static void init_callbacks(void) {
                 psx_pgxp_alu,
                 psx_pgxp_muldiv,
                 psx_pgxp_cop2,
+                psx_pgxp_gpr_write,
             };
             s_callbacks.pgxp = &pgxp_hooks_table;
         }

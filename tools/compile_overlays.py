@@ -1151,6 +1151,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     forward_branch_targets = set()
     rejected_cross_producer_calls = set()
     accepted_cross_producer_calls = set()
+    invalid_instructions = set()
 
     def producer_for(addr: int):
         for range_lo, range_hi in producer_ranges:
@@ -1207,15 +1208,23 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         if word is None:
             continue
         visited.add(pc)
+        if not _is_valid_mips_word(word):
+            invalid_instructions.add(pc)
         kind, target = _classify_cf(pc, word)
         delay = pc + 4
+
+        def visit_delay_slot():
+            if not in_function(delay):
+                return
+            visited.add(delay)
+            if not _is_valid_mips_word(_word_at(data, load_addr, delay)):
+                invalid_instructions.add(delay)
 
         if kind == 'normal':
             if in_function(pc + 4):
                 work.append(pc + 4)
         elif kind == 'branch':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
@@ -1228,8 +1237,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 # but the target remains mechanically proven code reachability.
                 forward_branch_targets.add(target)
         elif kind == 'branch_never':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
@@ -1238,16 +1246,14 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
         elif kind == 'j':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             if in_function(target):
                 work.append(target)
                 branch_targets.add(target)
             elif lo <= target < hi and target >= hard_cap and (target & 3) == 0:
                 forward_branch_targets.add(target)
         elif kind == 'jal':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
@@ -1257,8 +1263,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                     callable_transfer_target(pc, target)):
                 direct_jals.add(target)
         elif kind == 'jalr':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
@@ -1270,8 +1275,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                     and callable_transfer_target(pc, target)):
                 static_indirect_targets.add(target)
         elif kind == 'jr':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
             jr_rs = (word >> 21) & 0x1F
             target = _resolve_constant_transfer(data, load_addr, entry, pc, jr_rs)
             if target is not None and lo <= target < hi and (target & 3) == 0:
@@ -1291,8 +1295,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                         work.append(jt)
                 jump_table_proofs.extend(proofs)
         elif kind == 'jr_ra':
-            if in_function(delay):
-                visited.add(delay)
+            visit_delay_slot()
 
     return {
         'visited': visited,
@@ -1305,6 +1308,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         'forward_branch_targets': forward_branch_targets,
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
+        'invalid_instructions': invalid_instructions,
     }
 
 
@@ -1566,6 +1570,35 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     # roots — as roots they would hard-cap (truncate) the sibling walk that
     # owns them.
     known = {a for a, r in included.items() if r != 'DISPATCH_INTERIOR'}
+
+    # Runtime dispatch evidence is recorded per PC. A later byte variant can
+    # retain an unchanged prologue/entry PC while stores replace a downstream
+    # instruction in the same function with data. In that case the entry word
+    # still looks callable, but attributing the old root to the new image makes
+    # codegen walk the replacement data. Reject only capture-derived roots whose
+    # current, hard-capped CFG reaches an invalid instruction. Strong static,
+    # call-edge, and TOML roots retain the normal loud audit contract.
+    while True:
+        incoherent = []
+        sorted_known = sorted(known)
+        for index, entry in enumerate(sorted_known):
+            reason = included.get(entry)
+            if reason not in ('DISPATCH_ENTRY', 'STATIC_DISPATCH_ENTRY'):
+                continue
+            hard_cap = (sorted_known[index + 1]
+                        if index + 1 < len(sorted_known) else hi)
+            walk = _walk_overlay_function(
+                data, load_addr, size, entry, hard_cap, producer_ranges,
+                allow_cross_producer_calls)
+            if walk['invalid_instructions']:
+                incoherent.append(entry)
+        if not incoherent:
+            break
+        for entry in incoherent:
+            known.discard(entry)
+            included.pop(entry, None)
+            excluded[entry] = 'INCOHERENT_VARIANT_BYTES'
+
     initial_known = set(known)
     derived_reasons = {}
     promoted_roots = set()
@@ -1760,11 +1793,30 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             excluded[addr] = ('OBSERVED_PC_ONLY'
                               if addr in executed_pcs else 'UNKNOWN')
 
+    # An unowned dispatch PC still deserves the isolated-fragment pass when
+    # its current-image walk is valid. But a stale bitmap can nominate an
+    # unchanged instruction immediately before replacement data; feeding that
+    # PC to the recompiler recreates the cross-variant splice this classifier
+    # is meant to prevent. Apply the same byte-coherence proof to orphan roots,
+    # bounded by the next settled function root.
+    settled_roots = sorted(known)
+    for entry in sorted(dispatch_entry_pcs - set(included)):
+        index = bisect_left(settled_roots, entry)
+        hard_cap = (settled_roots[index]
+                    if index < len(settled_roots) else hi)
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
+        if walk['invalid_instructions']:
+            excluded[entry] = 'INCOHERENT_VARIANT_BYTES'
+
     candidates = {a for a in (executed_pcs | dispatch_entry_pcs |
                               captured_function_entries | static_discovery_entries |
                               legacy_seeds | toml_entries)
                   if region(a)}
     for addr in sorted(candidates - set(included)):
+        if excluded.get(addr) == 'INCOHERENT_VARIANT_BYTES':
+            continue
         if addr in all_branch_targets or addr in jump_table_targets:
             excluded[addr] = 'BRANCH_TARGET_ONLY'
         elif addr in executed_pcs or addr in legacy_seeds:
@@ -2036,7 +2088,8 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
     """
     Post-process psxrecomp-game's _full.c output for standalone DLL compilation:
 
-    1. Prepend the dispatch function-pointer preamble (before any includes).
+    1. Insert the dispatch function-pointer preamble immediately after the
+       generated source's unconditional psx_runtime.h include.
     2. Remove forward declarations for functions outside the overlay range —
        they'd be unresolved externals in the DLL.
     3. Replace direct calls to out-of-range func_XXXXXXXX(cpu) with
@@ -2050,14 +2103,20 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
         phys = addr & 0x1FFFFFFF
         return ov_lo <= phys < ov_hi
 
-    # 1. Insert preamble AFTER the last #include line (so CPUState is complete)
-    last_inc = -1
-    for m in re.finditer(r'^#include\s+[<"].*[>"]\s*$', src, re.MULTILINE):
-        last_inc = m.end()
-    if last_inc == -1:
-        src = DISPATCH_PREAMBLE + src
-    else:
-        src = src[:last_inc] + '\n' + DISPATCH_PREAMBLE + src[last_inc:]
+    # 1. Insert the shim after the one include the game emitter guarantees is
+    # unconditional. Do NOT use the syntactically last include: generated
+    # headers may contain includes inside #ifdef/#else (the per-insn I-cache
+    # fast path does), which would make the complete callback shim conditional
+    # too. PSX_OVERLAY_DLL_BUILD would then preprocess every shim definition
+    # away and leave raw runtime references for the DLL linker.
+    runtime_inc = re.search(
+        r'^#include[ \t]+"psx_runtime\.h"[ \t]*$', src, re.MULTILINE)
+    if runtime_inc is None:
+        raise ValueError(
+            'generated overlay source is missing unconditional '
+            '#include "psx_runtime.h"')
+    insert_at = runtime_inc.end()
+    src = src[:insert_at] + '\n' + DISPATCH_PREAMBLE + src[insert_at:]
 
     # 2. Remove out-of-range forward declarations
     def drop_extern(m):
@@ -2833,6 +2892,72 @@ def current_variant_func_id_coverage(func_ids: list, data: bytes,
     return entries, ranges_out
 
 
+def static_capture_request_entries(seed_audit: dict) -> set[int]:
+    """Return dispatch demands proven to belong to this exact byte recipe.
+
+    Raw capture dispatch bitmaps may contain stale per-address evidence from an
+    outgoing image. Classification is the byte-aware boundary: reject entries
+    whose current-image CFG proves that the captured root crosses replacement
+    data, while retaining observed interiors for the isolated-fragment pass.
+    """
+    dispatch = {
+        (entry & 0x1FFFFFFF) | 0x80000000
+        for entry in seed_audit.get('dispatch_entry_pcs', set())
+    }
+    incoherent = {
+        (entry & 0x1FFFFFFF) | 0x80000000
+        for entry, reason in seed_audit.get('excluded_reasons', {}).items()
+        if reason == 'INCOHERENT_VARIANT_BYTES'
+    }
+    return dispatch - incoherent
+
+
+def add_static_variant_request(requests: dict, entries, data: bytes,
+                               load_addr: int, size: int,
+                               phys_addr: int) -> None:
+    """Accumulate exact-image static demands without collapsing by address."""
+    normalized = {
+        (entry & 0x1FFFFFFF) | 0x80000000 for entry in entries
+    }
+    if not normalized:
+        return
+    key = (load_addr, size, data)
+    request = requests.setdefault(key, {
+        'data': data,
+        'load_addr': load_addr,
+        'size': size,
+        'phys_addr': phys_addr,
+        'image_crc': binascii.crc32(data) & 0xFFFFFFFF,
+        'entries': set(),
+    })
+    request['entries'].update(normalized)
+
+
+def unresolved_static_variant_requests(requests: dict,
+                                       static_parts: list) -> list:
+    """Return demands with no body whose live range guard matches that image."""
+    func_ids = [
+        (variant['addr'], variant['crc'], variant['ranges'])
+        for part in static_parts
+        for variant in part['variants']
+    ]
+    unresolved = []
+    for request in requests.values():
+        matching = {
+            (entry & 0x1FFFFFFF) | 0x80000000
+            for entry, _crc, _ranges in current_variant_func_ids(
+                func_ids, request['data'], request['load_addr'], request['size'])
+        }
+        unresolved.extend(
+            (entry, request)
+            for entry in request['entries']
+            if entry not in matching
+        )
+    return sorted(unresolved, key=lambda item: (
+        item[0], item[1]['load_addr'], item[1]['size'],
+        item[1]['image_crc']))
+
+
 # ---------------------------------------------------------------------------
 # Doomed-interior fail memo
 # ---------------------------------------------------------------------------
@@ -2938,7 +3063,11 @@ def append_interior_fail_memo(cache_dir: str, key: str, reason: str) -> None:
 def generate_interior_fragment_static(interior: int, data: bytes,
                                       load_addr: int, size: int,
                                       phys_addr: int, args):
-    """Generate one isolated, exact-range-gated static interior shard."""
+    """Generate one isolated, exact-range-gated static interior shard.
+
+    Return ``(part, reason)`` so the caller can distinguish a current-image
+    byte-coherence rejection from an infrastructure/codegen failure.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         psx = os.path.join(tmp, 'frag.psx')
         with open(psx, 'wb') as f:
@@ -2959,7 +3088,7 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             cmd, capture_output=True, text=True,
             cwd=os.path.dirname(os.path.abspath(args.game_toml)), env=sub_env)
         if result.returncode != 0:
-            return None
+            return None, f'recompiler-exit:{result.returncode}'
 
         full_c = ranges_src = None
         for filename in os.listdir(out_dir_tmp):
@@ -2968,7 +3097,7 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             elif filename.endswith('_full.ranges'):
                 ranges_src = os.path.join(out_dir_tmp, filename)
         if not full_c or not ranges_src:
-            return None
+            return None, 'no-generated-output'
 
         with open(full_c) as f:
             src, func_addrs = patch_generated_c_static(
@@ -2976,17 +3105,20 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         image_crc = binascii.crc32(data) & 0xFFFFFFFF
         audit = audit_generated_c(src, load_addr, size, image_crc, {})
         if audit['unknown_bad'] or audit['unsupported_todo_addrs']:
-            return None
+            bad = sorted(audit['unknown_bad'] |
+                         audit['unsupported_todo_addrs'])
+            sample = ','.join(f'{addr:08X}' for addr in bad[:4])
+            return None, f'INCOHERENT_VARIANT_BYTES:{sample}'
         func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         ids_by_addr = {}
         for ev, code_crc, ranges in func_ids:
             ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
         if set(func_addrs) - set(ids_by_addr):
-            return None
+            return None, 'generated-def-without-identity'
 
         entry = (interior & 0x1FFFFFFF) | 0x80000000
         if entry not in ids_by_addr or entry not in set(func_addrs):
-            return None
+            return None, 'requested-entry-not-emitted'
         namespace = (f'ov_frag_{phys_addr:08X}_{image_crc:08X}_'
                      f'{entry:08X}')
         continuation_owners = parse_cps_continuation_owners(src)
@@ -3008,7 +3140,7 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             'symbols': symbols,
             'ids_by_addr': ids_by_addr,
             'continuation_owners': continuation_owners,
-        }
+        }, None
 
 
 def validate_overlay_func_ids(func_ids: list,
@@ -5383,8 +5515,7 @@ def main():
     # B-2 static mode: accumulate privately-namespaced generated C plus exact
     # per-function identities for the content-validated dispatcher.
     static_parts = []
-    static_requested_entries = set()
-    static_entry_sources = {}
+    static_variant_requests = {}
 
     # overlay-cache v2: per-region_start function-identity coverage, so a capture
     # that adds no NEW (entry, code_crc) skips the gcc compile (volatile-data
@@ -5409,26 +5540,6 @@ def main():
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
         _label = f'overlay 0x{load_addr:08X} crc {crc32:08X}'
-        if args.static:
-            for captured_entry in _parse_addr_list(
-                    cap.get('dispatch_entry_pcs', [])):
-                entry = ((captured_entry & 0x1FFFFFFF) | 0x80000000)
-                static_requested_entries.add(entry)
-                static_entry_sources[entry] = (
-                    data, load_addr, size, phys_addr)
-            # --force-interior is an explicit operator assertion that a live
-            # dispatch entry was observed even if the retained capture lost its
-            # classifier provenance. Static mode must honor it just like DLL
-            # mode: bind the requested PC to this capture's exact bytes, then
-            # the post-pass will build a content-validated isolated shard.
-            region_hi = phys_addr + size
-            for forced_entry in forced_interiors:
-                forced_phys = forced_entry & 0x1FFFFFFF
-                if phys_addr <= forced_phys < region_hi:
-                    entry = forced_phys | 0x80000000
-                    static_requested_entries.add(entry)
-                    static_entry_sources[entry] = (
-                        data, load_addr, size, phys_addr)
 
         # Reclassify prior F entry addresses from an identical image. Callable
         # entries may become current roots; other entries re-enter as dispatch
@@ -5463,6 +5574,20 @@ def main():
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
+        if args.static:
+            requested = static_capture_request_entries(seed_audit)
+            # --force-interior is an explicit operator assertion. Bind it to
+            # every exact image containing the PC; coverage is decided by the
+            # same live code-range CRC that gates the final dispatcher.
+            region_hi = phys_addr + size
+            requested.update(
+                (forced_entry & 0x1FFFFFFF) | 0x80000000
+                for forced_entry in forced_interiors
+                if phys_addr <= (forced_entry & 0x1FFFFFFF) < region_hi
+            )
+            add_static_variant_request(
+                static_variant_requests, requested, data, load_addr, size,
+                phys_addr)
         this_ids = None   # region func-ids once recompiled (None if skipped early)
 
         # Record this region's executed dispatch-proven PCs for the decoupled
@@ -6625,55 +6750,59 @@ def main():
                     synthesized += 1
 
         synthesize_all_resume_wrappers(static_parts)
-        existing_entries = {
-            variant['addr']
-            for part in static_parts
-            for variant in part['variants']
-        }
 
         # Captured entries not owned by any compiled host are genuine orphan
-        # interiors. Compile each as an isolated dispatch-root shard, then give
-        # every block in those fragments the same universal resume treatment.
-        unresolved = sorted(static_requested_entries - existing_entries)
-        # PSX_STATIC_NO_ISOLATED=1: A/B guard -- skip the isolated-fragment pass
-        # entirely while testing the universal-resume machinery.
+        # interiors for a particular byte recipe. Compile each against those
+        # exact bytes, then give every block in those fragments the same
+        # universal resume treatment. An address-only body from another variant
+        # cannot satisfy the demand: its live range CRC must match this image.
+        unresolved = unresolved_static_variant_requests(
+            static_variant_requests, static_parts)
+        # PSX_STATIC_NO_ISOLATED=1: A/B guard — skip the isolated-fragment pass
+        # entirely (its universal-resume treatment is the newest machinery).
         if os.environ.get('PSX_STATIC_NO_ISOLATED'):
             unresolved = []
         fragment_built = 0
+        byte_incoherent = 0
         new_fragment_parts = []
-        for entry in unresolved:
-            if entry in existing_entries:
-                continue
-            source = static_entry_sources.get(entry)
-            if source is None:
-                continue
-            data, load_addr, size, phys_addr = source
-            part = generate_interior_fragment_static(
+        for entry, request in unresolved:
+            data = request['data']
+            load_addr = request['load_addr']
+            size = request['size']
+            phys_addr = request['phys_addr']
+            part, fragment_reason = generate_interior_fragment_static(
                 entry, data, load_addr, size, phys_addr, args)
             if part is None:
+                if (fragment_reason or '').startswith(
+                        'INCOHERENT_VARIANT_BYTES:'):
+                    # The exact-image recompile reached reserved/data words.
+                    # This is proof that the captured PC belongs to an outgoing
+                    # byte epoch, not a static demand for this recipe.
+                    request['entries'].discard(entry)
+                    byte_incoherent += 1
                 continue
             static_parts.append(part)
             new_fragment_parts.append(part)
-            existing_entries.update(
-                variant['addr'] for variant in part['variants'])
             fragment_built += 1
 
         synthesize_all_resume_wrappers(new_fragment_parts)
-        existing_entries = {
-            variant['addr']
-            for part in static_parts
-            for variant in part['variants']
-        }
-        unresolved = sorted(static_requested_entries - existing_entries)
+        unresolved = unresolved_static_variant_requests(
+            static_variant_requests, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')
         print(f'Static isolated interior shards: {fragment_built}')
+        print(f'Static byte-incoherent entries excluded: {byte_incoherent}')
         if unresolved:
-            sample = ', '.join(f'0x{entry:08X}' for entry in unresolved[:12])
+            sample = ', '.join(
+                f'0x{entry:08X}@{request["image_crc"]:08X}'
+                for entry, request in unresolved[:12])
             print(f'STATIC COVERAGE WARNING: {len(unresolved)} captured dispatch '
                   f'entry(s) have no compiled body/owner: {sample}')
-            for entry in unresolved:
-                stats.add_fail(f'static entry 0x{entry:08X}', 'static_unresolved',
-                               'captured dispatch entry with no compiled body/owner')
+            for entry, request in unresolved:
+                stats.add_fail(
+                    f'static entry 0x{entry:08X} variant '
+                    f'{request["image_crc"]:08X}', 'static_unresolved',
+                    'captured dispatch entry with no current-variant '
+                    'compiled body/owner')
 
         all_variants = []
         combined = '/* Auto-generated overlay dispatch — do not edit.\n'

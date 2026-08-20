@@ -207,6 +207,46 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_lds(cpu);
 }
 
+/* Generated AOT code knows the dependency mask at code-generation time.  Its
+ * overwhelmingly common masks contain at most two nonzero GPRs, so route those
+ * through shared helpers that perform the exact same base -> dependencies ->
+ * DO_LDS sequence without rediscovering the set bits at runtime.  The emitter
+ * guarantees r0/r1/r2 are distinct and in [1,31].
+ *
+ * Overlay DLLs cannot import host runtime symbols directly; keep equivalent
+ * inline definitions there.  In-process AOT/BIOS code shares one runtime copy,
+ * avoiding one large psx_cyc_step clone in every generated translation unit. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
+static inline void psx_cyc_step_0(CPUState* cpu) {
+    psx_cyc_base(cpu);
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_1(CPUState* cpu, uint32_t r0) {
+    psx_cyc_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_2(CPUState* cpu, uint32_t r0, uint32_t r1) {
+    psx_cyc_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    cpu->read_absorb[r1] = 0u;
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_3(CPUState* cpu, uint32_t r0, uint32_t r1,
+                                  uint32_t r2) {
+    psx_cyc_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    cpu->read_absorb[r1] = 0u;
+    cpu->read_absorb[r2] = 0u;
+    psx_cyc_lds(cpu);
+}
+#else
+void psx_cyc_step_0(CPUState* cpu);
+void psx_cyc_step_1(CPUState* cpu, uint32_t r0);
+void psx_cyc_step_2(CPUState* cpu, uint32_t r0, uint32_t r1);
+void psx_cyc_step_3(CPUState* cpu, uint32_t r0, uint32_t r1, uint32_t r2);
+#endif
+
 /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */
@@ -230,6 +270,13 @@ uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
                            uint32_t rt, uint32_t reg_mask);
 #else
+static inline void psx_cyc_load_charge_exact(uint32_t cycles) {
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
+    if (psx_cycles_try_fast_charge(cycles)) return;
+#endif
+    psx_advance_cycles(cycles);
+}
+
 /* CPU data load value+timing. Full Beetle sequence for main RAM is inlined;
  * MMIO / lockstep / data-shard fall through to *_slow in memory.c. */
 static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
@@ -239,7 +286,10 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
         if (g_psx_load_delay) {
-            psx_cyc_base(cpu);
+            uint32_t charge = 0u;
+            uint8_t w = cpu->read_absorb_which;
+            if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+            else                     charge = 1u;
             psx_cyc_deps(cpu, reg_mask);
             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
             psx_cyc_lds(cpu);
@@ -247,7 +297,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             cpu->read_absorb_which = 0u;
             uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
             cpu->ld_absorb = 5u; /* main-RAM wait 3 + completion 2 */
-            psx_cyc_charge(fudge + 5u);
+            psx_cyc_load_charge_exact(charge + fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t value;
@@ -269,7 +319,10 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
         if (g_psx_load_delay) {
-            psx_cyc_base(cpu);
+            uint32_t charge = 0u;
+            uint8_t w = cpu->read_absorb_which;
+            if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+            else                     charge = 1u;
             psx_cyc_deps(cpu, reg_mask);
             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
             psx_cyc_lds(cpu);
@@ -277,7 +330,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             cpu->read_absorb_which = 0u;
             uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
             cpu->ld_absorb = 5u;
-            psx_cyc_charge(fudge + 5u);
+            psx_cyc_load_charge_exact(charge + fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint16_t value;

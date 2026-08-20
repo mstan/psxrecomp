@@ -39,13 +39,13 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
 
 /* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
  * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic.
- * force_4_3 = pillarbox at native 4:3 even on a wide display aspect (FMVs
- * are authored 4:3 and get no GTE squash to compensate the stretch).
+ * content_4_3 keeps authored 4:3 content centered and undistorted; with a
+ * fixed outer canvas it never overrides the selected presentation aspect.
  * content_w: if 0 < content_w < src_w, only columns [0, content_w) are shown
  * (left-aligned in the letterbox; the rest stays cleared black). Used to hide
  * a trailing depth24 margin without changing CRTC width / stretching. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
-                         int force_4_3, int content_w);
+                         int content_4_3, int content_w);
 
 /* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
  * caller owns them and may free them on return. Passing NULL clears it.
@@ -139,9 +139,9 @@ int  gl_renderer_present_rect_dirty(int disp_x, int disp_y, int w, int h);
 /* THE present path for 15-bit frames: blit the display region straight from
  * the authoritative VRAM FBO into a letterboxed rect (no readback).
  * Deterministic — used for every 15-bit frame. linear = filter on scale.
- * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
+ * content_4_3 selects the centered native-content safe area. */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
-                              int force_4_3);
+                              int content_4_3);
 
 /* GPU-direct native-wide present: blit the displayed buffer's wide FBO (key =
  * disp_x) straight to the window, no CPU readback. Returns 0 if no wide surface
@@ -152,6 +152,10 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
+
+/* Opt into a configuration-owned outer canvas. Scene classification then
+ * changes only the content-safe transform inside that canvas. */
+void gl_renderer_set_fixed_outer_aspect(int enabled);
 
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */

@@ -26,6 +26,7 @@
 #include "psx_rewind.h"
 #include "crash_trace.h"
 #include "gpu_vk_upload.h"
+#include "ws_present_layout.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -44,6 +45,8 @@ void vk_renderer_present_blank(void){}
 void vk_renderer_sync_cpu(void){}
 void vk_renderer_restage_vram_after_savestate(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
+void vk_renderer_set_display_aspect(int n,int d){(void)n;(void)d;}
+void vk_renderer_set_fixed_outer_aspect(int e){(void)e;}
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
@@ -236,6 +239,9 @@ static VkExtent2D       s_sc_extent;
 static uint32_t         s_sc_count;
 static VkImage          s_sc_images[8];
 static int              s_present_mode_req = 1;   /* 1 tear-free, 0 IMMEDIATE, -1 MAILBOX */
+static int              s_aspect_num = 4;
+static int              s_aspect_den = 3;
+static int              s_fixed_outer_aspect = 0;
 
 /* Per-frame sync (double-buffered command recording). */
 #define VK_FRAMES 2
@@ -1475,6 +1481,14 @@ void vk_renderer_shutdown(void) {
 }
 
 void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
+void vk_renderer_set_display_aspect(int num, int den) {
+    if (num <= 0 || den <= 0) { num = 4; den = 3; }
+    s_aspect_num = num;
+    s_aspect_den = den;
+}
+void vk_renderer_set_fixed_outer_aspect(int enabled) {
+    s_fixed_outer_aspect = enabled ? 1 : 0;
+}
 
 /* ---- present ----------------------------------------------------------- */
 /* Acquire a swapchain image, run `record` (which leaves it in
@@ -1671,8 +1685,28 @@ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
     off[1].x = x + tw;  off[1].y = y + th;  off[1].z = 1;
 }
 
+static void present_content_rect(int sw, int sh, int content_4_3,
+                                 VkOffset3D off[2]) {
+    if (!s_fixed_outer_aspect) {
+        /* Preserve the Vulkan backend's existing 4:3 present policy for games
+         * that have not opted into separated outer/content layout. */
+        letterbox(sw, sh, 4, 3, off);
+        return;
+    }
+
+    PsxPresentLayout layout;
+    psx_present_layout_compute(sw, sh, s_aspect_num, s_aspect_den,
+                               1, content_4_3, &layout);
+    off[0].x = layout.content.x;
+    off[0].y = layout.content.y;
+    off[0].z = 0;
+    off[1].x = layout.content.x + layout.content.w;
+    off[1].y = layout.content.y + layout.content.h;
+    off[1].z = 1;
+}
+
 int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
-                             int linear, int force_4_3) {
+                             int linear, int content_4_3) {
     if (!s_ctx_ok) return 0;
     flush_cpu_upload();   /* displayed VRAM may include pending CPU writes */
     flush_tex_batch(); flush_geometry(); gpu_sync();   /* drain all draws; VRAM in TRANSFER_SRC */
@@ -1689,8 +1723,8 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
 
     VkOffset3D dst[2];
-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
-              force_4_3 ? 4 : 4, force_4_3 ? 3 : 3, dst);
+    present_content_rect((int)s_sc_extent.width, (int)s_sc_extent.height,
+                         content_4_3, dst);
 
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1758,8 +1792,7 @@ static void cpres_cache_free(void) {
 }
 
 void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
-                             int linear, int force_4_3) {
-    (void)force_4_3;
+                             int linear, int content_4_3) {
     if (!s_ctx_ok || !pixels || src_w <= 0 || src_h <= 0) { vk_renderer_present_blank(); return; }
     flush_tex_batch(); flush_geometry(); gpu_sync();
 
@@ -1799,7 +1832,8 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
 
     VkOffset3D dst[2];
-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height, 4, 3, dst);
+    present_content_rect((int)s_sc_extent.width, (int)s_sc_extent.height,
+                         content_4_3, dst);
     /* Short GP1(07h) bands: letterbox inside the 4:3 rect (see GL present). */
     if (src_h > 0 && src_h < 240) {
         int box_h = dst[1].y - dst[0].y;
@@ -1854,8 +1888,13 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     int native_w = s_wide_w - 2 * s_wide_offset;
     if (native_w <= 0) native_w = s_wide_w;
     VkOffset3D dst[2];
-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
-              4 * s_wide_w, 3 * native_w, dst);
+    if (s_fixed_outer_aspect) {
+        present_content_rect((int)s_sc_extent.width,
+                             (int)s_sc_extent.height, 0, dst);
+    } else {
+        letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+                  4 * s_wide_w, 3 * native_w, dst);
+    }
 
     int sy0 = disp_y * S, sy1 = (disp_y + disp_h) * S;
     if (sy0 < 0) sy0 = 0;

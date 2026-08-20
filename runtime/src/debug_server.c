@@ -5213,11 +5213,13 @@ static void handle_geom_correction(int id, const char *json)
      * triangles that reach the predicate. */
     uint64_t tc_att = 0, tc_arm = 0, tc_off = 0, tc_nosrc = 0, tc_noz = 0;
     gpu_texture_correction_stats(&tc_att, &tc_arm, &tc_off, &tc_nosrc, &tc_noz);
-    /* Exact-sign NCLIP coverage: fallbacks are frames' worth of faces decided
-     * by the integer sign (the flicker regime); invalidations counts shadow
-     * generation bumps (each one blinks the whole arena's provenance). */
-    uint64_t nc_hit = 0, nc_fb = 0, nc_corr = 0;
-    gte_nclip_precise_stats(&nc_hit, &nc_fb, &nc_corr);
+    uint64_t prim_arm = 0, prim_pos_reject = 0, prim_depth_reject = 0;
+    uint64_t mixed_position = 0, promoted = 0, demoted = 0, cache_overflow = 0;
+    gpu_pgxp_primitive_stats(&prim_arm, &prim_pos_reject, &prim_depth_reject,
+                             &mixed_position, &promoted, &demoted,
+                             &cache_overflow);
+    uint64_t nc_hit = 0, nc_fb = 0, nc_disagree = 0;
+    gte_nclip_precise_stats(&nc_hit, &nc_fb, &nc_disagree);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"geometry_correction\":%d,"
              "\"geometry_vertex_hits\":%u,"
@@ -5226,13 +5228,21 @@ static void handle_geom_correction(int id, const char *json)
              "\"no_correction\":%llu,\"no_source\":%llu,\"no_depth\":%llu},"
              "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
              "\"pgxp\":{\"enabled\":%d,\"cpu_mode\":%d,\"tolerance\":%.3f,"
+             "\"primitives_armed\":%llu,"
+             "\"primitives_rejected_incomplete_position\":%llu,"
+             "\"primitives_rejected_incomplete_depth\":%llu,"
+             "\"mixed_position_primitives\":%llu,"
+             "\"vertices_promoted_from_native\":%llu,"
+             "\"vertices_demoted_to_native\":%llu,"
+             "\"vertex_cache_overflow\":%llu,"
              "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
              "\"native\":%llu,\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
              "\"tolerance_reject\":%llu,\"w_valid\":%llu,"
              "\"produced\":%llu,\"swc2_stores\":%llu,"
-             "\"invalidations\":%llu},"
+             "\"invalidations\":%llu,\"memory_invalidations\":%llu,"
+             "\"mixed_projection_reject\":%llu},"
              "\"nclip\":{\"precise\":%llu,\"fallback\":%llu,"
-             "\"corrected\":%llu}}",
+             "\"sign_disagreements_observed\":%llu}}",
              id,
              gte_geometry_correction_enabled(),
              (unsigned)hits,
@@ -5242,6 +5252,13 @@ static void handle_geom_correction(int id, const char *json)
              (unsigned long long)tc_noz,
              (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
              pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+             (unsigned long long)prim_arm,
+             (unsigned long long)prim_pos_reject,
+             (unsigned long long)prim_depth_reject,
+             (unsigned long long)mixed_position,
+             (unsigned long long)promoted,
+             (unsigned long long)demoted,
+             (unsigned long long)cache_overflow,
              (unsigned long long)ps.lookups,
              (unsigned long long)ps.dataflow_hit,
              (unsigned long long)ps.fallback_hit,
@@ -5253,8 +5270,10 @@ static void handle_geom_correction(int id, const char *json)
              (unsigned long long)ps.produced,
              (unsigned long long)ps.swc2_stores,
              (unsigned long long)ps.invalidations,
+             (unsigned long long)ps.memory_invalidations,
+             (unsigned long long)ps.mixed_depth_reject,
              (unsigned long long)nc_hit, (unsigned long long)nc_fb,
-             (unsigned long long)nc_corr);
+             (unsigned long long)nc_disagree);
 }
 
 /* pgxp — live-tune the value-propagation engine for one-toggle isolation runs

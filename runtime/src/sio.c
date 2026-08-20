@@ -18,6 +18,7 @@
 #include "debug_server.h"
 #include "event_ring.h"
 #include "gpu.h"
+#include "interrupts.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -503,8 +504,8 @@ static int s_ape_torn_pulses = 0;
 
 /* Config default ([runtime] ape_card_unstick), set at boot. OFF unless the
  * game opts in: this pump force-re-edges I_MASK.7/IRQ7, and a misfired arm
- * (WipEout 3 under the x2 CRTC) storms the kernel card ISR so completion
- * events never deliver and the memcard screen hangs forever. */
+ * under unrelated or non-stock device timing can storm the kernel card ISR,
+ * preventing completion events from reaching the title. */
 static int s_ape_unstick_cfg = 0;
 void sio_set_ape_card_unstick(int on) { s_ape_unstick_cfg = on ? 1 : 0; }
 
@@ -560,6 +561,7 @@ static void ape_card_unstick_maybe(int allow_b4e38_synth) {
     if (!(i_mask & 0x80u))
         i_mask |= 0x80u;
     i_stat &= ~0x80u;
+    psx_irq_refresh_cause_ip2();
     psx_irq_raise(IRQ_SIO0, 0);
     /* ~2ms between pulses — faster than one VB/8 so two pops can land
      * before BIOS clears I_MASK.7 for good. */
@@ -779,6 +781,7 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
                 if (!(i_mask & 0x80u))
                     i_mask |= 0x80u;
                 i_stat &= ~0x80u;
+                psx_irq_refresh_cause_ip2();
                 card_handoff_push(9, (uint8_t)(a6 & 0xffu)); /* nest_irq_pulse */
                 psx_irq_raise(IRQ_SIO0, 0);
             }
@@ -2086,6 +2089,7 @@ uint32_t sio_read(uint32_t addr) {
         uint8_t b = sio_rx_data;
         sio_stat &= ~SIO_STAT_RX_RDY;
         sr_record(SR_EVT_RX_DATA_READ, 0, b);
+#ifndef PSX_NO_DEBUG_TOOLS
         if (active_device == DEV_MEMCARD &&
             mc_state >= MC_READ_DATA && mc_state <= MC_READ_END) {
             extern void card_data_writes_arm(uint8_t value,
@@ -2095,6 +2099,7 @@ uint32_t sio_read(uint32_t addr) {
             card_data_writes_arm(b, (uint16_t)mc_state,
                                  mc_data_idx, (uint8_t)mc_slot);
         }
+#endif
         return b;
     }
 

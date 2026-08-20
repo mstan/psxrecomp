@@ -30,15 +30,15 @@ void vk_renderer_shutdown(void);
  * swapchain (15-bit frames; deterministic, no readback). Returns 1 on success,
  * 0 if the Vulkan path is inactive (caller keeps the CPU present path). */
 int  vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
-                              int linear, int force_4_3);
+                              int linear, int content_4_3);
 
 /* GPU-direct native-wide present (mirrors gl_renderer_present_wide_fbo). */
 int  vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear);
 
 /* Present an ARGB8888 image as a letterboxed quad (24-bit FMV frames and the
- * display-disabled clear). force_4_3 pillarboxes at native 4:3. */
+ * display-disabled clear). content_4_3 selects the centered safe area. */
 void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
-                             int linear, int force_4_3);
+                             int linear, int content_4_3);
 void vk_renderer_present_blank(void);
 
 /* Sync the GPU VRAM image down into the CPU VRAM mirror (screenshots, debug
@@ -52,6 +52,9 @@ void vk_renderer_restage_vram_after_savestate(void);
  * -1=MAILBOX. Tear-free prefers MAILBOX because the frontend already paces
  * frames; unsupported modes fall back to FIFO (always available). */
 void vk_renderer_set_present_mode(int mode);
+
+void vk_renderer_set_display_aspect(int num, int den);
+void vk_renderer_set_fixed_outer_aspect(int enabled);
 
 #ifdef __cplusplus
 }
