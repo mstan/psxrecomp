@@ -545,6 +545,79 @@ static uint32_t g_text_exact_last_mismatch = 0;
 static uint32_t g_text_exact_last_live = 0;
 static uint32_t g_text_exact_last_ref = 0;
 
+/* ---- Text-guard verdict memo -------------------------------------------
+ *
+ * dirty_ram_text_native_ok_ranges_from() memcmp'd every emitted code range of
+ * the callee against the reference image on EVERY dispatch, uncached. In the
+ * WipEout 3 ntscfull8 mod that is ~33k dispatches/frame each re-comparing a
+ * whole function body — hundreds of MB/s of pure validation traffic, and the
+ * verdict is almost always the same "no" (the mod patches text via
+ * apply_main_write without blessing the reference, so patched functions are
+ * permanently non-native and fall to the interpreter after a full compare).
+ *
+ * The verdict is a pure function of (ranges, exec_pc, live text bytes,
+ * reference image). g_text_guard_gen advances whenever anything in the last
+ * two can change, so a memo keyed on it is exact:
+ *
+ *   - text_guard_note_write  — a CPU store into text that DIFFERS from the
+ *     reference (a store that MATCHES can only flip a verdict no->yes, and a
+ *     stale "no" is conservative: it costs interpretation, never correctness)
+ *   - dirty_ram_text_bless   — the reference image itself changed
+ *   - dirty_ram_mark_executable_range — DMA/mod wrote new code bytes
+ *   - register / reset_for_boot / resync_after_restore — wholesale re-arm
+ *
+ * PSX_TEXT_GUARD_MEMO=0 disables the memo (bisect switch: if a stale-native
+ * class ever appears, this proves or clears the memo in one run). */
+static uint32_t g_text_guard_gen = 1u;
+/* Page-granular guard generations: bumped only for the PAGE a diverging
+ * guarded write touched. The native-ok memo keys on the SUM over a function's
+ * own range pages (plus the global gen for image-registration/bless events),
+ * so CD streaming into unrelated text pages — hundreds of transitions per
+ * frame during races — no longer invalidates every memoized verdict in the
+ * game (measured: psx_game_text_native_ok at 6.8% of the emu thread with the
+ * memo never hitting). A diverging write to a covered page still invalidates
+ * exactly the functions on it. */
+static uint32_t text_guard_page_gen[DIRTY_RAM_PAGE_COUNT];
+static inline uint32_t text_guard_ranges_gen(const uint32_t *lo_len_pairs,
+                                             uint32_t count) {
+    uint32_t sum = g_text_guard_gen;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0 || phys >= RAM_SIZE || len > RAM_SIZE - phys) continue;
+        uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+        uint32_t lp = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+        for (uint32_t pg = fp; pg <= lp; pg++) sum += text_guard_page_gen[pg];
+    }
+    return sum;
+}
+
+#define TEXT_OK_MEMO_SLOTS 8192u          /* power of two */
+typedef struct {
+    const uint32_t *key;                  /* &k_psx_game_code_ranges[i].lo */
+    uint32_t        exec_pc;
+    uint32_t        count;
+    uint32_t        gen;
+    int             ok;
+} TextOkMemo;
+static TextOkMemo s_text_ok_memo[TEXT_OK_MEMO_SLOTS];
+
+static int text_ok_memo_enabled(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("PSX_TEXT_GUARD_MEMO");
+        s = (e && e[0] == '0') ? 0 : 1;
+    }
+    return s;
+}
+
+static inline uint32_t text_ok_memo_slot(const uint32_t *key, uint32_t exec_pc) {
+    uintptr_t p = (uintptr_t)key;
+    uint32_t h = (uint32_t)(p >> 3) * 2654435761u;
+    h ^= exec_pc * 2246822519u;
+    return (h >> 7) & (TEXT_OK_MEMO_SLOTS - 1u);
+}
+
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
@@ -575,6 +648,12 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        /* Live text now diverges here: any memoized "native ok" covering THIS
+         * PAGE must be re-decided (page-granular; see text_guard_page_gen).
+         * A store that MATCHES the reference is deliberately not invalidated —
+         * it can only flip a verdict no->yes, and keeping the stale "no" costs
+         * interpretation, not correctness. */
+        text_guard_page_gen[page]++;
     }
 }
 
@@ -629,7 +708,22 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                          uint32_t count,
                                          uint32_t exec_pc) {
     if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
-    (void)exec_pc;
+
+    /* Memo hit: same ranges, same entry PC, nothing has touched live text or
+     * the reference image since the verdict was computed (see g_text_guard_gen
+     * above). The diagnostic counters below are deliberately NOT re-bumped on
+     * a hit — they count compares performed, not dispatches rejected. */
+    TextOkMemo *memo = NULL;
+    if (text_ok_memo_enabled()) {
+        memo = &s_text_ok_memo[text_ok_memo_slot(lo_len_pairs, exec_pc)];
+        if (memo->key == lo_len_pairs && memo->exec_pc == exec_pc &&
+            memo->count == count &&
+            memo->gen == text_guard_ranges_gen(lo_len_pairs, count))
+            return memo->ok;
+    }
+
+    int ok = 0;
+    uint32_t at = exec_pc & 0x1FFFFFFFu;
     int any = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
@@ -680,7 +774,17 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
         g_text_native_blocked++;
         return 0;
     }
-    return 1;
+    ok = 1;
+
+done:
+    if (memo) {
+        memo->key     = lo_len_pairs;
+        memo->exec_pc = exec_pc;
+        memo->count   = count;
+        memo->gen     = text_guard_ranges_gen(lo_len_pairs, count);
+        memo->ok      = ok;
+    }
+    return ok;
 }
 
 /* Preserve the generated-code ABI used by existing game projects. */

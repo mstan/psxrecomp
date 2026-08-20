@@ -4984,7 +4984,10 @@ static GLint  s_bezel_shade_uTex = -1, s_bezel_shade_uTexOn = -1,
 static int      s_bezel_prev_rect[4] = { -1, -1, -1, -1 };
 static uint64_t s_bezel_fade_start_ms = 0;
 #define BEZEL_FADE_MS       200.0f
-#define BEZEL_SHADE_NEAR    0.92f  /* beside the game: near-black ground    */
+#define BEZEL_SHADE_NEAR    0.92f  /* beside the game: near-black ground,
+                                    * easing out over the wide falloff (the
+                                    * user keeps the gradient; only the seam
+                                    * hairline is removed)                  */
 #define BEZEL_SHADE_FAR     0.40f  /* outer screen edge: ground shows most  */
 #define BEZEL_WATERMARK_A   0.22f  /* single mark, pre-shade                */
 #define BEZEL_SEAM_A        0.32f  /* hairline at the viewport boundary     */
@@ -5167,26 +5170,10 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
             bezel_sdf_rect(band_x, 0, band_w, bot_h, 0.0f, 0.0f, 0.0f,
                            a_near, a_far, view, fall);
 
-        /* Hairline seam: a light terminator where the game meets the
-         * padding, so the viewport reads as mounted. Constant alpha (both
-         * endpoints equal), scaled with resolution so it survives 4K/8K. */
-        const float seam_a = BEZEL_SEAM_A * fade;
-        if (seam_a > 0.003f) {
-            int t = (int)(min_dim / 720.0f + 0.5f);
-            if (t < 1) t = 1;
-            if (lx > 0)
-                bezel_sdf_rect(lx - t, ly, t, lh, 0.62f, 0.62f, 0.66f,
-                               seam_a, seam_a, view, 1.0f);
-            if (right_w > 0)
-                bezel_sdf_rect(right_x, ly, t, lh, 0.62f, 0.62f, 0.66f,
-                               seam_a, seam_a, view, 1.0f);
-            if (top_h > 0)
-                bezel_sdf_rect(lx - t, top_y, lw + 2 * t, t,
-                               0.62f, 0.62f, 0.66f, seam_a, seam_a, view, 1.0f);
-            if (bot_h > 0)
-                bezel_sdf_rect(lx - t, ly - t, lw + 2 * t, t,
-                               0.62f, 0.62f, 0.66f, seam_a, seam_a, view, 1.0f);
-        }
+        /* No seam: the user wants the game to meet the bezel pattern with
+         * no separator hairline (removed 2026-08-19; BEZEL_SEAM_A kept for
+         * reference). */
+        (void)BEZEL_SEAM_A;
     }
     glDisable(GL_BLEND);
     p_glBindVertexArray(0);

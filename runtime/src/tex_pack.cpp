@@ -808,14 +808,100 @@ State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
     return ins.pixels.empty() ? nullptr : &ins;
 }
 
+static int tex_pack_lookup_replacement_uncached(const int lim[4], uint16_t clut_x,
+                                                uint16_t clut_y, uint16_t texpage,
+                                                TexPackRepl *out);
+
+/* Per-prim lookup memo. The uncached path pays a CLUT hash plus a newest-first
+ * containment scan over every live upload (up to 8192) for EVERY textured
+ * primitive — measured at 9.3% of the emu thread during WipEout 3 races. The
+ * decision is fully determined by (uv-limits, clut, texpage) and the upload/
+ * decode state, so key on those and an epoch that changes whenever any input
+ * can: uploads added (n_uploads — CLUT re-uploads included), uploads removed
+ * (n_kills), savestate revalidation (n_restore_kept), and repl-cache growth
+ * (repl.size() — a realloc moves the Repl objects the returned gl_handle/
+ * pixels pointers alias, so any new decode must flush the memo). */
+struct TexLookupMemo {
+    int l0, l1, l2, l3;
+    uint16_t cx, cy, tp;
+    uint8_t valid;
+    int ret;
+    /* Snapshot of the mutation counters at store time. Kills and repl-cache
+     * growth invalidate hard (indices/pointers move). Upload ADDS are checked
+     * LAZILY on hit: only uploads appended after `uploads_mark` are scanned,
+     * and the entry survives unless one of them touches this prim's sampled
+     * rect or its CLUT row — races upload continuously, and a global epoch
+     * self-flushed the memo exactly when it was needed most. */
+    uint64_t kills_mark, repl_mark, restore_mark;
+    size_t   uploads_mark;
+    int      rx, ry, rw, rh;      /* sampled VRAM rect at store time */
+    int      clut_w;              /* CLUT row width in halfwords (0 = 15bpp) */
+    TexPackRepl out;
+};
+static TexLookupMemo s_lookup_memo[8192];
+
 extern "C" int tex_pack_lookup_replacement(const int lim[4], uint16_t clut_x,
                                            uint16_t clut_y, uint16_t texpage,
                                            TexPackRepl *out) {
     if (!out) return 0;
     if (!tex_pack_active() || !lim) return 0;
-
     std::lock_guard<std::mutex> lk(g.mu);
     if (!g.replace_on || !g.repl_apply || g.known.empty()) return 0;
+    const uint32_t h = ((uint32_t)lim[0] * 73856093u) ^
+                       ((uint32_t)lim[1] * 19349663u) ^
+                       ((uint32_t)lim[2] * 83492791u) ^
+                       ((uint32_t)lim[3] * 2654435761u) ^
+                       ((uint32_t)texpage << 16) ^
+                       ((uint32_t)clut_y << 8) ^ (uint32_t)clut_x;
+    TexLookupMemo &m = s_lookup_memo[h & 8191u];
+    if (m.valid &&
+        m.l0 == lim[0] && m.l1 == lim[1] && m.l2 == lim[2] && m.l3 == lim[3] &&
+        m.cx == clut_x && m.cy == clut_y && m.tp == texpage &&
+        m.kills_mark == g.n_kills && m.restore_mark == g.n_restore_kept &&
+        m.repl_mark == (uint64_t)g.repl.size() &&
+        m.uploads_mark <= g.uploads.size()) {
+        int fresh_touches = 0;
+        for (size_t i = m.uploads_mark; i < g.uploads.size(); i++) {
+            const Upload &up = g.uploads[i];
+            if (rects_overlap(up.x, up.y, up.w, up.h, m.rx, m.ry, m.rw, m.rh) ||
+                (m.clut_w &&
+                 rects_overlap(up.x, up.y, up.w, up.h,
+                               (int)m.cx, (int)m.cy, m.clut_w, 1))) {
+                fresh_touches = 1;
+                break;
+            }
+        }
+        if (!fresh_touches) {
+            m.uploads_mark = g.uploads.size();  /* re-anchor past clean adds */
+            if (m.ret) *out = m.out;
+            return m.ret;
+        }
+    }
+    int ret = tex_pack_lookup_replacement_uncached(lim, clut_x, clut_y,
+                                                   texpage, out);
+    {
+        int depth = (texpage >> 7) & 3;
+        if (depth > 2) depth = 2;
+        const int shift = (depth == 0) ? 2 : (depth == 1) ? 1 : 0;
+        const int base_x = (texpage & 0xF) * 64;
+        const int base_y = ((texpage >> 4) & 1) * 256;
+        sampled_vram_rect(lim, base_x, base_y, shift, &m.rx, &m.ry, &m.rw, &m.rh);
+        m.clut_w = (depth == 0) ? 16 : (depth == 1) ? 256 : 0;
+    }
+    m.l0 = lim[0]; m.l1 = lim[1]; m.l2 = lim[2]; m.l3 = lim[3];
+    m.cx = clut_x; m.cy = clut_y; m.tp = texpage;
+    m.kills_mark = g.n_kills; m.restore_mark = g.n_restore_kept;
+    m.repl_mark = (uint64_t)g.repl.size();
+    m.uploads_mark = g.uploads.size();
+    m.ret = ret;
+    if (ret) m.out = *out;
+    m.valid = 1;
+    return ret;
+}
+
+static int tex_pack_lookup_replacement_uncached(const int lim[4], uint16_t clut_x,
+                                                uint16_t clut_y, uint16_t texpage,
+                                                TexPackRepl *out) {
 
     int depth = (texpage >> 7) & 3;
     if (depth > 2) depth = 2;
