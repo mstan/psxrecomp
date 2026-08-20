@@ -1684,6 +1684,8 @@ static void netplay_local_viewport_projection_aspect(
 static int g_ws_projection_num = 4;
 static int g_ws_projection_den = 3;
 static int g_ws_projection_mode = -1;
+extern "C" int psx_ws_scene_wide_active(void);  /* gpu.c: ws scene gate */
+
 static void refresh_widescreen_projection() {
     if (!g_ws_engaged) return;
 
@@ -6998,7 +7000,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * the bezels; gameplay presents at the mod aspect. The gpu.c gate carries
      * the 45-frame hysteresis and the bezel fade covers the transition. */
     if (g_ws_engaged) {
-        extern "C" int psx_ws_scene_wide_active(void);
         static int s_last_present_wide = -1;
         int wide_now = psx_ws_scene_wide_active() ? 1 : 0;
         if (wide_now != s_last_present_wide) {
