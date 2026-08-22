@@ -3065,13 +3065,11 @@ static int present_should_wall_pace(void) {
     return g_frame_period_ms > 0.0;
 }
 
-/* PAL x2 is a gameplay cadence. MDEC/depth-24 movies retain their authored
- * PAL 50-Hz presentation cadence even while the title/runtime clock remains
- * at the PAL x2 simulation rate. This is presentation-only: guest cycles,
- * CD timing, and SPU production are never rescaled here. */
+/* PAL x2 owns the guest/presentation cadence. FMV presentation is reduced to
+ * one of every two depth-24 frames below, while the guest remains at 100 Hz.
+ * This is presentation-only: guest cycles, CD timing, and SPU production are
+ * never rescaled for movies. */
 static double present_frame_period_ms(void) {
-    if (g_mod_native_vblank_rate && g_mod_native_vblank_active && gpu_display_is_depth24())
-        return 1000.0 / 50.0;
     return g_frame_period_ms;
 }
 
@@ -7122,24 +7120,33 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         }
     }
 
-    /* Netplay FMV: present 1 of every N depth24 vblanks while MDEC is hot.
+    /* FMV: under PAL x2, present 1 of every two depth24 vblanks while MDEC is
+     * hot. This keeps the guest/audio clock at 100 Hz while retaining the
+     * authored PAL 50-Hz movie cadence. Netplay uses the same skip point,
+     * with its configurable divisor.
      * §98: default N=2 (was 4). 1/4 made present_gap_p95≈80–100 ms look like
      * hitches; SW scanout is batched so 1/2 is affordable. Admit + wall pace
      * still run every tick. During MDEC-idle cutover present every frame.
      * Override: PSX_NET_FMV_PRESENT_DIV (1=every frame, 2=default, 4=legacy). */
-    if (psx_netplay_active() && gpu_display_is_depth24() &&
+    if ((psx_netplay_active() ||
+         (g_mod_native_vblank_rate && g_mod_native_vblank_active)) &&
+        gpu_display_is_depth24() &&
         mdec_recently_active(8)) {
         static int s_fmv_present_div = -1;
         int div;
-        if (s_fmv_present_div < 0) {
+        if (g_mod_native_vblank_rate && g_mod_native_vblank_active) {
+            div = 2;
+        } else if (s_fmv_present_div < 0) {
             const char *e = getenv("PSX_NET_FMV_PRESENT_DIV");
             unsigned v = 2u;
             if (e && e[0] && sscanf(e, "%u", &v) == 1 && v >= 1u && v <= 8u)
                 s_fmv_present_div = (int)v;
             else
                 s_fmv_present_div = 2;
+            div = s_fmv_present_div;
+        } else {
+            div = s_fmv_present_div;
         }
-        div = s_fmv_present_div;
         if (div <= 1) {
             s_netplay_depth24_present_skip = 0;
         } else if (s_netplay_depth24_present_skip > 0) {
