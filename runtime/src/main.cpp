@@ -2982,7 +2982,11 @@ static int present_vsync_owns_cadence(void) {
         return 0;
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
-    return host_refresh_matches_guest_cadence();
+    /* An explicit native guest rate is a simulation contract; keep the
+     * wall-clock pacer authoritative instead of feeding missed swaps back
+     * into guest progress. */
+    if (g_mod_native_vblank_rate)
+        return 0;    return host_refresh_matches_guest_cadence();
 }
 
 /* C accessor for the renderers (frame_pacing.h). The GL present-skip
