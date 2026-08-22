@@ -97,6 +97,9 @@ int savestate_request_load_blob_protocol(const void* data, size_t size);
 /* 1 while a staged save/load has not yet been consumed by savestate_poll. */
 int savestate_pending(void);
 
+/* Machine-readable lifecycle receipt for deterministic debug harnesses. */
+void savestate_status_json(char* buf, size_t cap);
+
 /* 1 once after a successful load restore (before scheduler longjmp). Clears. */
 int savestate_take_load_completed(void);
 

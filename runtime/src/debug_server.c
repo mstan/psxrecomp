@@ -8044,6 +8044,18 @@ static void handle_savestate(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
 }
 
+/* Deterministic harness receipt: unlike the savestate acknowledgement above,
+ * this reports the safe-boundary completion generation after savestate_poll
+ * has actually applied or rejected the request. */
+static void handle_savestate_status(int id, const char *json)
+{
+    (void)json;
+    extern void savestate_status_json(char *buf, size_t cap);
+    char status[256];
+    savestate_status_json(status, sizeof status);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, status);
+}
+
 static void handle_turbo(int id, const char *json)
 {
     int enabled = json_get_int(json, "enabled", -1);
@@ -13514,6 +13526,7 @@ static const CmdEntry s_commands[] = {
     { "input_route_stop",  handle_input_route_stop },
     { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
+    { "savestate_status",  handle_savestate_status },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },

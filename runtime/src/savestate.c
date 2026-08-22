@@ -55,6 +55,11 @@ static int      s_save_pending = -1;   /* slot, or -1 */
 static int      s_load_pending = -1;
 static int      s_load_completed = 0;
 static int      s_load_failed = 0;
+static uint32_t s_status_generation = 0;
+static int      s_status_pending = 0;
+static int      s_status_last_ok = 0;
+static int      s_status_last_load = 0;
+static int      s_status_last_slot = -1;
 static int      s_save_failed = 0;
 static uint32_t s_last_save_pc = 0;
 static int      s_save_defer_slot = -1;
@@ -587,6 +592,9 @@ static int request_save_inner(int slot) {
     s_last_save_pc = 0; /* block netplay transfer until this write stamps a PC */
     s_save_defer_slot = -1;
     s_save_pending = slot;
+    s_status_pending = 1;
+    s_status_last_load = 0;
+    s_status_last_slot = slot;
     return 1;
 }
 
@@ -603,6 +611,9 @@ static int request_load_inner(int slot) {
     s_load_failed = 0;
     s_load_completed = 0;
     s_load_pending = slot;
+    s_status_pending = 1;
+    s_status_last_load = 1;
+    s_status_last_slot = slot;
     return 1;
 }
 
@@ -658,6 +669,16 @@ int savestate_pending(void) {
     return (s_save_pending >= 0 || s_load_pending >= 0) ? 1 : 0;
 }
 
+void savestate_status_json(char* buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    snprintf(buf, cap,
+             "\"generation\":%u,\"pending\":%d,\"last_ok\":%d,"
+             "\"last_op\":\"%s\",\"last_slot\":%d",
+             (unsigned)s_status_generation, s_status_pending,
+             s_status_last_ok, s_status_last_load ? "load" : "save",
+             s_status_last_slot);
+}
+
 int savestate_take_load_completed(void) {
     int v = s_load_completed;
     s_load_completed = 0;
@@ -705,6 +726,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             s_save_defer_slot = -1;
             s_last_save_pc = 0;
             s_save_failed = 1;
+            s_status_pending = 0;
+            s_status_last_ok = 0;
+            s_status_generation++;
             fprintf(stderr,
                     "savestate: SAVE FAILED slot %d — no safe resume PC "
                     "(hint=0x%08X)\n",
@@ -733,12 +757,18 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                     s_last_save_pc = 0;
                     s_save_failed = 1;
                 }
+                s_status_pending = 0;
+                s_status_last_ok = ok ? 1 : 0;
+                s_status_generation++;
                 fprintf(stderr, "savestate: %s slot %d @ pc=0x%08X -> %s\n",
                         ok ? "SAVED" : "SAVE FAILED", slot, (unsigned)pc, path);
                 psx_frontend_on_savestate_notify(0, slot, ok);
             } else {
                 s_last_save_pc = 0;
                 s_save_failed = 1;
+                s_status_pending = 0;
+                s_status_last_ok = 0;
+                s_status_generation++;
                 psx_frontend_on_savestate_notify(0, slot, 0);
             }
         }
@@ -788,6 +818,11 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             s_load_failed = 1;
             psx_frontend_on_savestate_notify(1, slot, 0);
         }
+        if (!loaded) {
+            s_status_pending = 0;
+            s_status_last_ok = 0;
+            s_status_generation++;
+        }
         if (loaded) {
             t_after_boot = savestate_mono_ms();
             psx_cycles_resync_after_restore(cpu);
@@ -801,6 +836,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             cdrom_accelerate_after_savestate();
             /* Netplay post-load barrier observes this before the longjmp. */
             s_load_completed = 1;
+            s_status_pending = 0;
+            s_status_last_ok = 1;
+            s_status_generation++;
             /* Restage FBO/present latch so the restored frame is visible
              * immediately (avoids disabled-display blank latch + stale smooth). */
             psx_frontend_on_savestate_loaded();
