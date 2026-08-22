@@ -3451,6 +3451,28 @@ static void sdl_audio_pump(bool discard_output = false) {
     }
 }
 
+/* The accelerated load sink intentionally drops host audio while the guest
+ * continues to advance.  When it ends, the DRC ring is empty by definition;
+ * prime it with host-only silence before normal output resumes so the SDL
+ * callback cannot observe an artificial empty-ring transition.  This does not
+ * call spu_render and therefore cannot alter guest SPU state or timing. */
+static void sdl_audio_prime_after_turbo(void) {
+    if (audio_legacy_mode() || !sdl_audio_device || !s_drc_ready)
+        return;
+    const double target_ms = s_drc.cfg.target_ms + 20.0;
+    int frames = (int)std::ceil(target_ms * s_drc.cfg.source_rate / 1000.0);
+    if (frames <= 0)
+        return;
+    std::memset(sdl_audio_buf, 0, sizeof(sdl_audio_buf));
+    psx_sdl_audio_lock(sdl_audio_device);
+    while (frames > 0) {
+        int chunk = frames > 2048 ? 2048 : frames;
+        rab_push(&s_drc, sdl_audio_buf, chunk);
+        frames -= chunk;
+    }
+    psx_sdl_audio_unlock(sdl_audio_device);
+}
+
 /* Audio gating across turbo-loads transitions.
  *
  * The mute model stays: during turbo the guest runs at host speed, so
@@ -3905,6 +3927,7 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
     g_turbo_audio_sink_active = 0;
     if (sink_was_active) {
         sink_was_active = 0;
+        sdl_audio_prime_after_turbo();
         sdl_audio_fadein_left = sdl_audio_fade_samples;
         audio_trace_event(AUDIO_EV_UNMUTE,
                           (uint32_t)sdl_audio_fadein_left, 2);
