@@ -46,6 +46,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "../third_party/stb_image.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
+#include "guest_clock.h"
 #include "latency_ring.h"
 #include "sio.h"
 #ifndef PSX_MAX_PLAYERS
@@ -2149,6 +2150,42 @@ int g_audio_unmute_resync = 0;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
 extern "C" {
 int g_audio_host_rate = 44100;
+/* Guest-clocked audio observability. These counters are diagnostics only; the
+ * SPU still advances from psx_cycle_count and never from host presents. */
+uint64_t g_audio_guest_cycles_total = 0;
+uint64_t g_audio_guest_frames_budget = 0;
+uint64_t g_audio_guest_frames_rendered = 0;
+uint64_t g_audio_guest_pumps = 0;
+uint64_t g_audio_guest_cycle_carry = 0;
+}
+
+extern "C" void psx_runtime_timing_snapshot(
+    uint64_t *guest_cycles, uint64_t *guest_vblanks,
+    uint32_t *crtc_period_cycles, uint32_t *crtc_multiplier,
+    double *guest_hz, double *host_period_ms,
+    int *native_rate_override, uint32_t *native_rate_fps,
+    uint64_t *audio_guest_cycles, uint64_t *audio_frames_budget,
+    uint64_t *audio_frames_rendered, uint64_t *audio_pumps,
+    uint64_t *audio_cycle_carry)
+{
+    const uint32_t period = gpu_vblank_period_cycles();
+    if (guest_cycles) *guest_cycles = psx_get_cycle_count();
+    if (guest_vblanks) *guest_vblanks = s_frame_count;
+    if (crtc_period_cycles) *crtc_period_cycles = period;
+    if (crtc_multiplier) *crtc_multiplier = gpu_get_crtc_refresh_multiplier();
+    if (guest_hz) {
+        *guest_hz = period
+            ? (double)PSX_GUEST_CPU_CLOCK_HZ / (double)period
+            : 0.0;
+    }
+    if (host_period_ms) *host_period_ms = g_frame_period_ms;
+    if (native_rate_override) *native_rate_override = g_mod_native_vblank_rate ? 1 : 0;
+    if (native_rate_fps) *native_rate_fps = g_mod_native_vblank_fps;
+    if (audio_guest_cycles) *audio_guest_cycles = g_audio_guest_cycles_total;
+    if (audio_frames_budget) *audio_frames_budget = g_audio_guest_frames_budget;
+    if (audio_frames_rendered) *audio_frames_rendered = g_audio_guest_frames_rendered;
+    if (audio_pumps) *audio_pumps = g_audio_guest_pumps;
+    if (audio_cycle_carry) *audio_cycle_carry = g_audio_guest_cycle_carry;
 }
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
@@ -3278,8 +3315,11 @@ static void sdl_audio_pump(bool discard_output = false) {
     if (last_cycles == 0) last_cycles = now_cycles;
     uint64_t delta = (now_cycles - last_cycles) + cycle_carry;
     last_cycles = now_cycles;
-    int frames = (int)(delta / 768u);
-    cycle_carry = delta % 768u;
+    g_audio_guest_cycles_total += delta;
+    g_audio_guest_pumps++;
+    int frames = (int)psx_guest_audio_frames_for_cycles(delta, &cycle_carry);
+    g_audio_guest_frames_budget += (uint64_t)frames;
+    g_audio_guest_cycle_carry = cycle_carry;
     if (frames <= 0) return;
     if (frames > 2048 && !netplay) {
         /* Offline: a burst beyond one buffer (e.g. right after an unmute or a
@@ -3288,6 +3328,7 @@ static void sdl_audio_pump(bool discard_output = false) {
          * Netplay never drops: both peers must consume the same guest debt. */
         frames = 2048;
         cycle_carry = 0;
+        g_audio_guest_cycle_carry = 0;
     }
 
     audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
@@ -3300,6 +3341,7 @@ static void sdl_audio_pump(bool discard_output = false) {
     while (remaining > 0) {
         const int chunk = remaining > 2048 ? 2048 : remaining;
         spu_render(sdl_audio_buf, chunk);
+        g_audio_guest_frames_rendered += (uint64_t)chunk;
         remaining -= chunk;
         host_frames = chunk;
         if (discard_output) {

@@ -209,6 +209,15 @@ typedef struct CDROMDebugState {
     uint64_t accel_consumer_waits;
     uint64_t accel_consumer_wait_cycles;
     uint8_t  int1_pending_now;
+    /* Native media-clock observability. Diagnostic snapshots only; these
+     * fields are not part of the controller savestate wire format. */
+    uint8_t  xa_stream_active;
+    uint8_t  cdda_playing;
+    uint32_t cdda_lba;
+    int      cdda_delay;
+    uint64_t xa_audio_sectors;
+    uint64_t xa_audio_frames;
+    uint64_t cdda_sectors_played;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {

@@ -252,6 +252,13 @@ static uint64_t s_cd_probe_pause_count, s_cd_probe_pause_cycles;
 static uint64_t s_cd_probe_seek_count, s_cd_probe_seek_cycles;
 static uint64_t s_cd_probe_motor_count, s_cd_probe_motor_cycles;
 static uint64_t s_cd_probe_stop_count, s_cd_probe_stop_cycles;
+/* Media-clock counters are diagnostic-only and intentionally excluded from
+ * the boot/savestate wire format. */
+static uint64_t s_xa_audio_sector_total;
+static uint64_t s_xa_audio_frame_total;
+static uint64_t s_cd_timing_xa_audio_sector_base;
+static uint64_t s_cd_timing_xa_audio_frame_base;
+static uint64_t s_cd_timing_cdda_sector_base;
 
 static void cd_timing_note_intc(void);
 static uint8_t filter_file;
@@ -1050,6 +1057,9 @@ void cdrom_timing_reset(void) {
     s_cd_probe_seek_count = s_cd_probe_seek_cycles = 0;
     s_cd_probe_motor_count = s_cd_probe_motor_cycles = 0;
     s_cd_probe_stop_count = s_cd_probe_stop_cycles = 0;
+    s_cd_timing_xa_audio_sector_base = s_xa_audio_sector_total;
+    s_cd_timing_xa_audio_frame_base = s_xa_audio_frame_total;
+    s_cd_timing_cdda_sector_base = cdda_sectors_played;
 }
 
 uint64_t cdrom_timing_total(void) { return s_cd_timing_total; }
@@ -1133,7 +1143,12 @@ void cdrom_timing_stats_json(char *out, int cap) {
              "\"seek_count\":%llu,\"seek_cycles\":%llu,"
              "\"motor_count\":%llu,\"motor_cycles\":%llu,"
              "\"stop_count\":%llu,\"stop_cycles\":%llu,"
-             "\"latency_upper_cycles\":%llu",
+             "\"latency_upper_cycles\":%llu,"
+             "\"native_sector_cycles\":%u,"
+             "\"native_cdda_frames_per_sector\":%u,"
+             "\"xa_audio_sectors\":%llu,\"xa_audio_frames\":%llu,"
+             "\"cdda_sectors\":%llu,\"xa_stream_active\":%d,"
+             "\"cdda_playing\":%d,\"cdda_lba\":%u,\"cdda_delay\":%d",
              (unsigned long long)s_cd_timing_stream_starts,
              (unsigned long long)(s_cd_timing_total - s_cd_timing_reset_seq),
              (unsigned long long)dropped, (unsigned long long)data,
@@ -1167,7 +1182,16 @@ void cdrom_timing_stats_json(char *out, int cap) {
                                   s_cd_probe_pause_cycles +
                                   s_cd_probe_seek_cycles +
                                   s_cd_probe_motor_cycles +
-                                  s_cd_probe_stop_cycles));
+                                  s_cd_probe_stop_cycles),
+             (unsigned)CDROM_SINGLE_SPEED_SECTOR_CYCLES,
+             (unsigned)CDDA_SECTOR_FRAMES,
+             (unsigned long long)(s_xa_audio_sector_total -
+                                  s_cd_timing_xa_audio_sector_base),
+             (unsigned long long)(s_xa_audio_frame_total -
+                                  s_cd_timing_xa_audio_frame_base),
+             (unsigned long long)(cdda_sectors_played -
+                                  s_cd_timing_cdda_sector_base),
+             xa_stream_active, cdda_playing, (unsigned)cdda_lba, cdda_delay);
 }
 
 static uint8_t bin_to_bcd(int val) {
@@ -1405,6 +1429,8 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
     cd_apply_decode_volume(pcm_44100, out_frames);
     xa_zero_scan(pcm_44100, out_frames, lba, 1);
     spu_cd_audio_push(pcm_44100, out_frames);
+    s_xa_audio_sector_total++;
+    s_xa_audio_frame_total += (uint64_t)out_frames;
     trace_cdrom('A', 0,
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
                 ((uint32_t)coding << 8) | ((uint32_t)(out_frames / 32) & 0xFFu),
@@ -2822,6 +2848,11 @@ void cdrom_init(const char* cue_path) {
     stop_cdda_playback();
     cdda_lba = 0;
     cdda_sectors_played = 0;
+    s_xa_audio_sector_total = 0;
+    s_xa_audio_frame_total = 0;
+    s_cd_timing_xa_audio_sector_base = 0;
+    s_cd_timing_xa_audio_frame_base = 0;
+    s_cd_timing_cdda_sector_base = 0;
     mode_reg = 0;
     filter_file = 0;
     filter_channel = 0;

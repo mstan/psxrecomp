@@ -5501,7 +5501,18 @@ static void handle_irq_state(int id, const char *json)
  * and to probe double-buffer draw-offset alternation. */
 static void handle_vblank_rate(int id, const char *json)
 {
-    (void)json;
+    if (json_get_int(json, "reset", 0) == 1) {
+        extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+        extern uint64_t g_pollhack_vblank_count;
+        extern int32_t g_doff_min_last, g_doff_max_last;
+        extern uint32_t g_doff_cnt_last;
+        g_vblank_raise_count = 0;
+        g_vblank_deliver_count = 0;
+        g_pollhack_vblank_count = 0;
+        g_doff_min_last = 0;
+        g_doff_max_last = 0;
+        g_doff_cnt_last = 0;
+    }
     extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
     extern uint64_t g_pollhack_vblank_count;
     extern int32_t  g_doff_min_last, g_doff_max_last;

@@ -439,6 +439,12 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME frame_interpolation_schedule_test
              COMMAND frame_interpolation_schedule_test)
+    # PAL x2 timing audit: pure CRTC, guest-cycle SPU, and native CDDA clock
+    # relationships. This deliberately does not enable or inspect a title
+    # timing patch; it only pins the runtime clock-domain contracts.
+    add_executable(guest_clock_test tests/test_guest_clock.c)
+    target_include_directories(guest_clock_test PRIVATE include)
+    add_test(NAME guest_clock_test COMMAND guest_clock_test)
 
     add_executable(gpu_primitive_reject_test tests/test_gpu_primitive_reject.c)
     target_include_directories(gpu_primitive_reject_test PRIVATE include)
