@@ -17,7 +17,7 @@ id = "skip_fmv"
 name = "Skip FMVs"
 description = "On by default. This is presentation, not simulation: skipping a video changes no game state and no timing the game can observe, and save compatibility is unchanged. Turn it off to watch the intro and the attract sequence as shipped."
 group = "Quality of life"
-default_enabled = true
+default_enabled = false
 
 [[plugin]]
 feature = "skip_fmv"
