@@ -1281,7 +1281,30 @@ static double        g_host_refresh_hz = 0.0;
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
 static double        g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 static bool          g_mod_native_vblank_rate = false;
+static bool          g_mod_native_vblank_active = false;
+static uint32_t      g_mod_pending_crtc_multiplier = 1u;
 static uint32_t      g_mod_native_vblank_fps = 0;
+
+static double psx_crtc_frame_hz(void) {
+    const uint32_t period = gpu_vblank_period_cycles();
+    if (period == 0u)
+        return 59.94;
+    /* 33.8688 MHz CPU clock / cycles-per-vblank. */
+    return 33868800.0 / (double)period;
+}
+
+static void refresh_frame_pacer_period(void) {
+    if (g_mod_native_vblank_rate && g_mod_native_vblank_active)
+        return;
+    const double psx_hz = psx_crtc_frame_hz();
+    g_frame_period_ms = 1000.0 / psx_hz;
+    if (g_host_refresh_hz > 0.0) {
+        const double lo = psx_hz * 0.98;
+        const double hi = psx_hz * 1.02;
+        if (g_host_refresh_hz >= lo && g_host_refresh_hz <= hi)
+            g_frame_period_ms = 1000.0 / g_host_refresh_hz;
+    }
+}
 /* Activation-time request. -1 means no enabled mod owns load acceleration. */
 static int           g_mod_load_wall_multiplier = -1;
 static int           g_mod_load_release_frames = -1;
@@ -1394,10 +1417,13 @@ extern "C" int psx_mod_set_native_vblank_rate(
         return 0;
     }
     g_mod_native_vblank_rate = true;
+    g_mod_native_vblank_active = false;
     g_mod_native_vblank_fps = frames_per_second;
-    g_frame_period_ms = frames_per_second
-        ? 1000.0 / (double)frames_per_second
-        : 0.0;
+    /* Do not alter the live period during BIOS/boot.  The native rate is
+     * armed below and becomes authoritative only when the PAL title CRTC
+     * mode is observed by refresh_live_crtc_cadence(). */
+    if (!g_mod_native_vblank_active)
+        refresh_frame_pacer_period();
     /*
      * Above the physical panel rate (and in uncapped mode), swap-interval
      * blocking would silently replace the requested guest cadence with the
@@ -1442,7 +1468,11 @@ extern "C" int psx_mod_set_crtc_refresh_multiplier(
             (unsigned)multiplier);
         return 0;
     }
-    gpu_set_crtc_refresh_multiplier(multiplier);
+    if (g_mod_native_vblank_rate && !g_mod_native_vblank_active) {
+        g_mod_pending_crtc_multiplier = multiplier;
+    } else {
+        gpu_set_crtc_refresh_multiplier(multiplier);
+    }
     return 1;
 }
 
@@ -2179,7 +2209,8 @@ extern "C" void psx_runtime_timing_snapshot(
             : 0.0;
     }
     if (host_period_ms) *host_period_ms = g_frame_period_ms;
-    if (native_rate_override) *native_rate_override = g_mod_native_vblank_rate ? 1 : 0;
+    if (native_rate_override) *native_rate_override =
+        (g_mod_native_vblank_rate && g_mod_native_vblank_active) ? 1 : 0;
     if (native_rate_fps) *native_rate_fps = g_mod_native_vblank_fps;
     if (audio_guest_cycles) *audio_guest_cycles = g_audio_guest_cycles_total;
     if (audio_frames_budget) *audio_frames_budget = g_audio_guest_frames_budget;
@@ -2985,8 +3016,9 @@ static int present_vsync_owns_cadence(void) {
     /* An explicit native guest rate is a simulation contract; keep the
      * wall-clock pacer authoritative instead of feeding missed swaps back
      * into guest progress. */
-    if (g_mod_native_vblank_rate)
-        return 0;    return host_refresh_matches_guest_cadence();
+    if (g_mod_native_vblank_rate && g_mod_native_vblank_active)
+        return 0;
+    return host_refresh_matches_guest_cadence();
 }
 
 /* C accessor for the renderers (frame_pacing.h). The GL present-skip
@@ -3038,7 +3070,7 @@ static int present_should_wall_pace(void) {
  * at the PAL x2 simulation rate. This is presentation-only: guest cycles,
  * CD timing, and SPU production are never rescaled here. */
 static double present_frame_period_ms(void) {
-    if (g_mod_native_vblank_rate && gpu_display_is_depth24())
+    if (g_mod_native_vblank_rate && g_mod_native_vblank_active && gpu_display_is_depth24())
         return 1000.0 / 50.0;
     return g_frame_period_ms;
 }
@@ -3116,9 +3148,23 @@ static void refresh_live_crtc_cadence(void) {
     const bool period_changed = period != s_present_crtc_period_cycles;
     const bool standard_changed = is_pal != s_present_crtc_is_pal;
 
+    /* PAL x2 is a title-mode contract. Keep BIOS/boot on its GP1-selected
+     * cadence and arm the native override only once the PAL game display is
+     * actually programmed. */
+    const bool native_was_active = g_mod_native_vblank_active;
+    if (g_mod_native_vblank_rate && !g_mod_native_vblank_active &&
+        gpu_display_mode_is_programmed() && is_pal) {
+        gpu_set_crtc_refresh_multiplier(g_mod_pending_crtc_multiplier);
+        g_mod_native_vblank_active = true;
+        g_frame_period_ms = g_mod_native_vblank_fps
+            ? 1000.0 / (double)g_mod_native_vblank_fps : 0.0;
+    }
+    const bool native_active_changed =
+        native_was_active != g_mod_native_vblank_active;
+
     if (period_changed) {
         s_present_crtc_period_cycles = period;
-        if (!g_mod_native_vblank_rate) {
+        if (!(g_mod_native_vblank_rate && g_mod_native_vblank_active)) {
             refresh_frame_pacer_period();
             /* A new period must not inherit debt from the old clock. */
             s_frame_pacer = FramePacer{ 0 };
@@ -3127,6 +3173,10 @@ static void refresh_live_crtc_cadence(void) {
          * renderer's actual swap interval cannot remain startup-latched.
          * This is still required when a mod explicitly owns the wall target:
          * that override does not own or alter the live CRTC period. */
+        apply_present_cadence();
+    }
+    if (native_active_changed) {
+        s_frame_pacer = FramePacer{ 0 };
         apply_present_cadence();
     }
     s_present_crtc_is_pal = is_pal;

@@ -6,6 +6,7 @@
  * observation barrier.  In that exact context the generic psx_cyc_charge path
  * necessarily ends by adding to g_psx_cyc_batch, so do that directly.  Every
  * exceptional mode takes the unchanged generic path. */
+#if !defined(PSX_ENABLE_BLOCK_CYCLES)
 static inline void psx_cyc_generated_base(CPUState *cpu)
 {
     uint8_t w = cpu->read_absorb_which;
@@ -67,5 +68,6 @@ PSX_CYC_STEP_NOINLINE void psx_cyc_step_3(CPUState* cpu, uint32_t r0, uint32_t r
     cpu->read_absorb[r2] = 0u;
     psx_cyc_lds(cpu);
 }
+#endif
 
 #undef PSX_CYC_STEP_NOINLINE
