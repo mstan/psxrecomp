@@ -8271,6 +8271,8 @@ static void handle_savestate_status(int id, const char *json)
     char status[256];
     savestate_status_json(status, sizeof status);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, status);
+}
+
 /* Live CPU overclock for anchored A/B: animation-rate artifacts cannot be
  * attributed to the overclock without flipping it on the exact same scene. */
 /* Census of imperfect PGXP triangles for the last complete frame: which
