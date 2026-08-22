@@ -11336,14 +11336,12 @@ int main(int argc, char** argv) {
     }
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
-    /* Widescreen/View mode and Skip FMVs are mod-owned on PSX. Their legacy
-     * game.toml offer flags remain parseable for old projects but deliberately
-     * cannot expose generic launcher controls or activate the features. Trusted
-     * activation plugins apply them after launcher/settings resolution. */
+    /* Widescreen remains product-owned. WipEout 3 explicitly opts into the
+     * tested opening-sequence skip control exposed by recomp-ui. */
     constexpr bool ws_offered = false;
     constexpr bool ws_ultrawide_offered = false;
     constexpr bool frame_interpolation_offered = false;
-    constexpr bool skip_fmv_offered = false;
+    constexpr bool skip_fmv_offered = true;
     /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
      * former game.toml `offer_turbo_loads` opt-out is deprecated and ignored:
      * offering the generic switch is no longer possible for any title, so a

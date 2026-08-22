@@ -3,6 +3,7 @@
  * compile_overlays.py flow still works. */
 #include "autocompile.h"
 #include "overlay_loader.h"
+#include "overlay_api.h"
 
 #include <stdarg.h>   /* autocompile_set_degraded takes a format + varargs */
 #include <stdint.h>
