@@ -13345,6 +13345,33 @@ int main(int argc, char** argv) {
         hd_env = std::getenv("PSX_HD_TEXTURE_PACK");
         if (hd_env && hd_env[0]) g_hd_texture_pack = hd_env;
     }
+    /* Title-side authoring packs remain external user content. If the user
+     * placed a permitted replacement folder beside the disc, discover the
+     * exact Beetle convention first, then an explicit scale/coverage variant.
+     * Never search outside the disc directory and never copy the pack into
+     * the executable's release tree. */
+    if (g_hd_texture_pack.empty() && !resolved_disc.empty()) {
+        const std::filesystem::path parent = resolved_disc.parent_path();
+        const std::string stem = resolved_disc.stem().string();
+        const std::filesystem::path exact =
+            parent / (stem + "-texture-replacements");
+        std::error_code ec;
+        if (std::filesystem::is_directory(exact, ec)) {
+            g_hd_texture_pack = exact.string();
+        } else {
+            std::filesystem::path best;
+            const std::string prefix = stem + "-texture-replacements-";
+            for (const auto &entry : std::filesystem::directory_iterator(parent, ec)) {
+                if (ec) break;
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind(prefix, 0) == 0 && name.size() > prefix.size()) {
+                    if (best.empty() || name < best.filename().string()) best = entry.path();
+                }
+            }
+            if (!best.empty()) g_hd_texture_pack = best.string();
+        }
+    }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
                   g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());
     /* Config-owned exclusions survive pack-directory regeneration (the pack
