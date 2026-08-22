@@ -7151,6 +7151,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             s_netplay_depth24_present_skip = 0;
         } else if (s_netplay_depth24_present_skip > 0) {
             s_netplay_depth24_present_skip--;
+            /* Offline PAL x2 still paces every guest tick; only the movie
+             * presentation is skipped. Netplay performs its epilogue pace
+             * separately and keeps the historical skip behavior. */
+            if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+                refresh_frame_pacer_period();
+                frame_pacer_wait(&s_frame_pacer, present_frame_period_ms());
+            }
             return ep;
         } else {
             s_netplay_depth24_present_skip = div - 1;
