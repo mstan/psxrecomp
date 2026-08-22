@@ -13371,6 +13371,7 @@ int main(int argc, char** argv) {
     g_mod_disc_speed_divisor = -1;
     g_mod_disc_instant_rate = -1;
     g_turbo_audio_sink_enabled = g_turbo_audio_sink_config_enabled;
+    psx_ram_reset_size_request();
     g_turbo_load_wall_multiplier = 0;
     g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
     if (!turbo_loads_offered)
