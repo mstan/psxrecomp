@@ -3033,6 +3033,16 @@ static int present_should_wall_pace(void) {
     return g_frame_period_ms > 0.0;
 }
 
+/* PAL x2 is a gameplay cadence. MDEC/depth-24 movies retain their authored
+ * PAL 50-Hz presentation cadence even while the title/runtime clock remains
+ * at the PAL x2 simulation rate. This is presentation-only: guest cycles,
+ * CD timing, and SPU production are never rescaled here. */
+static double present_frame_period_ms(void) {
+    if (g_mod_native_vblank_rate && gpu_display_is_depth24())
+        return 1000.0 / 50.0;
+    return g_frame_period_ms;
+}
+
 /* Live query for the GL presenter: nonzero while the blocking Swap is the
  * game's frame clock. While true, unchanged-frame present skips must be
  * disabled — a skipped swap is an unpaced frame (the "fps readout off makes
@@ -7100,7 +7110,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
-            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            frame_pacer_wait(&s_frame_pacer, present_frame_period_ms());
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
         latency_ring_mark(LAT_PACED);
 
@@ -7195,6 +7205,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     bool scene_content_4_3 = false; /* menu/FMV/boot: native content correction */
     bool content_4_3 = false;       /* final inner-content policy after fallback */
     bool depth24_frame = false;
+    uint32_t depth24_display_x = 0;
     bool local_viewport_crop_applied = false;
     if (s_force_present_after_load && g_gl_active)
         gl_renderer_flush_cpu_uploads();
@@ -7235,6 +7246,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         s_disabled_frame_presented = false;
         s_force_present_after_load = false;
         w = di.width; h = di.height;
+        depth24_display_x = di.display_x;
         /* Scene classification controls content correction only. BIOS, FMV and
          * full-2D screens retain an undistorted 4:3 safe area; it must never
          * override the user-configured outer presentation canvas. */
@@ -7526,9 +7538,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * right-edge jump the old comment describes is 0 with filtering on.
          * Set video AA off to get nearest back. */
         gl_renderer_set_fmv_filter(g_video_fmv_filter);
+        const uint32_t depth24_w = depth24_frame
+            ? gpu_depth24_rgb_limit(depth24_display_x, present_w)
+            : 0u;
         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
                             g_video_aa ? 1 : 0,
-                            content_4_3 ? 1 : 0, 0 /* full width */);
+                            content_4_3 ? 1 : 0,
+                            depth24_w ? (int)depth24_w : 0);
         netplay_note_present();
     } else {
     if ((!sdl_renderer || !sdl_texture) && ensure_sw_sdl_present() != 0)
@@ -7704,7 +7720,7 @@ static void sdl_vblank_present(void) {
     }
     uint64_t perf_start = runtime_perf_section_begin();
     if (present_should_wall_pace())
-        frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+        frame_pacer_wait(&s_frame_pacer, present_frame_period_ms());
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     latency_ring_mark(LAT_PACED);
 }
