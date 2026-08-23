@@ -29,6 +29,7 @@ _OP_ORDER = [
     "annotate_legacy_packaging",
     "probe_disc_refresh",
     "record_framework_pins",
+    "patch_readme_metrics",
 ]
 
 _OP_TITLES = {
@@ -51,6 +52,7 @@ _OP_TITLES = {
     "annotate_legacy_packaging": "Annotate legacy prebuilt packaging",
     "probe_disc_refresh": "Refresh disc identity via probe_disc.py",
     "record_framework_pins": "Write framework_pins.txt",
+    "patch_readme_metrics": "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
 }
 
 

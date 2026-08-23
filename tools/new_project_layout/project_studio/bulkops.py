@@ -509,7 +509,13 @@ def resolve_catalog_root(studio_toml: Path | None = None) -> Path | None:
 
 
 def _catalog_name_keys(catalog_root: Path) -> set[str]:
-    """Folder / github short-name keys (lowercased) for every catalog title."""
+    """Folder / github short-name keys for every catalog title.
+
+    Stores raw lowercased names plus ``repo_match_keys`` forms so spacey /
+    ``… Recomp`` legacy checkouts still match hyphenated ``install_dir_name``.
+    """
+    from fill_tokens import repo_match_keys
+
     index_path = catalog_root / "index.json"
     titles_dir = catalog_root / "titles"
     if not index_path.is_file() or not titles_dir.is_dir():
@@ -519,8 +525,16 @@ def _catalog_name_keys(catalog_root: Path) -> set[str]:
     except (OSError, json.JSONDecodeError):
         return set()
     keys: set[str] = set()
+
+    def _add(raw: str) -> None:
+        s = (raw or "").strip()
+        if not s:
+            return
+        keys.add(s.lower())
+        keys.update(repo_match_keys(s))
+
     for tid in ids:
-        keys.add(str(tid).lower())
+        _add(str(tid))
         path = titles_dir / f"{tid}.json"
         if not path.is_file():
             continue
@@ -530,7 +544,7 @@ def _catalog_name_keys(catalog_root: Path) -> set[str]:
             continue
         name = str(raw.get("install_dir_name") or "").strip()
         if name:
-            keys.add(name.lower())
+            _add(name)
         for nest in (
             ("release", "github"),
             ("build", "source", "github"),
@@ -543,13 +557,139 @@ def _catalog_name_keys(catalog_root: Path) -> set[str]:
                     break
                 cur = cur[k]
             if ok and isinstance(cur, str) and "/" in cur:
-                keys.add(cur.rsplit("/", 1)[-1].lower())
+                _add(cur.rsplit("/", 1)[-1])
         homepage = str(raw.get("homepage") or "")
         if "github.com/" in homepage.lower():
             tail = homepage.rstrip("/").split("github.com/")[-1]
             if "/" in tail:
-                keys.add(tail.split("/")[-1].lower())
+                _add(tail.split("/")[-1])
     return keys
+
+
+def catalog_title_id_for_root(
+    root: Path,
+    *,
+    catalog_root: Path | None = None,
+) -> str | None:
+    """Best-effort catalog title id for a local checkout (install_dir / github slug)."""
+    from fill_tokens import repo_match_keys
+
+    cat = catalog_root or resolve_catalog_root()
+    if cat is None:
+        return None
+    index_path = cat / "index.json"
+    titles_dir = cat / "titles"
+    if not index_path.is_file() or not titles_dir.is_dir():
+        return None
+    try:
+        ids = list(json.loads(index_path.read_text(encoding="utf-8")).get("titles") or [])
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    want = set(repo_match_keys(root.name))
+    try:
+        from .gitops import _git
+
+        code, url, _ = _git(root, "remote", "get-url", "origin")
+        if code == 0 and url:
+            u = url.strip().rstrip("/")
+            if u.endswith(".git"):
+                u = u[:-4]
+            if "github.com" in u.lower():
+                # git@github.com:Owner/Repo or https://github.com/Owner/Repo
+                tail = u.replace(":", "/").split("github.com/")[-1]
+                if "/" in tail:
+                    want.update(repo_match_keys(tail.split("/")[-1]))
+    except Exception:
+        pass
+    want.discard("")
+
+    for tid in ids:
+        path = titles_dir / f"{tid}.json"
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidates = [str(tid), str(raw.get("install_dir_name") or "")]
+        gh = raw.get("release") if isinstance(raw.get("release"), dict) else {}
+        if isinstance(gh, dict) and isinstance(gh.get("github"), str) and "/" in gh["github"]:
+            candidates.append(gh["github"].rsplit("/", 1)[-1])
+        homepage = str(raw.get("homepage") or "")
+        if "github.com/" in homepage.lower():
+            tail = homepage.rstrip("/").split("github.com/")[-1]
+            if "/" in tail:
+                candidates.append(tail.split("/")[-1])
+        for c in candidates:
+            if repo_match_keys(c) & want:
+                return str(tid)
+    return None
+
+
+def upsert_studio_toml_title(
+    title_id: str,
+    project_root: Path,
+    *,
+    studio_toml: Path | None = None,
+) -> str | None:
+    """Ensure ``[titles] "id" = "rel/path"`` in studio.toml. Returns note or None."""
+    cfg = studio_toml or find_studio_toml()
+    if cfg is None or not (title_id or "").strip():
+        return None
+    title_id = title_id.strip()
+    root = project_root.expanduser().resolve()
+    if not root.is_dir():
+        return None
+    try:
+        rel = os.path.relpath(root, cfg.parent.resolve()).replace("\\", "/")
+    except ValueError:
+        rel = str(root)
+    key_line = f'"{title_id}" = "{rel}"'
+    text = cfg.read_text(encoding="utf-8")
+    # Already present with any path → leave alone (user may have customized).
+    existing = re.search(
+        rf'^[ \t]*"{re.escape(title_id)}"\s*=\s*("[^"]*"|\'[^\']*\')',
+        text,
+        re.M,
+    )
+    if existing:
+        return f"studio.toml already maps {title_id}"
+    if re.search(r"^\[titles\]\s*$", text, re.M):
+        # Append after [titles] block's last assignment, or right after header.
+        lines = text.splitlines(keepends=True)
+        out: list[str] = []
+        in_titles = False
+        inserted = False
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                if in_titles and not inserted:
+                    out.append(key_line + "\n")
+                    inserted = True
+                in_titles = s == "[titles]"
+                out.append(line)
+                i += 1
+                continue
+            out.append(line)
+            i += 1
+        if in_titles and not inserted:
+            if out and not out[-1].endswith("\n"):
+                out[-1] = out[-1] + "\n"
+            out.append(key_line + "\n")
+            inserted = True
+        if not inserted:
+            return None
+        cfg.write_text("".join(out), encoding="utf-8")
+    else:
+        suffix = "" if text.endswith("\n") or not text else "\n"
+        cfg.write_text(
+            text + suffix + "\n[titles]\n" + key_line + "\n",
+            encoding="utf-8",
+        )
+    return f"studio.toml [titles] += {title_id}"
 
 
 def _studio_title_paths(studio_toml: Path | None = None) -> set[Path]:
@@ -576,6 +716,8 @@ def repo_has_catalog_entry(
     studio_toml: Path | None = None,
 ) -> bool:
     """True if this indexed checkout maps to a retcomm-catalog title."""
+    from fill_tokens import repo_match_keys
+
     try:
         root = entry.resolved()
     except OSError:
@@ -589,12 +731,34 @@ def repo_has_catalog_entry(
     keys = _catalog_name_keys(cat)
     if not keys:
         return False
-    basename = root.name.lower()
-    if basename in keys:
+
+    def _hits(label: str) -> bool:
+        s = (label or "").strip()
+        if not s:
+            return False
+        if s.lower() in keys:
+            return True
+        return bool(repo_match_keys(s) & keys)
+
+    if _hits(root.name):
         return True
-    name = (entry.name or "").strip().lower()
-    if name and name in keys:
+    if _hits(entry.name or ""):
         return True
+    # GitHub origin short name (catalog often matches repo slug, not local folder).
+    try:
+        from .gitops import _git
+
+        code, url, _ = _git(root, "remote", "get-url", "origin")
+        if code == 0 and url:
+            u = url.strip().rstrip("/")
+            if u.endswith(".git"):
+                u = u[:-4]
+            if "github.com" in u.lower():
+                tail = u.replace(":", "/").split("github.com/")[-1]
+                if "/" in tail and _hits(tail.split("/")[-1]):
+                    return True
+    except Exception:
+        pass
     return False
 
 

@@ -309,6 +309,12 @@ def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> P
             return p.resolve()
     names = [basename, f"{basename}.exe"]
     search_dirs = [
+        # The dedicated analyzer tree comes FIRST. ensure_analyzer() builds and
+        # source-stamps that one, and an older psxrecomp-analyze left behind in
+        # the shared emitters tree would otherwise shadow every rebuild — the
+        # tool would be rebuilt correctly and then never used.
+        project_root / "psxrecomp" / "recompiler" / "build-analyze",
+        ROOT / "recompiler" / "build-analyze",
         project_root / "psxrecomp" / "recompiler" / "build",
         project_root / "psxrecomp" / "recompiler" / "build" / "Release",
         project_root / "build-recompiler",
@@ -337,6 +343,10 @@ def find_psxrecomp_game(project_root: Path) -> Path:
 
 def find_psxrecomp_bios(project_root: Path) -> Path:
     return _find_recompiler_tool(project_root, "psxrecomp-bios", "PSXRECOMP_BIOS")
+
+
+def find_psxrecomp_analyze(project_root: Path) -> Path:
+    return _find_recompiler_tool(project_root, "psxrecomp-analyze", "PSXRECOMP_ANALYZE")
 
 
 def find_emitters(project_root: Path) -> tuple[Path, Path]:
@@ -380,6 +390,191 @@ def ensure_emitters(
         pct=0.12,
         message="Building psxrecomp-game + psxrecomp-bios…",
     )
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        # psxrecomp-analyze is deliberately NOT built here. It has its own
+        # ensure_analyzer()/build tree, and requesting it from the shared
+        # emitters build breaks `ensure-emitters` outright on any checkout whose
+        # recompiler/CMakeLists.txt predates the target ("ninja: error: unknown
+        # target"). The emitters path must keep working on old framework pins.
+        ("psxrecomp-game", "psxrecomp-bios"),
+        download_toolchain=download_toolchain,
+        clean=force,
+    )
+
+    try:
+        game, bios = find_emitters(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"emitters build finished but binaries not found: {exc}"
+        ) from exc
+    progress.log(f"Emitters built: {game} , {bios}")
+    return game, bios
+
+
+# Source files that make up psxrecomp-analyze. Kept in step with the target's
+# source list in recompiler/CMakeLists.txt.
+ANALYZER_SOURCES = (
+    "recompiler/src/ps1_exe_parser.cpp",
+    "recompiler/src/mips_decoder.cpp",
+    "recompiler/src/function_analysis.cpp",
+    "recompiler/src/analysis_db.cpp",
+    "recompiler/src/bios_call_names.cpp",
+    "recompiler/src/analysis_export.cpp",
+    "recompiler/src/widescreen_scan.cpp",
+    "recompiler/src/main_analyze.cpp",
+    "recompiler/include/analysis_db.h",
+    "recompiler/src/analysis_export.h",
+    "recompiler/include/widescreen_scan.h",
+    "runtime/include/ws_cull_detect.h",
+)
+
+
+def _analyzer_source_hash(project_root: Path) -> str:
+    """Digest of the analyzer's sources, or "" if they cannot be read.
+
+    The toolchain stamp notices a changed COMPILER; nothing noticed changed
+    CODE, so a psxrecomp-analyze built before a feature landed kept being reused
+    and rejected the very options the caller had just learned to pass. This is
+    the same guard `psxrecomp-game --codegen-hash` provides for the emitters,
+    computed here rather than baked in so it needs no CMake support.
+    """
+    import hashlib
+
+    fw = framework_root(project_root)
+    h = hashlib.sha256()
+    for rel in ANALYZER_SOURCES:
+        p = fw / rel
+        if not p.is_file():
+            return ""
+        h.update(rel.encode("utf-8"))
+        h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def _analyzer_stamp_path(tool: Path) -> Path:
+    return tool.parent / (tool.name + ".srcstamp")
+
+
+def ensure_analyzer(
+    project_root: Path,
+    progress: ProgressReporter,
+    *,
+    download_toolchain: bool = True,
+) -> Path:
+    """Return psxrecomp-analyze, building ONLY that target when it is missing.
+
+    Every build tree created before this target existed has game+bios but no
+    analyzer, so `analyze` has to be able to add one. It must not do that by
+    rebuilding the emitters: they already work, a relink is slow, and on a repo
+    whose tree was configured with the portable cmake-clang toolchain against a
+    newer system glibc the psxrecomp-game link fails outright on
+    ``__isoc23_strtoul`` — a pre-existing toolchain mismatch that has nothing to
+    do with analysis. Building the one target that is actually missing avoids
+    dragging that failure into an unrelated command.
+    """
+    src = recompiler_source_dir(project_root)
+    dedicated = src / "build-analyze"
+
+    # If this project already has the dedicated tree, always run the build step
+    # rather than trusting the binary's presence. Ninja is a no-op when nothing
+    # changed (tens of milliseconds), and it is the only thing that notices an
+    # analyzer SOURCE edit — the toolchain stamp catches a changed compiler, not
+    # changed code, so a stale binary would otherwise keep producing old-format
+    # reports indefinitely.
+    want = _analyzer_source_hash(project_root)
+    try:
+        existing = find_psxrecomp_analyze(project_root)
+        stamp = _analyzer_stamp_path(existing)
+        have = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+        if want and have == want:
+            return existing
+        progress.log(
+            "psxrecomp-analyze is stale for the current sources — rebuilding"
+            if have
+            else "psxrecomp-analyze has no source stamp — rebuilding once"
+        )
+    except FileNotFoundError:
+        pass
+
+    progress.phase("emitters", pct=0.12, message="Building psxrecomp-analyze…")
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        ("psxrecomp-analyze",),
+        download_toolchain=download_toolchain,
+        build_dir_override=dedicated,
+        # The analyzer needs fmt and nothing else. Configuring its own tree with
+        # libchdr and the test suite off keeps `analyze` independent of whatever
+        # state the emitters' build directory is in — a half-configured cache, a
+        # cold FetchContent needing the network, or a project path containing a
+        # colon, all of which fail the shared configure for reasons that have
+        # nothing to do with static analysis.
+        extra_cmake_args=("-DPSXRECOMP_ENABLE_CHD=OFF", "-DBUILD_TESTING=OFF"),
+    )
+    try:
+        tool = find_psxrecomp_analyze(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"psxrecomp-analyze build finished but the binary was not found: {exc}"
+        ) from exc
+    if want:
+        try:
+            _analyzer_stamp_path(tool).write_text(want, encoding="utf-8")
+        except OSError:
+            pass
+    progress.log(f"Analyzer built: {tool}")
+    return tool
+
+
+def _toolchain_stamp(clang_cxx: Optional[str], cmake_tool: Optional[str]) -> str:
+    """Identity of the toolchain that a build directory's objects were made with.
+
+    The portable toolchain is addressed through a stable ``latest`` symlink, so
+    an upgrade behind it leaves CMAKE_CXX_COMPILER unchanged and CMake's
+    compiler-change detection never fires. Ninja then relinks object files
+    built by the previous toolchain.
+
+    That is not theoretical: cmake-clang-v1 v1.0.10 shipped no sysroot and
+    compiled against the host's glibc, so `strtoul` became `__isoc23_strtoul`
+    (glibc >= 2.38). v1.0.14 added a bundled older sysroot that exports no such
+    symbol, and every build tree from before the upgrade failed to link with
+    "undefined symbol: __isoc23_strtoul" while nothing looked out of date.
+
+    Resolving the symlink puts the concrete version in the stamp, so the
+    upgrade becomes visible and the tree can be wiped.
+    """
+    parts: list[str] = []
+    for tool in (clang_cxx, cmake_tool):
+        if not tool:
+            continue
+        real = Path(tool).resolve()
+        parts.append(str(real))
+        try:
+            parts.append(str(real.stat().st_size))
+        except OSError:
+            pass
+        manifest = real.parent.parent / "retcomm-toolchain.json"
+        if manifest.is_file():
+            try:
+                parts.append(manifest.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
+def _build_recompiler_targets(
+    project_root: Path,
+    progress: ProgressReporter,
+    targets: tuple[str, ...],
+    *,
+    download_toolchain: bool = True,
+    build_dir_override: Path | None = None,
+    extra_cmake_args: tuple[str, ...] = (),
+    clean: bool = False,
+) -> Path:
+    """Configure recompiler/ and build `targets`. Returns the build directory."""
     if not activate_embedded_toolchain(project_root, progress):
         if not download_toolchain or not ensure_toolchain_for_rebuild(
             project_root, progress, download=True
@@ -410,6 +605,9 @@ def ensure_emitters(
     except FileNotFoundError:
         pass
 
+    if build_dir_override is not None:
+        build_dir = build_dir_override
+
     build_dir.mkdir(parents=True, exist_ok=True)
     ninja = _which_tool("ninja")
     clang_c = _which_tool("clang")
@@ -417,6 +615,37 @@ def ensure_emitters(
     cmake = _which_tool("cmake")
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
+
+    # Wipe when the caller asked for a clean build, or when the toolchain that
+    # produced this tree's objects is not the one about to link them.
+    stamp_file = build_dir / ".retcomm-toolchain-stamp"
+    stamp = _toolchain_stamp(clang_cxx, cmake)
+    if clean:
+        progress.log(f"Clean rebuild requested — removing {build_dir}")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and stamp_file.is_file():
+        try:
+            previous = stamp_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            previous = ""
+        if previous and previous != stamp:
+            progress.log(
+                "Toolchain changed since this build directory was configured — "
+                f"removing {build_dir} so objects are rebuilt against it"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and not stamp_file.is_file() and (build_dir / "CMakeCache.txt").is_file():
+        # A tree configured before stamping existed. Its objects may predate the
+        # current toolchain with no way to tell, and a mismatch surfaces only as
+        # an undefined symbol at link time. Rebuild once, then stamp.
+        progress.log(
+            f"Unstamped build directory {build_dir} — rebuilding once so its "
+            "objects are known to match the active toolchain"
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
 
     cache_file = build_dir / "CMakeCache.txt"
     gen: list[str] = []
@@ -449,6 +678,7 @@ def ensure_emitters(
     # no MSYS2 GCC DLLs (same as tools/ci/build_emitters.sh).
     if clang_c is not None or clang_cxx is not None:
         cmake_args.append("-DPSXRECOMP_STATIC_CLI=ON")
+    cmake_args.extend(extra_cmake_args)
 
     progress.log(" ".join(cmake_args))
     proc = subprocess.run(
@@ -465,17 +695,9 @@ def ensure_emitters(
         )
 
     jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 4)
-    build_cmd = [
-        str(cmake),
-        "--build",
-        str(build_dir),
-        "--parallel",
-        jobs,
-        "--target",
-        "psxrecomp-game",
-        "--target",
-        "psxrecomp-bios",
-    ]
+    build_cmd = [str(cmake), "--build", str(build_dir), "--parallel", jobs]
+    for target in targets:
+        build_cmd += ["--target", target]
     progress.log(" ".join(build_cmd))
     proc = subprocess.run(build_cmd, capture_output=True, text=True)
     for stream in (proc.stdout, proc.stderr):
@@ -484,16 +706,16 @@ def ensure_emitters(
                 if line.strip():
                     progress.log(line)
     if proc.returncode != 0:
-        raise RuntimeError(f"emitters cmake build failed (exit {proc.returncode})")
-
-    try:
-        game, bios = find_emitters(project_root)
-    except FileNotFoundError as exc:
         raise RuntimeError(
-            f"emitters build finished but binaries not found under {build_dir}: {exc}"
-        ) from exc
-    progress.log(f"Emitters built: {game} , {bios}")
-    return game, bios
+            f"recompiler cmake build failed (exit {proc.returncode}) for "
+            + ", ".join(targets)
+        )
+    if stamp:
+        try:
+            stamp_file.write_text(stamp, encoding="utf-8")
+        except OSError:
+            pass
+    return build_dir
 
 
 def framework_root(project_root: Path) -> Path:
@@ -1473,6 +1695,139 @@ def cmd_ensure_emitters(args: argparse.Namespace, progress: ProgressReporter) ->
     return EXIT_OK
 
 
+def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
+    """Static function discovery over the project's boot EXE.
+
+    Distinct from `generate`: this produces knowledge *about* the executable
+    (function boundaries, call graph, recovered jump tables, inferred
+    signatures) rather than C for the runtime, and it never consults the
+    runtime or any capture set to do it.
+    """
+    project_root = (
+        Path(args.project_root).expanduser().resolve()
+        if args.project_root
+        else Path.cwd().resolve()
+    )
+    config = Path(args.config).expanduser()
+    if not config.is_absolute():
+        config = (project_root / config).resolve()
+
+    exe = str(getattr(args, "exe", "") or "").strip()
+    seeds = ""
+    if not exe:
+        if not config.is_file():
+            progress.error(
+                f"no --exe given and config not found: {config}", code=EXIT_USAGE
+            )
+            return EXIT_USAGE
+        secs = load_sections(config)
+        exe = str((secs.get("game") or {}).get("exe") or "").strip()
+        seeds = str((secs.get("recompiler") or {}).get("seeds") or "").strip()
+        if not exe:
+            progress.error(f"[game].exe not set in {config}", code=EXIT_USAGE)
+            return EXIT_USAGE
+
+    exe_path = Path(exe).expanduser()
+    if not exe_path.is_absolute():
+        exe_path = (project_root / exe_path).resolve()
+    if not exe_path.is_file():
+        progress.error(
+            f"boot EXE not found: {exe_path} (run `prepare-disc` first?)",
+            code=EXIT_USAGE,
+        )
+        return EXIT_USAGE
+
+    activate_embedded_toolchain(project_root, progress)
+    # Always go through ensure_analyzer: it owns both the "is it there" and the
+    # "is it current" questions. Calling find_psxrecomp_analyze() here first
+    # made the source-stamp check unreachable whenever a binary already existed,
+    # which is exactly the case it was written for.
+    try:
+        tool = ensure_analyzer(project_root, progress)
+    except Exception as exc:  # noqa: BLE001
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
+
+    out_dir = Path(args.out).expanduser() if args.out else (project_root / "analysis")
+    if not out_dir.is_absolute():
+        out_dir = (project_root / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    symbols = Path(args.symbols).expanduser() if args.symbols else (
+        project_root / "symbols.toml"
+    )
+    if not symbols.is_absolute():
+        symbols = (project_root / symbols).resolve()
+
+    cmd = [
+        str(tool),
+        str(exe_path),
+        "--out",
+        str(out_dir),
+        "--emit-tsv",
+        str(out_dir / "functions.tsv"),
+        "--top",
+        str(int(getattr(args, "top", 15) or 15)),
+    ]
+    if symbols.is_file():
+        cmd += ["--symbols", str(symbols)]
+    if getattr(args, "no_refs", False):
+        cmd.append("--no-refs")
+    if getattr(args, "exact", False):
+        cmd.append("--exact")
+    seeds_arg = str(getattr(args, "seeds", "") or "").strip() or seeds
+    if seeds_arg:
+        seeds_path = Path(seeds_arg).expanduser()
+        if not seeds_path.is_absolute():
+            seeds_path = (project_root / seeds_path).resolve()
+        if seeds_path.is_file():
+            cmd += ["--seeds", str(seeds_path)]
+    if getattr(args, "emit_symbols", False):
+        cmd += ["--symbols", str(symbols)] if not symbols.is_file() else []
+        cmd += [
+            "--emit-symbols",
+            "--min-confidence",
+            str(getattr(args, "min_confidence", "high") or "high"),
+        ]
+    if getattr(args, "emit_ghidra", False):
+        cmd += ["--emit-ghidra", str(out_dir / "psxrecomp_import.py")]
+    if getattr(args, "emit_symbol_addrs", False):
+        cmd += ["--emit-symbol-addrs", str(out_dir / "symbol_addrs.txt")]
+    if getattr(args, "scan_widescreen", False):
+        cmd += [
+            "--scan-widescreen",
+            "--emit-ws-sites",
+            str(out_dir / "widescreen_sites.toml"),
+        ]
+    prev = out_dir / "functions.prev.tsv"
+    if getattr(args, "diff", False) and prev.is_file():
+        cmd += ["--diff", str(prev)]
+
+    # Keep the last run so the next one can diff against it without the caller
+    # having to manage snapshots.
+    cur = out_dir / "functions.tsv"
+    if cur.is_file():
+        shutil.copy2(cur, prev)
+
+    progress.phase("analyze", pct=0.3, message=f"Analyzing {exe_path.name}…")
+    progress.log(" ".join(cmd))
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    for stream in (proc.stdout, proc.stderr):
+        if stream:
+            for line in stream.splitlines():
+                if line.strip():
+                    progress.log(line)
+    if proc.returncode != 0:
+        progress.error(
+            f"psxrecomp-analyze failed (exit {proc.returncode})", code=EXIT_ERROR
+        )
+        return EXIT_ERROR
+
+    progress.phase("done", pct=1.0, message=f"Analysis written to {out_dir}")
+    progress.result(ok=True, out_dir=str(out_dir), exe=str(exe_path))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="psxrecomp_cli", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1632,6 +1987,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not fetch cmake-clang-v1 when no local pack is found",
     )
     em.set_defaults(handler=cmd_ensure_emitters)
+
+    an = sub.add_parser(
+        "analyze",
+        help="static function discovery over the boot EXE (no runtime involved)",
+    )
+    an.add_argument("--project-root", default="", help="game project root")
+    an.add_argument("--config", default="game.toml", help="game.toml path")
+    an.add_argument("--exe", default="", help="override the boot EXE path")
+    an.add_argument("--out", default="", help="output dir (default: <root>/analysis)")
+    an.add_argument("--symbols", default="", help="symbols.toml (default: <root>/symbols.toml)")
+    an.add_argument("--seeds", default="", help="seed address file (default: [recompiler].seeds)")
+    an.add_argument("--top", default="15", help="rows in the stdout top lists")
+    an.add_argument("--exact", action="store_true", help="reachability-only partition")
+    an.add_argument("--no-refs", action="store_true", help="skip refs.json")
+    an.add_argument("--diff", action="store_true", help="diff against the previous run")
+    an.add_argument(
+        "--emit-symbols",
+        action="store_true",
+        help="merge discovered functions into symbols.toml (existing names win)",
+    )
+    an.add_argument("--min-confidence", default="high", help="gate for --emit-symbols")
+    an.add_argument("--emit-ghidra", action="store_true", help="write a Ghidra import script")
+    an.add_argument(
+        "--emit-symbol-addrs", action="store_true", help="write a decomp symbol map"
+    )
+    an.add_argument(
+        "--scan-widescreen",
+        action="store_true",
+        help="also scan for [widescreen.cull] site candidates",
+    )
+    an.add_argument("--json-progress", action="store_true")
+    an.set_defaults(handler=cmd_analyze)
 
     p = sub.add_parser("pgo-train", help="force PGO rebuild+train+use")
     add_common(p)

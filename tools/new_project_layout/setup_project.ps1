@@ -22,6 +22,8 @@ param(
     [string]$BootExe = "SLUS_01234",
     [int]$Players = 0,
     [string]$ZipPrefix = "",
+    [string]$GithubOwner = "",
+    [string]$GithubRepo = "",
     [switch]$EnableRecompUi,
     [switch]$NoRecompUi,
     [switch]$EnableNetplay,
@@ -142,6 +144,24 @@ if (-not $ZipPrefix) {
     }
 }
 
+if (-not $GithubOwner) {
+    if ($interactive) {
+        $GithubOwner = Prompt-Line "GitHub owner / org (README download badges)" "TechnicallyComputers"
+    } else {
+        $GithubOwner = "TechnicallyComputers"
+    }
+}
+$derivedRepo = (python -c "from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))" $Name).Trim()
+if (-not $GithubRepo) {
+    if ($interactive) {
+        $GithubRepo = Prompt-Line "GitHub repo name (README download badges)" $derivedRepo
+    } else {
+        $GithubRepo = $derivedRepo
+    }
+}
+$GithubOwner = (python -c "from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))" $GithubOwner).Trim()
+$GithubRepo = (python -c "from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))" $GithubRepo).Trim()
+
 if (-not $PSBoundParameters.ContainsKey("Description")) {
     if ($interactive) { $Description = Prompt-Line "Short game description (optional)" "" }
 }
@@ -246,8 +266,13 @@ $PublisherDisp = if ($Publisher) { $Publisher } else { "-" }
 $YearDisp = if ($Year) { $Year } else { "-" }
 $DescriptionMd = if ($Description) { $Description } else { "_Add a short pitch in catalog_identity.json / README._" }
 
-$Root = Join-Path (Resolve-Path $Dir) $Name
+# Folder = GitHub/catalog install_dir slug (hyphenated), not display $Name with spaces.
+$InstallDirName = $GithubRepo
+$Root = Join-Path (Resolve-Path $Dir) $InstallDirName
 if (Test-Path $Root) { throw "Target already exists: $Root" }
+if ($InstallDirName -ne $Name) {
+    Write-Host "note: project folder is '$InstallDirName' (catalog/GitHub slug; display name stays '$Name')"
+}
 
 $NetplayBlockFile = Join-Path $env:TEMP "psxrecomp_netplay_block.cmake"
 $WizardBlockFile = Join-Path $env:TEMP "psxrecomp_wizard_block.cmake"
@@ -316,6 +341,8 @@ function Fill-Template([string]$src, [string]$dst) {
         --set "ENV_PREFIX=$EnvPrefix" `
         --set "EXE_BASENAME=$ExeBasename" `
         --set "ZIP_PREFIX=$ZipPrefix" `
+        --set "GITHUB_OWNER=$GithubOwner" `
+        --set "GITHUB_REPO=$GithubRepo" `
         --set "DISC_HINT=$DiscHint" `
         --set "GAME_TITLE=$WindowTitle" `
         --set "PLAYERS=$Players" `
@@ -339,6 +366,7 @@ Write-Host "== New Project Layout =="
 Write-Host "  repo:       $Root"
 Write-Host "  disc:       $Disc"
 Write-Host "  zip prefix: $ZipPrefix"
+Write-Host "  gh slug:    $GithubOwner/$GithubRepo"
 Write-Host "  players:    $Players"
 Write-Host "  recomp-ui:  $useRecompUi"
 Write-Host "  wizard:     $useWizard"
@@ -564,6 +592,32 @@ print(m.group(1) if m else '')
     Write-Warning "-Disc is not a .cue; skipped probe autofill."
 }
 
+if ($doBoxart) {
+    Write-Host "== Fetching libretro boxart =="
+    $cueHint = if ($DiscBasename) { $DiscBasename } else { $GameName }
+    $prevPy = $env:PYTHONPATH
+    try {
+        python $FetchBoxartPy `
+            --out (Join-Path $Root "launcher_assets\img\boxart.tga") `
+            --cue-stem $cueHint `
+            --display-name $GameName
+        if ($LASTEXITCODE -eq 0) {
+            $HasBoxart = $true
+            Set-Content -Encoding UTF8 -Path $BoxartBlockFile -Value '    LAUNCHER_BOXART "${CMAKE_CURRENT_SOURCE_DIR}/launcher_assets/img/boxart.tga"'
+            Fill-Template (Join-Path $TemplateDir "CMakeLists.txt.in") (Join-Path $Root "CMakeLists.txt")
+            Write-Host "  wired LAUNCHER_BOXART in CMakeLists.txt"
+            $env:PYTHONPATH = $ScriptDir
+            python -c "from pathlib import Path; import sys; from project_studio.readme_metrics import inject_readme_boxart; inject_readme_boxart(Path(sys.argv[1]), sys.argv[2])" (Join-Path $Root "README.md") $GameName
+            Write-Host "  injected boxart into README.md"
+        } else {
+            Write-Warning "boxart fetch failed — leave LAUNCHER_BOXART commented."
+        }
+    } catch {
+        Write-Warning "boxart fetch failed — leave LAUNCHER_BOXART commented."
+    } finally {
+        if ($null -eq $prevPy) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPy }
+    }
+}
 
 Write-Host "== Sync symbols header =="
 Push-Location $Root
@@ -571,8 +625,8 @@ try { python tools/sync_symbols.py --game $GameName } catch { Write-Warning "syn
 Pop-Location
 
 git add CMakeLists.txt game.toml codegen_setup.c codegen_setup.h .gitignore VERSION README.md seeds scripts tools mods framework_pins.txt symbols.toml psx_symbols.h 2>$null
-if (Test-Path (Join-Path $Root ".github\workflows")) {
-    git add .github/workflows 2>$null
+if (Test-Path (Join-Path $Root ".github")) {
+    git add .github 2>$null
 }
 if (Test-Path (Join-Path $Root "catalog_identity.json")) {
     git add catalog_identity.json 2>$null
@@ -581,7 +635,7 @@ if (Test-Path (Join-Path $Root "disc_probe.json")) {
     git add disc_probe.json 2>$null
 }
 if ($HasBoxart) {
-    git add launcher_assets/img/boxart.tga launcher_assets/img/BOXART_SOURCE.txt 2>$null
+    git add launcher_assets/img/boxart.tga launcher_assets/img/boxart.png launcher_assets/img/BOXART_SOURCE.txt 2>$null
 }
 $committed = $false
 try {
@@ -606,15 +660,18 @@ if ($createGithub) {
             "internal" { "--internal" }
             default { "--private" }
         }
+        $ghSlug = "$GithubOwner/$GithubRepo"
+        $ghDesc = (python -c "from fill_tokens import GITHUB_ABOUT_DESCRIPTION; print(GITHUB_ABOUT_DESCRIPTION)").Trim()
+        $ghHome = (python -c "from fill_tokens import GITHUB_ABOUT_HOMEPAGE; print(GITHUB_ABOUT_HOMEPAGE)").Trim()
         try {
-            gh repo create $Name $vis --source=$Root --remote=origin
+            gh repo create $ghSlug $vis --source=$Root --remote=origin --description "$ghDesc" --homepage "$ghHome"
             Write-Host "  created origin ($GithubVisibility); push deferred until end"
             $githubCreated = $true
         } catch {
             Write-Warning "gh repo create failed -- if the repo already exists, add origin and push at the end."
             if (-not (git remote get-url origin 2>$null)) {
                 try {
-                    $ghUrl = (gh repo view $Name --json url -q .url 2>$null)
+                    $ghUrl = (gh repo view $ghSlug --json url -q .url 2>$null)
                     if ($ghUrl) {
                         git remote add origin $ghUrl
                         Write-Host "  attached existing origin -> $ghUrl"
@@ -623,6 +680,14 @@ if ($createGithub) {
                 } catch {}
             } else {
                 $githubCreated = $true
+            }
+        }
+        if ($githubCreated) {
+            try {
+                gh repo edit $ghSlug --description "$ghDesc" --homepage "$ghHome"
+                Write-Host "  GitHub About: R.A.I.D. description + Discord homepage"
+            } catch {
+                Write-Warning "gh repo edit (About) failed — set description/homepage by hand."
             }
         }
     }

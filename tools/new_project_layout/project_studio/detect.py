@@ -14,6 +14,13 @@ from .models import (
     Severity,
 )
 from .naming import boot_exe_from_game_toml, infer_project_name
+from .readme_metrics import (
+    boxart_png_present,
+    readme_has_boxart,
+    readme_has_launcher,
+    readme_has_metrics,
+    readme_has_raid,
+)
 
 
 def _read(path: Path) -> str:
@@ -746,6 +753,47 @@ def audit_project(root: Path) -> AuditReport:
                 severity=Severity.OPTIONAL,
                 detail="No mods/preloaded catalog stub.",
                 fix_op="emit_mods_preloaded",
+            )
+        )
+
+    # README download badges + boxart + RetComM Launcher (idempotent migrate op)
+    readme_path = root / "README.md"
+    readme_text = _read(readme_path) if readme_path.is_file() else ""
+    missing_readme: list[str] = []
+    if not readme_path.is_file():
+        missing_readme.append("README.md")
+    else:
+        if not readme_has_metrics(readme_text):
+            missing_readme.append("download badges")
+        if not readme_has_boxart(readme_text):
+            missing_readme.append("libretro boxart")
+        if not readme_has_launcher(readme_text):
+            missing_readme.append("RetComM Launcher section")
+        if not readme_has_raid(readme_text):
+            missing_readme.append("R.A.I.D. Discord footer")
+    if not (root / ".github" / "raid-discord.png").is_file():
+        missing_readme.append(".github/raid-discord.png")
+    if not boxart_png_present(root):
+        missing_readme.append("launcher_assets/img/boxart.png")
+    if missing_readme:
+        checks.append(
+            CheckResult(
+                id="readme_metrics",
+                title="README download metrics / launcher / RAID / boxart",
+                status=CheckStatus.WARN,
+                severity=Severity.RECOMMENDED,
+                detail="Missing: " + ", ".join(missing_readme),
+                fix_op="patch_readme_metrics",
+            )
+        )
+    else:
+        checks.append(
+            CheckResult(
+                id="readme_metrics",
+                title="README download metrics / launcher / RAID / boxart",
+                status=CheckStatus.PASS,
+                severity=Severity.RECOMMENDED,
+                detail="Download badges, boxart, RetComM Launcher, and R.A.I.D. footer present.",
             )
         )
 
