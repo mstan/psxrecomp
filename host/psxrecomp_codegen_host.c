@@ -1496,6 +1496,55 @@ static void handle_progress_line(const char* line,
     }
 }
 
+/* Last-lines capture so a failed CLI run can say WHY in the wizard, which has
+ * no console: the child's stderr shares the progress pipe, JSON progress rows
+ * contribute their "message", raw rows (compiler/traceback text) contribute
+ * as-is, and the most recent error-looking line is appended to err_msg. This
+ * is what turns "psxrecomp rebuild failed (exit 1)" into "… failed (exit 1):
+ * Could NOT find OpenGL (missing: OPENGL_INCLUDE_DIR)". */
+typedef struct {
+    char last[480];
+    char last_err[480];
+} CliTail;
+
+static int cli_tail_line_is_error(const char* s) {
+    return strstr(s, "rror") != NULL || strstr(s, "ailed") != NULL ||
+           strstr(s, "FAILED") != NULL || strstr(s, "Traceback") != NULL ||
+           strstr(s, "fatal") != NULL || strstr(s, "Fatal") != NULL;
+}
+
+static void cli_tail_note(CliTail* t, const char* line) {
+    char msg[480];
+    const char* rec = line;
+    int is_error_event = 0;
+    if (line[0] == '{') {
+        /* sdk_progress emits compact JSON: {"event":"error","message":…}. */
+        is_error_event = strstr(line, "\"event\":\"error\"") != NULL;
+        if (!json_get_string(line, "message", msg, sizeof(msg)))
+            return; /* structured row without text (e.g. result) */
+        rec = msg;
+    }
+    if (!rec[0])
+        return;
+    snprintf(t->last, sizeof(t->last), "%s", rec);
+    if (is_error_event || cli_tail_line_is_error(rec))
+        snprintf(t->last_err, sizeof(t->last_err), "%s", rec);
+}
+
+static void cli_fail_msg(char* err_msg, size_t err_cap, const char* fail_label,
+                         long code, const CliTail* t) {
+    const char* why = t->last_err[0] ? t->last_err : t->last;
+    if (code == 3) {
+        snprintf(err_msg, err_cap, "Disc verification failed (wrong dump).");
+        return;
+    }
+    if (why[0])
+        snprintf(err_msg, err_cap, "%s failed (exit %ld): %s", fail_label,
+                 code, why);
+    else
+        snprintf(err_msg, err_cap, "%s failed (exit %ld).", fail_label, code);
+}
+
 #if defined(_WIN32)
 static int run_cli_win(const char* cmdline,
                        RecompLauncherCPrepareProgressFn on_progress,
@@ -1519,7 +1568,9 @@ static int run_cli_win(const char* cmdline,
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wr;
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    /* stderr shares the pipe: Python tracebacks and raw tool output feed the
+     * CliTail capture instead of vanishing (the wizard has no console). */
+    si.hStdError = wr;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
     char mutable_cmd[4096];
@@ -1538,6 +1589,8 @@ static int run_cli_win(const char* cmdline,
     char line[16384];
     size_t line_len = 0;
     DWORD n = 0;
+    CliTail tail;
+    memset(&tail, 0, sizeof(tail));
     while (ReadFile(rd, buf, sizeof(buf), &n, NULL) && n > 0) {
         for (DWORD i = 0; i < n; ++i) {
             char c = buf[i];
@@ -1545,6 +1598,7 @@ static int run_cli_win(const char* cmdline,
             if (c == '\n') {
                 line[line_len] = '\0';
                 handle_progress_line(line, on_progress, progress_ctx);
+                cli_tail_note(&tail, line);
                 line_len = 0;
                 continue;
             }
@@ -1555,6 +1609,7 @@ static int run_cli_win(const char* cmdline,
     if (line_len) {
         line[line_len] = '\0';
         handle_progress_line(line, on_progress, progress_ctx);
+        cli_tail_note(&tail, line);
     }
     CloseHandle(rd);
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -1563,11 +1618,7 @@ static int run_cli_win(const char* cmdline,
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     if (code == 0) return 1;
-    if (code == 3)
-        snprintf(err_msg, err_cap, "Disc verification failed (wrong dump).");
-    else
-        snprintf(err_msg, err_cap, "%s failed (exit %lu).", fail_label,
-                 (unsigned long)code);
+    cli_fail_msg(err_msg, err_cap, fail_label, (long)code, &tail);
     return 0;
 }
 #else
@@ -1585,6 +1636,9 @@ static int run_cli_posix(char* const argv[],
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addclose(&actions, pipefd[0]);
     posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    /* stderr shares the pipe: Python tracebacks and raw tool output feed the
+     * CliTail capture instead of vanishing (the wizard has no console). */
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
     posix_spawn_file_actions_addclose(&actions, pipefd[1]);
 
     pid_t pid = 0;
@@ -1606,11 +1660,14 @@ static int run_cli_posix(char* const argv[],
         return 0;
     }
     char line[16384];
+    CliTail tail;
+    memset(&tail, 0, sizeof(tail));
     while (fgets(line, sizeof(line), out)) {
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
             line[--n] = '\0';
         handle_progress_line(line, on_progress, progress_ctx);
+        cli_tail_note(&tail, line);
     }
     fclose(out);
 
@@ -1621,10 +1678,7 @@ static int run_cli_posix(char* const argv[],
     }
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     if (code == 0) return 1;
-    if (code == 3)
-        snprintf(err_msg, err_cap, "Disc verification failed (wrong dump).");
-    else
-        snprintf(err_msg, err_cap, "%s failed (exit %d).", fail_label, code);
+    cli_fail_msg(err_msg, err_cap, fail_label, (long)code, &tail);
     return 0;
 }
 #endif

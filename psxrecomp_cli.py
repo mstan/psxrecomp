@@ -449,6 +449,7 @@ def ensure_emitters(
     # no MSYS2 GCC DLLs (same as tools/ci/build_emitters.sh).
     if clang_c is not None or clang_cxx is not None:
         cmake_args.append("-DPSXRECOMP_STATIC_CLI=ON")
+    cmake_args.extend(_pack_sysroot_cmake_args(clang_c, cmake_args))
 
     progress.log(" ".join(cmake_args))
     proc = subprocess.run(
@@ -966,6 +967,30 @@ def _which_tool(name: str) -> Optional[Path]:
     return None
 
 
+def _pack_sysroot_cmake_args(
+    clang_path: Optional[Path], existing: list[str] | tuple[str, ...] = ()
+) -> list[str]:
+    """CMake args that wire the portable pack's bundled sysroot (Linux only).
+
+    clang.cfg already gives the *compiler* ``--sysroot``, but CMake's find_*
+    still searches the host, so on a headerless host (stock SteamOS) recomp-ui's
+    ``find_package(OpenGL REQUIRED)`` fails at configure with "Could NOT find
+    OpenGL (missing: OPENGL_INCLUDE_DIR)". CMAKE_SYSROOT re-roots find_* into
+    the pack. OpenGL_GL_PREFERENCE=LEGACY is required with it: the sysroot
+    ships legacy ``libGL.so`` + ``GL/gl.h`` but no GLVND dev files
+    (``glx.h`` / ``libOpenGL.so`` / ``libGLX.so``), so the GLVND path cannot
+    complete inside the sysroot and ``OpenGL::GL`` would never be created.
+    """
+    if not sys.platform.startswith("linux") or clang_path is None:
+        return []
+    if any("CMAKE_SYSROOT" in str(a) for a in existing):
+        return []
+    sysroot = Path(clang_path).resolve().parent.parent / "sysroot"
+    if not (sysroot / "usr" / "include").is_dir():
+        return []
+    return [f"-DCMAKE_SYSROOT={sysroot}", "-DOpenGL_GL_PREFERENCE=LEGACY"]
+
+
 def _read_cmake_cache_generator(cache_file: Path) -> str:
     if not cache_file.is_file():
         return ""
@@ -1015,6 +1040,7 @@ def _cmake_configure(
         compiler_args.append(f"-DCMAKE_C_COMPILER={clang_c}")
     if clang_cxx is not None:
         compiler_args.append(f"-DCMAKE_CXX_COMPILER={clang_cxx}")
+    compiler_args.extend(_pack_sysroot_cmake_args(clang_c, extra))
 
     cmd = [
         "cmake",
