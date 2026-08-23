@@ -1697,14 +1697,25 @@ static const char* toolchain_zip_asset_name(void) {
 #endif
 }
 
-/* Optional floor via RETCOMM_TOOLCHAIN_MIN_VERSION. Wizard/default is empty:
- * download GitHub /releases/latest and accept any usable pack (no per-title
- * version pinning to maintain). */
+/* Framework floor for accepted packs, not a per-title pin. v1.0.14 is the
+ * first cmake-clang-v1 with the Linux build sysroot; older cached packs
+ * compile against host headers (absent on stock SteamOS) and mis-link after a
+ * pack upgrade (__isoc23_strtoul). The cache is otherwise accepted forever
+ * once any cmake runs, so the floor is what makes a stale pre-sysroot pack
+ * get replaced. RETCOMM_TOOLCHAIN_MIN_VERSION overrides in either direction;
+ * "0" / "off" / "none" disables the floor (pre-floor behavior). Mirrors
+ * tools/toolchain_pack.py default_min_version(). */
+#define TOOLCHAIN_DEFAULT_MIN_VERSION "1.0.14"
+
 static const char* toolchain_min_version(void) {
     const char* env = getenv("RETCOMM_TOOLCHAIN_MIN_VERSION");
-    if (env && env[0])
+    if (env && env[0]) {
+        if (strcmp(env, "0") == 0 || strcasecmp(env, "off") == 0 ||
+            strcasecmp(env, "none") == 0)
+            return "";
         return env;
-    return "";
+    }
+    return TOOLCHAIN_DEFAULT_MIN_VERSION;
 }
 
 /* Parse leading dotted integers from a version / tag (optional leading 'v'). */

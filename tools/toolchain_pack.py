@@ -331,12 +331,29 @@ def version_satisfies(have: str, need: str) -> bool:
     return parse_version_tuple(have) >= parse_version_tuple(need)
 
 
-def default_min_version() -> str:
-    """Optional semver floor. Empty by default — wizard downloads /releases/latest.
+# Framework floor, not a per-title pin: v1.0.14 is the first pack with the
+# Linux build sysroot (glibc/libstdc++/GL headers + stubs). Older cached packs
+# compile against host headers, which do not exist on stock SteamOS, and their
+# objects mis-link after a pack upgrade (__isoc23_strtoul). Because the cache
+# is accepted forever once any cmake runs, a floor is the only way a stale
+# pre-sysroot pack ever gets replaced.
+DEFAULT_MIN_VERSION = "1.0.14"
 
-    Set RETCOMM_TOOLCHAIN_MIN_VERSION only when you need to reject stale caches.
+# RETCOMM_TOOLCHAIN_MIN_VERSION values that disable the floor entirely.
+_MIN_VERSION_DISABLE = {"0", "off", "none"}
+
+
+def default_min_version() -> str:
+    """Semver floor for accepted packs (DEFAULT_MIN_VERSION unless overridden).
+
+    RETCOMM_TOOLCHAIN_MIN_VERSION overrides in either direction: a version
+    raises/lowers the floor, and "0" / "off" / "none" disables it (accept any
+    usable pack, matching the pre-floor behavior).
     """
-    return (os.environ.get("RETCOMM_TOOLCHAIN_MIN_VERSION") or "").strip()
+    env = (os.environ.get("RETCOMM_TOOLCHAIN_MIN_VERSION") or "").strip()
+    if env:
+        return "" if env.lower() in _MIN_VERSION_DISABLE else env
+    return DEFAULT_MIN_VERSION
 
 
 def pack_satisfies_min(root: Path, min_version: str = "") -> bool:
@@ -973,7 +990,8 @@ def ensure_toolchain(
         )
 
     # Usable pack exists but is too old — fall through to download/replace.
-    stale = resolve_toolchain_bin(project_root, min_version="")
+    # min_version="0" probes without the default floor ("" would re-apply it).
+    stale = resolve_toolchain_bin(project_root, min_version="0")
     if stale and need and not existing and log:
         log(
             f"Cached toolchain does not meet min_version {need}; "
