@@ -355,6 +355,44 @@ def recompiler_source_dir(project_root: Path) -> Path:
     return src
 
 
+def _toolchain_stamp(
+    clang_cxx: Optional[Path], cmake_tool: Optional[Path]
+) -> str:
+    """Identity of the toolchain that a build directory's objects were made with.
+
+    The portable toolchain is addressed through a stable ``latest`` symlink, so
+    an upgrade behind it leaves CMAKE_CXX_COMPILER unchanged and CMake's
+    compiler-change detection never fires. Ninja then relinks object files
+    built by the previous toolchain.
+
+    That is not theoretical: cmake-clang-v1 v1.0.10 shipped no sysroot and
+    compiled against the host's glibc, so `strtoul` became `__isoc23_strtoul`
+    (glibc >= 2.38). v1.0.14 added a bundled older sysroot that exports no such
+    symbol, and every build tree from before the upgrade failed to link with
+    "undefined symbol: __isoc23_strtoul" while nothing looked out of date.
+
+    Resolving the symlink puts the concrete version in the stamp, so the
+    upgrade becomes visible and the tree can be wiped.
+    """
+    parts: list[str] = []
+    for tool in (clang_cxx, cmake_tool):
+        if not tool:
+            continue
+        real = Path(tool).resolve()
+        parts.append(str(real))
+        try:
+            parts.append(str(real.stat().st_size))
+        except OSError:
+            pass
+        manifest = real.parent.parent / "retcomm-toolchain.json"
+        if manifest.is_file():
+            try:
+                parts.append(manifest.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
 def ensure_emitters(
     project_root: Path,
     progress: ProgressReporter,
@@ -417,6 +455,33 @@ def ensure_emitters(
     cmake = _which_tool("cmake")
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
+
+    # Wipe when the toolchain that produced this tree's objects is not the one
+    # about to link them (ported from feat/rbengine — see _toolchain_stamp).
+    stamp_file = build_dir / ".retcomm-toolchain-stamp"
+    stamp = _toolchain_stamp(clang_cxx, cmake)
+    if stamp and stamp_file.is_file():
+        try:
+            previous = stamp_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            previous = ""
+        if previous and previous != stamp:
+            progress.log(
+                "Toolchain changed since this build directory was configured — "
+                f"removing {build_dir} so objects are rebuilt against it"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and not stamp_file.is_file() and (build_dir / "CMakeCache.txt").is_file():
+        # A tree configured before stamping existed. Its objects may predate the
+        # current toolchain with no way to tell, and a mismatch surfaces only as
+        # an undefined symbol at link time. Rebuild once, then stamp.
+        progress.log(
+            f"Unstamped build directory {build_dir} — rebuilding once so its "
+            "objects are known to match the active toolchain"
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
 
     cache_file = build_dir / "CMakeCache.txt"
     gen: list[str] = []
@@ -486,6 +551,11 @@ def ensure_emitters(
                     progress.log(line)
     if proc.returncode != 0:
         raise RuntimeError(f"emitters cmake build failed (exit {proc.returncode})")
+    if stamp:
+        try:
+            stamp_file.write_text(stamp, encoding="utf-8")
+        except OSError:
+            pass
 
     try:
         game, bios = find_emitters(project_root)
