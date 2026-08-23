@@ -579,8 +579,13 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
   cd "${STAGE}"
   if command -v zip >/dev/null 2>&1; then
     zip -r -q "${DIST}/${ZIP_NAME}" .
+  elif command -v tar >/dev/null 2>&1; then
+    # Windows installations commonly have bsdtar but no zip.exe.  Its
+    # archive-format auto-detection keeps the published artifact a normal
+    # .zip without requiring an installer or an extra SDK package.
+    tar -a -c -f "${DIST}/${ZIP_NAME}" .
   else
-    echo "error: zip not found" >&2
+    echo "error: neither zip nor tar is available" >&2
     exit 1
   fi
 )
