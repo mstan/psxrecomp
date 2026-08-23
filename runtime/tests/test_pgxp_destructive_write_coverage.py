@@ -38,10 +38,28 @@ def main():
         ("case 0x0E: set_reg(cpu, RT(insn),", "PGXP_GPR_WRITE(RT(insn));", 180),
         ("case 0x03: { /* JAL */", "PGXP_GPR_WRITE(31);", 300),
         ("if (link) { set_reg(cpu, 31, pc + 8);", "PGXP_GPR_WRITE(31);", 120),
-        ("case 0x00: /* MFC0 */", "PGXP_GPR_WRITE(RT(insn));", 420),
+        ("case 0x00: /* MFC0 */", "psx_pgxp_load_delayed(cpu, insn", 420),
     )
     for marker, hook, window in oracle_cases:
         require_guard(oracle, marker, hook, window)
+
+    # The interpreter's load-delay register and shadow must commit at the same
+    # boundary.  Check every ordinary load family plus unaligned merge loads;
+    # a source-only recompiler fix would leave this oracle one instruction
+    # early and make the dependent successor see the new projection.
+    apply = oracle[oracle.find("static inline void apply_load_delay"):
+                   oracle.find("static inline void apply_load_delay") + 800]
+    if ("cpu->gpr[reg] = value;" not in apply or
+            "psx_pgxp_load_commit(cpu, reg, value);" not in apply or
+            apply.find("cpu->gpr[reg] = value;") >
+            apply.find("psx_pgxp_load_commit(cpu, reg, value);")):
+        raise AssertionError("interpreter load-delay commit is not after CPU writeback")
+    for marker in (
+            "case 0x20: { /* LB */", "case 0x21: { /* LH */",
+            "case 0x22: { /* LWL */", "case 0x23: { /* LW */",
+            "case 0x24: { /* LBU */", "case 0x25: { /* LHU */",
+            "case 0x26: { /* LWR */"):
+        require_guard(oracle, marker, "psx_pgxp_load_delayed(cpu, insn", 900)
 
     dirty_cases = (
         ("case 0x09: { /* JALR rd, rs */", "PGXP_GPR_WRITE(rd ? rd : 31);", 420),

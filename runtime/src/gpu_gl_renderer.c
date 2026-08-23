@@ -2924,7 +2924,11 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
  * SW @ 1× for authority, then GPU @ s_scale for present quality. */
 /* The sub-pixel / perspective override describes exactly one triangle; drop it
  * once that triangle has been submitted so a later prim can never inherit it. */
-static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
+static inline void precise_consumed(void) {
+    s_pc_valid = 0;
+    s_pq_valid = 0;
+    s_pz_valid = 0;
+}
 
 static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
     if (s_cpu_auth_dual || !s_raster_ok)

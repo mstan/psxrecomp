@@ -38,6 +38,8 @@ extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
 
+void gpu_pgxp_vertex_cache_invalidate(void);
+
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
@@ -2694,6 +2696,7 @@ uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank 
 /* ---- Initialization ---- */
 
 static void gpu_reset_state(int clear_vram) {
+    gpu_pgxp_vertex_cache_invalidate();
     if (clear_vram) {
         memset(vram, 0, sizeof(vram));
         gpu_vram_dirty_mark_all();
@@ -3472,6 +3475,10 @@ static struct {
 
 static PgxpVertexCache s_pgxp_vertex_cache;
 
+void gpu_pgxp_vertex_cache_invalidate(void) {
+    pgxp_vertex_cache_reset(&s_pgxp_vertex_cache);
+}
+
 void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
                               uint64_t *rejected_incomplete_position,
                               uint64_t *rejected_incomplete_depth,
@@ -3529,6 +3536,11 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
         }
         int canonical_precise_count = 0;
         for (int i = 0; i < count; i++) {
+            const int index = indices[i];
+            const uint32_t addr = (gp0_cmd_source_addr == 0xFFFFFFFFu)
+                                      ? 0xFFFFFFFFu
+                                      : gp0_cmd_source_addr +
+                                            (uint32_t)index * 4u;
             const int candidate_precise =
                 decision->cls[i] != PGXP_SRC_NATIVE && decision->cls[i] != 3u;
             int32_t candidate_x16 =
@@ -3544,12 +3556,19 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
                     (int64_t)(vy[i] - decision->raw_y[i]) * 65536);
             }
             int canonical_precise = 0;
-            const int cache_result = pgxp_vertex_cache_resolve(
-                &s_pgxp_vertex_cache, s_frame_count,
-                vx[i], vy[i], candidate_precise,
-                candidate_x16, candidate_y16, &decision->precise_x[i],
-                &decision->precise_y[i], &canonical_precise);
-            if (cache_result == PGXP_VERTEX_CACHE_OVERFLOW)
+            int cache_result = PGXP_VERTEX_CACHE_OVERFLOW;
+            if (addr != 0xFFFFFFFFu) {
+                cache_result = pgxp_vertex_cache_resolve(
+                    &s_pgxp_vertex_cache, s_frame_count, addr,
+                    vx[i], vy[i], candidate_precise,
+                    candidate_x16, candidate_y16, &decision->precise_x[i],
+                    &decision->precise_y[i], &canonical_precise);
+            } else {
+                decision->precise_x[i] = (int32_t)((int64_t)vx[i] * 65536);
+                decision->precise_y[i] = (int32_t)((int64_t)vy[i] * 65536);
+            }
+            if (cache_result == PGXP_VERTEX_CACHE_OVERFLOW &&
+                addr != 0xFFFFFFFFu)
                 s_pgxp_primitive_stats.vertex_cache_overflow++;
             if (canonical_precise) canonical_precise_count++;
             if (!candidate_precise && canonical_precise)
@@ -3557,7 +3576,11 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
             if (candidate_precise && !canonical_precise)
                 s_pgxp_primitive_stats.vertices_demoted_to_native++;
         }
-        decision->position_armed = canonical_precise_count != 0;
+        /* Never feed a mixed primitive to a precise renderer.  Native fallback
+         * vertices are not guaranteed to share the PGXP projection's affine
+         * basis, so arming on only one corner creates shearing/jitter at the
+         * exact seam this correction is meant to remove. */
+        decision->position_armed = canonical_precise_count == count;
         if (canonical_precise_count != count)
             s_pgxp_primitive_stats
                 .primitives_rejected_incomplete_position++;
@@ -6260,6 +6283,9 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     if (len != gpu_snapshot_bytes()) return 0;
     pst_r_init(&r, p, len);
     if (!gpu_snap_parse(&r)) return 0;
+    /* A restore can rewind to the same frame number.  Do not let canonical
+     * sub-pixel positions from the abandoned timeline leak into replay. */
+    gpu_pgxp_vertex_cache_invalidate();
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,

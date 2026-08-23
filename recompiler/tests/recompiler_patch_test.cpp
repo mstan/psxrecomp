@@ -1046,14 +1046,19 @@ void cfg_codegen_load_delay_test() {
     PSXRecomp::CodeGenerator generator(exe);
     const std::string code = generator.generate_function(function, cfg).full_code;
 
-    const size_t deferred = code.find("uint32_t psx_ldd_80003590 =");
+    const size_t deferred = code.find("uint32_t psx_ldd_80003590;");
     const size_t successor = code.find("cpu->gpr[1] = cpu->gpr[26]");
     const size_t writeback = code.find(
         "cpu->gpr[26] = psx_ldd_80003590;  /* load-delay writeback */");
+    const size_t staged = code.find(
+        "PGXP_LOAD_DELAYED(0x8F5A4C38u");
+    const size_t commit = code.find(
+        "PGXP_LOAD_COMMIT(26u, psx_ldd_80003590);");
     check(deferred != std::string::npos && successor != std::string::npos &&
-          writeback != std::string::npos && deferred < successor &&
-          successor < writeback,
-          "CFG codegen preserves MIPS-I dependent load-delay value semantics");
+          staged != std::string::npos && writeback != std::string::npos &&
+          commit != std::string::npos && deferred < successor &&
+          successor < writeback && writeback < commit,
+          "CFG codegen preserves MIPS-I load-delay value and PGXP shadow semantics");
 }
 
 } // namespace

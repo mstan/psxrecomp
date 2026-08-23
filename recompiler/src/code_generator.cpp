@@ -2056,14 +2056,12 @@ std::string CodeGenerator::translate_basic_block(
                     // wrapper, so an inline declaration would go out of
                     // scope before the writeback below.
                     emitted.replace(pos, lhs.size(), temp + " =");
-                    // Point the PGXP hook at the temp: the writeback is
-                    // deferred, so the GPR still holds the pre-load value.
-                    const std::string pgxp_tail =
-                        fmt::format(", _pgxa, cpu->gpr[{}]);", load_dest);
-                    const size_t hook = emitted.rfind(pgxp_tail);
+                    /* The GPR writeback is delayed, so stage provenance until
+                     * this pair either commits, forwards, or cancels it. */
+                    const size_t hook = emitted.find("PGXP_LOAD(");
                     if (hook != std::string::npos)
-                        emitted.replace(hook, pgxp_tail.size(),
-                                        fmt::format(", _pgxa, {});", temp));
+                        emitted.replace(hook, std::string("PGXP_LOAD").size(),
+                                        "PGXP_LOAD_DELAYED");
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
                     ss << config_.indent
                        << fmt::format("    uint32_t {} = 0;\n", temp);
@@ -2074,17 +2072,28 @@ std::string CodeGenerator::translate_basic_block(
             }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
+                const int successor_load_dest = simple_load_dest(instr);
+                const bool successor_replaces_pending =
+                    successor_load_dest == static_cast<int>(delayed_load_dest) &&
+                    ((instr >> 21) & 31u) == delayed_load_dest;
                 if (forward_to_lwlr) {
                     ss << config_.indent << fmt::format(
                         "/* psx_ldd_{:08X} forwarded into the LWL/LWR merge above */\n",
                         delayed_load_addr);
-                } else if (writes_gpr(instr, delayed_load_dest)) {
+                } else if (writes_gpr(instr, delayed_load_dest) &&
+                           !successor_replaces_pending) {
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_CANCEL({}u);  /* successor write wins */\n",
+                        delayed_load_dest);
                     ss << config_.indent << fmt::format(
                         "(void)psx_ldd_{:08X};  /* successor write wins */\n",
                         delayed_load_addr);
-                } else {
+                } else if (!successor_replaces_pending) {
                     ss << config_.indent << fmt::format(
                         "cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
+                        delayed_load_dest, delayed_load_addr);
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_COMMIT({}u, psx_ldd_{:08X});\n",
                         delayed_load_dest, delayed_load_addr);
                 }
                 ss << config_.indent << "}\n";

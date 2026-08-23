@@ -9,6 +9,7 @@
 
 extern "C" uint32_t psx_read_word(uint32_t addr);
 extern "C" int gpu_ws_precise_nclip_enabled(void);
+extern "C" void gpu_pgxp_vertex_cache_invalidate(void);
 
 namespace PSXRecomp {
 namespace GTE {
@@ -253,6 +254,7 @@ extern "C" void gte_precision_timeline_invalidate(void) {
         return;
     }
     gte_geom_generation_advance();
+    gpu_pgxp_vertex_cache_invalidate();
 }
 
 extern "C" void gte_precision_speculative_begin(void) {
@@ -270,6 +272,7 @@ extern "C" void gte_precision_speculative_end(void) {
     if (--s_speculative_depth == 0) {
         if (s_speculative_timeline_invalidated) {
             gte_geom_generation_advance();
+            gpu_pgxp_vertex_cache_invalidate();
             s_speculative_timeline_invalidated = 0;
         }
     }

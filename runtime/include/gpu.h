@@ -57,6 +57,9 @@ void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
                               uint64_t *promoted_from_native,
                               uint64_t *demoted_to_native,
                               uint64_t *cache_overflow);
+/* Frame-local PGXP vertex canonicalization is invalid after a reset or
+ * savestate timeline jump, even when the restored frame number matches. */
+void gpu_pgxp_vertex_cache_invalidate(void);
 /* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */

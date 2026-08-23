@@ -128,6 +128,41 @@ int main(void) {
         CHECK(x == X16 && y == Y16 && z == SZ3);
     }
 
+    /* --- dependent recompiler load-delay shadow ------------------------- */
+    /* Stage a different projection into the same GPR.  Until architectural
+     * writeback, a successor must still store the old projection. */
+    produce_at(ADDR_A);
+    psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+    pgxp_gte_push_sxy(X16 + 0x1000, Y16 + 0x1000, SZ3, PACKED);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_C);
+    psx_pgxp_load_delayed(nullptr, LW(1, 8), ADDR_C, PACKED);
+    CHECK((g_pgxp_pending_load_mask & (1u << 8)) != 0);
+    psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, PACKED);
+    {
+        int32_t x, y;
+        CHECK(lookup(ADDR_B, PACKED, 160, 80, &x, &y, nullptr) ==
+              PGXP_SRC_DATAFLOW);
+        CHECK(x == X16 && y == Y16);
+    }
+    psx_pgxp_load_commit(nullptr, 8, PACKED);
+    CHECK((g_pgxp_pending_load_mask & (1u << 8)) == 0);
+    psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, PACKED);
+    {
+        int32_t x, y;
+        CHECK(lookup(ADDR_B, PACKED, 160, 80, &x, &y, nullptr) ==
+              PGXP_SRC_DATAFLOW);
+        CHECK(x == X16 + 0x1000 && y == Y16 + 0x1000);
+    }
+    /* A successor that writes the destination cancels the pending slot; a
+     * later commit must not resurrect either the old or staged projection. */
+    psx_pgxp_load_delayed(nullptr, LW(1, 8), ADDR_C, PACKED);
+    psx_pgxp_alu(nullptr, ADDIU(8, 8, 1), PACKED + 1u, PACKED, 1u);
+    CHECK((g_pgxp_pending_load_mask & (1u << 8)) == 0);
+    psx_pgxp_load_commit(nullptr, 8, PACKED);
+    psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, PACKED);
+    CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==
+          PGXP_SRC_NATIVE);
+
     /* --- stale GPR: register changed between load and store --- */
     psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
     psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, 0xDEADBEEFu);   /* r8 mutated */

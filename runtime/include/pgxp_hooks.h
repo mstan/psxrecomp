@@ -62,7 +62,15 @@ void psx_pgxp_alu   (struct CPUState *cpu, uint32_t instr, uint32_t result, uint
 void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr, uint32_t hi, uint32_t lo, uint32_t s1, uint32_t s2);
 void psx_pgxp_cop2  (struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr);
 void psx_pgxp_gpr_write(struct CPUState *cpu, uint32_t reg);
+/* Recompiler load-delay support.  A dependent successor must execute with
+ * the old GPR shadow, just like it sees the old architectural GPR.  Stage the
+ * loaded word separately, then commit or cancel it with the delayed CPU
+ * writeback. */
+void psx_pgxp_load_delayed(struct CPUState *cpu, uint32_t instr, uint32_t addr, uint32_t value);
+void psx_pgxp_load_commit(struct CPUState *cpu, uint32_t reg, uint32_t value);
+void psx_pgxp_load_cancel(struct CPUState *cpu, uint32_t reg);
 extern uint32_t g_pgxp_gpr_live_mask;
+extern uint32_t g_pgxp_pending_load_mask;
 
 /* Forwarder table for overlay DLLs (OverlayCallbacks.pgxp). Appended-last
  * member semantics apply: a NULL pointer (older host) means "no shadowing". */
@@ -73,6 +81,9 @@ typedef struct PGXPHooks {
     void (*muldiv)(struct CPUState *cpu, uint32_t instr, uint32_t hi, uint32_t lo, uint32_t s1, uint32_t s2);
     void (*cop2)  (struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr);
     void (*gpr_write)(struct CPUState *cpu, uint32_t reg);
+    void (*load_delayed)(struct CPUState *cpu, uint32_t instr, uint32_t addr, uint32_t value);
+    void (*load_commit)(struct CPUState *cpu, uint32_t reg, uint32_t value);
+    void (*load_cancel)(struct CPUState *cpu, uint32_t reg);
 } PGXPHooks;
 
 #if defined(PSX_PGXP) && PSX_PGXP
@@ -91,14 +102,20 @@ typedef struct PGXPHooks {
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
 #define PGXP_GPR_WRITE(reg)                       psx_pgxp_gpr_write(cpu, (reg))
+#define PGXP_LOAD_DELAYED(instr, addr, val)      psx_pgxp_load_delayed(cpu, (instr), (addr), (val))
+#define PGXP_LOAD_COMMIT(reg, val)               psx_pgxp_load_commit(cpu, (reg), (val))
+#define PGXP_LOAD_CANCEL(reg)                    psx_pgxp_load_cancel(cpu, (reg))
 #else
 extern int g_pgxp_alu_armed;
+#define PGXP_LOAD_DELAYED(instr, addr, val)      psx_pgxp_load_delayed(cpu, (instr), (addr), (val))
+#define PGXP_LOAD_COMMIT(reg, val)               psx_pgxp_load_commit(cpu, (reg), (val))
+#define PGXP_LOAD_CANCEL(reg)                    psx_pgxp_load_cancel(cpu, (reg))
 #define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
 #define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
-#define PGXP_ALU(instr, res, s1, s2)             do { if (g_pgxp_alu_armed) psx_pgxp_alu(cpu, (instr), (res), (s1), (s2)); } while (0)
+#define PGXP_ALU(instr, res, s1, s2)             do { if (g_pgxp_alu_armed || g_pgxp_pending_load_mask) psx_pgxp_alu(cpu, (instr), (res), (s1), (s2)); } while (0)
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       do { if (g_pgxp_alu_armed) psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2)); } while (0)
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
-#define PGXP_GPR_WRITE(reg)                       do { uint32_t _pgxr = (uint32_t)(reg); if (_pgxr != 0u && (g_pgxp_gpr_live_mask & (1u << _pgxr))) psx_pgxp_gpr_write(cpu, _pgxr); } while (0)
+#define PGXP_GPR_WRITE(reg)                       do { uint32_t _pgxr = (uint32_t)(reg); if (_pgxr != 0u && ((g_pgxp_gpr_live_mask | g_pgxp_pending_load_mask) & (1u << _pgxr))) psx_pgxp_gpr_write(cpu, _pgxr); } while (0)
 #endif
 #else
 #define PGXP_LOAD(instr, addr, val)              ((void)0)
@@ -107,6 +124,9 @@ extern int g_pgxp_alu_armed;
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       ((void)0)
 #define PGXP_COP2(instr, val, addr)              ((void)0)
 #define PGXP_GPR_WRITE(reg)                       ((void)0)
+#define PGXP_LOAD_DELAYED(instr, addr, val)      ((void)0)
+#define PGXP_LOAD_COMMIT(reg, val)               ((void)0)
+#define PGXP_LOAD_CANCEL(reg)                    ((void)0)
 #endif
 
 #ifdef __cplusplus
