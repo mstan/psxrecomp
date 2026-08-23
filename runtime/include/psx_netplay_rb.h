@@ -54,6 +54,7 @@ void psx_netplay_rb_flush_resume(void);
 
 /* 1 after flush_resume longjmp until finish_frame / abort — top-level
  * dispatch has no native call chain under the resume PC. */
+int  psx_netplay_rb_active_episode(void);
 int  psx_netplay_rb_top_level_resume_active(void);
 
 /* After outermost psx_dispatch returns pc==0 following an RB resume: retry

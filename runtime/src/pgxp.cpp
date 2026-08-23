@@ -66,7 +66,8 @@ struct PGXPValue {
 #define PGXP_REG_HI        32
 #define PGXP_REG_LO        33
 
-static PGXPValue *s_ram = nullptr;            /* lazily allocated, ~10 MB     */
+static PGXPValue *s_ram = nullptr;            /* lazily allocated             */
+static uint32_t   s_ram_words = 0;            /* sized to live RAM at arm     */
 static PGXPValue  s_scratch[PGXP_SCRATCH_WORDS];
 static PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
 static PGXPValue  s_gte[32];                  /* GTE data registers           */
@@ -94,7 +95,7 @@ extern "C" void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
     if (++s_gen == 0) {
         /* generation wrapped: physically clear so stale slots can't revive */
-        if (s_ram) std::memset(s_ram, 0, PGXP_RAM_WORDS * sizeof(PGXPValue));
+        if (s_ram) std::memset(s_ram, 0, s_ram_words * sizeof(PGXPValue));
         std::memset(s_scratch, 0, sizeof(s_scratch));
         std::memset(s_gpr, 0, sizeof(s_gpr));
         std::memset(s_gte, 0, sizeof(s_gte));
@@ -103,9 +104,35 @@ extern "C" void pgxp_invalidate_all(void) {
 }
 
 extern "C" void pgxp_set_enabled(int enabled) {
-    if (enabled && !s_ram) {
-        s_ram = (PGXPValue *)std::calloc(PGXP_RAM_WORDS, sizeof(PGXPValue));
-        if (!s_ram) enabled = 0;              /* fail closed: stay faithful   */
+    if (enabled) {
+        /* Cover the REAL guest RAM, not the stock 2 MB. With the 8 MB mod the
+         * extension is real memory, and a 2 MB-wrapped shadow aliased every
+         * extended-RAM packet onto unrelated low-RAM slots — the enhancement
+         * engine's geometry (built in extended RAM) and the base game then
+         * poisoned each other's entries, every lookup missed, and the maxed
+         * track rendered from native integers: the "8"-tier ground cracks.
+         *
+         * Sizing must also SURVIVE ORDERING: the first enable can arrive from
+         * the config path BEFORE the 8 MB mod expands RAM, and a lazily-sized
+         * 2 MB shadow then silently wraps every extended-RAM packet for the
+         * whole session (measured live: the player ship's packets at
+         * 0x50xxxx resolved fully native — the flickering ship textures and
+         * dark track dashes). Re-size on ANY enable whose live RAM size
+         * disagrees; correction toggles re-enter here after mods activate. */
+        extern uint32_t memory_get_ram_bytes(void);
+        uint32_t want = memory_get_ram_bytes() >> 2;
+        if (want < (2u * 1024u * 1024u) >> 2)
+            want = (2u * 1024u * 1024u) >> 2;
+        if (!s_ram || s_ram_words != want) {
+            PGXPValue *fresh = (PGXPValue *)std::calloc(want, sizeof(PGXPValue));
+            if (fresh) {
+                std::free(s_ram);
+                s_ram = fresh;
+                s_ram_words = want;
+            } else if (!s_ram) {
+                enabled = 0;                  /* fail closed: stay faithful   */
+            }
+        }
     }
     s_enabled = enabled ? 1 : 0;
     pgxp_invalidate_all();
@@ -146,8 +173,12 @@ extern "C" void pgxp_get_stats(PGXPStats *out) {
 /* Guest address -> shadow slot, or NULL for BIOS/MMIO/KSEG2 (untrackable). */
 static inline PGXPValue *pgxp_ptr(uint32_t addr) {
     uint32_t m = addr & 0x1FFFFFFFu;
-    if (m < 0x00800000u)                       /* RAM + its mirrors           */
-        return s_ram ? &s_ram[(m & 0x1FFFFCu) >> 2] : nullptr;
+    if (m < 0x00800000u) {                     /* RAM (+ mirrors when 2 MB)   */
+        if (!s_ram) return nullptr;
+        uint32_t w = (m >> 2);
+        if (w >= s_ram_words) w &= (s_ram_words - 1u); /* stock: mirror wrap  */
+        return &s_ram[w];
+    }
     if ((m & 0xFFFFFC00u) == 0x1F800000u)      /* scratchpad                  */
         return &s_scratch[(m & 0x3FCu) >> 2];
     return nullptr;
@@ -232,6 +263,12 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
             if ((src->flags & want) && ((src->value ^ actual_half) & mask) == 0) {
                 dst->x16 = hi_half ? src->y16 : src->x16;
                 dst->flags |= PGXP_F_VX;
+                /* The half still belongs to a vertex that knows its depth;
+                 * dropping it here is what starved perspective UVs on every
+                 * packet rebuilt through lh/sll/or or lhu+sh pairs. */
+                if (src->flags & PGXP_F_VZ) {
+                    dst->z = src->z; dst->flags |= PGXP_F_VZ;
+                }
             }
         }
         return;
@@ -276,6 +313,18 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
             ((src->value ^ value) & 0xFFFFu) == 0) {
             if (hi_half) { dst->y16 = src->x16; dst->flags |= PGXP_F_VY; }
             else         { dst->x16 = src->x16; dst->flags |= PGXP_F_VX; }
+            /* The half came from a projected vertex that still knows its
+             * depth: carry it across the rebuild. Once both halves land from
+             * depth-carrying sources the reassembled word has a whole vertex
+             * again, and dropping Z here was what disarmed perspective UVs on
+             * every packet the game builds with SH pairs (the affine-warped
+             * "swimming" wall panels). A mixed-source rebuild takes the later
+             * source's depth; its halves describe different vertices, and the
+             * truncation-agreement gate at lookup already owns that case. */
+            if ((src->flags & PGXP_F_VZ) && src->z != 0) {
+                dst->z = src->z;
+                dst->flags |= PGXP_F_VZ;
+            }
         }
         return;
     }
@@ -462,6 +511,9 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                 if (src->flags & PGXP_F_VX) {
                     dst->y16 = src->x16;
                     dst->flags |= PGXP_F_VY;
+                    if (src->flags & PGXP_F_VZ) {
+                        dst->z = src->z; dst->flags |= PGXP_F_VZ;
+                    }
                 }
                 dst->x16 = 0;
                 dst->flags |= PGXP_F_VX;       /* low half exactly zero       */
@@ -469,6 +521,9 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                 if (src->flags & PGXP_F_VY) {
                     dst->x16 = src->y16;
                     dst->flags |= PGXP_F_VX;
+                    if (src->flags & PGXP_F_VZ) {
+                        dst->z = src->z; dst->flags |= PGXP_F_VZ;
+                    }
                 }
                 dst->y16 = ((int32_t)result >> 16) << 16;  /* 0 or sign fill  */
                 dst->flags |= PGXP_F_VY;
@@ -519,6 +574,18 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                 } else if ((result & 0xFFFF0000u) == 0) {
                     dst->y16 = 0; dst->flags |= PGXP_F_VY;
                 }
+                /* Depth follows the merged halves when their sources agree
+                 * (one source, or two describing the same vertex). */
+                {
+                    uint16_t zx = (xsrc && xsrc->gen == s_gen &&
+                                   (xsrc->flags & PGXP_F_VZ)) ? xsrc->z : 0;
+                    uint16_t zy = (ysrc && ysrc->gen == s_gen &&
+                                   (ysrc->flags & PGXP_F_VZ)) ? ysrc->z : 0;
+                    uint16_t zm = zx ? zx : zy;
+                    if (zm && (!zx || !zy || zx == zy)) {
+                        dst->z = zm; dst->flags |= PGXP_F_VZ;
+                    }
+                }
                 return;
             }
             /* add/sub: require at least one tracked component and halves
@@ -535,6 +602,18 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
             dst->y16 = is_sub ? comp16(a, s1, 1) - comp16(b, s2, 1)
                               : comp16(a, s1, 1) + comp16(b, s2, 1);
             dst->flags = PGXP_F_VXY;
+            /* A screen-space translate does not change the vertex's view
+             * depth: carry it when the operands do not disagree. */
+            {
+                uint16_t za = (a && a->gen == s_gen &&
+                               (a->flags & PGXP_F_VZ)) ? a->z : 0;
+                uint16_t zb = (b && b->gen == s_gen &&
+                               (b->flags & PGXP_F_VZ)) ? b->z : 0;
+                uint16_t zm = za ? za : zb;
+                if (zm && (!za || !zb || za == zb)) {
+                    dst->z = zm; dst->flags |= PGXP_F_VZ;
+                }
+            }
             return;
         }
         default:
@@ -789,6 +868,21 @@ extern "C" void pgxp_test_set_generation(uint32_t gen) { s_gen = gen; }
 /* Address-keyed depth lookup for the shipped perspective-texturing path
  * (gpu.c prepare_texture_triangle). Same contract as the retired hashed
  * table: hit only when the tracked word matches the packet word exactly. */
+/* Diagnostic: which rung of the load ladder fails for this word. 0 = no
+ * entry, 1 = stale generation, 2 = value mismatch, 3 = position incomplete,
+ * 4 = depth flag dead, 5 = depth zero, 6 = engine off, 7 = would arm. */
+extern "C" int pgxp_debug_shadow_class(uint32_t addr, uint32_t packed) {
+    if (!s_enabled) return 6;
+    PGXPValue *pv = pgxp_ptr(addr);
+    if (!pv) return 0;
+    if (pv->gen != s_gen) return 1;
+    if (pv->value != packed) return 2;
+    if ((pv->flags & PGXP_F_VXY) != PGXP_F_VXY) return 3;
+    if (!(pv->flags & PGXP_F_VZ)) return 4;
+    if (pv->z == 0) return 5;
+    return 7;
+}
+
 extern "C" int pgxp_load_precise_word(uint32_t addr, uint32_t packed,
                                       int32_t *x16, int32_t *y16, uint16_t *z) {
     if (!s_enabled) return 0;

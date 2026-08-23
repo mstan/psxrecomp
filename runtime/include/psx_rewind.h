@@ -10,7 +10,8 @@
  * Keyboard: F8 (config.ini [KeyMap] Rewind). Controller: View/Back or L3.
  * While open: D-pad / left-stick Left/Right, Cross load, Circle/Back close.
  *
- * Env: PSX_REWIND=0 disables; PSX_REWIND_INTERVAL (1/4/8/12/15, default 15);
+ * Env: PSX_REWIND=0 disables; PSX_REWIND_INTERVAL (1/4/8/12/15/30, default 15;
+ *      soft-default 30 when unique 8 MB RAM is active and no pref is set);
  *      PSX_REWIND_FMV_INTERVAL (frames while depth24/MDEC/XA, default 4);
  *      PSX_REWIND_DEPTH (50/100/150/200, default 50, max 200).
  * settings.toml [video] rewind_depth / rewind_interval (env still wins).

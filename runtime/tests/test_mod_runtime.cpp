@@ -340,6 +340,35 @@ int main() {
               ram[0x1202] == 0 && ram[0x1203] == 0x32,
           "savestate restore must reapply the complete enabled main plan");
 
+    /* Loading a checkpoint that already carries plan replacements must not
+     * re-store / re-dirty those pages (enhanced 8 MB softlock class). */
+    ram[0x1000] = 0xa1; ram[0x1001] = 0xa2; ram[0x1002] = 0xa3; ram[0x1003] = 0xa4;
+    ram[0x1100] = 42; ram[0x1101] = 0;
+    ram[0x1102] = 43; ram[0x1103] = 0;
+    ram[0x1200] = 1; ram[0x1201] = 0x42;
+    ram[0x1202] = 0; ram[0x1203] = 0x32;
+    mod_runtime_on_savestate_loaded();
+    check(ram[0x1000] == 0xa1 && ram[0x1003] == 0xa4 &&
+              ram[0x1100] == 42 && ram[0x1102] == 43 &&
+              ram[0x1200] == 1 && ram[0x1201] == 0x42 &&
+              ram[0x1202] == 0 && ram[0x1203] == 0x32,
+          "already-patched savestate must keep plan bytes without reapply");
+
+    /* Disc overlays can LoadExe the boot EXE already rewritten. Entry must
+     * accept planned replacements in RAM (not only stock expected). */
+    check(PSXRecompV4::mod_runtime_commit(cue_path, &error), error.c_str());
+    ram[0x1000] = 0xa1; ram[0x1001] = 0xa2; ram[0x1002] = 0xa3; ram[0x1003] = 0xa4;
+    ram[0x1100] = 42; ram[0x1101] = 0;
+    ram[0x1102] = 43; ram[0x1103] = 0;
+    ram[0x1200] = 1; ram[0x1201] = 0x42;
+    ram[0x1202] = 0; ram[0x1203] = 0x32;
+    mod_runtime_on_dispatch(0x80002000);
+    check(ram[0x1000] == 0xa1 && ram[0x1003] == 0xa4 &&
+              ram[0x1100] == 42 && ram[0x1102] == 43 &&
+              ram[0x1200] == 1 && ram[0x1201] == 0x42 &&
+              ram[0x1202] == 0 && ram[0x1203] == 0x32,
+          "entry apply must accept disc-prepatched main EXE replacements");
+
     std::array<uint8_t, 2352> sector{};
     sector[10] = 0xaa;
     mod_runtime_patch_disc_sector(2, 1, sector.data(), (uint32_t)sector.size());

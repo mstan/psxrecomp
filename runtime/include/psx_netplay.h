@@ -65,6 +65,14 @@ typedef struct PsxNetplayConfig {
      * Env PSX_NET_MODE=delay|rollback overrides. */
     int         rollback;
     uint32_t    session_id;
+    /* PSX-Link lobby (two consoles over the serial cable): the 4-seat session
+     * partitions into console A = seats {0,1} and console B = seats {2,3}.
+     * link_base_seat is MY console's first seat (0 or 2); this client applies
+     * only its console's two seats to SIO pads and drives a spawned headless
+     * follower (psx_link_pair.h) simulating the other console. 0/-1 in
+     * link_base_seat with link_lobby=0 = ordinary session. */
+    int         link_lobby;
+    int         link_base_seat;
     char        bind_hostport[64];
     char        peer_hostport[64];
 } PsxNetplayConfig;
@@ -73,6 +81,21 @@ void psx_netplay_config_defaults(PsxNetplayConfig *cfg);
 void psx_netplay_apply_env(PsxNetplayConfig *cfg);
 
 int  psx_netplay_active(void);
+/* PSX-Link lobby state: link_active = pair mode running; base seat = my
+ * console's first seat; hash_enforced = this client's console group runs the
+ * full digest ladder (console A) vs log-only (console B, per link policy). */
+int  psx_netplay_link_active(void);
+/* Netplay EXECUTION CONTRACT gate: true for session members AND PSX-Link
+ * followers (deterministic co-simulators). Use for guards that change how
+ * the guest executes; use psx_netplay_active() for session plumbing. */
+int  psx_netplay_determinism_active(void);
+int  psx_netplay_link_base_seat(void);
+int  psx_netplay_link_hash_enforced(void);
+/* Link mode: a machine-fold mismatch persisted past the debounce with no
+ * local episode running — real cross-machine desync; end the session. */
+int  psx_netplay_link_desynced(void);
+/* Apply one 8-byte netplay pad blob to a local SIO port (link follower). */
+void psx_netplay_apply_pad_blob(int port, const uint8_t row[8]);
 int  psx_netplay_is_running(void);
 /* "ice" | "lan" | "none" */
 const char *psx_netplay_transport_name(void);
@@ -233,6 +256,10 @@ void psx_netplay_wait_recv(int timeout_ms);
 /* Diagnostics for a stuck admit barrier (stall name, sim tick, remote lead). */
 void psx_netplay_admit_wait_info(char *stall_out, size_t stall_cap,
                                  uint32_t *sim_tick_out, int *lead_out);
+
+/* LINKPERF breakdown: 1 if try_admit last refused because the peer's input
+ * or confirm had not arrived (network wait), 0 for any other reason. */
+int  psx_netplay_admit_stall_is_net(void);
 
 /* Normalize sticks (deadzone → center) for stabler cross-device blobs. */
 void psx_netplay_normalize_pad(PsxNetPad *pad);

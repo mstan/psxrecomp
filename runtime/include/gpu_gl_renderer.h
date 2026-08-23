@@ -28,6 +28,11 @@ void gl_renderer_set_swap_interval(int interval);
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
                                    int blend_mode);
 void gl_renderer_set_interpolation_suspended(int suspended);
+/* Async present: the interpolation worker thread owns quad+OSD+SwapWindow
+ * and re-presents the newest captured frame at host cadence (no blending);
+ * the sim thread pays only flush + capture copy + fence. Netplay uses this
+ * to take the present path off the lockstep critical path. */
+void gl_renderer_set_present_async(int enabled, double host_hz);
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,
@@ -46,6 +51,39 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w);
 
+/* Pillarbox edge fill: on a 4:3-pinned present, extend the frame's own left and
+ * right edge columns across the black margins instead of leaving them black.
+ *
+ * The 4:3 content stays exactly where it is, at its own scale, undistorted --
+ * only the margins change. It exists for wide displays showing 2D screens
+ * (menus, title, loading) that a 3D-gated widescreen layer deliberately keeps
+ * at 4:3: on 32:9 those margins are most of the screen, and a flat-gradient
+ * backdrop reads as a small floating island. It is a look, not a correctness
+ * fix, and it is wrong where the edge pixels are busy, so it is opt-in and the
+ * crop path (content_w) is excluded. */
+
+/* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
+ * caller owns them and may free them on return. Passing NULL clears it.
+ * Returns 0 only if a texture could not be created. */
+int  gl_renderer_set_bezel(const void *rgba, int w, int h);
+int  gl_renderer_has_bezel(void);
+void gl_renderer_set_pillarbox_edge_fill(int enabled);
+int  gl_renderer_pillarbox_edge_fill(void);
+
+/* PGXP depth ([video] pgxp_depth): depth-test polygons using the per-vertex W
+ * PGXP recovered, instead of relying solely on the ordering table.
+ *
+ * The PS1 sorts per PRIMITIVE, by one averaged depth quantised into buckets, so
+ * interpenetrating or near-coplanar polygons resolve by submission order — an
+ * answer the hardware cannot get right. Only primitives whose W provenance is
+ * proven participate; everything else (2D, UI, anything the provenance test
+ * rejects) neither tests nor writes, since it has no meaningful depth.
+ *
+ * Off is bit-identical to a build without the feature: the vertex program's z
+ * term is 0, the test stays disabled, and the buffer is never cleared. */
+void gl_renderer_set_pgxp_depth(int enabled);
+int  gl_renderer_pgxp_depth(void);
+
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
@@ -53,6 +91,14 @@ void gl_renderer_present_blank(void);
  * snapshot when interpolation owned the last present). Used during rollback
  * resim so the window keeps a wall-clock present cadence without reading
  * mid-resim VRAM. Returns 1 if a Swap happened, 0 if no hold is available. */
+/* VRAM banks — one GPU-side VRAM per emulated console. Dual-console switching
+ * activates the peer's bank instead of reading 1 MiB back through
+ * gr_vram_transfer_out and re-uploading it on every machine switch. */
+int gl_renderer_vram_bank_create(int slot);
+int gl_renderer_vram_bank_activate(int slot);
+int gl_renderer_vram_bank_live(void);
+int gl_renderer_vram_bank_seed(int dst, int src);
+
 int gl_renderer_present_hold_last(void);
 
 /* Sync the authoritative FBO down to CPU VRAM if the GPU side is ahead (else
@@ -81,6 +127,12 @@ void gl_renderer_restage_vram_after_savestate(void);
  * digests / GPUREAD authority) while the OpenGL hr FBO keeps settings-scale
  * SSAA for present-only. Never enables glReadPixels; CPU stays current. */
 void gl_renderer_set_cpu_auth_dual(int on);
+
+/* FMV present reconstruction, settings.toml [video] fmv_filter. Takes the
+ * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
+ * Only consulted while video antialiasing is on; AA off is always nearest.
+ * PSX_FMV_FILTER overrides this for one run. */
+void gl_renderer_set_fmv_filter(int cfg_value);
 int  gl_renderer_cpu_auth_dual(void);
 
 /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).

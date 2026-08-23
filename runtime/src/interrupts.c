@@ -27,6 +27,7 @@
 
 #include "interrupts.h"
 #include "sio.h"
+#include "sio1.h"
 #include "timers.h"
 #include "gpu.h"
 #include "cdrom.h"
@@ -177,8 +178,10 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
 
 /* Dispatch counter for vblank scheduling. */
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
-#define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
-#define VBLANK_DEFER_STALE_CYCLES (VBLANK_CYCLES * 10ull)
+static uint32_t vblank_cycles(void) {
+    return gpu_vblank_period_cycles();
+}
+#define VBLANK_DEFER_STALE_CYCLES_FRAMES 10ull
 static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
@@ -356,7 +359,7 @@ static int should_defer_vblank_for_sio(void) {
     uint64_t since_progress = now >= last_sio_progress_cycle
                             ? now - last_sio_progress_cycle
                             : 0;
-    return since_progress < VBLANK_DEFER_STALE_CYCLES;
+    return since_progress < ((uint64_t)vblank_cycles() * VBLANK_DEFER_STALE_CYCLES_FRAMES);
 }
 
 /* ---- Mid-dispatch audio pump -------------------------------------------
@@ -390,13 +393,14 @@ static void fire_vblank_edge(void) {
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
-    cycles_since_vblank -= VBLANK_CYCLES;
+    const uint32_t period = vblank_cycles();
+    cycles_since_vblank -= period;
     dispatch_count = 0;
     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
                           (uint32_t)psx_get_cycle_count());
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
-                          (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
+                          (uint32_t)(psx_get_cycle_count() + period));
     psx_irq_raise(IRQ_VBLANK, 0);
     g_vblank_raise_count++;
     event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
@@ -412,15 +416,17 @@ static void fire_vblank_edge(void) {
 void interrupts_service_scheduled_events(void) {
     note_sio_progress_cycle();
     if (in_exception) return;
-    while (cycles_since_vblank >= VBLANK_CYCLES) {
+    const uint32_t period = vblank_cycles();
+    while (cycles_since_vblank >= period) {
         if (should_defer_vblank_for_sio()) return;
         fire_vblank_edge();
     }
 }
 
 uint32_t interrupts_cycles_to_vblank(void) {
-    if (cycles_since_vblank >= VBLANK_CYCLES) return 0;
-    return VBLANK_CYCLES - cycles_since_vblank;
+    const uint32_t period = vblank_cycles();
+    if (cycles_since_vblank >= period) return 0;
+    return period - cycles_since_vblank;
 }
 
 uint32_t interrupts_get_cycles_since_vblank(void) {
@@ -626,6 +632,10 @@ void interrupts_cosim_dump(uint32_t *csv, int *inexc) {
 int      g_rfe_escape_pending = 0;
 int      g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
 uint32_t g_exception_real_epc = 0;
+/* dirty_ram_interp.c — async-RFE resume latch. File scope so the wholesale
+ * re-arm points (soft-return reboot, post-restore resync) can zero it with
+ * the other resume-PC latches, not just the delivery site that sets it. */
+extern uint32_t g_async_rfe_resume_pc;
 extern void psx_exception_longjmp(void);
 
 /* Called by the recompiled `rfe` opcode (after it pops the COP0 SR stack). When we
@@ -736,11 +746,30 @@ void interrupts_init(void) {
     g_exc_escape_reason = PSX_EXC_ESCAPE_NONE;
     g_rfe_escape_pending = 0;
     g_pending_exception_longjmp = 0;
+    /* Same ambient class: a latched async-RFE resume PC from the previous
+     * match is a PRE-REBOOT guest address. Carrying it across a soft-return
+     * lets the first sentinel reach of the new session resume at a dead
+     * timeline's PC — and it forks a cold peer, which starts at zero. */
+    g_async_rfe_resume_pc = 0;
     s_fast_maintenance = 0;
     {
         extern uint32_t g_dirty_safe_resume_pc;
         g_dirty_safe_resume_pc = 0;
     }
+}
+
+/* Dual-console: a machine switch may only happen where the host-static
+ * exception layer is quiescent -- outside exception dispatch, no deferred
+ * cooperative ChangeThread, no pending deferred exception longjmp, and not
+ * inside device service. At such points every field the switch does NOT
+ * carry across is zero on both machines by construction. */
+int psx_interrupts_switch_safe(void) {
+    extern int psx_in_device_service;
+    if (in_exception) return 0;
+    if (s_defer_switch_pending) return 0;
+    if (g_pending_exception_longjmp) return 0;
+    if (psx_in_device_service) return 0;
+    return 1;
 }
 
 void interrupts_resync_after_restore(void) {
@@ -774,6 +803,10 @@ void interrupts_resync_after_restore(void) {
     g_exc_escape_reason = PSX_EXC_ESCAPE_NONE;
     g_rfe_escape_pending = 0;
     g_pending_exception_longjmp = 0;
+    /* Not in the snap, and a resume TARGET rather than a discriminator: a
+     * pre-load latch would resume the restored timeline at an address from
+     * the abandoned one. Zeroed with the other resume-PC latches below. */
+    g_async_rfe_resume_pc = 0;
     s_compiled_interrupt_resume_pc = 0;
     s_last_interrupt_check_pc = 0;
     /* De-dupe key for dispatch_entry: a stale absolute cycle from the pre-load
@@ -896,14 +929,16 @@ uint32_t cycles_to_next_event(void) {
      * card-SIO case only pushes VBlank LATER, so this estimate stays a safe
      * under-estimate. */
     if (i_mask & (1u << IRQ_VBLANK)) {
-        uint32_t d = (cycles_since_vblank >= VBLANK_CYCLES)
-                       ? 0u : (VBLANK_CYCLES - cycles_since_vblank);
+        const uint32_t period = vblank_cycles();
+        uint32_t d = (cycles_since_vblank >= period)
+                       ? 0u : (period - cycles_since_vblank);
         if (d < best) best = d;
     }
     uint32_t t = timers_cycles_to_irq(i_mask); if (t < best) best = t;
     uint32_t c = cdrom_cycles_to_irq(i_mask);  if (c < best) best = c;
     uint32_t d = dma_cycles_to_irq(i_mask);    if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);    if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);  if (s1 < best) best = s1;
     return best;
 }
 
@@ -964,9 +999,31 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 
 void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
+    /* Dual-console cooperative switcher (dual_machine.c). One load+branch
+     * when inactive; on a slice-deadline switch the poll does not return
+     * (longjmps into the other machine via psx_scheduler_resume_at). */
+    {
+        extern int g_psx_dual_active;
+        if (g_psx_dual_active) {
+            extern void psx_dual_machine_poll(CPUState *cpu, uint32_t resume_pc);
+            psx_dual_machine_poll(cpu, s_compiled_interrupt_resume_pc);
+        }
+    }
+    /* Two-process shm link: bounded-skew barrier against the peer process.
+     * Same one-load-and-branch cost when inactive as the dual poll above;
+     * when this side runs ahead of peer+lookahead it naps until the peer
+     * catches up (psx_link_shm.c). Throttled: the barrier bound is thousands
+     * of cycles, so checking every 64th interrupt poll loses nothing. */
+    {
+        extern int psx_link_shm_active(void);
+        extern void psx_link_shm_poll(uint64_t cycle_now);
+        static uint32_t s_shm_div;
+        if (psx_link_shm_active() && (++s_shm_div & 0x3Fu) == 0)
+            psx_link_shm_poll(psx_get_cycle_count());
+    }
     extern int g_ls_suppress_record;
-    extern int psx_netplay_active(void);
-    const int np_active = psx_netplay_active();
+    extern int psx_netplay_determinism_active(void);
+    const int np_active = psx_netplay_determinism_active();
     /* Publish this edge's resume PC BEFORE deferred present flush. The MotK
      * CDA0 gate reads s_last_interrupt_check_pc; leaving it at the previous
      * BB (CD54) made every CDA0 entry flush look like CD54 and no-op. Present
@@ -1027,7 +1084,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * host-only state (not in the snap), so replay delivery timing forked
      * across peers. Edge PC + I_STAT are guest-deterministic; the wait
      * ping-pong reaches B a few instructions later, so no starvation. */
-    if (!in_exception && psx_netplay_active()) {
+    if (!in_exception && np_active) {
         const uint32_t wait_a = 0x8006CD54u;
         const uint32_t wait2_a = 0x800768C8u;
         uint32_t edge = s_last_interrupt_check_pc;
@@ -1465,6 +1522,8 @@ irq_deliver_eval:
      * disarms the RFE-flag escape). */
     g_rfe_escape_pending = 0;
     {
+        extern uint32_t g_async_rfe_resume_pc;   /* dirty_ram_interp.c */
+        extern uint64_t g_async_rfe_set_count;
         uint32_t real_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                   : s_compiled_interrupt_resume_pc;
         /* Top-level flush_resume / savestate: resync cleared the latches and
@@ -1476,6 +1535,8 @@ irq_deliver_eval:
             if (psx_scheduler_top_level_resume_active() &&
                 cpu->pc != 0u && (cpu->pc & 3u) == 0u) {
                 uint32_t phys = cpu->pc & 0x1FFFFFFFu;
+                if (phys < 0x00800000u)
+                    phys &= 0x001FFFFFu;
                 if (phys < 0x00200000u ||
                     (phys >= 0x1FC00000u && phys < 0x1FC80000u))
                     real_pc = cpu->pc;
@@ -1496,6 +1557,8 @@ irq_deliver_eval:
          * ROM pc still falls back to the sentinel (pre-fix behavior);
          * RAM acceptance is unchanged byte-for-byte. */
         uint32_t real_phys = real_pc & 0x1FFFFFFFu;
+        if (real_phys < 0x00800000u)
+            real_phys &= 0x001FFFFFu;
         int resume_in_ram  = real_phys < 0x00200000u;
         int resume_in_rom  = real_phys >= 0x1FC00000u && real_phys < 0x1FC80000u &&
                              psx_is_dispatchable(real_pc);
@@ -1504,6 +1567,15 @@ irq_deliver_eval:
             cpu->cop0[COP0_EPC]  = real_pc;     /* architectural: the real resume PC */
             g_exception_real_epc = real_pc;
             g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE; /* set at the actual RFE/SYSCALL return */
+            /* Async-RFE latch (Tomba 2 frame-1997 fix): persist the most
+             * recent real interruption PC so a game-driven asynchronous
+             * ReturnFromException (sentinel RFE with in_exception==0, e.g. a
+             * card-ISR longjmp installed via HookEntryInt) resumes the guest
+             * here instead of resolving to pc=0 (abnormal top-level exit).
+             * The latch was documented but never assigned — the whole rescue
+             * in the traps/dirty sentinel gates was inert. */
+            g_async_rfe_resume_pc = real_pc;
+            g_async_rfe_set_count++;
         } else {
             uint32_t sentinel = PSX_EXC_SENTINEL_PC;
             cpu->write_word(sentinel, 0x00000000u); /* NOP, read by the handler's BD check */
@@ -1777,11 +1849,11 @@ irq_deliver_eval:
         if (s_str_mode_env < -1 || s_str_mode_env > 3) s_str_mode_env = -1;
     }
     {
-        extern int psx_netplay_active(void);
+        extern int psx_netplay_determinism_active(void);
         extern int psx_selfcheck_enabled(void);
         if (s_str_mode_env >= 0)
             s_str_mode = s_str_mode_env;
-        else if (psx_netplay_active() || psx_selfcheck_enabled())
+        else if (psx_netplay_determinism_active() || psx_selfcheck_enabled())
             s_str_mode = 3; /* netplay/selfcheck: TCB-stable always restore */
         else
             s_str_mode = 1;
@@ -1834,14 +1906,30 @@ irq_deliver_eval:
         same_thread_resume = 1;
         {
             extern int psx_scheduler_top_level_resume_active(void);
-            if (psx_scheduler_top_level_resume_active()) {
+            /* pc=0 means "the interrupted native frame is still on the host
+             * stack below us — return and it continues". That contract also
+             * breaks whenever dispatch has already collapsed to TOP LEVEL
+             * (depth 0): statically-baked overlay functions cross into AOT
+             * text via CPS returns, so the interrupted chain may hold no
+             * host frames at all, and a published 0 reaches the main loop
+             * as a bogus GUEST_EXIT (WipEout 3 ntsc120full8 static bake:
+             * deterministic "execution completed, PC=0" ~10 s into boot,
+             * ra=0x800D7FC0 epc=0x8015FAEC). Same remedy as the scheduler
+             * case: prefer the compiled interrupt resume PC. */
+            if (psx_scheduler_top_level_resume_active() ||
+                g_psx_dispatch_depth <= 0) {
                 uint32_t resume = s_compiled_interrupt_resume_pc;
                 if (resume == 0u)
                     resume = s_last_interrupt_check_pc;
                 if (resume != 0u)
                     cpu->pc = resume;
                 /* else keep post-RFE cpu->pc — never publish 0 */
+                psx_pc0_journal_note(PSX_PC0J_IRQ_RESCUE, cpu, resume,
+                                     g_exc_escape_reason);
             } else {
+                psx_pc0_journal_note(PSX_PC0J_IRQ_SAME_THREAD, cpu,
+                                     s_compiled_interrupt_resume_pc,
+                                     g_exc_escape_reason);
                 cpu->pc = 0;   /* continue the interrupted live chain */
             }
         }

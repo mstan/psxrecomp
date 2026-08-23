@@ -54,6 +54,14 @@ void gr_set_precise_triangle(int enabled,
  * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
  * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
 void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+/* Absolute per-vertex GTE screen Z for the next textured triangle, for PGXP
+ * depth. Separate from the perspective weights on purpose: those are
+ * normalised per triangle (q/qmax), which is right for UV correction and
+ * useless as a depth, because it says nothing about where the triangle sits
+ * relative to any OTHER triangle. Deriving depth from them is what shattered
+ * the scene on the first attempt. Optional hook: backends without it are
+ * unaffected. */
+void gr_set_depth_triangle(int enabled, float z0, float z1, float z2);
 
 /* Primitives */
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
@@ -142,6 +150,12 @@ typedef struct GpuRenderBackend {
                                  int32_t x1, int32_t y1,
                                  int32_t x2, int32_t y2);
     void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
+    void (*set_depth_triangle)(int enabled, float z0, float z1, float z2);
+    /* Optional: HD texture replacement for the NEXT textured primitive. `repl`
+     * is a const TexPackRepl* (void* to keep this header free of tex_pack.h),
+     * or NULL to clear. Set immediately before the draw and cleared after, the
+     * same one-shot contract as set_precise_triangle. */
+    void (*set_replacement)(const void *repl);
     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
@@ -200,6 +214,15 @@ typedef struct GpuRenderBackend {
     int  (*wide_dump_full)(uint32_t *out, int cap_pixels, int *ow, int *oh,
                            int base_x);
 } GpuRenderBackend;
+
+/* GL supersampling ceiling. Deliberately separate from SW_MAX_INTERNAL_SCALE:
+ * the software path allocates a VRAM-sized hi-res MIRROR costing 1 MB * scale^2
+ * (256 MB at 16x), but under GL that mirror stays at 1x and the cost is an FBO
+ * the GPU already has memory for. 16x is a 16384x8192 render target, the
+ * GL_MAX_TEXTURE_SIZE floor for desktop GL 3.3; the GL backend clamps again to
+ * the driver's real limit once a context exists. */
+#define GL_MAX_INTERNAL_SCALE 16
+
 
 #ifdef __cplusplus
 }

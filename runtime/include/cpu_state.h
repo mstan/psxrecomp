@@ -220,6 +220,49 @@ extern uint32_t gte_geometry_correction_hits(void);
 extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
                                               uint32_t *miss_unrecorded,
                                               uint32_t *miss_ambiguous);
+/* Exact-sign NCLIP coverage: precise = all three SXY shadows live and
+ * word-validated; fallback = integer sign decided (the widescreen thin-face
+ * flicker regime); corrected = sign disagreements actually fixed. */
+extern void     gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
+                                        uint64_t *corrected);
+
+/* pc=0 escape journal (traps.c). Every runtime site that publishes a null PC
+ * (the "continue the native chain below" convention) or rescues one records
+ * an entry; when the convention breaks — a published 0 reaches the top-level
+ * trampoline and the run dies with "execution completed, PC=0" — the ring
+ * tail names the exact publisher and its context. Publishes are rare, so the
+ * always-on cost is a few stores; this works in play builds where the
+ * per-dispatch fntrace ring is compiled out (the exit trace was blind). */
+enum {
+    PSX_PC0J_TRAP_CHANGE_SELF  = 1,  /* a: target_tcb                        */
+    PSX_PC0J_TRAP_FIBER_SWITCH = 2,
+    PSX_PC0J_TRAP_CRIT_ENTER   = 3,  /* a: sr                                */
+    PSX_PC0J_TRAP_CRIT_EXIT    = 4,  /* a: sr                                */
+    PSX_PC0J_TRAP_NULL_TARGET  = 5,  /* a: addr (0)                          */
+    PSX_PC0J_TRAP_SENTINEL     = 6,  /* a: addr; in-exception longjmp path   */
+    PSX_PC0J_TRAP_ASYNC_RFE    = 7,  /* a: resume pc (rescue, not a 0)       */
+    PSX_PC0J_TRAP_E10_NOOP     = 8,  /* a: addr                              */
+    PSX_PC0J_TRAP_STALE_MISS   = 9,  /* a: addr                              */
+    PSX_PC0J_IRQ_SAME_THREAD   = 10, /* a: would-be resume; d: escape reason */
+    PSX_PC0J_IRQ_RESCUE        = 11, /* a: published resume; d: reason       */
+    PSX_PC0J_DIRTY_SENTINEL    = 12, /* d: bit0 in_exception, bit1 async-armed */
+    PSX_PC0J_DIRTY_UNSUPPORTED = 13, /* a: unsupported pc; d: reason         */
+};
+typedef struct Pc0JournalEntry {
+    uint64_t seq;
+    uint32_t site;    /* PSX_PC0J_*                                   */
+    uint32_t frame;   /* present frame count at publish               */
+    int32_t  depth;   /* g_psx_dispatch_depth at publish              */
+    uint32_t a;       /* site-specific (see enum)                     */
+    uint32_t b;       /* $ra at publish                               */
+    uint32_t c;       /* COP0 EPC at publish                          */
+    uint32_t d;       /* site-specific extra                          */
+} Pc0JournalEntry;
+#define PSX_PC0J_CAP 64
+extern Pc0JournalEntry g_pc0j_ring[PSX_PC0J_CAP];
+extern uint64_t g_pc0j_seq;
+extern void psx_pc0_journal_note(uint32_t site, CPUState *cpu,
+                                 uint32_t a, uint32_t d);
 
 /* PGXP dataflow-shadowing hook macros (PGXP_LOAD/STORE/ALU/MULDIV/COP2).
  * The emitter writes them unconditionally; they expand to real calls only

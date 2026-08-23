@@ -211,6 +211,23 @@ int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
     return (((x + (uint32_t)margin) & 0xFFFFu) <
             (bound + 2u * (uint32_t)margin)) ? 1 : 0;
 }
+/* [[widescreen.cull.widen]] SLT-family helpers. The emitter writes these at
+ * explicitly configured cull sites, INCLUDING in overlay-resident code, so
+ * the DLL must define them or the shard fails to link (undefined reference ->
+ * no native shard -> that mod-patched page runs interpreted forever). Same
+ * contract as the funnel helpers above: self-contained on psx_ws_x_margin(),
+ * identity at margin 0 (4:3), MUST stay byte-for-byte identical to the gpu.c
+ * implementations. */
+int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
+    int32_t bound = (int32_t)(int16_t)(uint16_t)imm;
+    return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
+}
+int psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt) {
+    const int32_t m = psx_ws_x_margin();
+    const int32_t a = (int32_t)rs, b = (int32_t)rt;
+    return bound_is_rt ? ((a < b + m) ? 1 : 0)
+                       : ((a + m < b) ? 1 : 0);
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }

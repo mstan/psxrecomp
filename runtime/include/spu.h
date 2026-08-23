@@ -167,6 +167,13 @@ int         spu_shadow_tap_count(void);
 uint32_t spu_snapshot_bytes(void);
 void     spu_snapshot_write(uint8_t *p);
 int      spu_snapshot_read(const uint8_t *p, uint32_t len);
+/* SPU RAM banks — one per emulated console (see memory_ram_bank_* in psx_ram.h).
+ * Dual-console switching activates the peer's bank instead of copying 512 KiB. */
+#define PSX_SPU_MAX_BANKS 2
+int      spu_ram_bank_create(int slot);
+int      spu_ram_bank_activate(int slot);
+uint8_t *spu_ram_bank_ptr(int slot);
+
 uint8_t *spu_get_ram_ptr(void);
 uint32_t spu_get_ram_bytes(void);
 

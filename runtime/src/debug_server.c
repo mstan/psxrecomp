@@ -28,10 +28,13 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "tex_pack.h"     /* HD texture replacement state (tex_pack command) */
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
+#include "sio1.h"
+#include "dual_machine.h"
 #include "memcard.h"
 #include "spu.h"
 #include "audio_trace.h"
@@ -45,6 +48,7 @@
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
 #include "lockstep.h"
+#include "psx_ram.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,7 +164,7 @@ uint64_t s_frame_count = 0;
  * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
  * classifies the fork: pc differs but wr matches => same writes via a different
  * control path; wr differs => actual state divergence. Reusable for any title.
- * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
+ * Hashed over main RAM (phys < live size) only — game state lives there; MMIO/
  * scratchpad churn (device polling) would add benign cross-backend noise. */
 uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
 uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
@@ -177,7 +181,7 @@ static PSX_BSS FpEntry  s_fp_ring[FP_RING_CAP];
 static uint32_t s_fp_head  = 0;
 static uint64_t s_fp_total = 0;
 
-/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
+/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys < live size)
  * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
  * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
  * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
@@ -194,7 +198,7 @@ static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
         g_fp_sp_count++;
         return;
     }
-    if (phys >= 0x200000u) return;                  /* main RAM only */
+    if (phys >= g_psx_ram_size) return;                  /* main RAM only */
     uint64_t h = g_fp_wr_hash;
     h = (h ^ (uint64_t)phys) * 1099511628211ULL;
     h = (h ^ (uint64_t)val)  * 1099511628211ULL;
@@ -5127,9 +5131,9 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+    /* Effectively the entire live main RAM in one shot.  Response uses a heap-
      * sized envelope so we don't truncate. */
-    if (len > 0x200000) len = 0x200000;
+    if ((uint32_t)len > g_psx_ram_size) len = (int)g_psx_ram_size;
 
     /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
     size_t env = 256;
@@ -5204,10 +5208,19 @@ static void handle_geom_correction(int id, const char *json)
      * but described a different word (stale = provenance hole to hunt). */
     PGXPStats ps;
     pgxp_get_stats(&ps);
+    /* Perspective arming, with its real denominator. perspective_triangles on
+     * its own could only be compared against gp0_draw, which counts untextured
+     * primitives that are correctly never armed — so it read as a coverage
+     * figure without being one. texcorr.attempts counts exactly the textured
+     * triangles that reach the predicate. */
+    uint64_t tc_att = 0, tc_arm = 0, tc_off = 0, tc_nosrc = 0, tc_noz = 0;
+    gpu_texture_correction_stats(&tc_att, &tc_arm, &tc_off, &tc_nosrc, &tc_noz);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"geometry_correction\":%d,"
              "\"geometry_vertex_hits\":%u,"
              "\"perspective_triangles\":%u,"
+             "\"texcorr\":{\"attempts\":%llu,\"armed\":%llu,"
+             "\"no_correction\":%llu,\"no_source\":%llu,\"no_depth\":%llu},"
              "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
              "\"pgxp\":{\"enabled\":%d,\"cpu_mode\":%d,\"tolerance\":%.3f,"
              "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
@@ -5218,6 +5231,9 @@ static void handle_geom_correction(int id, const char *json)
              gte_geometry_correction_enabled(),
              (unsigned)hits,
              (unsigned)gpu_texture_correction_hits(),
+             (unsigned long long)tc_att, (unsigned long long)tc_arm,
+             (unsigned long long)tc_off, (unsigned long long)tc_nosrc,
+             (unsigned long long)tc_noz,
              (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
              pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
              (unsigned long long)ps.lookups,
@@ -5426,11 +5442,13 @@ static void handle_cycles_to_next_event(int id, const char *json)
     uint32_t c = cdrom_cycles_to_irq(i_mask);
     uint32_t d = dma_cycles_to_irq(i_mask);
     uint32_t s = sio_cycles_to_irq(i_mask);
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
              "\"cycles_to_next_event\":%u,"
-             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u}",
-             id, i_stat, i_mask, agg, t, c, d, s);
+             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u,"
+             "\"sio1\":%u}",
+             id, i_stat, i_mask, agg, t, c, d, s, s1);
 }
 
 static void handle_irq_state(int id, const char *json)
@@ -6293,6 +6311,79 @@ static void handle_gte_latch_dump(int id, const char *json)
     snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
              id, gte_latch_total(), emitted, body);
     debug_server_send_line(reply); free(body); free(reply);
+}
+
+static void handle_dual_input(int id, const char *json)
+{
+    char route[16];
+    int r = -1;
+    if (json_get_str(json, "route", route, sizeof route)) {
+        if      (!strcmp(route, "both")) r = 0;
+        else if (!strcmp(route, "a"))    r = 1;
+        else if (!strcmp(route, "b"))    r = 2;
+    }
+    if (r < 0) { send_err(id, "route must be 'both'|'a'|'b'"); return; }
+    psx_dual_set_input_route(r);
+    send_fmt("{\"id\":%d,\"ok\":true,\"route\":%d}", id, r);
+}
+
+static void handle_dual_state(int id, const char *json)
+{
+    (void)json;
+    uint64_t cyc[2] = { 0, 0 };
+    int live = psx_dual_machine_live();
+    psx_dual_machine_cycles(cyc);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"active\":%d,"
+             "\"live\":%d,"
+             "\"input_route\":%d,"
+             "\"swaps\":%llu,"
+             "\"cycles_a\":%llu,"
+             "\"cycles_b\":%llu,"
+             "\"skew\":%lld}",
+             id,
+             live >= 0,
+             live,
+             psx_dual_get_input_route(),
+             (unsigned long long)psx_dual_machine_swaps(),
+             (unsigned long long)cyc[0],
+             (unsigned long long)cyc[1],
+             (long long)(cyc[0] - cyc[1]));
+}
+
+static void handle_sio1_state(int id, const char *json)
+{
+    (void)json;
+    Sio1Device *d = sio1_get_device();
+    uint32_t txc = 0, rxc = 0, ovr = 0, irqs = 0;
+    if (!d) { send_err(id, "sio1 not initialized"); return; }
+    sio1_device_get_counters(d, &txc, &rxc, &ovr, &irqs);
+    /* Side-effect-free peeks only (a real STAT/RXDATA read pops/perturbs). */
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"regs_enabled\":%d,"
+             "\"backend\":\"%s\","
+             "\"stat\":\"0x%08X\","
+             "\"mode\":\"0x%04X\","
+             "\"ctrl\":\"0x%04X\","
+             "\"baud\":\"0x%04X\","
+             "\"bit_cycles\":%u,"
+             "\"char_cycles\":%u,"
+             "\"active\":%d,"
+             "\"tx_chars\":%u,"
+             "\"rx_chars\":%u,"
+             "\"overruns\":%u,"
+             "\"irqs\":%u}",
+             id,
+             g_sio1_regs_enabled,
+             sio1_get_backend(),
+             sio1_device_peek_stat(d, psx_get_cycle_count()),
+             sio1_device_peek_mode(d),
+             sio1_device_peek_ctrl(d),
+             sio1_device_peek_baud(d),
+             sio1_device_bit_cycles(d),
+             sio1_device_char_cycles(d),
+             sio1_device_active(d),
+             txc, rxc, ovr, irqs);
 }
 
 static void handle_sio_state(int id, const char *json)
@@ -7841,6 +7932,161 @@ static void handle_ws_backdrop_ring(int id, const char *json)
     free(buf);
 }
 
+/* ws_ui_groups: dump the auto_ui_squash partition for the last UI prepass —
+ * per primitive its op / key / raw key inputs (y, h, derived band and family) /
+ * union-find root / final anchor.
+ *
+ * auto_ui_squash squashes each spatial run about its own anchor, so a HUD
+ * element split across two runs gets two anchors and comes apart as the frame
+ * widens (elements drifting to opposite edges, glyphs sliding off their
+ * background box). Diagnosing that needed to know which run each primitive
+ * landed in, and nothing exposed it: `key` is a hash, so unequal keys do not
+ * say WHICH of CLUT/texpage/band/family differed, and `anchor` takes only three
+ * values, so equal anchors do not prove two prims actually co-grouped.
+ * Read-only; sized for the 2048-entry prepass cap. */
+static void handle_ws_ui_groups(int id, const char *json)
+{
+    (void)json;
+    size_t cap = 1u << 19;                 /* 512 KB: 2048 items * ~180 chars */
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int hdr  = snprintf(buf, cap, "{\"id\":%d,\"ok\":true,", id);
+    int body = psx_ws_ui_groups_json(buf + hdr, (int)cap - hdr - 4);
+    snprintf(buf + hdr + body, cap - (size_t)(hdr + body), "}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+/* pgxp_depth [on=0/1]: depth-test using PGXP's recovered per-vertex W.
+ *
+ * Live, because this one changes WHICH PIXELS SURVIVE and the only honest test
+ * is flipping it on the same scene. No args = report. */
+/* zbuf <path>: dump the real depth buffer over the display rect as a 16-bit
+ * greyscale PNG. Distinct from pgxp_depth zdebug, which paints every fragment
+ * its own depth including semi-transparent ones that never write. */
+static void handle_zbuf(int id, const char *json)
+{
+    extern int gl_renderer_read_depth(float *, int, int, int, int);
+    extern int gr_scale(void);
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    if (di.disabled || !di.width || !di.height) { send_err(id, "display disabled"); return; }
+    if (di.depth24) { send_err(id, "24bpp scanout"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
+    int S = gr_scale(); if (S < 1) S = 1;
+    uint32_t w = di.width > 640 ? 640 : di.width;
+    uint32_t h = di.height > 512 ? 512 : di.height;
+    uint32_t ow = w * (uint32_t)S, oh = h * (uint32_t)S;
+    float *f = (float *)malloc((size_t)ow * oh * sizeof(float));
+    if (!f) { send_err(id, "alloc failed"); return; }
+    int got = gl_renderer_read_depth(f, (int)di.display_x, (int)di.display_y, (int)w, (int)h);
+    if (got <= 0) { free(f); send_err(id, "no depth surface"); return; }
+    /* Raw float32, row-major, bottom-up as GL returns it. No PNG: the consumer
+     * is a histogram, and quantising to 8 or 16 bits would throw away exactly
+     * the resolution this is being read to measure. */
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(f); send_err(id, "open failed"); return; }
+    const size_t wrote = fwrite(f, sizeof(float), (size_t)ow * oh, fp);
+    fclose(fp); free(f);
+    if (wrote != (size_t)ow * oh) { send_err(id, "short write"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"w\":%u,\"h\":%u,\"scale\":%d}",
+             id, path, ow, oh, S);
+}
+
+static void handle_pgxp_depth(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", -1);
+    extern void  gl_renderer_set_pgxp_zscale(float s);
+    extern float gl_renderer_pgxp_zscale(void);
+    const int zs = json_get_int(json, "zscale", -1);
+    if (zs > 0) gl_renderer_set_pgxp_zscale((float)zs);
+    extern void gl_renderer_set_zdebug(int on);
+    const int zdbg = json_get_int(json, "zdebug", -1);
+    if (zdbg >= 0) gl_renderer_set_zdebug(zdbg);
+    extern void gl_renderer_set_depth_always(int on);
+    const int always = json_get_int(json, "always", -1);
+    if (always >= 0) gl_renderer_set_depth_always(always);
+    if (on >= 0) gl_renderer_set_pgxp_depth(on);
+    /* Report the Z distribution alongside the flag: choosing znear without it
+     * is guesswork, and guessing it wrong is what broke this twice. */
+    extern void gl_renderer_pgxp_zstats(float *, float *, double *,
+                                        unsigned long long *,
+                                        unsigned long long *, int);
+    float zmn = 0.0f, zmx = 0.0f; double zmean = 0.0;
+    unsigned long long zn = 0, hist[20] = {0};
+    gl_renderer_pgxp_zstats(&zmn, &zmx, &zmean, &zn, hist, 20);
+    char hb[256]; int ho = 0;
+    for (int i = 0; i < 20 && ho < (int)sizeof(hb) - 24; i++)
+        ho += snprintf(hb + ho, sizeof(hb) - (size_t)ho, "%s%llu",
+                       i ? "," : "", hist[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"zmin\":%.1f,\"zmax\":%.1f,"
+             "\"zmean\":%.1f,\"zn\":%llu,\"zhist\":[%s]}",
+             id, gl_renderer_pgxp_depth(), zmn, zmx, zmean, zn, hb);
+}
+
+/* ws_menu_edge_fill [on=0/1]: pillarbox edge fill for 4:3-pinned presents.
+ *
+ * The 3D-gated widescreen layer keeps 2D screens (title, menus, loading) at
+ * 4:3, which on a very wide display leaves them as an island in a black
+ * window. With this on, the frame's own edge columns are extended across the
+ * margins instead. It is a look, not a correctness fix — it smears where the
+ * edge pixels are busy — so it needs a live A/B rather than a rebuild.
+ * No args = report. */
+static void handle_ws_menu_edge_fill(int id, const char *json)
+{
+    extern int g_ws_menu_edge_fill_flag;
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) g_ws_menu_edge_fill_flag = on ? 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, g_ws_menu_edge_fill_flag);
+}
+
+/* tex_pack [sub=stats|uploads|dumped|missing]: HD texture replacement state.
+ *
+ * tex_pack.cpp has carried tex_pack_debug_json since it was written, but it was
+ * never reachable from the wire -- so "is the pack actually matching?" could
+ * only be answered by looking at the screen and guessing. That is precisely the
+ * question that decides whether a Beetle-authored pack is compatible at all,
+ * and "missing" (pack entries no draw has claimed yet) is the authoring aid for
+ * building a new one. Defaults to stats. */
+static void handle_tex_pack(int id, const char *json)
+{
+    /* repl=0/1 toggles substitution live. An A/B that needs a rebuild is an
+     * A/B that does not get run. */
+    const int dbg = json_get_int(json, "repl_debug", -1);
+    if (dbg >= 0) {
+        extern int g_repl_debug;
+        g_repl_debug = dbg ? 1 : 0;
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl_debug\":%d}", id, g_repl_debug);
+        return;
+    }
+    const int repl = json_get_int(json, "repl", -1);
+    if (repl >= 0) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"repl\":%d}",
+                 id, tex_pack_replace_enabled(repl));
+        return;
+    }
+
+    char sub[32];
+    if (!json_get_str(json, "sub", sub, sizeof(sub)))
+        strncpy(sub, "stats", sizeof(sub) - 1);
+    sub[sizeof(sub) - 1] = '\0';
+
+    const int cap = 1 << 16;
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    /* tex_pack_debug_json emits a complete JSON VALUE — an object for "stats",
+     * an array for the others — so it has to be given a key, not spliced in as
+     * bare fields. */
+    int hdr = snprintf(buf, (size_t)cap,
+                       "{\"id\":%d,\"ok\":true,\"active\":%d,\"%s\":",
+                       id, tex_pack_active(), sub);
+    int body = tex_pack_debug_json(sub, buf + hdr, cap - hdr - 4);
+    if (body <= 0) { free(buf); send_err(id, "unknown sub"); return; }
+    snprintf(buf + hdr + body, 4, "}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 /* ws_backdrop_margin [m=<N>]: live-tune the far-backdrop widen strategy without
  * a rebuild. m<0 = whole-row preload, m=0 = off, m>0 = widen N columns each side.
  * No m= just reports the current value. */
@@ -8042,6 +8288,67 @@ static void handle_savestate(int id, const char *json)
         return;
     }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
+}
+
+/* Live CPU overclock for anchored A/B: animation-rate artifacts cannot be
+ * attributed to the overclock without flipping it on the exact same scene. */
+/* Census of imperfect PGXP triangles for the last complete frame: which
+ * screen prims are NOT fully dataflow-corrected, and why, per vertex. */
+static void handle_pgxp_census(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0, tris = 0, clean = 0;
+    int n = gpu_pgxp_census_dump(&frame, &tris, &clean, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"tris\":%u,\"clean\":%u,"
+        "\"imperfect\":%d,\"entries\":[", id, frame, tris, clean, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"cls\":[%u,%u,%u],\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_pgxp_texcensus(int id, const char *json)
+{
+    (void)json;
+    static PgxpCensusEnt ents[8192];
+    uint32_t frame = 0;
+    int n = gpu_pgxp_texcensus_dump(&frame, ents, 8192);
+    size_t buf_sz = 256 + (size_t)n * 96u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"misses\":%d,\"entries\":[",
+        id, frame, n);
+    for (int i = 0; i < n && pos < buf_sz - 128; i++) {
+        PgxpCensusEnt *e = &ents[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"bb\":[%d,%d,%d,%d],\"reason\":%u,\"vtx\":%u,\"why\":%u,\"src\":\"0x%08X\"}",
+            i ? "," : "", e->x0, e->y0, e->x1, e->y1,
+            e->cls[0], e->cls[1], e->cls[2], e->src);
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_overclock(int id, const char *json)
+{
+    int pct = json_get_int(json, "percent", -1);
+    if (pct > 0)
+        psx_set_cpu_overclock((uint32_t)pct);
+    send_fmt("{\"id\":%d,\"ok\":true,\"percent\":%u}",
+             id, psx_get_cpu_overclock());
 }
 
 static void handle_turbo(int id, const char *json)
@@ -8682,17 +8989,37 @@ static void handle_screenshot_hires(int id, const char *json)
         strncpy(path, "psx_screenshot_hires.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
-    uint32_t *argb = (uint32_t *)malloc((size_t)ow * oh * sizeof(uint32_t));
+    /* calloc, not malloc: any pixel a resolve declines to touch must be a
+     * deterministic black, never whatever the allocator handed back. */
+    uint32_t *argb = (uint32_t *)calloc((size_t)ow * oh, sizeof(uint32_t));
     if (!argb) { send_err(id, "alloc failed"); return; }
-    int got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
+    /* Pitch is BYTES, not pixels: the resolves step rows with
+     * (uint8_t *)out + row * out_pitch (gpu_sw_renderer.c sw_render_display /
+     * sw_render_display_hires), and the present path passes it that way
+     * (main.cpp gr_render_display_hires(sdl_pixel_buf, sw * sizeof(uint32_t))).
+     * Passing the pixel width here stepped 1/4 of a row per row, which tiled
+     * the frame 4x across and left the bottom three quarters black. */
+    int got = gr_render_display_hires(argb, (int)(ow * sizeof(uint32_t)),
+                                      (int)di.display_x,
                                       (int)di.display_y, (int)w, (int)h);
-    if (!got) {
-        /* No hi-res surface (scale 1, or a backend without one): resolve the
-         * native display instead and say so, rather than emitting a blank. */
+    /* The resolves return the pixel COUNT they wrote, and a partial cover is a
+     * real case: gr_scale() reports the GL backend's internal scale, but
+     * sw_render_display_hires falls back to the native resolve when the CPU
+     * hi-res mirror does not exist (gpu_sw_renderer.c: !g_hr || g_scale <= 1).
+     * That fills w*h of an ow*oh buffer and still returns non-zero, so testing
+     * `!got` alone would emit a PNG that is mostly untouched allocation. Demand
+     * full cover, else redo it honestly at native size. */
+    if (got < (int)((size_t)ow * oh)) {
+        /* No hi-res surface (scale 1, a backend without one, or a partial
+         * cover): resolve the native display instead and say so, rather than
+         * emitting a blank. */
         scale = 1; ow = w; oh = h;
-        got = gr_render_display(argb, (int)ow, (int)di.display_x,
+        got = gr_render_display(argb, (int)(ow * sizeof(uint32_t)),
+                                (int)di.display_x,
                                 (int)di.display_y, (int)w, (int)h);
-        if (!got) { free(argb); send_err(id, "no display surface"); return; }
+        if (got < (int)((size_t)ow * oh)) {
+            free(argb); send_err(id, "no display surface"); return;
+        }
     }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
@@ -8714,6 +9041,56 @@ static void handle_screenshot_hires(int id, const char *json)
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,"
              "\"height\":%u,\"scale\":%d}", id, path, ow, oh, scale);
+}
+
+/* present_shot — PNG of the COMPOSED renderer output: the frame after SDL fits
+ * the display buffer into the logical surface, i.e. at the aspect the player is
+ * actually looking at.
+ *
+ * The three buffer-level captures above (screenshot / screenshot_file /
+ * screenshot_hires) all resolve the display buffer BEFORE that fit. On a 508x256
+ * display in a 4:3 window they answer 508x256 while the window shows 640x480 —
+ * the same pixels at a different shape. That is correct for faithfulness work
+ * and WRONG for anything aspect-shaped: a widescreen change alters the GTE
+ * squash and the present fit, so validating it against a pre-fit buffer measures
+ * the one stage the change does not touch.
+ *
+ * Staged and fulfilled in the present path (see present_shot_request in
+ * main.cpp), so the ack means "queued", not "written" — the PNG lands on the
+ * next present. Sample `present_shot_seq` before staging and poll it until the
+ * counter moves; `wrote` in that reply says whether a file actually landed.
+ *
+ * Refused up front on headless (no present surface) and on the Vulkan backend,
+ * which presents through its own swapchain and has no readback hook — accepting
+ * there would leave a request nothing can ever fulfil. */
+static void handle_present_shot(int id, const char *json)
+{
+    extern int present_shot_request(const char *path);
+    extern int present_shot_seq(void);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_present_shot.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    if (!present_shot_request(path)) {
+        send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
+                     "which has no present readback)");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"staged\":true,\"seq\":%d}",
+             id, path, present_shot_seq());
+}
+
+/* present_shot_seq — completion counter for the staged capture above. Sample it
+ * before present_shot and poll until it changes; the counter advances on every
+ * completion, success or not, so the poll always terminates. `wrote` reports
+ * whether that completion actually produced a PNG. */
+static void handle_present_shot_seq(int id, const char *json)
+{
+    extern int present_shot_seq(void);
+    extern int present_shot_ok(void);
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"seq\":%d,\"wrote\":%d}",
+             id, present_shot_seq(), present_shot_ok());
 }
 
 /* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
@@ -9332,7 +9709,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
-        if (phys < 0x200000u)
+        if (phys < g_psx_ram_size)
             rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
         else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
             rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
@@ -13348,6 +13725,11 @@ static const CmdEntry s_commands[] = {
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+    { "ws_ui_groups",      handle_ws_ui_groups },
+    { "tex_pack",          handle_tex_pack },
+    { "ws_menu_edge_fill", handle_ws_menu_edge_fill },
+    { "pgxp_depth",        handle_pgxp_depth },
+    { "zbuf",              handle_zbuf },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
@@ -13385,6 +13767,9 @@ static const CmdEntry s_commands[] = {
     { "dma_trace_clear",   handle_dma_trace_clear },
     { "dma_cdrom_history", handle_dma_cdrom_history },
     { "sio_state",         handle_sio_state },
+    { "sio1_state",        handle_sio1_state },
+    { "dual_state",        handle_dual_state },
+    { "dual_input",        handle_dual_input },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },
@@ -13514,6 +13899,9 @@ static const CmdEntry s_commands[] = {
     { "input_route_stop",  handle_input_route_stop },
     { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
+    { "pgxp_census",       handle_pgxp_census },
+    { "pgxp_texcensus",    handle_pgxp_texcensus },
+    { "overclock",         handle_overclock },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },
@@ -13534,6 +13922,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_present_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "screenshot_hires",  handle_screenshot_hires },
+    { "present_shot",      handle_present_shot },
+    { "present_shot_seq",  handle_present_shot_seq },
     { "display_ring_get",  handle_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },

@@ -4,6 +4,7 @@
 #include "iso_reader.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "psx_lobby_client.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -65,7 +66,13 @@ struct RuntimeMods {
     std::filesystem::path effective_disc_path;
     uint32_t entry_phys = 0;
     bool initialized = false;
-    bool main_applied = false;
+    /* PER-MACHINE. Dual-console runs two independent guests that each boot the
+     * disc and each reach the EXE entry, so a single process-global one-shot
+     * meant only whichever console got there FIRST received the mod plan --
+     * the other silently booted stock, i.e. the two consoles ran different
+     * games and could never link. Index by psx_dual_machine_live() (-1 =>
+     * single console => slot 0). */
+    bool main_applied[2] = { false, false };
     bool disc_enabled = false;
     bool disc_guard_failed = false;
 };
@@ -209,6 +216,36 @@ bool restored_main_matches_plan(const RuntimeMods& s, uint32_t& failed_at) {
             failed_at = address;
             return false;
         }
+    }
+    return true;
+}
+
+/* True when every planned MainExe replacement byte is already live in RAM.
+ * Used after savestate restore so we do not re-psx_write + dirty executable
+ * pages for a checkpoint that was saved with the plan already applied
+ * (re-dirty + overlay invalidate soft-locks enhanced 8 MB titles). */
+bool restored_main_has_replacements(const RuntimeMods& s) {
+    std::map<uint32_t, uint8_t> desired;
+    for (const ModResolution::Write& write : s.plan.writes) {
+        if (write.target != ModPatchTarget::MainExe) continue;
+        if (write.fields.empty()) {
+            for (size_t i = 0; i < write.replacement.size(); ++i)
+                desired[(uint32_t)write.location + (uint32_t)i] =
+                    write.replacement[i];
+        } else {
+            for (const ModResolution::Write::Field& field : write.fields) {
+                for (size_t i = 0; i < field.replacement.size(); ++i)
+                    desired[
+                        (uint32_t)write.location +
+                        (uint32_t)field.offset + (uint32_t)i] =
+                        field.replacement[i];
+            }
+        }
+    }
+    if (desired.empty()) return true;
+    for (const auto& kv : desired) {
+        if (psx_read_byte(kv.first) != kv.second)
+            return false;
     }
     return true;
 }
@@ -964,7 +1001,8 @@ int provider_commit(void*, const char* image_path) {
 int provider_commit_netplay(void*, const char* image_path) {
     (void)image_path;
     std::string error;
-    if (!mod_runtime_clear_for_netplay(&error)) {
+    if (!mod_runtime_commit_for_netplay(image_path ? std::filesystem::path(image_path) :
+                                                    std::filesystem::path(), &error)) {
         set_error(error);
         return 0;
     }
@@ -1028,7 +1066,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.effective_disc_path.clear();
     s.entry_phys = 0;
     s.initialized = false;
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
     s.manager.set_root(root);
@@ -1061,7 +1099,7 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     s.raw_overlay_index.clear();
     s.user_overlay_index.clear();
     s.effective_disc_path.clear();
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
     s.error.clear();
@@ -1070,7 +1108,375 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     return true;
 }
 
+/* One CSV element is "<feature>" or "<feature>=<opt>~<val>[+<opt>~<val>]".
+ * Split the name from its option tail. */
+static void feat_token_split(const std::string& token, std::string& name,
+                             std::string& opts) {
+    const size_t eq = token.find('=');
+    if (eq == std::string::npos) {
+        name = token;
+        opts.clear();
+    } else {
+        name = token.substr(0, eq);
+        opts = token.substr(eq + 1);
+    }
+}
+
+static bool feat_csv_wants(const char* csv, const std::string& id) {
+    if (!csv || !csv[0]) return true;
+    const char* p = csv;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') ++p;
+        std::string name, opts;
+        feat_token_split(std::string(start, p), name, opts);
+        if (name == id) return true;
+        if (*p == ',') ++p;
+    }
+    return false;
+}
+
+/* Apply the option values the host published for one feature. */
+static void feat_csv_apply_options(ModPackageManager& mgr,
+                                   const std::string& package_id,
+                                   const std::string& feature_id,
+                                   const char* csv) {
+    if (!csv || !csv[0]) return;
+    const char* p = csv;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') ++p;
+        std::string name, opts;
+        feat_token_split(std::string(start, p), name, opts);
+        if (*p == ',') ++p;
+        if (name != feature_id || opts.empty()) continue;
+        size_t pos = 0;
+        while (pos < opts.size()) {
+            size_t end = opts.find('+', pos);
+            if (end == std::string::npos) end = opts.size();
+            const std::string kv = opts.substr(pos, end - pos);
+            pos = end + 1;
+            const size_t tilde = kv.find('~');
+            if (tilde == std::string::npos) continue;
+            const std::string key = kv.substr(0, tilde);
+            const std::string val = kv.substr(tilde + 1);
+            std::string err;
+            if (!mgr.set_feature_option(package_id, feature_id, key, val, &err)) {
+                std::fprintf(stderr,
+                             "psxrecomp: session plan option %s.%s=%s rejected: "
+                             "%s\n", feature_id.c_str(), key.c_str(),
+                             val.c_str(), err.c_str());
+            }
+        }
+        return;
+    }
+}
+
+static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* error) {
+    RuntimeMods& s = state();
+    if (!s.initialized) return true;
+    for (int pass = 0; pass < 8; ++pass) {
+        bool changed = false;
+        for (const auto& [package_id, versions] : s.manager.packages()) {
+            (void)versions;
+            const ModPackage* package = s.manager.selected_package(package_id);
+            if (!package) continue;
+            int required = -1;
+            for (int i = 0; i < caps.mod_count; ++i) {
+                if (package_id == caps.mods[i].id) {
+                    required = i;
+                    break;
+                }
+            }
+            const bool legacy = package->features.size() == 1 &&
+                                package->features.front().legacy;
+            if (legacy) {
+                const bool want = required >= 0;
+                std::string err;
+                if (!s.manager.set_enabled(package_id, want, &err) && want) {
+                    if (error) *error = err;
+                    return false;
+                }
+                continue;
+            }
+            for (const ModFeature& feature : package->features) {
+                const bool want = required >= 0 &&
+                    feat_csv_wants(caps.mods[required].feats, feature.id);
+                const bool have = s.manager.feature_enabled(package_id, feature.id);
+                if (want == have) continue;
+                std::string err;
+                if (!s.manager.set_feature_enabled(package_id, feature.id, want, &err)) {
+                    if (want) {
+                        if (error) *error = err;
+                        return false;
+                    }
+                    continue;
+                }
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    for (int i = 0; i < caps.mod_count; ++i) {
+        const PsxLobbyModPkg& pkg = caps.mods[i];
+        if (!pkg.id[0] || !pkg.ver[0]) continue;
+        std::string err;
+        if (!s.manager.select_version(pkg.id, pkg.ver, &err)) {
+            if (error) *error = err.empty() ? (std::string(pkg.id) + " is not installed") : err;
+            return false;
+        }
+        const ModPackage* package = s.manager.selected_package(pkg.id);
+        if (!package) {
+            if (error) *error = std::string(pkg.id) + " is not installed";
+            return false;
+        }
+        const bool legacy = package->features.size() == 1 &&
+                            package->features.front().legacy;
+        if (legacy) {
+            if (!s.manager.set_enabled(pkg.id, true, &err)) {
+                if (error) *error = err;
+                return false;
+            }
+            continue;
+        }
+        for (const ModFeature& feature : package->features) {
+            const bool want = feat_csv_wants(pkg.feats, feature.id);
+            if (!s.manager.set_feature_enabled(pkg.id, feature.id, want, &err) && want) {
+                if (error) *error = err;
+                return false;
+            }
+            if (want)
+                feat_csv_apply_options(s.manager, pkg.id, feature.id, pkg.feats);
+        }
+    }
+    return true;
+}
+
+/* LAN / Direct-IP session plan (see mod_runtime.h). Process-global because
+ * it is set from the netplay datagram pump and read at launch commit. */
+static std::string& session_plan_spec() {
+    static std::string spec;
+    return spec;
+}
+
+void mod_runtime_set_session_plan_spec(const std::string& spec) {
+    session_plan_spec() = spec;
+}
+
+static std::string& session_plan_fp() {
+    static std::string fp;
+    return fp;
+}
+
+void mod_runtime_set_session_plan_fp(const std::string& fp) {
+    session_plan_fp() = fp;
+}
+
+const std::string& mod_runtime_session_plan_fp() {
+    return session_plan_fp();
+}
+
+const std::string& mod_runtime_session_plan_spec() {
+    return session_plan_spec();
+}
+
+bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path,
+                                    std::string* error) {
+    if (!psx_lobby_in_lobby()) {
+        /* No lobby server in the picture (LAN / Direct-IP): the host's plan
+         * arrived in the session datagrams instead. Applying it here is what
+         * makes LAN sessions modded rather than silently vanilla. */
+        if (!session_plan_spec().empty()) {
+            if (!mod_runtime_apply_link_spec(session_plan_spec(), disc_path,
+                                             error))
+                return false;
+            return mod_runtime_verify_session_plan_fp(error);
+        }
+        return mod_runtime_clear_for_netplay(error);
+    }
+    const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+    if (!caps || !caps->valid || caps->mod_count <= 0)
+        return mod_runtime_clear_for_netplay(error);
+    if (!apply_host_mod_plan(*caps, error)) return false;
+    if (!mod_runtime_commit(disc_path, error, false)) return false;
+    return mod_runtime_verify_session_plan_fp(error);
+}
+
+/* Post-apply guard: this peer's resolution of the session plan must match the
+ * host's. Divergence here is silent by nature (both sides "have the mods"),
+ * so refuse the launch and name the two fingerprints. */
+bool mod_runtime_verify_session_plan_fp(std::string* error) {
+    const std::string& want = session_plan_fp();
+    if (want.empty()) return true;               /* host published nothing */
+    const std::string got = mod_runtime_plan_fingerprint_portable();
+    if (got.empty() || got == want) return true;
+    if (error) {
+        *error = "this machine resolves the session's mods differently from "
+                 "the host (host " + want.substr(0, 16) + "…, here " +
+                 got.substr(0, 16) + "…) — check that both have the same mod "
+                 "versions and option values";
+    }
+    return false;
+}
+
+/* ===== PSX-Link pair mod propagation (see mod_runtime.h) ================ */
+
+/* Spec delimiters: ';' entries, '@' id/ver, ':' ver/feats, ',' features,
+ * '=' feature/options, '+' between options, '~' key/value. A token holding
+ * any of them (or whitespace) would corrupt the grammar, so it is dropped
+ * rather than silently mis-parsed on the far side. */
+static bool spec_token_safe(const std::string& t) {
+    if (t.empty()) return false;
+    return t.find_first_of(";@:,=+~\n\r ") == std::string::npos;
+}
+
+std::string mod_runtime_link_spec_from_session() {
+    RuntimeMods& s = state();
+    std::string spec;
+    if (!s.initialized) return spec;
+    /* Walk packages in the manager's stable (std::map) order so repeated
+     * calls and both processes produce byte-identical specs. The enabled
+     * test mirrors ae_np_fill_required_mods' provider walk, so a link
+     * follower applies exactly what the lobby would have published. */
+    for (const auto& [package_id, versions] : s.manager.packages()) {
+        (void)versions;
+        const ModPackage* package = s.manager.selected_package(package_id);
+        if (!package) continue;
+        std::string feats;
+        for (const ModFeature& feature : package->features) {
+            if (!s.manager.feature_enabled(package_id, feature.id)) continue;
+            if (!feats.empty()) feats += ',';
+            feats += feature.id;
+            /* Option values ride with their feature: two peers running the
+             * same feature with different option values resolve different
+             * bytes, which is invisible to an id/version-only plan and only
+             * shows up as a mid-race desync. */
+            std::string opts;
+            for (const ModOption& option : package->options) {
+                if (option.feature_id != feature.id) continue;
+                const std::string value =
+                    s.manager.feature_option_value(package_id, feature.id,
+                                                   option.id);
+                if (value.empty()) continue;
+                if (!spec_token_safe(option.id) || !spec_token_safe(value))
+                    continue;      /* never emit a token that breaks parsing */
+                opts += opts.empty() ? '=' : '+';
+                opts += option.id;
+                opts += '~';
+                opts += value;
+            }
+            feats += opts;
+        }
+        if (feats.empty()) continue;   /* nothing enabled in this package */
+        if (!spec.empty()) spec += ';';
+        spec += package_id;
+        spec += '@';
+        spec += package->version;
+        spec += ':';
+        spec += feats;
+    }
+    return spec;
+}
+
+bool mod_runtime_apply_link_spec(const std::string& spec,
+                                 const std::filesystem::path& disc_path,
+                                 std::string* error) {
+    if (spec.empty())
+        return mod_runtime_clear_for_netplay(error);
+
+    /* Reuse the lobby application path verbatim: the spec is just a caps
+     * mod list by another transport, so the follower runs the exact same
+     * enable/version resolution the lobby peers run. */
+    PsxLobbyMatchCaps caps{};
+    caps.valid = 1;
+    size_t pos = 0;
+    while (pos < spec.size() && caps.mod_count < PSX_LOBBY_MAX_MODS) {
+        size_t end = spec.find(';', pos);
+        if (end == std::string::npos) end = spec.size();
+        std::string entry = spec.substr(pos, end - pos);
+        pos = end + 1;
+        if (entry.empty()) continue;
+        const size_t at = entry.find('@');
+        if (at == std::string::npos) {
+            if (error) *error = "malformed link mod spec entry: " + entry;
+            return false;
+        }
+        std::string id = entry.substr(0, at);
+        std::string rest = entry.substr(at + 1);
+        std::string ver = rest;
+        std::string feats;
+        const size_t colon = rest.find(':');
+        if (colon != std::string::npos) {
+            ver = rest.substr(0, colon);
+            feats = rest.substr(colon + 1);
+        }
+        PsxLobbyModPkg& pkg = caps.mods[caps.mod_count++];
+        std::snprintf(pkg.id, sizeof pkg.id, "%s", id.c_str());
+        std::snprintf(pkg.ver, sizeof pkg.ver, "%s", ver.c_str());
+        std::snprintf(pkg.name, sizeof pkg.name, "%s", id.c_str());
+        std::snprintf(pkg.feats, sizeof pkg.feats, "%s", feats.c_str());
+    }
+    if (!apply_host_mod_plan(caps, error)) return false;
+    return mod_runtime_commit(disc_path, error, false);
+}
+
+std::string mod_runtime_plan_fingerprint_portable() {
+    RuntimeMods& s = state();
+    if (!s.initialized) return std::string();
+    /* Empty disc sha on purpose: peers legitimately hold different dumps of
+     * the same title, and disc identity is already matched by the lobby's own
+     * disc fingerprint. What must agree here is the MOD plan. */
+    const ModResolution r = s.manager.resolve(s.game_id, s.exe_sha256,
+                                              std::string());
+    return r.fingerprint;
+}
+
+uint32_t mod_runtime_link_spec_hash(const std::string& spec) {
+    /* FNV-1a: identity only (pair cfg cross-check), never persisted. */
+    uint32_t h = 2166136261u;
+    for (unsigned char c : spec) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+bool mod_runtime_export_package(const std::string& id, const std::string& version,
+                                std::vector<uint8_t>& out, std::string* sha256_hex,
+                                std::string* error) {
+    if (!state().manager.export_archive(id, version, out, error)) return false;
+    if (sha256_hex) {
+        uint8_t digest[32];
+        psx_sha256_compute(out.data(), out.size(), digest);
+        sha256_hex->assign(64, '0');
+        static const char* kHex = "0123456789abcdef";
+        for (int i = 0; i < 32; ++i) {
+            (*sha256_hex)[(size_t)i * 2] = kHex[digest[i] >> 4];
+            (*sha256_hex)[(size_t)i * 2 + 1] = kHex[digest[i] & 0xf];
+        }
+    }
+    return true;
+}
+
+bool mod_runtime_install_bytes(const uint8_t* data, size_t size, std::string* error) {
+    std::string err;
+    if (!state().manager.install_archive_bytes(data, size, nullptr, nullptr, &err)) {
+        if (err.find("already installed") != std::string::npos) {
+            if (error) error->clear();
+            return true;
+        }
+        if (error) *error = err;
+        return false;
+    }
+    return true;
+}
+
 bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error) {
+    return mod_runtime_commit(disc_path, error, true);
+}
+
+bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error,
+                        bool persist) {
     RuntimeMods& s = state();
     if (!s.initialized) return true;
     if (disc_path != s.disc_path) {
@@ -1111,20 +1517,24 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
         if (error) *error = s.error;
         return false;
     }
-    if (!s.manager.save_state(&s.error)) {
+    if (persist && !s.manager.save_state(&s.error)) {
         if (error) *error = s.error;
         return false;
     }
     s.plan = std::move(plan);
     build_disc_index(s);
     s.effective_disc_path = std::move(effective_disc);
-    s.main_applied = false;
+    s.main_applied[0] = s.main_applied[1] = false;
     s.error.clear();
     return true;
 }
 
 const std::string& mod_runtime_fingerprint() {
     return state().plan.fingerprint;
+}
+
+extern "C" const char* psx_mod_runtime_fingerprint_cstr(void) {
+    return state().plan.fingerprint.c_str();
 }
 
 const std::filesystem::path& mod_runtime_effective_disc_path() {
@@ -1139,32 +1549,38 @@ const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
 
 } // namespace PSXRecompV4
 
+extern "C" int psx_dual_machine_live(void);
+
+/* Which console is asking. -1 (single console) folds to slot 0. */
+static int mod_runtime_machine_slot() {
+    return (psx_dual_machine_live() == 1) ? 1 : 0;
+}
+
 extern "C" void mod_runtime_on_dispatch(uint32_t target) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
-    if (!s.initialized || s.main_applied ||
+    const int slot = mod_runtime_machine_slot();
+    if (!s.initialized || s.main_applied[slot] ||
         (target & 0x1FFFFFFFu) != s.entry_phys) return;
 
-    for (const ModResolution::Write& write : s.plan.writes) {
-        if (write.target != ModPatchTarget::MainExe) continue;
-        for (size_t i = 0; i < write.expected.size(); ++i) {
-            if (psx_read_byte((uint32_t)write.location + (uint32_t)i) !=
-                write.expected[i]) {
-                std::fprintf(stderr,
-                    "psxrecomp: mod plan %s rejected at 0x%08X "
-                    "(expected-byte guard failed; booting unmodified)\n",
-                    s.plan.fingerprint.c_str(),
-                    (unsigned)((uint32_t)write.location + (uint32_t)i));
-                s.main_applied = true;
-                return;
-            }
-        }
+    /* Disc overlays can rewrite the boot EXE while the BIOS LoadExe path
+     * reads it, so by entry RAM may already hold plan replacements. Accept
+     * stock expected OR the planned replacement (same rule as savestate
+     * reapply); reject only when live bytes match neither. */
+    uint32_t failed_at = 0;
+    if (!restored_main_matches_plan(s, failed_at)) {
+        std::fprintf(stderr,
+            "psxrecomp: mod plan %s rejected at 0x%08X "
+            "(expected-byte guard failed; booting unmodified)\n",
+            s.plan.fingerprint.c_str(), (unsigned)failed_at);
+        s.main_applied[slot] = true;
+        return;
     }
     for (const ModResolution::Write& write : s.plan.writes) {
         if (write.target != ModPatchTarget::MainExe) continue;
         apply_main_write(write);
     }
-    s.main_applied = true;
+    s.main_applied[slot] = true;
     if (!s.plan.writes.empty())
         std::fprintf(stdout, "psxrecomp: applied mod plan %s\n",
                      s.plan.fingerprint.c_str());
@@ -1175,15 +1591,23 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
 
-    if (!s.main_applied) {
-        uint32_t failed_at = 0;
-        if (!restored_main_matches_plan(s, failed_at)) {
-            std::fprintf(stderr,
-                "psxrecomp: mod plan %s rejected after savestate restore at "
-                "0x%08X (expected-byte guard failed)\n",
-                s.plan.fingerprint.c_str(), (unsigned)failed_at);
-            return;
-        }
+    /* Always validate: stock expected OR planned replacement. Reject only
+     * when live bytes match neither (corrupt / foreign checkpoint). */
+    uint32_t failed_at = 0;
+    if (!restored_main_matches_plan(s, failed_at)) {
+        std::fprintf(stderr,
+            "psxrecomp: mod plan %s rejected after savestate restore at "
+            "0x%08X (expected-byte guard failed)\n",
+            s.plan.fingerprint.c_str(), (unsigned)failed_at);
+        return;
+    }
+
+    /* Checkpoint saved under this plan already carries replacements in RAM.
+     * Re-psx_write + dirty_ram_mark_executable_range after overlay invalidate
+     * soft-locks enhanced 8 MB sessions; leave bytes alone. */
+    if (restored_main_has_replacements(s)) {
+        s.main_applied[mod_runtime_machine_slot()] = true;
+        return;
     }
 
     bool applied = false;
@@ -1192,7 +1616,7 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
         apply_main_write(write);
         applied = true;
     }
-    s.main_applied = true;
+    s.main_applied[mod_runtime_machine_slot()] = true;
     if (applied)
         std::fprintf(stdout,
             "psxrecomp: reapplied mod plan %s after savestate restore\n",
@@ -1292,6 +1716,7 @@ extern "C" int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback) {
     using namespace PSXRecompV4;
     if (!id || !*id || !address || !callback) return 0;
+    if (!mod_register_function_entry_plugin_id(id)) return 0;
     auto& plugins = function_entry_plugins();
     const auto duplicate = std::find_if(
         plugins.begin(), plugins.end(), [&](const FunctionEntryPlugin& item) {
@@ -1305,8 +1730,19 @@ extern "C" int psx_mod_register_function_entry_plugin(
 extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
     if (!cpu) return;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return;
     for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
-        if (plugin.address == address) plugin.callback(cpu, address);
+        if (plugin.address != address) continue;
+        bool enabled = false;
+        for (const ModResolution::Plugin& planned : s.plan.plugins) {
+            if (planned.id == plugin.id) {
+                enabled = true;
+                break;
+            }
+        }
+        if (!enabled) continue;
+        plugin.callback(cpu, address);
     }
 }
 

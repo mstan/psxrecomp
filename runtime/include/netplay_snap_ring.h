@@ -3,7 +3,8 @@
 
 /*
  * MotK snap ring: opaque blob ring from retcomm-rbengine; save/load wrap
- * boot_state serialize (PSX-specific).
+ * boot_state serialize (PSX-specific). Default depth comes from
+ * RBE_SNAP_RING_DEFAULT_DEPTH (40: TipHold runway + FMV slack).
  */
 
 #include <stddef.h>

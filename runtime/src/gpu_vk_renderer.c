@@ -2306,9 +2306,9 @@ static void flush_cpu_upload(void) {
 
 /* GPU -> CPU mirror: drain batches, pack, copy the whole raw mirror down. */
 static void ensure_cpu(void) {
-    extern int psx_netplay_active(void);
+    extern int psx_netplay_determinism_active(void);
     if (!s_ready || !s_gpu_dirty || !s_vram) return;
-    if (psx_netplay_active()) {
+    if (psx_netplay_determinism_active()) {
         s_gpu_dirty = 0;
         return;
     }

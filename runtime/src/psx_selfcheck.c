@@ -493,7 +493,7 @@ void psx_selfcheck_finish_frame(int defer_window)
 {
     if (s_phase == SC_OFF)
         return;
-    if (psx_netplay_active()) {
+    if (psx_netplay_determinism_active()) {
         /* Netplay owns the resim machinery from here on. */
         fprintf(stderr, "psxrecomp: selfcheck off (netplay active)\n");
         fflush(stderr);
@@ -906,7 +906,7 @@ void psx_selfcheck_flush_load(void)
 {
     if (s_phase != SC_LOAD_WAIT || !s_load_after_present)
         return;
-    if (psx_netplay_active())
+    if (psx_netplay_determinism_active())
         return;
     /* Prefer span-end present: same VBlank boundary for every rewind. */
     sc_do_load(s_cpu, "present");
@@ -951,7 +951,7 @@ void psx_selfcheck_poll(struct CPUState *cpu, uint32_t resume_pc)
 {
     if (s_phase != SC_SAVE_WAIT && s_phase != SC_LOAD_WAIT)
         return;
-    if (!cpu || psx_netplay_active())
+    if (!cpu || psx_netplay_determinism_active())
         return;
 
     if (s_phase == SC_SAVE_WAIT) {

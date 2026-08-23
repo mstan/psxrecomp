@@ -172,9 +172,12 @@ Generate & rebuild / prepare flows should point at the **`.cue`**, not a lone
   netplay.
 - **VERSION / lobby match pin:** peers should run the same release pin so
   generated code and protocol stay compatible.
-- **Mods:** disabled for all netplay sessions (lobby / LAN / direct / rematch).
-  Launcher `commit_netplay` and the runtime clear the in-session plan without
-  touching the user's offline mod selection. Synced mod plans are deferred.
+- **Mods:** the **host** determines the match’s package/feature set via
+  `match_caps.mods`. Online peers are prompted **before seating** if they are
+  missing those packages; the lobby WebSocket can transfer `.psxmod` zips
+  host → peer, then the peer rejoins. Empty host plan stays vanilla. LAN /
+  direct IP does not transfer packages and still launches vanilla. Offline
+  selection is not rewritten (`commit_netplay` persist=false).
 
 ---
 

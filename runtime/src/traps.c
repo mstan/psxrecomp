@@ -14,6 +14,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include "psx_fiber.h"   /* cross-platform fibers (Win32 fibers / POSIX ucontext) */
+#include "fntrace.h"
 #include "psx_scheduler.h" /* deterministic TCB scheduler carve-out (scaffolding) */
 #include "parity_trace.h"  /* general two-process control-flow parity ring */
 
@@ -240,6 +241,24 @@ enum {
 };
 uint32_t g_pc0_reason = PSX_PC0_GUEST_RETURN;
 
+/* pc=0 escape journal — see cpu_state.h for the site enum and rationale. */
+Pc0JournalEntry g_pc0j_ring[PSX_PC0J_CAP];
+uint64_t g_pc0j_seq = 0;
+void psx_pc0_journal_note(uint32_t site, CPUState *cpu, uint32_t a, uint32_t d)
+{
+    extern int g_psx_dispatch_depth;
+    extern uint64_t s_frame_count;   /* present frame counter (debug_server.c) */
+    Pc0JournalEntry *e = &g_pc0j_ring[g_pc0j_seq % PSX_PC0J_CAP];
+    e->seq   = g_pc0j_seq++;
+    e->site  = site;
+    e->frame = (uint32_t)s_frame_count;
+    e->depth = g_psx_dispatch_depth;
+    e->a = a;
+    e->b = cpu->gpr[31];
+    e->c = cpu->cop0[14];
+    e->d = d;
+}
+
 static uint32_t psx_current_tcb_ptr(CPUState* cpu)
 {
     uint32_t tcbh = cpu->read_word(0x00000108u);
@@ -399,6 +418,90 @@ typedef struct HostThreadFiber {
 static HostThreadFiber s_host_threads[32];
 static psx_fiber_t s_main_fiber;
 
+/* ===== dual-console machine context (dual_machine.c) ======================
+ * Everything scheduler/exception-layer that is per-MACHINE but lives in host
+ * statics. With each machine on its own fiber tree the jmp_bufs stay valid
+ * across a swap (they target that machine's preserved stacks); the TCB->fiber
+ * table must swap so two machines' identical guest TCB addresses do not
+ * collide on host fibers. Opaque to callers. */
+static int g_in_scheduler_run;   /* defined below (scheduler loop) */
+static psx_fiber_t psx_current_host_fiber(void);  /* defined below */
+
+typedef struct PsxSchedMachineCtx {
+    jmp_buf            sched_jmpbuf;
+    psx_sched_escape_t escape;
+    uint32_t           return_tcb;
+    int                top_level_resume;
+    int                in_scheduler_run;
+    HostThreadFiber    host_threads[32];
+    int                dispatch_depth;
+    int                call_bail;
+    int                call_unit_depth;
+    jmp_buf            exc_jmpbuf;
+    void              *exc_owner_fiber;
+    int                exc_pending_longjmp;
+} PsxSchedMachineCtx;
+
+size_t psx_sched_machine_ctx_size(void) { return sizeof(PsxSchedMachineCtx); }
+
+void psx_sched_machine_swap_out(void *out_v) {
+    PsxSchedMachineCtx *out = (PsxSchedMachineCtx *)out_v;
+    extern int g_psx_dispatch_depth;
+    extern int g_call_unit_depth;
+    extern void *g_exception_owner_fiber;
+    extern int g_pending_exception_longjmp;
+    extern jmp_buf exception_jmpbuf;
+    memcpy(out->sched_jmpbuf, g_scheduler_jmpbuf, sizeof(jmp_buf));
+    out->escape           = g_sched_escape;
+    out->return_tcb       = g_sched_return_tcb;
+    out->top_level_resume = psx_scheduler_top_level_resume_active();
+    out->in_scheduler_run = g_in_scheduler_run;
+    memcpy(out->host_threads, s_host_threads, sizeof(s_host_threads));
+    out->dispatch_depth   = g_psx_dispatch_depth;
+    out->call_bail        = g_psx_call_bail;
+    out->call_unit_depth  = g_call_unit_depth;
+    memcpy(out->exc_jmpbuf, exception_jmpbuf, sizeof(jmp_buf));
+    out->exc_owner_fiber      = g_exception_owner_fiber;
+    out->exc_pending_longjmp  = g_pending_exception_longjmp;
+}
+
+void psx_sched_machine_swap_in(const void *in_v) {
+    const PsxSchedMachineCtx *in = (const PsxSchedMachineCtx *)in_v;
+    extern int g_psx_dispatch_depth;
+    extern int g_call_unit_depth;
+    extern void *g_exception_owner_fiber;
+    extern int g_pending_exception_longjmp;
+    extern jmp_buf exception_jmpbuf;
+    extern void psx_scheduler_top_level_resume_clear(void);
+    memcpy(g_scheduler_jmpbuf, in->sched_jmpbuf, sizeof(jmp_buf));
+    g_sched_escape     = in->escape;
+    g_sched_return_tcb = in->return_tcb;
+    if (!in->top_level_resume) psx_scheduler_top_level_resume_clear();
+    g_in_scheduler_run = in->in_scheduler_run;
+    memcpy(s_host_threads, in->host_threads, sizeof(s_host_threads));
+    g_psx_dispatch_depth = in->dispatch_depth;
+    g_psx_call_bail      = in->call_bail;
+    g_call_unit_depth    = in->call_unit_depth;
+    memcpy(exception_jmpbuf, in->exc_jmpbuf, sizeof(jmp_buf));
+    g_exception_owner_fiber     = in->exc_owner_fiber;
+    g_pending_exception_longjmp = in->exc_pending_longjmp;
+}
+
+/* Clean context for a machine that has never run: empty TCB-fiber table,
+ * no escapes, zero depths. Its root fiber entry calls psx_scheduler_run,
+ * which setjmps before any longjmp can occur, so the jmp_bufs' contents
+ * are never consumed. */
+void psx_sched_machine_ctx_init(void *ctx_v) {
+    memset(ctx_v, 0, sizeof(PsxSchedMachineCtx));
+    ((PsxSchedMachineCtx *)ctx_v)->escape.reason = PSX_RUN_CONTINUE;
+    ((PsxSchedMachineCtx *)ctx_v)->in_scheduler_run = 1;
+}
+
+/* Root fiber for the calling thread (converting it on first use). */
+psx_fiber_t psx_sched_root_fiber(void) {
+    return psx_current_host_fiber();
+}
+
 static uint32_t psx_tcb_state(CPUState* cpu, uint32_t tcb)
 {
     return psx_is_valid_tcb(cpu, tcb) ? cpu->read_word(tcb) : 0;
@@ -555,6 +658,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     if (current_tcb == target_tcb) {
         debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
         g_pc0_reason = PSX_PC0_CHANGE_SELF;
+        psx_pc0_journal_note(PSX_PC0J_TRAP_CHANGE_SELF, cpu, target_tcb, 0);
         cpu->pc = 0;
         return 1;
     }
@@ -625,6 +729,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 
     debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
     g_pc0_reason = PSX_PC0_FIBER_SWITCH;
+    psx_pc0_journal_note(PSX_PC0J_TRAP_FIBER_SWITCH, cpu, 0, 0);
     cpu->pc = 0;
     return 1;
 }
@@ -943,6 +1048,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
             cpu->gpr[2] = sr & 1u; /* return old IEc */
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_CRIT_ENTER, cpu, sr, 0);
             cpu->pc = 0;
             /* Directly handled "void" syscall. Return 0: under CPS the caller
              * (`if (psx_syscall(...)) return;`) falls through to the inline
@@ -955,6 +1061,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_CRIT_EXIT, cpu, sr, 0);
             cpu->pc = 0;
             return 0;
 
@@ -1106,6 +1213,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * or uninitialized callback slot is dispatched. */
     if (addr == 0) {
         g_pc0_reason = PSX_PC0_DISPATCH_MISS; /* guest jumped/returned to a null (0) target */
+        psx_pc0_journal_note(PSX_PC0J_TRAP_NULL_TARGET, cpu, addr, 0);
         cpu->pc = 0;
         return;
     }
@@ -1117,6 +1225,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * the exception handler, longjmp back to psx_check_interrupts to
      * properly unwind the handler call tree. */
     if (addr == 0x80000048u && psx_get_in_exception()) {
+        psx_pc0_journal_note(PSX_PC0J_TRAP_SENTINEL, cpu, addr, 1);
         cpu->pc = 0;
         psx_exception_longjmp(); /* does not return */
     }
@@ -1136,6 +1245,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         g_sentinel_reach_async = g_async_rfe_resume_pc;
         if (g_async_rfe_resume_pc != 0u) {
             g_async_rfe_fire_count++;
+            psx_pc0_journal_note(PSX_PC0J_TRAP_ASYNC_RFE, cpu,
+                                 g_async_rfe_resume_pc, 0);
             cpu->pc = g_async_rfe_resume_pc;
             return;
         }
@@ -1151,6 +1262,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * the psx_dispatch tail-call loop picking up $ra), it's a no-op — the
      * continuation was already handled by the merged function. */
     if (phys == 0x00000E10u) {
+        psx_pc0_journal_note(PSX_PC0J_TRAP_E10_NOOP, cpu, addr, 0);
         cpu->pc = 0;
         return;
     }
@@ -1422,6 +1534,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
          * ring-recorded above. Stale registers WILL corrupt the caller —
          * diagnostic use only. */
         g_pc0_reason = PSX_PC0_DISPATCH_MISS;
+        psx_pc0_journal_note(PSX_PC0J_TRAP_STALE_MISS, cpu, addr, 0);
         cpu->pc = 0;
     }
 }

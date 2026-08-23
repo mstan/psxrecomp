@@ -22,6 +22,7 @@ static int s_cd_ready = 0;
 static uint32_t s_dma_ready_cycles = 0;
 
 void sio_advance(uint32_t cycles) { (void)cycles; }
+void sio1_advance(uint32_t cycles) { (void)cycles; }
 
 void cdrom_advance(uint32_t cycles) {
     if (s_cd_ready) return;
@@ -53,6 +54,7 @@ uint32_t dma_cycles_to_deliverable_irq(uint32_t mask) {
     return UINT32_MAX;
 }
 uint32_t sio_cycles_to_irq(uint32_t mask) { (void)mask; return UINT32_MAX; }
+uint32_t sio1_cycles_to_irq(uint32_t mask) { (void)mask; return UINT32_MAX; }
 int psx_get_in_exception(void) { return 0; }
 
 void starvation_watchdog_check(void) {}

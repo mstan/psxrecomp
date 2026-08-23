@@ -15,7 +15,9 @@ typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
 /*
  * Register a trusted, statically linked plugin implementation. Package
  * manifests select implementations by this stable id; archives never provide
- * native code or symbol names.
+ * native code or symbol names. Activation / VBlank / function-entry ids all
+ * count as registered for package resolve; function-entry callbacks only run
+ * when the committed plan lists that id.
  */
 int psx_mod_register_activation_plugin(const char* id,
                                        PSXModActivationCallback callback);
@@ -104,6 +106,20 @@ int psx_mod_set_adaptive_display_aspect(uint32_t max_numerator,
 int psx_mod_set_native_vblank_rate(uint32_t frames_per_second);
 
 /*
+ * GooseStation-style Nx CRTC: divide guest cycles per VBlank by `multiplier`
+ * (1 = stock, 2 = NTSC 120 Hz / PAL 100 Hz). Pair with
+ * psx_mod_set_native_vblank_rate(base_hz * multiplier) so wall-clock and
+ * guest time stay aligned; otherwise audio and realtime speed drift.
+ */
+int psx_mod_set_crtc_refresh_multiplier(uint32_t multiplier);
+/*
+ * Force the guest VBlank IRQ period to a fixed CRTC rate (50 or 60 Hz), or
+ * pass 0 to follow GP1(08h) again. Does not change the GPU video-mode bit —
+ * NTSC display programming can keep a 50 Hz IRQ for audio-safe PAL ports.
+ */
+int psx_mod_set_crtc_vblank_hz(uint32_t hz);
+
+/*
  * Enable presentation-only frame interpolation while leaving guest VBlank,
  * game logic, timers, and audio at their stock cadence. The OpenGL presenter
  * blends between completed guest frames at the requested output rate.
@@ -122,6 +138,19 @@ enum {
 };
 int psx_mod_set_frame_interpolation_blend(uint32_t blend_mode);
 int psx_mod_set_auto_skip_fmv(int enabled);
+
+/*
+ * Select the artwork tiled into the letterbox/pillarbox margins ([video]
+ * bezel). Accepts "off", "random", a bare name resolved against
+ * <exe dir>/bezels/<name>.png, or a path relative to the disc directory —
+ * the same vocabulary as the config key, so a game can move margin artwork
+ * out of game.toml and into its mod catalog the way widescreen and frame
+ * interpolation already are. Must be called from an activation plugin: the
+ * art is loaded once, right after the GL context is created. Margins are a
+ * property of the presented frame, so this draws only on the OpenGL
+ * renderer, and only when the game rect does not fill the window.
+ */
+int psx_mod_set_bezel(const char* selection);
 
 /*
  * Upper bounds for the two loading-speed knobs below. Both are generous on
@@ -156,6 +185,22 @@ int psx_mod_set_load_acceleration(uint32_t wall_clock_multiplier,
  */
 int psx_mod_set_disc_speed(uint32_t divisor,
                            uint32_t instant_max_per_frame);
+
+/*
+ * DuckStation-style unique 8 MiB main RAM (full high window registered).
+ * Must be called from an activation plugin before memory_init. Default is
+ * retail 2 MB. Still-aliased code PCs fold to low 2 MiB for AOT. Both
+ * netplay peers must match.
+ */
+int psx_mod_set_main_ram_8mb(int enabled);
+
+/* Fingerprint of the resolved mod plan for this session ("" when no mods
+ * runtime is active). Savestates embed it (BS_SEC_MODSET) so a load into a
+ * session with a different enabled mod set refuses cleanly. */
+const char* psx_mod_runtime_fingerprint_cstr(void);
+
+/* Mark a guest main-RAM range unique under 8 MB mode (optional narrowing). */
+void psx_ram_register_unique(uint32_t addr, uint32_t len);
 
 /*
  * Override one player's resolved controller presentation mode for this launch.

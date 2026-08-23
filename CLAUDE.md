@@ -510,3 +510,33 @@ all handle install-at-runtime code this way. PSXRecomp v4 follows suit.
 Implementation lives in `runtime/src/dirty_ram_interp.c` (or similar). It
 is intentionally small (~300 LOC), modular, and isolated. It does NOT
 expand into a general-purpose CPU emulator.
+---
+
+## 19. Rewind stays ON. It is never a performance excuse.
+
+Rewind (`psx_rewind.c`, `[video] rewind_depth` / `rewind_interval`,
+`PSX_REWIND`) is a **shipped, always-enabled feature**. Every performance
+number that matters is a number measured with rewind running, because that
+is what the player runs.
+
+**Forbidden:**
+
+- A/B'ing a performance problem with `PSX_REWIND=0` and reporting the
+  delta as a finding. Disabling rewind is not an experiment, it is
+  changing the product.
+- "The hitch is rewind snapshots" as a root cause, diagnosis, or
+  recommendation. That is a non-answer: rewind is not going away, so the
+  statement carries no action.
+- Any fix, config default, or `game.toml` / `settings.toml` change that
+  lowers rewind depth/interval, gates rewind off for a title, or skips
+  captures to buy frame time.
+
+**Required instead:** if capture cost shows up in a profile, the work is to
+make the *capture path itself* cheaper — snapshot serialization, the
+`rbe_snap_ring` store, `capture_thumb`, the `list_push` memmove — while
+depth and interval stay exactly where the user set them. Same rule as
+Rule -1: fix the real code, do not disable the feature to hide the cost.
+
+Hitches at menu entry, level load, and post-FMV transitions have real
+causes in the emulation and render paths. Find those. Rewind is a constant,
+not a variable.

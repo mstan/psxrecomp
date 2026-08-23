@@ -79,6 +79,34 @@ void psx_advance_cycles(uint32_t cycles);
  * on the HARD_CAP / event cadence, ≥ every 16K guest cycles) — not on every
  * per-instruction charge. MotK VLC issues millions of advances/s; two add+
  * branch pairs there were pure host tax. */
+/* CPU overclock. The guest CPU runs as native code, so "faster CPU" cannot
+ * mean "execute quicker" -- it means CHARGE LESS for the same work. Every
+ * device schedules off psx_cycle_count and the CRTC fires VBlank on a fixed
+ * cycle period, so scaling the per-instruction charge down by N lets the CPU
+ * complete N times as much work per frame while timers, SPU, CDROM and the
+ * refresh rate keep their real-world rates. Scaling the VBlank period instead
+ * would slow everything EXCEPT the CPU, which is the opposite.
+ *
+ * Q16 fixed point with a carried remainder rather than a divide: this is the
+ * hottest path in the runtime (millions of charges/sec), and integer division
+ * of a 1-2 cycle instruction cost would floor to zero and lose all time.
+ * 65536 == 1.0 == stock, and the accumulator makes the total charge exact
+ * over time rather than drifting by the truncation each call. */
+extern uint32_t g_psx_oc_scale_q16;
+extern uint32_t g_psx_oc_accum;
+
+/* percent: 100 = stock. hueponik's pal100full8 needs >900%. */
+void     psx_set_cpu_overclock(uint32_t percent);
+uint32_t psx_get_cpu_overclock(void);
+
+static inline uint32_t psx_oc_apply(uint32_t cycles) {
+    if (g_psx_oc_scale_q16 == 65536u) return cycles;   /* stock: exact */
+    uint64_t t = (uint64_t)cycles * (uint64_t)g_psx_oc_scale_q16
+               + (uint64_t)g_psx_oc_accum;
+    g_psx_oc_accum = (uint32_t)(t & 0xFFFFu);
+    return (uint32_t)(t >> 16);
+}
+
 static inline void psx_advance_cycles(uint32_t cycles) {
 #if !defined(PSX_COSIM)
     if (g_psx_cyc_batch) {
@@ -88,7 +116,7 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         if (cycles <= UINT32_MAX - b) cycles += b;
         else {
             /* Extreme: publish b first, then continue with cycles. */
-            psx_cycle_count += (uint64_t)b;
+            psx_cycle_count += (uint64_t)psx_oc_apply(b);
             if (!psx_in_device_service &&
                 (psx_next_service_cycle == 0u ||
                  psx_cycle_count >= psx_next_service_cycle)) {
@@ -111,9 +139,20 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         return;
     }
     if (psx_in_device_service) {
+        /* RAW, not overclocked. Charges made while servicing a device are the
+         * device's own time, not CPU instruction retirement. Scaling them too
+         * compresses DMA and peripheral work by the same factor, which is not
+         * an overclock but a speed hack on the whole machine -- and it broke
+         * boot outright at 10x while 3x survived.
+         *
+         * DuckStation overclocks the CPU alone: device delays keep their
+         * real-world duration. Same intent here. */
         psx_cycle_count += (uint64_t)cycles;
         return;
     }
+    /* CPU instruction retirement: this is the only charge an overclock scales. */
+    cycles = psx_oc_apply(cycles);
+    if (cycles == 0u) return;
     psx_cycle_count += (uint64_t)cycles;
     if (psx_next_service_cycle == 0u ||
         psx_cycle_count >= psx_next_service_cycle) {

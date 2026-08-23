@@ -1,4 +1,5 @@
 #include "boot_state.h"
+#include "netplay_ram_dirty.h"
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "dirty_ram_interp.h"
 #include "gpu.h"           /* gpu_get_vram — CPU-auth mirror under dual-raster   */
@@ -8,12 +9,15 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
+#include "psx_ram.h"
 #include "pst_wire.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include "tex_pack.h"
+#include "mod_plugins.h"
 #if defined(_WIN32)
 #  include <windows.h>
 #else
@@ -37,7 +41,6 @@ static double boot_state_mono_ms(void) {
 /* Compress payloads at/above this size (RAM/VRAM/SPU/dirty dominate I/O). */
 #define BOOT_STATE_ZLIB_MIN 256u
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
 #define SPAD_SIZE  (1024u)
 #define VRAM_W     1024
 #define VRAM_H     512
@@ -45,6 +48,20 @@ static double boot_state_mono_ms(void) {
 
 /* ---- core accessors (existing runtime modules) ---- */
 extern uint8_t*  memory_get_ram_ptr(void);
+
+/* Sections the caller owns by other means and does not want in the blob.
+ * Dual-console machine switching hands RAM over by swapping DRAM bank pointers
+ * (memory_ram_bank_activate), so carrying 8 MiB of it through every switch
+ * blob is pure copying. Excluded sections are neither written nor required. */
+static uint32_t s_section_exclude;
+/* Only these may be excluded — each has a matching guard at its write site. */
+#define BS_SEC_EXCLUDABLE ((1u << BS_SEC_RAM) | (1u << BS_SEC_VRAM) | \
+                           (1u << BS_SEC_SPURAM) | (1u << BS_SEC_CPU))
+
+void boot_state_set_section_exclude(uint32_t mask) { s_section_exclude = mask; }
+uint32_t boot_state_section_exclude(void) { return s_section_exclude; }
+
+extern uint32_t  memory_get_ram_bytes(void);
 extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
@@ -74,6 +91,10 @@ extern int      dma_snapshot_read(const uint8_t* p, uint32_t len);
 extern uint32_t sio_snapshot_bytes(void);
 extern void     sio_snapshot_write(uint8_t* p);
 extern int      sio_snapshot_read(const uint8_t* p, uint32_t len);
+extern uint32_t sio1_snapshot_bytes(void);
+extern void     sio1_snapshot_write(uint8_t* p);
+extern int      sio1_snapshot_read(const uint8_t* p, uint32_t len);
+extern void     sio1_init(void);
 extern uint32_t mdec_snapshot_bytes(void);
 extern void     mdec_snapshot_write(uint8_t* p);
 extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
@@ -82,6 +103,9 @@ extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
 #define CPU_REGS_WIRE_BYTES (524u)
 /* Timer wire: 3*u16 + 3*u32 + 3*u16 + 3*i32 + 3*u32 = 48 bytes (no pad holes). */
 #define TIMER_REGS_WIRE_BYTES (48u)
+
+static int s_quiet_load;
+void boot_state_set_quiet_load(int on) { s_quiet_load = on ? 1 : 0; }
 
 /* ---- deferred capture state (armed before first boot, fired at handoff) ---- */
 static char     s_capture_path[512];
@@ -192,6 +216,10 @@ typedef struct BsOut {
     size_t   len;
     size_t   cap;
     int      no_zlib; /* 1 => always raw sections (netplay snap ring) */
+    uint32_t sections;/* sections actually written; backpatched into the header.
+                       * The old hardcoded section_count=16 made every appended
+                       * section a poison pill: the loader stopped at 16 and a
+                       * LATER section's bytes read as garbage (the TEXPACK trap). */
 } BsOut;
 
 static int bs_write(BsOut* o, const void* p, size_t n) {
@@ -242,6 +270,7 @@ static int write_section_raw(BsOut* o, uint32_t tag, uint32_t flags,
         return 0;
     if (!bs_write(o, hdr, sizeof hdr)) return 0;
     if (len && !bs_write(o, data, (size_t)len)) return 0;
+    o->sections++;
     return 1;
 }
 
@@ -326,6 +355,16 @@ static int write_timer_section(BsOut* o) {
 
 /* ============================ SAVE ============================ */
 
+/* Rewind's async-readback override: when set, the next full-VRAM section is
+ * serialized from this caller-owned buffer (a PBO readback kicked one frame
+ * earlier) instead of gr_vram_transfer_out's synchronous GL pipeline drain.
+ * One-shot per save; the caller clears it after boot_state_save_buffer_raw. */
+static const uint16_t *s_vram_save_override = NULL;
+void boot_state_set_vram_override(const uint16_t *vram)
+{
+    s_vram_save_override = vram;
+}
+
 /* Classic full VRAM section (offline / zlib / tracking off). */
 static int write_vram_section_full(BsOut *o)
 {
@@ -333,7 +372,10 @@ static int write_vram_section_full(BsOut *o)
     int ok;
     if (!vbuf)
         return 0;
-    gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
+    if (s_vram_save_override)
+        memcpy(vbuf, s_vram_save_override, VRAM_SIZE);
+    else
+        gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
     s_last_vram_dirty_rows = VRAM_H;
     s_last_vram_incremental = 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -370,12 +412,26 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 16;
+    /* Backpatched after the last section lands (see below). The counter also
+     * subsumes the exclude-mask arithmetic: excluded sections simply never
+     * reach write_section, so the count is right by construction. */
+    h.section_count = 0;
 
+    size_t hdr_off = o->f ? (size_t)ftell(o->f) : o->len;
+    o->sections = 0;
     ok = write_header_le(o, &h);
 
-    if (ok) ok = write_cpu_section(o, cpu);
-    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        RAM_SIZE);
+    /* Mod-plan guard rides FIRST: applying it is a pure compare, so a
+     * mismatched load rejects before any machine state is touched. */
+    if (ok) {
+        const char* fp = psx_mod_runtime_fingerprint_cstr();
+        ok = write_section(o, BS_SEC_MODSET, fp, (uint64_t)strlen(fp));
+    }
+
+    if (ok && !(s_section_exclude & (1u << BS_SEC_CPU)))
+        ok = write_cpu_section(o, cpu);
+    if (ok && !(s_section_exclude & (1u << BS_SEC_RAM)))
+        ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
@@ -399,7 +455,11 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
              write_section(o, BS_SEC_CLOCK, cyc, 8);
     }
     if (ok) ok = write_module_section(o, BS_SEC_GPU, gpu_snapshot_bytes, gpu_snapshot_write);
-    if (ok) {
+    if (ok && (s_section_exclude & (1u << BS_SEC_VRAM))) {
+        /* Owned elsewhere (dual-console VRAM banks): skip the section AND the
+         * readback that would build it — gr_vram_transfer_out is a synchronous
+         * GL pipeline drain and was the dominant half of a machine switch. */
+    } else if (ok) {
         /* §96 incremental mirror only while RB dirty-tracking is on.
          * Offline / delay-sync / zlib disk: classic full transfer_out. */
         if (o->no_zlib && gpu_vram_dirty_tracking()) {
@@ -426,10 +486,12 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         }
     }
     if (ok) ok = write_module_section(o, BS_SEC_SPU, spu_snapshot_bytes, spu_snapshot_write);
-    if (ok) ok = write_section(o, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
+    if (ok && !(s_section_exclude & (1u << BS_SEC_SPURAM)))
+        ok = write_section(o, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
     if (ok) ok = write_module_section(o, BS_SEC_CDROM, cdrom_snapshot_bytes, cdrom_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
+    if (ok) ok = write_module_section(o, BS_SEC_SIO1,  sio1_snapshot_bytes,  sio1_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_MDEC,  mdec_snapshot_bytes,  mdec_snapshot_write);
     if (ok) {
         /* I-cache tags: warm loads must replay with the fetch-cost state the
@@ -456,6 +518,42 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
                 ok = pst_w_u32(&w, dirty_ram_get_bitmap_word(i));
             if (ok) ok = write_section(o, BS_SEC_DIRTY, db, nbytes);
             free(db);
+        }
+    }
+    /* HD texture pack tracker: rects+hashes only; pixels rebuild from the
+     * restored VRAM at apply (see tex_pack_state_apply). Zero bytes when the
+     * pack is inactive — the section is simply absent. */
+    if (ok) {
+        uint32_t tb = tex_pack_state_bytes();
+        if (tb) {
+            uint8_t* buf = (uint8_t*)malloc(tb);
+            if (!buf) ok = 0;
+            else {
+                tex_pack_state_write(buf);
+                ok = write_section(o, BS_SEC_TEXPACK, buf, tb);
+                free(buf);
+            }
+        }
+    }
+    /* Backpatch the real section count over the header's placeholder. */
+    if (ok) {
+        uint8_t le[4];
+        le[0] = (uint8_t)(o->sections & 0xFF);
+        le[1] = (uint8_t)((o->sections >> 8) & 0xFF);
+        le[2] = (uint8_t)((o->sections >> 16) & 0xFF);
+        le[3] = (uint8_t)((o->sections >> 24) & 0xFF);
+        if (o->f) {
+            long end_pos = ftell(o->f);
+            if (end_pos < 0 ||
+                fseek(o->f, (long)hdr_off + 28, SEEK_SET) != 0 ||
+                fwrite(le, 1, 4, o->f) != 4 ||
+                fseek(o->f, end_pos, SEEK_SET) != 0)
+                ok = 0;
+        } else {
+            if (hdr_off + 32 <= o->len)
+                memcpy(o->data + hdr_off + 28, le, 4);
+            else
+                ok = 0;
         }
     }
     return ok;
@@ -485,8 +583,8 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
     *out_len = 0;
     memset(&o, 0, sizeof o);
     o.no_zlib = no_zlib ? 1 : 0;
-    /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (RAM+VRAM+SPU). */
-    o.cap = no_zlib ? (5u * 1024u * 1024u) : (2u * 1024u * 1024u);
+    /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (2 MB RAM) or ~9.5 MiB (8 MB). */
+    o.cap = no_zlib ? (12u * 1024u * 1024u) : (2u * 1024u * 1024u);
     o.data = (uint8_t*)malloc(o.cap);
     if (!o.data) return 0;
     if (!boot_state_save_to(&o, cpu, bios_checksum, entry_pc)) {
@@ -539,11 +637,12 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     }
     case BS_SEC_RAM:
-        if (len != RAM_SIZE) return 0;
-        memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
+        if (len != memory_get_ram_bytes()) return 0;
+        memcpy(memory_get_ram_ptr(), p, memory_get_ram_bytes());
         {
             extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
-            psx_kernel_bless_note_range(0, RAM_SIZE);
+            psx_kernel_bless_note_range(0, memory_get_ram_bytes());
+            psx_ram_resync_high_after_restore();
         }
         return 1;
     case BS_SEC_SPAD:
@@ -647,6 +746,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return dma_snapshot_read(p, len);
     case BS_SEC_SIO:
         return sio_snapshot_read(p, len);
+    case BS_SEC_SIO1:
+        return sio1_snapshot_read(p, len);
     case BS_SEC_MDEC:
         return mdec_snapshot_read(p, len);
     case BS_SEC_DIRTY: {
@@ -676,8 +777,39 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &g_psx_icache_tv[i])) return 0;
         return 1;
     }
+    case BS_SEC_MODSET: {
+        /* Pure compare — no state touched. A state saved under a different
+         * enabled mod set must not apply: RAM layout / patched code paths
+         * differ and the machine resumes into garbage (observed as a null-PC
+         * recovery spin). Section order puts this first, so the reject lands
+         * before any mutation. */
+        const char* live = psx_mod_runtime_fingerprint_cstr();
+        size_t live_len = strlen(live);
+        if (live_len != (size_t)len || (len && memcmp(live, p, (size_t)len) != 0)) {
+            fprintf(stderr,
+                    "savestate: REFUSED - state's mod set differs from this "
+                    "session's (state %.*s... vs live %.8s...). Relaunch with "
+                    "the matching mods enabled to load it.\n",
+                    (int)(len < 8 ? len : 8), (const char*)p, live);
+            return 0;
+        }
+        return 1;
+    }
+    case BS_SEC_TEXPACK: {
+        /* Applies AFTER BS_SEC_VRAM in stream order; pixels rebuild from the
+         * freshly restored CPU VRAM mirror and are hash-verified inside. */
+        tex_pack_state_apply(p, len, NULL);
+        return 1;
+    }
     default:
-        return 0;
+        /* Unknown section: SKIP, never fail. This was `return 0`, which made
+         * every state written by a build with one extra section a poison pill
+         * for every build without it -- and worse than unloadable: the apply
+         * loop had already restored RAM/VRAM/CPU by the time it hit the
+         * unknown tag, so the refusal left a HALF-RESTORED machine that
+         * wedged or died at PC=0. A sectioned state format exists precisely
+         * so readers can step over what they do not know. */
+        return 1;
     }
 }
 
@@ -791,11 +923,11 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     const uint8_t* end;
     BootStateHeader h;
     char reject[256];
-    const uint32_t required =
+    const uint32_t required = ~s_section_exclude & (
         (1u<<BS_SEC_CPU)|(1u<<BS_SEC_RAM)|(1u<<BS_SEC_SPAD)|(1u<<BS_SEC_IRQ)|
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
-        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY);
+        (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY));
     uint32_t seen = 0;
     int ok = 1;
     const double t0 = boot_state_mono_ms();
@@ -890,10 +1022,15 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     if (!ok || (seen & required) != required)
         return 0;
 
+    /* Pre-SIO1 blob (v5 written before BS_SEC_SIO1 existed): power-on. */
+    if (!(seen & (1u << BS_SEC_SIO1)))
+        sio1_init();
+
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
+    np_ram_dig_mark_all();
 
-    {
+    if (!s_quiet_load) {
         const double total_ms = boot_state_mono_ms() - t0;
         fprintf(stderr,
                 "savestate: load_timing read=0.0 inflate=%.1f "

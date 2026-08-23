@@ -143,6 +143,7 @@ void np_sched_bind(const PsxNpSchedBridge *bridge)
     rb.input_prediction = bridge->input_prediction;
     rb.local_slot = bridge->local_slot;
     rb.force_turn = bridge->force_turn;
+    rb.rollback = bridge->rollback;
     rb.gates.now_ms = np_gate_now_ms;
     rb.gates.rtt_ms = np_gate_rtt_ms;
     rb.gates.episode_active = np_gate_episode_active;

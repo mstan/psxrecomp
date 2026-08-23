@@ -34,7 +34,17 @@ static uint32_t s_arm_record_all = 0;  /* opt-in via fntrace_arm(0xFFFFFFFF) */
  * false-triggering on the BIOS shell, which runs from RAM 0x30000-0x5B000 —
  * overlapping the game text range but never at entry_pc. */
 static uint32_t s_game_entry_phys = 0;
-static int      s_game_started = 0;
+/* PER-MACHINE. Dual-console runs two independent guests that each boot the
+ * disc and each reach their own game entry, so a single global made machine 0's
+ * game-start suppress machine 1's -- which among other things blocked machine
+ * 1's BIOS shell-skip and left it playing the whole SCEA intro. Slot from
+ * psx_dual_machine_live(); -1 (single console) folds to 0. */
+static int      s_game_started[2] = { 0, 0 };
+
+static int fntrace_slot(void) {
+    extern int psx_dual_machine_live(void);
+    return (psx_dual_machine_live() == 1) ? 1 : 0;
+}
 extern void cdrom_notify_game_started(void);
 extern void boot_state_trigger_capture(const CPUState* cpu);
 
@@ -42,18 +52,18 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
     /* lo is treated as entry_pc; hi is ignored (kept for API compat). */
     (void)hi;
     s_game_entry_phys = lo & 0x1FFFFFFFu;
-    s_game_started = 0;
+    s_game_started[0] = s_game_started[1] = 0;
 }
 
-int fntrace_is_game_started(void) { return s_game_started; }
+int fntrace_is_game_started(void) { return s_game_started[fntrace_slot()]; }
 
 /* Centralised game-start transition.  Idempotent — safe to call from both
  * the dispatcher (fntrace_record) and the generated entry-point function.
  * Performs the complete handoff side effects: dirty-image baseline clear,
  * low-boot scratch clear, CD speed switch, and boot-state capture. */
 void fntrace_mark_game_started(CPUState* cpu) {
-    if (s_game_started) return;
-    s_game_started = 1;
+    if (s_game_started[fntrace_slot()]) return;
+    s_game_started[fntrace_slot()] = 1;
     extern void dirty_ram_clear_image_baseline(void);
     extern void memory_clear_low_boot_scratch(void);
     dirty_ram_clear_image_baseline();
@@ -69,7 +79,7 @@ void fntrace_mark_game_started(CPUState* cpu) {
  * load address during boot, and a premature handoff (baseline/scratch
  * clears, CD speed switch) corrupts the boot sequence. */
 void fntrace_maybe_mark_game_started(CPUState* cpu, uint32_t addr) {
-    if (s_game_started) return;
+    if (s_game_started[fntrace_slot()]) return;
     if (s_game_entry_phys == 0) return;   /* no game range armed */
     if ((addr & 0x1FFFFFFFu) == s_game_entry_phys)
         fntrace_mark_game_started(cpu);
@@ -191,7 +201,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
         }
     }
 
-    if (!s_game_started && s_game_entry_phys != 0) {
+    if (!s_game_started[fntrace_slot()] && s_game_entry_phys != 0) {
         /* Latch on the entry_pc dispatch (the common case) OR the first dispatch
          * to any game-text address whose RAM already holds the loaded game EXE
          * image (native-ok). Some titles reach their PS-EXE entry via compiled

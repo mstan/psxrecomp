@@ -28,6 +28,7 @@ typedef struct {
     uint64_t cdrom;    /* CDROM command/FIFO/phase/next-event */
     uint64_t dma;      /* DMA channel regs + in-flight/deadlines */
     uint64_t sio;      /* SIO/pad/memcard transaction state */
+    uint64_t sio1;     /* SIO1 serial link regs + FIFO + shifter + wire queue */
     uint64_t timers;   /* RootCounters counter/mode/target/frac/last-update */
     uint64_t clock;    /* psx_cycle_count */
     uint64_t dirty;    /* dirty-RAM page bitmap (affects dispatch/interp routing) */

@@ -12,6 +12,7 @@ void psx_netplay_rb_poll(struct CPUState *cpu, uint32_t resume_pc)
     (void)resume_pc;
 }
 void psx_netplay_rb_flush_resume(void) {}
+int psx_netplay_rb_active_episode(void) { return 0; }
 int psx_netplay_rb_top_level_resume_active(void) { return 0; }
 int psx_netplay_rb_recover_null_pc(struct CPUState *cpu, uint32_t *out_pc)
 {
@@ -20,6 +21,20 @@ int psx_netplay_rb_recover_null_pc(struct CPUState *cpu, uint32_t *out_pc)
     return 0;
 }
 void psx_netplay_rb_request_snap(uint32_t tick) { (void)tick; }
+int psx_netplay_rb_pair_snap_save(void *ring, uint32_t tick,
+                                  struct CPUState *cpu, uint32_t bios,
+                                  uint32_t entry)
+{
+    (void)ring; (void)tick; (void)cpu; (void)bios; (void)entry;
+    return 0;
+}
+uint32_t psx_netplay_rb_pair_snap_load_apply(void *ring, uint32_t tick,
+                                             struct CPUState *cpu,
+                                             uint32_t bios, uint32_t entry)
+{
+    (void)ring; (void)tick; (void)cpu; (void)bios; (void)entry;
+    return 0;
+}
 int psx_netplay_rb_begin_rewind(uint32_t mismatch_tick, int slot)
 {
     (void)mismatch_tick;
@@ -117,6 +132,7 @@ uint32_t psx_netplay_rb_rtt_estimate_ms(void) { return 0; }
 #include "netplay_input_hist.h"
 #include "netplay_rb_post.h"
 #include "netplay_snap_ring.h"
+#include "psx_link_pair.h"
 #include "netplay_state_digest.h"
 #include "psx_netplay.h"
 #include "psx_netplay_sched.h"
@@ -134,6 +150,7 @@ uint32_t psx_netplay_rb_rtt_estimate_ms(void) { return 0; }
 #include "psx_scheduler.h"
 #include "savestate.h"
 #include "spu.h"
+#include "psx_ram.h"
 
 #include "recomp_net/recomp_net.h"
 
@@ -191,9 +208,10 @@ static int g_empty_span_verify_pending;
 static int g_episode_snap_applied;
 
 /* Live-path snap every N ticks (raw boot_state ~3.5MB, no zlib). Resim still
- * snaps every tick so episode baselines stay dense.
- * Override: PSX_NET_SNAP_INTERVAL (default 16 — was 8; live memcpy was a
- * major FPS tax stacked on per-frame RAM digests). */
+ * snaps every tick so episode baselines stay dense. The ring itself is only
+ * 40 slots (RBE_SNAP_RING_DEFAULT_DEPTH): 24 TipHold runway + FMV/interval
+ * slack, not a deep history. Override: PSX_NET_SNAP_INTERVAL (default 16 —
+ * was 8; live memcpy was a major FPS tax stacked on per-frame RAM digests). */
 static uint32_t snap_interval(void)
 {
     static int latched;
@@ -1579,8 +1597,8 @@ static int rb_resume_pc_ok(uint32_t pc)
     if ((pc & 0xfff00000u) == 0xbfc00000u)
         return 1; /* BIOS ROM */
     phys = pc & 0x1fffffffu;
-    /* 2MB main RAM; skip the low scratch page (catches 0xB0 / 0x800000B0). */
-    if (phys >= 0x1000u && phys < 0x200000u)
+    /* Live main RAM; skip the low scratch page (catches 0xB0 / 0x800000B0). */
+    if (phys >= 0x1000u && phys < g_psx_ram_size)
         return 1;
     return 0;
 }
@@ -2154,8 +2172,9 @@ static int pin_baseline_from_cpu(uint32_t tick)
     g_pin_tick = tick;
     g_pin_valid = 1;
     if (g_snaps) {
-        (void)netplay_snap_ring_save(g_snaps, tick, &snap, *g_b.bios_checksum,
-                                     *g_b.entry_pc);
+        if (netplay_snap_ring_save(g_snaps, tick, &snap, *g_b.bios_checksum,
+                                   *g_b.entry_pc))
+            psx_link_pair_on_save(tick);
         /* Invent snaps above the matched tip are a dead timeline. */
         dropped = netplay_snap_ring_drop_after(g_snaps, tick);
     }
@@ -2349,6 +2368,11 @@ static void abort_episode(const char *why)
     }
 }
 
+int psx_netplay_rb_active_episode(void)
+{
+    return (g_rb && rnet_rb_is_active(g_rb)) ? 1 : 0;
+}
+
 int psx_netplay_rb_top_level_resume_active(void)
 {
     /* Shared with savestate/selfcheck — armed inside psx_scheduler_resume_at. */
@@ -2375,11 +2399,19 @@ int psx_netplay_rb_recover_null_pc(struct CPUState *cpu_in, uint32_t *out_pc)
             cand = cands[i];
             if (!rb_resume_pc_ok(cand))
                 continue;
-            fprintf(stderr,
-                    "psxrecomp: rb recover null-pc → 0x%08x (ra=0x%08x sticky=0x%08x)\n",
-                    (unsigned)cand, (unsigned)cpu_in->gpr[31],
-                    (unsigned)g_last_good_bb_pc);
-            fflush(stderr);
+            {
+                /* Dual-console switches arm top-level-resume ~100x/s and this
+                 * bridge legitimately fires after each -- log only offline/
+                 * netplay resumes, not the dual steady state. */
+                extern int g_psx_dual_active;
+                if (!g_psx_dual_active) {
+                    fprintf(stderr,
+                            "psxrecomp: rb recover null-pc → 0x%08x (ra=0x%08x sticky=0x%08x)\n",
+                            (unsigned)cand, (unsigned)cpu_in->gpr[31],
+                            (unsigned)g_last_good_bb_pc);
+                    fflush(stderr);
+                }
+            }
             *out_pc = cand;
             note_good_bb_pc(cand);
             return 1;
@@ -2819,9 +2851,11 @@ static int host_save_state(void *ctx, uint32_t tick)
         return -1;
     snap = *c;
     snap.pc = pc;
-    return netplay_snap_ring_save(g_snaps, tick, &snap, *g_b.bios_checksum, *g_b.entry_pc)
-               ? 0
-               : -1;
+    if (!netplay_snap_ring_save(g_snaps, tick, &snap, *g_b.bios_checksum,
+                                *g_b.entry_pc))
+        return -1;
+    psx_link_pair_on_save(tick);
+    return 0;
 }
 
 static int host_load_state(void *ctx, uint32_t tick)
@@ -2855,6 +2889,12 @@ static uint32_t host_state_digest(void *ctx, uint32_t tick, uint32_t partition)
 static uint8_t host_hash_confirm_through(void *ctx, uint32_t tick)
 {
     (void)ctx;
+    /* PSX-Link: FRAME_COMMITs are MACHINE folds on independent A/B episode
+     * timelines — a cross-generation mismatch parked the B-pair's promote
+     * forever. Episode agreement is the partner-scoped POST/baseline compare;
+     * the fold stream feeds the debounced desync detector instead. */
+    if (psx_netplay_link_active())
+        return 1;
     if (!g_b.hc)
         return 0;
     return netplay_hc_confirm_through(g_b.hc, tick);
@@ -4817,15 +4857,13 @@ static void maybe_enter_replay(void)
                  (unsigned)g_local_baseline_digest, (unsigned)g_peer_baseline_digest);
         abort_episode_realign(why);
         return;
-    }
-    if (g_peer_baseline_av != g_local_baseline_av) {
+    } else if (g_peer_baseline_av != g_local_baseline_av) {
         char why[112];
         snprintf(why, sizeof(why), "baseline av mismatch local=%08x peer=%08x",
                  (unsigned)g_local_baseline_av, (unsigned)g_peer_baseline_av);
         abort_episode_realign(why);
         return;
-    }
-    if (g_peer_baseline_aux != g_local_baseline_aux) {
+    } else if (g_peer_baseline_aux != g_local_baseline_aux) {
         char why[256];
         snprintf(why, sizeof(why),
                  "baseline ext mismatch local=%08x peer=%08x "
@@ -5977,6 +6015,15 @@ static int tip_extend_keep_live(uint32_t prefer)
     uint32_t pc;
     RNetSession *s = sess();
     uint32_t sim;
+    /* PSX-Link: keep-live vouches for THIS console only — corrected rows for
+     * the follower's seats do not perturb this console's state directly (they
+     * only arrive later over the cable), so "live matches sealed fin" says
+     * nothing about the follower, which consumed the MISPREDICTED rows and
+     * needs the resim to re-run it with sealed ones. Machines that kept live
+     * left their followers permanently forked (soak: B-clients kept live,
+     * their A-followers diverged from the A-clients, LINK DESYNC latched). */
+    if (psx_netplay_link_active())
+        return 0;
 
     if (!c || !g_rb || !s)
         return 0;
@@ -6003,6 +6050,7 @@ static int tip_extend_keep_live(uint32_t prefer)
         if (netplay_snap_ring_save(g_snaps, prefer, &snap, *g_b.bios_checksum,
                                    *g_b.entry_pc)) {
             note_good_bb_pc(pc);
+            psx_link_pair_on_save(prefer);
             if (prefer > g_auth_snap_through)
                 g_auth_snap_through = prefer;
         }
@@ -6153,6 +6201,7 @@ void psx_netplay_rb_start(void)
     gpu_vram_dirty_set_tracking(1);
     boot_state_vram_mirror_reset();
 
+    /* 40 slots: TipHold runway 24 + FMV/interval slack (see rbengine header). */
     g_snaps = netplay_snap_ring_create(NETPLAY_SNAP_RING_DEFAULT_DEPTH);
     tip_dense_reset();
     if (!g_snaps) {
@@ -6557,6 +6606,11 @@ static int try_apply_pending_load(CPUState *cpu_in)
                 overlay_loader_clear_lazy_miss();
             }
             psx_frontend_on_rb_snap_loaded();
+            /* PSX-Link pair: mirror the restore into the local follower and
+             * fence before any guest code can consume cable bytes from the
+             * abandoned timeline. Failure latches pair-failed; the admit
+             * loop soft-exits the session. */
+            (void)psx_link_pair_after_load(loaded_tick);
             resim_audit_cache_invalidate();
             g_pending_load_valid = 0;
             /* §72: must arm resume like a normal snap apply. Clearing
@@ -6692,6 +6746,11 @@ static int try_apply_pending_load(CPUState *cpu_in)
                 overlay_loader_clear_lazy_miss();
             }
             psx_frontend_on_rb_snap_loaded();
+            /* PSX-Link pair: mirror the restore into the local follower and
+             * fence before any guest code can consume cable bytes from the
+             * abandoned timeline (failure latches pair-failed; the admit
+             * loop soft-exits). */
+            (void)psx_link_pair_after_load(loaded_tick);
             /* §74/§75: tip-extend keep-live should have avoided this. If a
              * load still disagrees with fin, the ring slot was poison —
              * drop it and fall back to the episode pin (do not arm from
@@ -6975,11 +7034,14 @@ void psx_netplay_rb_poll(struct CPUState *cpu_in, uint32_t resume_pc)
              * (baseline core matched; ext forked on sio pads after rematch). */
             if (g_pending_save_tick == 0u) {
                 int seats = g_b.slot_count ? *g_b.slot_count : 2;
+                if (psx_netplay_link_active())
+                    seats = 2;   /* per-console ports, never the 4-seat width */
                 sio_netplay_canonicalize_session_pads(seats);
             }
             if (netplay_snap_ring_save(g_snaps, g_pending_save_tick, &snap,
                                        *g_b.bios_checksum, *g_b.entry_pc)) {
                 note_good_bb_pc(pc);
+                psx_link_pair_on_save(g_pending_save_tick);
                 /* §75: Replay finishes seal the ring slot against Live invent. */
                 if (g_rb && rnet_rb_is_resimulating(g_rb) &&
                     g_pending_save_tick > g_auth_snap_through)
@@ -9742,6 +9804,101 @@ int psx_netplay_rb_phase(void)
 uint32_t psx_netplay_rb_snap_count(void)
 {
     return g_snaps ? netplay_snap_ring_count(g_snaps) : 0u;
+}
+
+/* ===== PSX-Link pair: follower-side snapshot save/load ==================
+ *
+ * The link follower (psx_link_pair.c) is a session-less co-simulator, so it
+ * cannot use the engine-coupled host_save_state/try_apply_pending_load. These
+ * reuse the exact same mechanics -- resume-pc canonicalization, boot_state
+ * serialize, the restore resync battery, and the flush_resume longjmp prep --
+ * WITHOUT touching engine state. pick_snap_resume_pc is not reusable here:
+ * its boot0 gate keys on the (absent) session and would pin every follower
+ * snap to BIOS-only PCs forever; boot preference keys on tick==0 instead. */
+
+static uint32_t rb_pair_pick_pc(const CPUState *c, uint32_t tick,
+                                uint32_t hint)
+{
+    const uint32_t cands[5] = {
+        psx_last_irq_check_pc(),
+        psx_compiled_irq_resume_pc(),
+        c ? c->gpr[31] : 0u,
+        hint,
+        c ? c->pc : 0u,
+    };
+    int i;
+    if (tick == 0u) {
+        for (i = 0; i < 5; ++i) {
+            if (rb_resume_pc_ok(cands[i]) && rb_pc_is_bios(cands[i]))
+                return rb_canonicalize_resume_pc(cands[i]);
+        }
+        return 0; /* defer: no main-RAM residue in the boot snap */
+    }
+    for (i = 0; i < 5; ++i) {
+        if (rb_resume_pc_ok(cands[i]))
+            return rb_canonicalize_resume_pc(cands[i]);
+    }
+    return 0;
+}
+
+int psx_netplay_rb_pair_snap_save(void *ring, uint32_t tick,
+                                  struct CPUState *cpu, uint32_t bios,
+                                  uint32_t entry)
+{
+    CPUState snap;
+    uint32_t pc;
+    if (!ring || !cpu || !bios || !entry)
+        return 0;
+    pc = rb_pair_pick_pc(cpu, tick, 0u);
+    if (!pc)
+        return 0;
+    snap = *cpu;
+    snap.pc = pc;
+    return netplay_snap_ring_save((NetplaySnapRing *)ring, tick, &snap, bios,
+                                  entry)
+               ? 1
+               : 0;
+}
+
+uint32_t psx_netplay_rb_pair_snap_load_apply(void *ring, uint32_t tick,
+                                             struct CPUState *cpu,
+                                             uint32_t bios, uint32_t entry)
+{
+    uint32_t pc;
+    if (!ring || !cpu || !bios || !entry)
+        return 0;
+    if (!netplay_snap_ring_load((NetplaySnapRing *)ring, tick, cpu, bios,
+                                entry))
+        return 0;
+    pc = rb_canonicalize_resume_pc(cpu->pc);
+    if (!rb_resume_pc_ok(pc))
+        pc = rb_pair_pick_pc(cpu, tick, pc);
+    if (!pc)
+        return 0;
+    cpu->pc = pc;
+    psx_cycles_resync_after_restore(cpu);
+    interrupts_resync_after_restore();
+    cdrom_resync_deadlines_after_restore();
+    if (!cdrom_xa_stream_active() && !cdrom_fmv_stream_pending())
+        spu_cd_audio_reset();
+    {
+        extern void overlay_loader_clear_lazy_miss(void);
+        overlay_loader_clear_lazy_miss();
+    }
+    psx_frontend_on_rb_snap_loaded();
+    /* The caller longjmps from the follower admit (inside the vblank present
+     * flush) -- same context as flush_resume; mirror its longjmp prep. */
+    gpu_vblank_clear_deferred_present();
+    {
+        extern int g_psx_cyc_bb_defer;
+        extern uint32_t g_psx_cyc_batch;
+        extern uint32_t *g_psx_cyc_local_acc;
+        if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
+        g_psx_cyc_local_acc = NULL;
+        g_psx_cyc_bb_defer = 0;
+        g_psx_cyc_batch = 0;
+    }
+    return pc;
 }
 
 #endif /* PSX_HAS_RECOMP_NET */

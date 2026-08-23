@@ -11,6 +11,7 @@
 #include "dma.h"
 #include "interrupts.h"
 #include "sio.h"
+#include "sio1.h"
 #include "starvation_ring.h"
 #include "timers.h"
 #if defined(PSX_HAS_RECOMP_NET)
@@ -20,6 +21,26 @@
 #include "cosim_state.h"
 #endif
 
+/* CPU overclock state; the model is documented at psx_oc_apply in the header. */
+uint32_t g_psx_oc_scale_q16 = 65536u;   /* 1.0 = stock */
+uint32_t g_psx_oc_accum     = 0u;
+
+/* percent: 100 = stock, 1000 = 10x. Floor 100 because UNDERclocking would
+ * starve the guest of cycles the game assumes it has; ceiling 6400 because
+ * beyond that a single instruction charges 0 for long runs and the deadline
+ * model loses resolution against device schedules. */
+void psx_set_cpu_overclock(uint32_t percent) {
+    if (percent < 100u)  percent = 100u;
+    if (percent > 6400u) percent = 6400u;
+    g_psx_oc_scale_q16 = (uint32_t)((65536ull * 100ull) / (uint64_t)percent);
+    if (g_psx_oc_scale_q16 == 0u) g_psx_oc_scale_q16 = 1u;
+    g_psx_oc_accum = 0u;
+}
+
+uint32_t psx_get_cpu_overclock(void) {
+    if (g_psx_oc_scale_q16 == 0u) return 100u;
+    return (uint32_t)((65536ull * 100ull) / (uint64_t)g_psx_oc_scale_q16);
+}
 uint64_t psx_cycle_count = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
@@ -76,6 +97,7 @@ void psx_event_step_conservative_env_init(void) {
 static void advance_devices(uint32_t c) {
     psx_cycle_count += (uint64_t)c;
     sio_advance(c);
+    sio1_advance(c);
     cdrom_advance(c);
     dma_advance(c);
     timers_advance(c);
@@ -139,6 +161,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(0xFFFFFFFFu);   if (s1 < best) best = s1;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
 }
@@ -156,6 +179,7 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
     uint32_t c = cdrom_cycles_to_irq(i_mask);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_deliverable_irq(i_mask); if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);     if (s < best) best = s;
+    uint32_t s1 = sio1_cycles_to_irq(i_mask);   if (s1 < best) best = s1;
     if (best == 0) best = 1;
     return best;
 }
@@ -415,9 +439,9 @@ static int idle_skip_on(void) {
     /* Cycle-skip is a host enhancement; under netplay it forks peers (detector
      * streak / skip quanta are not part of the shared snap). Same for the
      * solo resim self-check — keep the window on the faithful cycle path. */
-    extern int psx_netplay_active(void);
+    extern int psx_netplay_determinism_active(void);
     extern int psx_selfcheck_enabled(void);
-    if (psx_netplay_active() || psx_selfcheck_enabled())
+    if (psx_netplay_determinism_active() || psx_selfcheck_enabled())
         return 0;
     if (g_idle_skip_enabled < 0) {
         /* No game config reached this process (for example a BIOS-only

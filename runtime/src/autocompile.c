@@ -855,6 +855,16 @@ int autocompile_request(void) {
     if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
     if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
     SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
+    /* Pin the FLAVOR the same way: the tool's --flavor defaults to 0 (play),
+     * so an instrumented (flavor 2) runtime spawned a compile whose shards it
+     * could never load — the loader's flavor guard rejected them and EVERY
+     * overlay ran interpreted, forever, on debug builds. The child must
+     * always write the flavor this runtime reads. */
+    {
+        char flavor_buf[16];
+        snprintf(flavor_buf, sizeof flavor_buf, "%d", (int)PSX_OVERLAY_FLAVOR);
+        SetEnvironmentVariableA("PSX_OVERLAY_FLAVOR", flavor_buf);
+    }
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). The WHOLE command is

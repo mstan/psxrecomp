@@ -35,6 +35,7 @@
 #include "lockstep.h"
 #include "starvation_ring.h"
 #include "fntrace.h"  /* fntrace_is_game_started / fntrace_mark_game_started */
+#include "psx_ram.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -256,7 +257,9 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
  * cache-unfriendly open-addressed lookup on every guest instruction. */
 static inline void exec_pc_table_record(uint32_t pc) {
     uint32_t phys = pc & 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    /* Full 8 MiB capacity, matching DIRTY_RAM_EXEC_WORD_COUNT: high-bank
+     * enhancement code (8 MB mod) must leave coverage evidence too. */
+    if (phys < 8u * 1024u * 1024u && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         uint32_t mask = 1u << (word & 31u);
         uint32_t *slot = &g_dirty_ram_exec_pc_bitmap[word >> 5];
@@ -478,6 +481,11 @@ static void callret_end(uint32_t idx, CPUState *cpu, uint32_t path) {
  * load. See dirty_ram_interp.h for the per-game rationale. */
 uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
 
+/* Text-image base (phys) = the loaded game's main-EXE load address. Defaults to
+ * the kernel-window end so the below-text overlay clause is empty until a
+ * high-loading game pins it; main.cpp sets it at game load. See the header. */
+uint32_t g_text_image_lo = DIRTY_RAM_KERNEL_WINDOW_END;
+
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 extern int psx_game_address_in_text(uint32_t addr);
@@ -505,10 +513,14 @@ static inline uint32_t target26    (uint32_t i) { return  i        & 0x03FFFFFFu
 /* Read a 32-bit instruction word from kernel RAM at the given physical addr.
  * Caller has already verified the address is in dirty kernel RAM. */
 static inline uint32_t fetch_word(uint32_t phys) {
-    /* Main RAM is a process-lifetime static allocation. Cache its address so
-     * instruction fetch does not cross translation units for every guest op. */
-    static const uint8_t *ram;
-    if (!ram) ram = memory_get_ram_ptr();
+    /* Read through the LIVE DRAM bank pointer. This used to cache the base in
+     * a function-static ("main RAM is a process-lifetime static allocation"),
+     * which dual-console bank swapping invalidates — memory_ram_bank_activate
+     * moves it, and a cached base would keep fetching the other machine's
+     * instructions forever. g_psx_ram is the same global psx_cyc.h's load fast
+     * path already dereferences per guest access, so this is not a new cost. */
+    extern uint8_t *g_psx_ram;
+    const uint8_t *ram = g_psx_ram;
     return  (uint32_t)ram[phys]
          | ((uint32_t)ram[phys + 1] <<  8)
          | ((uint32_t)ram[phys + 2] << 16)
@@ -546,7 +558,7 @@ static int ws_cull_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;       /* 8 MB capacity */
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -572,7 +584,7 @@ static int ws_cull_bltz_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;       /* 8 MB capacity */
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -609,7 +621,7 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     }
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
-    if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
+    if (hi > 0x800000u) hi = 0x800000u;          /* 8 MB capacity */
     static uint32_t words[2 * WIN + 2];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 2); a += 4u)
@@ -1348,7 +1360,7 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     /* Decline when the target page no longer matches the static game image.
      * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
      * of the live RAM bytes instead of running stale compiled code. */
-    if (!psx_game_text_native_ok(target)) return 0;
+    if (!psx_game_text_native_ok_memo(target)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -1821,7 +1833,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             uint32_t vanilla =
                 ((int32_t)cpu->gpr[rs] < (int32_t)cpu->gpr[rt]) ? 1u : 0u;
             uint32_t kept = vanilla;
-            if (!psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
+            /* A widen site moves the bound; a keep site pins the verdict. A
+             * site is only ever one of the three, but check widen first so a
+             * config migrated from keep to widen cannot be served the pinned
+             * answer by a stale entry. */
+            if (!psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept) &&
+                !psx_ws_cull_widen_site(pc, insn, cpu->gpr[rs], cpu->gpr[rt],
+                                        0u, &kept))
                 (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
             cpu->gpr[rd] = kept;
             cpu->gpr[0] = 0;
@@ -1990,6 +2008,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     {
         uint32_t vanilla = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         uint32_t kept = vanilla;
+        uint32_t widened = 0;
         if (psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
             cpu->gpr[rt] = kept;
         else if (psx_ws_cull_keep_site(pc, insn, vanilla, &kept))
@@ -1999,6 +2018,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
+        else if (psx_ws_cull_widen_site(pc, insn, cpu->gpr[rs], 0u, imm,
+                                        &widened))
+            cpu->gpr[rt] = widened;
         else if (psx_ws_is_cull_slti_lower_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti_lower(
                 cpu->gpr[rs], imm);
@@ -2356,6 +2378,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
+    /* High-mirror code PCs fold to the low 2 MiB only while still aliased.
+     * Unique high pages (enhancement code) keep their real PC. */
+    addr = psx_ram_canon_code_addr(addr);
+    if (stop_addr != 0u)
+        stop_addr = psx_ram_canon_code_addr(stop_addr);
 #ifndef PSX_NO_DEBUG_TOOLS
     /* A0/B0/C0 kernel-vector stubs are runtime-written, so calls to them
      * land HERE, not in the static dispatcher — which meant the bioscall
@@ -2733,6 +2760,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         g_sentinel_reach_dirty++;
         if (!psx_get_in_exception()) g_sentinel_reach_traps++; /* reuse: in_exc==0 dirty reaches */
         g_sentinel_reach_async = g_async_rfe_resume_pc;
+        psx_pc0_journal_note(PSX_PC0J_DIRTY_SENTINEL, cpu, addr,
+                             (psx_get_in_exception() ? 1u : 0u) |
+                             (g_async_rfe_resume_pc ? 2u : 0u));
         cpu->pc = 0;
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
@@ -2743,6 +2773,15 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         if (g_async_rfe_resume_pc != 0u) {
             g_async_rfe_fire_count++;
             cpu->pc = g_async_rfe_resume_pc;
+            /* CONSUME: a resume PC rescues exactly the async RFE it was
+             * latched for. The latch is set on every exception entry with a
+             * real EPC and is deliberately allowed to outlive its own
+             * exception (that IS the fix — the sentinel RFE arrives later),
+             * but leaving it armed made every subsequent sentinel reach
+             * resume at a stale, possibly unrelated PC instead of taking the
+             * loud pc=0 exit. A genuinely-needed PC is re-latched by the next
+             * real exception entry, so consuming here is self-healing. */
+            g_async_rfe_resume_pc = 0u;
             return 1;
         }
         return 1;
@@ -2755,7 +2794,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     /* Run the statically-compiled game function only while the target is still
      * native-safe. Dirty overlay pages and pages whose text bytes diverged from
      * the original EXE image fall through to interpret the live RAM bytes. */
-    if (psx_game_text_native_ok(addr)) {
+    if (psx_game_text_native_ok_memo(addr)) {
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);
@@ -2831,11 +2870,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) {
         /* Bulk host transfers can populate post-EXE executable RAM without
          * passing through the write hooks that mark dirty pages. A real
-         * control transfer to a decodable word above the configured boot-EXE
-         * text end is enough evidence to admit that word to the interpreter.
-         * Data and invalid targets still fail closed. */
-        if (phys < (2u * 1024u * 1024u) &&
-            phys >= g_overlay_region_floor &&
+         * control transfer to a decodable word OUTSIDE the configured boot-EXE
+         * text image is enough evidence to admit that word to the interpreter.
+         * "Outside" is both sides of the text: a boot EXE that loads high
+         * streams its gameplay overlays into the RAM below itself (Klonoa's
+         * text is 0x180000-0x18B000, its overlays run from 0x10000+), and
+         * gating on the floor alone rejected every one of those targets —
+         * a JALR into a CD-DMA'd overlay page then fell through to
+         * psx_unknown_dispatch and fail-fast exit(1). Data and invalid targets
+         * still fail closed via the decodability check. */
+        if (phys < (8u * 1024u * 1024u) &&
+            phys_is_overlay_region(phys) &&
             dirty_ram_word_looks_decodable(fetch_word(phys))) {
             dirty_ram_mark_executable_range(phys, 4u);
         } else {
@@ -3070,6 +3115,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             g_dirty_ram_last_unsupported_pc     = g_unsupported_pc;
             g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
             g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
+            psx_pc0_journal_note(PSX_PC0J_DIRTY_UNSUPPORTED, cpu,
+                                 g_unsupported_pc, g_unsupported_insn);
             cpu->pc = 0;
             OV_FPLOG_RET1();
         }

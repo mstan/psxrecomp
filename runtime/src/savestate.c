@@ -570,6 +570,12 @@ int savestate_write_slot(int slot, const void* data, size_t size) {
 /* User APIs during netplay: guests cannot initiate; host must use
  * psx_netplay_request_* so peers hash-probe and sync over STATE_*. */
 static int netplay_user_blocked(void) {
+    extern int psx_link_pair_follower_mode(void);
+    if (psx_link_pair_follower_mode()) {
+        fprintf(stderr, "savestate: blocked — PSX-Link follower state is "
+                        "driven by its netplay client\n");
+        return 1;
+    }
     if (!psx_netplay_active()) return 0;
     if (!psx_netplay_is_host()) {
         fprintf(stderr, "savestate: netplay guest cannot save/load (host-only)\n");
@@ -687,7 +693,16 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         int slot = s_save_pending;
         char path[600];
         uint32_t pc = savestate_resolve_resume_pc(cpu, resume_pc);
-        if (!savestate_resume_pc_ok(pc)) {
+        /* hint==0 ALSO defers, even when the resolver found a plausible-looking
+         * substitute. The substitute chain ends in sticky-BB latches and $ra,
+         * which pass the sanity check while being the wrong place to resume:
+         * the first F7 of a session saved such a state, it loaded, ran for
+         * ~150M instructions off the rails, and died at PC=0 -- poison that
+         * looks valid at save time and only fails minutes later. Deferring
+         * reuses the existing retry: the save completes at the next poll where
+         * a real block-leader PC is published, or fails LOUDLY after the
+         * timeout instead of writing a corrupt state silently. */
+        if (resume_pc == 0u || !savestate_resume_pc_ok(pc)) {
             /* FMV/present edges often poll with hint=0; wait briefly for a
              * sticky BB / IRQ latch rather than writing pc=0 poison. */
             const double now = savestate_mono_ms();

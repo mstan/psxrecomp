@@ -99,6 +99,34 @@ void dirty_ram_irq_ambient_resync_after_restore(void);
 extern uint32_t g_overlay_region_floor;
 #define OVERLAY_REGION_FLOOR (g_overlay_region_floor)
 
+/* The text-image BASE (phys) = this game's main-EXE load address. The floor
+ * above only bounds the text from ABOVE; on its own it encodes the assumption
+ * that the boot EXE sits at the bottom of usable RAM, so that [KERNEL_END,
+ * FLOOR) is text and [FLOOR, RAM) is overlay. That holds for a load_address of
+ * 0x80010000 (text base == KERNEL_END, so the region below text is empty) but
+ * is FALSE for a boot EXE that loads HIGH and streams its gameplay code into
+ * the RAM BELOW itself: Klonoa loads at 0x80180000 (text 0x180000-0x18B000,
+ * overlays at 0x10000-0x130000), Street Fighter Alpha 3 at 0x80113B00,
+ * Bomberman Fantasy Race at 0x8003004C. For those the sub-text RAM was
+ * misclassified as main-EXE text — clear_image_baseline() wiped its dirty bits
+ * and the dispatch admit-heuristic refused it, so a JALR into an overlay page
+ * the CD DMA'd there fell through to psx_unknown_dispatch and fail-fast
+ * exit(1) (Klonoa, frame 687, target 0x80123D00).
+ *
+ * The overlay region is therefore BOTH sides of the text image, not just above
+ * it. main.cpp pins g_text_image_lo = load_address & 0x1FFFFFFF at game load;
+ * the default equals DIRTY_RAM_KERNEL_WINDOW_END so the below-text clause is
+ * empty for BIOS-only runs and for every bottom-loading game. */
+extern uint32_t g_text_image_lo;
+
+/* 1 iff phys is runtime-loaded overlay RAM rather than main-EXE text — either
+ * side of the text image. Identical to `phys >= FLOOR` whenever the game loads
+ * at the bottom of RAM (g_text_image_lo == KERNEL_WINDOW_END). */
+static inline int phys_is_overlay_region(uint32_t phys) {
+    return phys >= g_overlay_region_floor ||
+           (phys >= DIRTY_RAM_KERNEL_WINDOW_END && phys < g_text_image_lo);
+}
+
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
@@ -145,6 +173,9 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
 int      dirty_ram_text_native_ok(uint32_t phys);
+/* (addr, text-guard generation) memo over the generated psx_game_text_native_ok
+ * — same verdict, without the dispatch-table binary search on every dispatch. */
+int      psx_game_text_native_ok_memo(uint32_t addr);
 /* Exact CFG ranges; exec_pc clips ranges that end before the resume PC. */
 int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                              uint32_t count,
@@ -201,15 +232,19 @@ extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 /* Every aligned main-RAM word is a possible instruction PC.  Execution
  * coverage only needs presence, not a hit count, so record it in a direct
  * bitmap instead of probing a large hash table for every retired instruction.
- * This covers all 524,288 RAM words (the old 262K-entry hash could saturate)
- * and is also the execution-verified seed source used by overlay_capture. */
-#define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
+ * Sized for the full 8 MiB host RAM capacity (PSX_RAM_CAPACITY), not retail
+ * 2 MiB: the 8 MB hardware mod runs enhancement code from the high banks
+ * (WipEout 3 ntscfull8 loads its engine at 0x781000+), and a 2 MB bitmap
+ * silently dropped that coverage — the region could never be captured or
+ * compiled, so it interpreted forever. 512 KiB of static bitmaps total.
+ * Also the execution-verified seed source used by overlay_capture. */
+#define DIRTY_RAM_EXEC_WORD_COUNT   ((8u * 1024u * 1024u) / 4u)
 #define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 /* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
  * guard; they clear that page's capture bits rather than serializing from the
- * universal store hot path. */
-#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 16u
+ * universal store hot path. 8 MiB / 4 KiB / 32 = 64 words. */
+#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 64u
 extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
 /* Presence-only companion for interpreted block/dispatch entries. The richer
  * counter table remains for telemetry, while capture can snapshot/reset this

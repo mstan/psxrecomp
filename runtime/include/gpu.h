@@ -39,10 +39,38 @@ typedef struct {
 } GpuDisplayInfo;
 
 void gpu_get_display_info(GpuDisplayInfo* out);
+
+/* Perspective-correct UV arming rate, per condition. armed/attempts is the
+ * real perspective coverage: attempts counts only textured triangles, so it is
+ * the denominator that gp0_draw (which includes untextured primitives that are
+ * correctly never armed) cannot provide. Diagnostic; any pointer may be NULL. */
+void gpu_texture_correction_stats(uint64_t *attempts, uint64_t *armed,
+                                  uint64_t *no_correction,
+                                  uint64_t *no_source, uint64_t *no_depth);
 /* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
 int  gpu_display_is_depth24(void);
+/* GP1(08h) bit 3: 0 = NTSC, 1 = PAL. */
+int  gpu_display_is_pal(void);
+/* Guest CPU cycles per CRTC frame (33.8688 MHz / 60 NTSC, / 50 PAL). */
+#define PSX_VBLANK_CYCLES_NTSC 564480u
+#define PSX_VBLANK_CYCLES_PAL  677376u
+uint32_t gpu_vblank_period_cycles(void);
+/*
+ * Force guest cycles per VBlank regardless of GP1(08h) PAL/NTSC. 0 clears.
+ * Used so NTSC display mode can keep a 50 Hz IRQ (25 fps with stock skip)
+ * for audio-safe ports of PAL titles. Still divided by the Nx multiplier.
+ */
+void gpu_set_crtc_vblank_period_override(uint32_t cycles);
+uint32_t gpu_get_crtc_vblank_period_override(void);
+/*
+ * Experimental enhancement: GooseStation-style Nx video timing. Multiplier 2
+ * halves the guest VBlank period (NTSC 120 Hz / PAL 100 Hz CRTC). Default 1.
+ * Host wall-clock pacing is separate (psx_mod_set_native_vblank_rate).
+ */
+void gpu_set_crtc_refresh_multiplier(uint32_t multiplier);
+uint32_t gpu_get_crtc_refresh_multiplier(void);
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b);
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);
@@ -119,6 +147,27 @@ uint64_t gpu_gp0_ring_total(void);
 uint32_t gpu_gp0_ring_capacity(void);
 uint32_t gpu_gp0_ring_max_words(void);
 int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
+
+/* PGXP per-prim resolution census: one entry per prepared precise triangle
+ * whose vertices did NOT all resolve through the dataflow shadow. cls[] is
+ * per-vertex: 0 = shadow miss (addr known, no valid entry), 1 = geometry-cache
+ * fallback, 2 = dataflow, 3 = no packet address (CPU-built submission path).
+ * Draw-space bbox, so it overlays the display half directly. */
+typedef struct {
+    int16_t  x0, y0, x1, y1;
+    uint8_t  cls[3];
+    uint8_t  _pad;
+    uint32_t src;
+    uint32_t frame;
+} PgxpCensusEnt;
+/* Copies the census of the most recent COMPLETE frame; returns entry count.
+ * tris/clean report that frame's totals (all triangles vs all-dataflow). */
+int gpu_pgxp_census_dump(uint32_t *frame_out, uint32_t *tris, uint32_t *clean,
+                         PgxpCensusEnt *out, int max_out);
+/* Same shape for texture-UV correction misses: cls[0] carries the reason
+ * (0 = no_source, 1 = no_depth), cls[1] the offending vertex index. */
+int gpu_pgxp_texcensus_dump(uint32_t *frame_out, PgxpCensusEnt *out, int max_out);
+
 void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
 
 /* Vblank presentation callback — called from gpu_vblank_tick().
@@ -240,6 +289,11 @@ void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_cull_keep_sites(const uint32_t *addresses,
                                 const uint32_t *expected,
                                 const uint32_t *results, int nsites);
+/* [[widescreen.cull.widen]] sites, so the dirty-RAM interpreter and any overlay
+ * shard reach the same widened verdict the AOT image does. */
+void gpu_ws_set_cull_widen_sites(const uint32_t *addresses,
+                                 const uint32_t *expected,
+                                 const uint32_t *modes, int nsites);
 void gpu_ws_set_angle_sites(const uint32_t *addresses,
                             const uint32_t *expected, int nsites);
 void gpu_ws_set_aspect_cone(const uint32_t *addresses,
@@ -273,6 +327,8 @@ uint32_t psx_ws_xclip_bound(uint32_t vanilla);
 uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced);
 int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
                           uint32_t *out);
+int psx_ws_cull_widen_site(uint32_t pc, uint32_t instr, uint32_t rs,
+                           uint32_t rt, uint32_t imm, uint32_t *out);
 uint32_t psx_ws_angle_widen(uint32_t vanilla);
 int psx_ws_angle_site(uint32_t pc, uint32_t instr, uint32_t *out);
 uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla,
@@ -297,6 +353,11 @@ int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
 int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm);
+/* Register-bound widen for SLT ([[widescreen.cull.widen]]). bound_is_rt picks
+ * which operand carries the bound: 1 -> rs < rt + m, 0 -> rs + m < rt. Identity
+ * at margin 0. Use instead of pinning a clip classifier, which stops the
+ * clipper subdividing and gets whole primitives dropped by the GPU. */
+int  psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt);
 int  psx_ws_cull_bltz(uint32_t v);
 int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 /* True if a run of instruction words carries the screen-extent reject signature
@@ -382,6 +443,12 @@ void psx_ws_backdrop_ring_note(uint32_t pc, int kind, int wcols, uint32_t orig,
                                uint32_t finalv, int extent, int camx, int count,
                                uint32_t base, uint32_t dl);
 int  psx_ws_backdrop_ring_json(char *buf, int cap);
+
+/* auto_ui_squash partition dump (`ws_ui_groups`). Reports, for the last UI
+ * prepass, each primitive's raw key inputs (CLUT/texpage band/family via op,
+ * y, h) alongside its union-find root and final anchor — enough to tell whether
+ * two HUD primitives shared a run, and which key component split them if not. */
+int  psx_ws_ui_groups_json(char *buf, int cap);
 
 /* Live-tunable backdrop widen amount (ws_backdrop_margin command): <0 whole-row,
  * 0 off, >0 N-column widen. g_ws_bd_from_interp is the interp's one-shot

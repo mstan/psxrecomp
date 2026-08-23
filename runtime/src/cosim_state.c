@@ -45,6 +45,7 @@ extern uint8_t* spu_get_ram_ptr(void);      extern uint32_t spu_get_ram_bytes(vo
 extern uint32_t cdrom_snapshot_bytes(void); extern void cdrom_snapshot_write(uint8_t*);
 extern uint32_t dma_snapshot_bytes(void);   extern void dma_snapshot_write(uint8_t*);
 extern uint32_t sio_snapshot_bytes(void);   extern void sio_snapshot_write(uint8_t*);
+extern uint32_t sio1_snapshot_bytes(void);  extern void sio1_snapshot_write(uint8_t*);
 /* interrupts.c: fold the genuine guest-timing statics (NOT the call-count artifacts). */
 extern uint64_t interrupts_cosim_hash(uint64_t seed);
 /* renderer-agnostic VRAM readback (sw renderer = cheap memcpy). */
@@ -203,6 +204,7 @@ uint64_t cosim_state_hash(CosimSubHashes *sub) {
     s.cdrom = blob_hash(FNV_OFF, cdrom_snapshot_bytes, cdrom_snapshot_write);
     s.dma   = blob_hash(FNV_OFF, dma_snapshot_bytes,   dma_snapshot_write);
     s.sio   = blob_hash(FNV_OFF, sio_snapshot_bytes,   sio_snapshot_write);
+    s.sio1  = blob_hash(FNV_OFF, sio1_snapshot_bytes,  sio1_snapshot_write);
 
     /* dirty-RAM page bitmap (affects dispatch/interp routing) */
     { uint64_t h = FNV_OFF; uint32_t wc = dirty_ram_get_bitmap_word_count();

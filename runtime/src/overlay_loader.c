@@ -1,4 +1,5 @@
 #include "overlay_loader.h"
+#include "netplay_ram_dirty.h"
 #include "overlay_api.h"
 #include "overlay_path_canon.h"
 #include "code_provider.h"
@@ -24,6 +25,7 @@ extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
 #  include <windows.h>
 #else
 #  include <unistd.h>
+#  include <dirent.h>   /* orphaned-cache tripwire in scan_cache_dir() */
 #endif
 
 #ifdef _WIN32
@@ -116,7 +118,9 @@ static int       s_cand_n = 0;
  * scales catastrophically once a warmed cache contains hundreds of variant
  * DLLs. Index candidates by the 4 KiB RAM pages touched by their code ranges;
  * a continuation then examines only candidates that could contain its PC. */
-#define RANGE_PAGE_COUNT (2u * 1024u * 1024u / 4096u)
+/* Full 8 MiB capacity: 8 MB-mod shards live in the high banks (WipEout 3
+ * ntscfull8 engine at 0x781000+) and their continuations must be indexable. */
+#define RANGE_PAGE_COUNT (8u * 1024u * 1024u / 4096u)
 #define RANGE_LINK_CAP   (CAND_CAP * 8)
 typedef struct { int cand, next; } RangeLink;
 static int       s_range_page_head[RANGE_PAGE_COUNT];
@@ -182,7 +186,7 @@ static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
 static void exact_entry_set(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    if (phys < 8u * 1024u * 1024u && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
     }
@@ -190,7 +194,7 @@ static void exact_entry_set(uint32_t phys) {
 
 static int exact_entry_has(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
+    if (phys >= 8u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
     uint32_t word = phys >> 2;
     return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
 }
@@ -585,8 +589,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0u || lo >= 2u * 1024u * 1024u ||
-            len > 2u * 1024u * 1024u - lo) {
+        if (len == 0u || lo >= 8u * 1024u * 1024u ||
+            len > 8u * 1024u * 1024u - lo) {
             s_static_match_crc_misses++;
             return 0;
         }
@@ -662,7 +666,9 @@ typedef struct {
     int      n;
 } ManFn;
 
-#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
+/* Full 8 MiB host capacity: 8 MB-mod shards (high-bank enhancement code)
+ * must pass manifest entry/range validation. Backing RAM is always 8 MiB. */
+#define OVERLAY_RAM_SIZE (8u * 1024u * 1024u)
 #define MANIFEST_LINE_MAX 128u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
 #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
@@ -676,12 +682,15 @@ enum {
 static int man_structurally_valid(const ManFn *m) {
     if (!m || !m->has_crc || m->n < 1 || m->n > MAX_CODE_RANGES)
         return 0;
-    if ((m->entry & 0xFFE00000u) != 0x80000000u) return 0;
+    /* KSEG0 within the 8 MiB capacity (mask keeps bits 31..23): 8 MB-mod
+     * shards carry high-bank entries (0x80780000+); the old 0xFFE00000 mask
+     * additionally required phys < 2 MiB and rejected them structurally. */
+    if ((m->entry & 0xFF800000u) != 0x80000000u) return 0;
     uint32_t entry = m->entry & 0x1FFFFFFFu;
     if ((entry & 3u) != 0u || entry >= OVERLAY_RAM_SIZE) return 0;
     int entry_covered = 0;
     for (int r = 0; r < m->n; r++) {
-        if ((m->lo[r] & 0xFFE00000u) != 0x80000000u) return 0;
+        if ((m->lo[r] & 0xFF800000u) != 0x80000000u) return 0;
         uint32_t lo = m->lo[r] & 0x1FFFFFFFu;
         uint32_t len = m->len[r];
         if ((lo & 3u) != 0u || (len & 3u) != 0u || len < 4u ||
@@ -895,7 +904,7 @@ static int mips_control_kind(uint32_t instr) {
 static int ranges_contain_word(const uint32_t *lo_list,
                                const uint32_t *len_list, int n,
                                uint32_t phys) {
-    if ((phys & 3u) != 0u || phys > (2u * 1024u * 1024u) - 4u) return 0;
+    if ((phys & 3u) != 0u || phys > (8u * 1024u * 1024u) - 4u) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
         uint32_t len = len_list[r];
@@ -911,7 +920,7 @@ static int ranges_contain_word(const uint32_t *lo_list,
 static int ranges_delay_slots_hashed(const uint32_t *lo_list,
                                      const uint32_t *len_list, int n) {
     const uint8_t *ram = memory_get_ram_ptr();
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = 8u * 1024u * 1024u;  /* full backing capacity */
     if (!ram || n < 1 || n > MAX_CODE_RANGES) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
@@ -1440,10 +1449,23 @@ static void lazy_miss_invalidate_loader(void) {
     }
 }
 
+/* Watched-code invalidation is PAGE-granular, not global. The historical
+ * global generation (s_lazy_watched_code_gen) was bumped by
+ * overlay_loader_note_code_write on EVERY guest data write to ANY watched
+ * page — and candidate code pages are mixed code+data on real games, written
+ * many times per frame in-race. That gave every negative memo a lifetime of
+ * under a frame, so try_load_region's full manifest scan re-ran per dispatch
+ * anyway (profiled at 32% of process CPU under turbo WITH the memo, WipEout 3
+ * ntscfull8). Keying each entry on its own page's generation keeps the exact
+ * correctness event — "bytes at/near this PC may now match a previously
+ * absent variant" — while writes to unrelated pages no longer wipe anything.
+ * Cross-page CPS bundles whose OTHER pages change are covered by loader_gen
+ * (every DLL publish) and g_dirty_ram_code_gen (code writes/DMA), the same
+ * events that already re-run the scan. */
 static int lazy_miss_cached(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     return e->phys == phys && e->code_gen == g_dirty_ram_code_gen &&
-           e->watched_code_gen == s_lazy_watched_code_gen &&
+           e->watched_code_gen == overlay_watch_pagegen_sum(phys & ~3u, 4u) &&
            e->loader_gen == s_lazy_loader_gen;
 }
 
@@ -1451,7 +1473,7 @@ static void lazy_miss_record(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     e->phys = phys;
     e->code_gen = g_dirty_ram_code_gen;
-    e->watched_code_gen = s_lazy_watched_code_gen;
+    e->watched_code_gen = overlay_watch_pagegen_sum(phys & ~3u, 4u);
     e->loader_gen = s_lazy_loader_gen;
 }
 
@@ -1918,6 +1940,64 @@ static void scan_cache_dir(void) {
              (unsigned)PSX_OVERLAY_FLAVOR);
     scan_one_cache_dir(dir, CACHE_TIER_TCC);
     abi_preflight_sweep(dir);
+
+    /* Orphaned-cache tripwire. The cache path embeds a content hash of the
+     * emitter sources, so a cache built before the last emitter change lives in
+     * a sibling directory this build will never open: the scan simply finds
+     * nothing, registers nothing, and every mod-patched region falls to the
+     * dirty-RAM interpreter at its 10-30x frame cost — silently, and looking
+     * exactly like "this machine is just slow". That cost days: a bundle with
+     * 443 shards tagged cg10_79105b41 running against a 7a17c3b1 runtime
+     * measured 13.1M interpreted dispatches over 3,623 frames at ~47 fps, with
+     * registered=0 the only evidence and no message saying why.
+     *
+     * If we indexed nothing, look for siblings and name the mismatch. This is a
+     * one-shot startup diagnostic on the operator's existing status stream, not
+     * a trace: a run that loads shards prints nothing extra. */
+    if (s_cache_idx_count == 0) {
+        char parent[768];
+        snprintf(parent, sizeof(parent), "%s/%s/gcc/%s",
+                 s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI);
+        char expect[128];
+        snprintf(expect, sizeof(expect), "cg%d_%08x_gc%08x_f%u",
+                 PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+                 (unsigned)s_config_hash, (unsigned)PSX_OVERLAY_FLAVOR);
+        int orphans = 0;
+#ifdef _WIN32
+        char pat[832];
+        snprintf(pat, sizeof(pat), "%s/cg*", parent);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (strcmp(fd.cFileName, expect) == 0) continue;
+                printf("psxrecomp: overlay cache ORPHANED — found '%s' but this "
+                       "build needs '%s'\n", fd.cFileName, expect);
+                orphans++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+#else
+        DIR *d = opendir(parent);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strncmp(e->d_name, "cg", 2) != 0) continue;
+                if (strcmp(e->d_name, expect) == 0) continue;
+                printf("psxrecomp: overlay cache ORPHANED — found '%s' but this "
+                       "build needs '%s'\n", e->d_name, expect);
+                orphans++;
+            }
+            closedir(d);
+        }
+#endif
+        if (orphans)
+            printf("psxrecomp: %d stale overlay cache tag(s) in %s — every "
+                   "mod-patched region will INTERPRET. Rebuild shards with the "
+                   "current emitter (overlay_autocompile_cmd).\n",
+                   orphans, parent);
+    }
 
     refresh_bios_resident_flags();
     rebuild_lazy_manifest_index();
@@ -3236,8 +3316,18 @@ static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys,
     LazyMan *lm = &s_lazy_man[li];
     int ci = lm->cache_idx;
     if (ci < 0 || ci >= s_cache_idx_count) return 0;
+    /* Region agreement is CONTAINMENT, not equality. The walkback recovers
+     * region_start from the sticky dirty-page bitmap, but capture epochs key
+     * regions by executed-page evidence — the two disagree whenever the dirty
+     * run has a hole inside a captured region (measured: dispatch at 0x172868
+     * recovered 0x172000 vs shard key 0x16F000; every interior continuation
+     * then failed to load its owner DLL forever, WipEout 3 ntscfull8 ran
+     * 57M dispatches/bench through the interpreter). Identity is not weakened:
+     * lazy_man_contains pins phys inside the function's ranges and
+     * lazy_man_matches verifies the function's LIVE bytes against the
+     * manifest CRC at those addresses. */
     return (!require_region_start ||
-            s_cache_idx[ci].region_start == region_start) &&
+            s_cache_idx[ci].region_start <= region_start) &&
         !s_cache_idx[ci].load_failed &&
         !s_cache_idx[ci].capacity_suppressed &&
         !dll_already_loaded(s_cache_idx[ci].path) &&
@@ -3277,6 +3367,19 @@ static int try_load_region(uint32_t phys) {
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
 
     if (!overlay_loads_allowed())
+        return 0;
+    /* Negative memo — profiled load-bearing. A dispatch PC in the overlay
+     * window with NO loadable shard re-ran this full scan (dirty walkback +
+     * manifest bucket + per-page range links, each with gen-gated CRC work)
+     * on EVERY dispatch: the exact-entry/CPS call site above never reaches
+     * the terminal lazy_miss_record, so nothing remembered the failure.
+     * Measured (WipEout 3 ntscfull8, mod-patched text kept dirty at the
+     * game-start baseline): try_load_region = 46% of total process CPU while
+     * the interpreter itself was 4%. The memo self-expires on any code write
+     * (g_dirty_ram_code_gen), watched-page write, or new DLL publish
+     * (load_one_dll -> lazy_miss_invalidate_loader), so a shard that becomes
+     * available or bytes that change re-run the scan exactly once. */
+    if (lazy_miss_cached(phys))
         return 0;
 
     uint32_t page_sz = 4096u;
@@ -3331,8 +3434,11 @@ retry_artifact:
         int ci = s_lazy_man[li].cache_idx;
         /* Cross-region recovery is safe only for a fully coherent CPS bundle.
          * A partial exact-function match can have snapshot-specific internal
-         * tails, so retain it as fallback only when the heuristic base agrees. */
-        if (s_cache_idx[ci].region_start == region_start &&
+         * tails, so retain it as fallback only when the heuristic base agrees
+         * — by containment, matching lazy_is_loadable: the dirty-bitmap
+         * walkback recovers a start INSIDE the captured (executed-page keyed)
+         * region whenever the dirty run has a hole. */
+        if (s_cache_idx[ci].region_start <= region_start &&
             lazy_candidate_preferred(li, fallback))
             fallback = li;
         /* Entry chains are newest-first/semantic. Preserve their established
@@ -3361,12 +3467,13 @@ retry_artifact:
         }
     }
     int selected = lazy_choose_complete_or_fallback(best, fallback);
-    if (selected < 0) return 0;
+    if (selected < 0) { lazy_miss_record(phys); return 0; }
     if (lazy_load_selected(selected)) return 1;
     /* An unloadable/corrupt GCC artifact must not suppress an older immutable
      * repair or the TCC fallback. lazy_load_selected marks the failed cache
      * entry, so a bounded re-selection chooses the next live candidate. */
     if (++select_attempts < s_cache_idx_count) goto retry_artifact;
+    lazy_miss_record(phys);
     return 0;
 }
 
@@ -3374,6 +3481,72 @@ retry_artifact:
  * interior CPS continuation. The latter must use its already-loaded range owner
  * first (the Whoopee 0x107624 fix); the former must be allowed to publish its
  * exact DLL even when a broader conservative owner contains the same PC. */
+/* ---- dispatch-miss classification (PSX_OVERLAY_MISS_DIAG=1) -------------
+ * 97.5% of overlay dispatches fall back to interp (measured: 1.35M native vs
+ * 53.5M fallback). That single number cannot distinguish "nothing was ever
+ * captured for this PC" from "a shard exists but its bytes no longer match"
+ * from "it matches but the DLL is unusable" — which are three different bugs
+ * with three different fixes. Classify each FIRST-TIME miss (the memoized
+ * negative path is counted separately) and report periodically. */
+static uint64_t s_miss_no_manifest = 0; /* no captured shard declares this PC  */
+static uint64_t s_miss_crc         = 0; /* declared, but live bytes differ     */
+static uint64_t s_miss_unusable    = 0; /* matches, but DLL load_failed/suppr. */
+static uint64_t s_miss_other       = 0; /* matched+usable yet still fell back  */
+static uint64_t s_miss_cachedhit   = 0; /* memoized negative, no search done   */
+static int      s_miss_diag        = -1;
+static void miss_diag_dump(int force);
+
+static int miss_diag_on(void) {
+    if (s_miss_diag < 0) s_miss_diag = getenv("PSX_OVERLAY_MISS_DIAG") ? 1 : 0;
+    return s_miss_diag;
+}
+
+static void miss_classify(uint32_t phys) {
+    if (!miss_diag_on() || !s_active) return;
+    uint32_t bucket = (phys * 2654435761u) & LAZY_ENTRY_MASK;
+    int any = 0, crcfail = 0, unusable = 0, usable = 0;
+    for (int li = s_lazy_entry_head[bucket]; li >= 0;
+         li = s_lazy_man[li].next_entry) {
+        if ((s_lazy_man[li].fn.entry & 0x1FFFFFFFu) != phys) continue;
+        any = 1;
+        if (!lazy_man_matches(&s_lazy_man[li])) { crcfail = 1; continue; }
+        int ci = s_lazy_man[li].cache_idx;
+        if (ci < 0 || ci >= s_cache_idx_count ||
+            s_cache_idx[ci].load_failed || s_cache_idx[ci].capacity_suppressed)
+            unusable = 1;
+        else usable = 1;
+    }
+    if (!any)          s_miss_no_manifest++;
+    else if (usable)   s_miss_other++;
+    else if (crcfail)  s_miss_crc++;
+    else if (unusable) s_miss_unusable++;
+    miss_diag_dump(0);
+}
+
+/* force=1 ignores the rate limit (periodic tick / shutdown). */
+static void miss_diag_dump(int force) {
+    if (!miss_diag_on()) return;
+    uint64_t tot = s_miss_no_manifest + s_miss_crc + s_miss_unusable +
+                   s_miss_other;
+    if (!force && (tot & 0x3Fu) != 0u) return;
+    fprintf(stderr,
+        "psxrecomp: [missdiag] distinct first-time misses=%llu  no_manifest=%llu "
+        "crc_mismatch=%llu unusable=%llu matched_but_fellback=%llu ; "
+        "memoized_negative_hits=%llu native=%llu interp=%llu\n",
+        (unsigned long long)tot,
+        (unsigned long long)s_miss_no_manifest,
+        (unsigned long long)s_miss_crc,
+        (unsigned long long)s_miss_unusable,
+        (unsigned long long)s_miss_other,
+        (unsigned long long)s_miss_cachedhit,
+        (unsigned long long)s_disp_native,
+        (unsigned long long)s_disp_interp);
+}
+
+/* Called from the loader status query so a run always emits a final tally even
+ * when fewer than the rate-limit number of distinct misses occurred. */
+void overlay_loader_miss_diag_report(void) { miss_diag_dump(1); }
+
 static int lazy_has_exact_entry(uint32_t phys) {
     /* Same overlay-off hazard as overlay_find_by_range: the lazy entry index
      * (s_lazy_entry_head) is -1-initialized only when overlay_cache is enabled;
@@ -3511,6 +3684,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
     if (!s_active) return 0;
     if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
+        if (miss_diag_on()) s_miss_cachedhit++;
         s_disp_interp++;
         return 0;
     }
@@ -3824,7 +3998,10 @@ retry_candidates:
         goto retry_candidates;
     }
 
-    if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
+    if (overlay_cache_window_contains(phys)) {
+        miss_classify(phys);
+        lazy_miss_record(phys);
+    }
     s_disp_interp++;
     return 0;
 }
@@ -4104,6 +4281,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     *cpu = cpu0;
     memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
+    np_ram_dig_mark_all();
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     /* Arm the own-interior native route for the NATIVE pass only (see
      * s_shadow_cand decl): the candidate's CPS continuation re-entries run
@@ -4211,6 +4389,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     *cpu = cpuI;
     memcpy(ram,  s_ramI,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spadI, SHADOW_SPAD_SIZE);
+    np_ram_dig_mark_all();
     g_psx_call_bail = 0;
     s_native_exec  = sv;
     s_suppress_irq = saved_supp;
@@ -4800,6 +4979,10 @@ void overlay_loader_get_status(int *active, int *registered,
                                uint32_t *checked_out, int checked_max,
                                int *checked_written,
                                uint32_t *last_crc_out, int *last_file_found_out) {
+    /* PSX_OVERLAY_MISS_DIAG: emit the running tally on every status poll (the
+     * periodic perf-diag line) so a run reports even when the distinct-miss
+     * count never reaches the rate limit. */
+    miss_diag_dump(1);
     if (active)          *active          = s_active;
     if (registered)      *registered      = s_valid_count;
     if (regions_checked) *regions_checked = s_nchecked;

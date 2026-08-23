@@ -48,6 +48,7 @@ uint32_t netplay_aux_digest(void); /* crc(spu, mdec) */
 uint32_t netplay_spad_digest(void); /* 1 KiB scratchpad */
 uint32_t netplay_dma_digest(void);
 uint32_t netplay_sio_digest(void);
+uint32_t netplay_sio1_digest(void);
 
 /* SIO snapshot section CRCs — which subsystem forked a resim (a single SIO
  * digest could not say). Sections mirror sio_snap_emit order.

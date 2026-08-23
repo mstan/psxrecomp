@@ -13,6 +13,7 @@
 #include "cdrom.h"
 #include "cdrom_irq.h"
 #include "dma.h"
+#include "gpu.h"
 #include "spu.h"
 #include "event_ring.h"
 #include "audio_trace.h"
@@ -340,8 +341,7 @@ uint32_t g_cd_overwrite_last_frame = 0;
  * frames always advance. Paired with the per-source exception-progress
  * guarantee in interrupts.c (the real anti-starvation fix); this floor keeps
  * the exception VOLUME sane so the framerate doesn't collapse. Tunable via the
- * MAX_PER_FRAME knob. */
-#define VBLANK_CYCLES_NTSC          564480   /* 33.8688 MHz / 60 Hz; matches interrupts.c */
+ * MAX_PER_FRAME knob. PAL uses the live CRTC period from gpu_vblank_period_cycles(). */
 #define CDROM_INSTANT_MAX_PER_FRAME_DEFAULT 32
 #define CDROM_SINGLE_SPEED_SECTOR_CYCLES 451584
 
@@ -511,14 +511,14 @@ void cdrom_set_instant_rate(int per_frame) {
 int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
 
 static int instant_period(void) {
-    int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
+    int p = (int)(gpu_vblank_period_cycles() / (uint32_t)g_instant_max_per_frame);
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
 }
 
 static int warm_route_period(void) {
     const CDROMWarmRoute *route = warm_route_current();
     int rate = route ? route->rate : CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
-    int p = VBLANK_CYCLES_NTSC / rate;
+    int p = (int)(gpu_vblank_period_cycles() / (uint32_t)rate);
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
 }
 

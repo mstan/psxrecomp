@@ -43,6 +43,8 @@ typedef struct PsxNpSchedBridge {
     int *local_slot;
     /* Sticky for the session (from launch cfg / PSX_NET_FORCE_TURN). */
     int force_turn;        /* 1 = ICE relay-only — auto-delay floor applies */
+    /* 1 while the session runs rollback — gates the engine's min-D floor. */
+    int *rollback;
 } PsxNpSchedBridge;
 
 void np_sched_bind(const PsxNpSchedBridge *bridge);

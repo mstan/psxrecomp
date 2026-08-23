@@ -20,6 +20,7 @@
 #include "mdec.h"
 #include "mod_memory.h"
 #include "overlay_capture.h"
+#include "psx_ram.h"
 #include "spu.h"
 #include "audio_trace.h"
 #include "event_ring.h"
@@ -39,6 +40,15 @@ extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 extern uint64_t s_frame_count;
+
+static inline uint32_t dma_madr(uint32_t addr) {
+    return psx_mod_gpu_dma_resolve_address(addr);
+}
+
+static inline uint32_t dma_ram_remain(uint32_t addr) {
+    if (addr >= g_psx_ram_size) return 0u;
+    return g_psx_ram_size - addr;
+}
 
 /* ---- Per-channel registers ---- */
 
@@ -238,7 +248,7 @@ static void start_cdrom_dma_capture(uint32_t requested_words) {
     memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
     cdrom_dma_active_entry.seq = cdrom_dma_history_seq++;
     cdrom_dma_active_entry.frame_start = (uint32_t)s_frame_count;
-    cdrom_dma_active_entry.start_addr = channels[3].madr & 0x1FFFFCu;
+    cdrom_dma_active_entry.start_addr = dma_madr(channels[3].madr);
     cdrom_dma_active_entry.final_addr = cdrom_dma_active_entry.start_addr;
     cdrom_dma_active_entry.requested_words = requested_words;
     cdrom_dma_active_entry.bcr = channels[3].bcr;
@@ -285,7 +295,7 @@ static void finish_cdrom_dma_capture(uint32_t final_addr, uint8_t completed) {
     cdrom_debug_snapshot(&s);
 
     cdrom_dma_active_entry.frame_end = (uint32_t)s_frame_count;
-    cdrom_dma_active_entry.final_addr = final_addr & 0x1FFFFCu;
+    cdrom_dma_active_entry.final_addr = dma_madr(final_addr);
     cdrom_dma_active_entry.dicr_end = dicr_read_value(dicr);
     cdrom_dma_active_entry.i_stat_end = i_stat;
     cdrom_dma_active_entry.sector_read_pos_end = s.sector_read_pos;
@@ -382,7 +392,7 @@ static void cancel_async_transfer(int ch) {
         mdec_async[ch].cycles_accum = 0;
     }
     if (ch == 3) {
-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 0);
+        finish_cdrom_dma_capture(dma_madr(channels[3].madr), 0);
         cdrom_async.active = 0;
         cdrom_async.debug_started = 0;
         cdrom_async.total_words = 0;
@@ -437,9 +447,9 @@ static void start_async_mdec_transfer(int ch) {
     a->cycles_accum = 0;
 
     if (ch == 0) {
-        mdec_debug_dma_in_start(channels[0].madr & 0x1FFFFCu, a->remaining_words);
+        mdec_debug_dma_in_start(dma_madr(channels[0].madr), a->remaining_words);
     } else {
-        mdec_debug_dma_out_start(channels[1].madr & 0x1FFFFCu, a->remaining_words);
+        mdec_debug_dma_out_start(dma_madr(channels[1].madr), a->remaining_words);
     }
     a->debug_started = 1;
 }
@@ -463,11 +473,11 @@ static void start_async_cdrom_transfer(void) {
     a->total_words = transfer_word_count(3);
     a->remaining_words = a->total_words;
     a->cycles_accum = 0;
-    a->start_addr = channels[3].madr & 0x1FFFFCu;
+    a->start_addr = dma_madr(channels[3].madr);
     start_cdrom_dma_capture(a->total_words);
 
     if (a->total_words == 0) {
-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 1);
+        finish_cdrom_dma_capture(dma_madr(channels[3].madr), 1);
         cancel_async_transfer(3);
         complete_transfer(3);
     }
@@ -483,11 +493,11 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
     /* Log and capture game-data transfers only.
      * Transfers to 0x1C0000+ are FMV/streaming buffers; skip them. */
     if (!step && size > 0 && load_start < 0x1C0000u) {
-        /* The DMA word loop wraps inside the 2 MB RAM mask; the capture
+        /* The DMA word loop wraps inside the live RAM mask; the capture
          * path below takes a flat ram+offset span and must not follow the
          * wrap past the end of host RAM. */
-        if (size > 0x200000u - load_start)
-            size = 0x200000u - load_start;
+        if (size > dma_ram_remain(load_start))
+            size = dma_ram_remain(load_start);
         int lba = cdrom_get_setloc_lba();
         if (lba >= 0) cd_dma_log_push(lba, load_start, size);
 
@@ -517,7 +527,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
 
     if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0)) {
         uint32_t words = a->total_words;
-        uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+        uint32_t addr = dma_madr(channels[ch].madr);
         finish_async_mdec_transfer(ch, addr, words);
         return;
     }
@@ -537,7 +547,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
     uint32_t words_budget = a->cycles_accum / cycles_per_word;
     if (words_budget == 0) return;
 
-    uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[ch].madr);
     uint32_t moved = 0;
     /* ch1 (MDEC→RAM) writes guest RAM here in a deferred step; mark it as
      * DMA-sourced so write-provenance tags these writes with ch1 + the kick PC
@@ -558,13 +568,13 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
             if (!mdec_dma_write_ready()) break;
             uint32_t n = a->remaining_words < words_budget
                        ? a->remaining_words : words_budget;
-            uint32_t max_by_ram = (0x200000u - addr) / 4u;
+            uint32_t max_by_ram = dma_ram_remain(addr) / 4u;
             if (max_by_ram == 0) break;
             if (n > max_by_ram) n = max_by_ram;
             uint32_t got =
                 mdec_dma_write_words((const uint32_t *)(ram + addr), n);
             if (got == 0) break;
-            addr = (addr + got * 4u) & 0x1FFFFCu;
+            addr = dma_madr((addr + got * 4u));
             a->remaining_words -= got;
             words_budget -= got;
             moved += got;
@@ -580,7 +590,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
                 psx_write_word(addr, mdec_dma_read_word());
             }
 
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
             a->remaining_words--;
             words_budget--;
             moved++;
@@ -603,26 +613,26 @@ static void execute_ch0_mdec_in(void) {
     uint32_t direction = chcr & 1;           /* 1=from RAM to MDEC */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(0);
-    uint32_t addr = channels[0].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[0].madr);
     int32_t addr_step = step ? -4 : 4;
 
     if (direction != 0) {
         mdec_debug_dma_in_start(addr, total_words);
         if (addr_step == 4 && total_words > 0 &&
-            addr + total_words * 4u <= 0x200000u) {
+            addr + total_words * 4u <= g_psx_ram_size) {
             extern uint8_t *memory_get_ram_ptr(void);
             uint32_t got = mdec_dma_write_words(
                 (const uint32_t *)(memory_get_ram_ptr() + addr), total_words);
-            addr = (addr + got * 4u) & 0x1FFFFCu;
+            addr = dma_madr((addr + got * 4u));
             /* If the FIFO stalled mid-burst, finish any remainder word-wise. */
             for (uint32_t i = got; i < total_words; i++) {
                 mdec_dma_write_word(psx_read_word(addr));
-                addr = (addr + 4u) & 0x1FFFFCu;
+                addr = dma_madr((addr + 4u));
             }
         } else {
             for (uint32_t i = 0; i < total_words; i++) {
                 mdec_dma_write_word(psx_read_word(addr));
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = dma_madr((addr + addr_step));
             }
         }
         mdec_debug_dma_in_end(addr, total_words);
@@ -637,14 +647,14 @@ static void execute_ch1_mdec_out(void) {
     uint32_t direction = chcr & 1;           /* 0=from MDEC to RAM */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(1);
-    uint32_t addr = channels[1].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[1].madr);
     int32_t addr_step = step ? -4 : 4;
 
     if (direction == 0) {
         mdec_debug_dma_out_start(addr, total_words);
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, mdec_dma_read_word());
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
         mdec_debug_dma_out_end(addr, total_words);
         channels[1].madr = addr;
@@ -667,12 +677,12 @@ static uint32_t execute_ch2_gpu(void) {
             uint32_t block_size = channels[2].bcr & 0xFFFF;
             uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
             uint32_t total_words = block_size * block_count;
-            uint32_t addr = channels[2].madr & 0x1FFFFCu;
+            uint32_t addr = dma_madr(channels[2].madr);
             int32_t  addr_step = step ? -4 : 4;
             for (uint32_t i = 0; i < total_words; i++) {
                 uint32_t pixel_data = gpu_read_gpuread();
                 psx_write_word(addr, pixel_data);
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = dma_madr((addr + addr_step));
             }
             channels[2].madr = addr;
             actual_words = total_words;
@@ -686,14 +696,14 @@ static uint32_t execute_ch2_gpu(void) {
         uint32_t block_size = channels[2].bcr & 0xFFFF;
         uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
         uint32_t total_words = block_size * block_count;
-        uint32_t addr = channels[2].madr & 0x1FFFFCu; /* mask to RAM, word-aligned */
+        uint32_t addr = dma_madr(channels[2].madr); /* mask to RAM, word-aligned */
         int32_t  addr_step = step ? -4 : 4;
 
         for (uint32_t i = 0; i < total_words; i++) {
             uint32_t word = psx_read_word(addr);
             gpu_set_gp0_source(addr);
             gpu_write_gp0(word);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
         channels[2].madr = addr;
         actual_words = total_words;
@@ -806,14 +816,14 @@ static uint32_t execute_ch2_gpu(void) {
         /* Burst mode (sync_mode == 0) */
         uint32_t word_count = channels[2].bcr & 0xFFFF;
         if (word_count == 0) word_count = 0x10000; /* 0 means 0x10000 */
-        uint32_t addr = channels[2].madr & 0x1FFFFCu;
+        uint32_t addr = dma_madr(channels[2].madr);
         int32_t  addr_step = step ? -4 : 4;
 
         for (uint32_t i = 0; i < word_count; i++) {
             uint32_t word = psx_read_word(addr);
             gpu_set_gp0_source(addr);
             gpu_write_gp0(word);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
         channels[2].madr = addr;
         actual_words = word_count;
@@ -843,18 +853,18 @@ static uint32_t execute_ch4_spu(void) {
     uint32_t direction = chcr & 1;           /* 1=from RAM to SPU, 0=SPU to RAM */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(4);
-    uint32_t addr = channels[4].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[4].madr);
     int32_t addr_step = step ? -4 : 4;
 
     if (direction != 0) {
         for (uint32_t i = 0; i < total_words; i++) {
             spu_dma_write(psx_read_word(addr));
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
         /* One aggregated event per SPU-bound transfer (per-word would flood
          * the ring: a full sound-bank upload is ~128k words). */
         audio_trace_event(AUDIO_EV_DMA_WRITE, total_words,
-                          channels[4].madr & 0x1FFFFCu);
+                          dma_madr(channels[4].madr));
     } else {
         /* SPU RAM -> CPU RAM. This direction previously zero-filled the
          * destination, which is not a transfer at all: SPU RAM is readable
@@ -865,10 +875,10 @@ static uint32_t execute_ch4_spu(void) {
          * fell back to a cold-boot path. */
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, spu_dma_read());
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
         audio_trace_event(AUDIO_EV_DMA_READ, total_words,
-                          channels[4].madr & 0x1FFFFCu);
+                          dma_madr(channels[4].madr));
     }
 
     channels[4].madr = addr;
@@ -882,7 +892,7 @@ static void execute_ch6_otc(void) {
      * BCR bits 0-15 = number of entries. */
     uint32_t num_entries = channels[6].bcr & 0xFFFF;
     if (num_entries == 0) num_entries = 0x10000;
-    uint32_t addr = channels[6].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[6].madr);
 
     for (uint32_t i = 0; i < num_entries; i++) {
         uint32_t val;
@@ -894,7 +904,7 @@ static void execute_ch6_otc(void) {
             val = (addr - 4) & 0x00FFFFFFu;
         }
         psx_write_word(addr, val);
-        addr = (addr - 4) & 0x1FFFFCu;
+        addr = dma_madr((addr - 4));
     }
 
     complete_transfer(6);
@@ -910,20 +920,20 @@ static void execute_ch5_pio(void) {
     uint32_t direction = chcr & 1u;
     uint32_t step = (chcr >> 1) & 1u;
     uint32_t total_words = transfer_word_count(5);
-    uint32_t addr = channels[5].madr & 0x1FFFFCu;
+    uint32_t addr = dma_madr(channels[5].madr);
     int32_t addr_step = step ? -4 : 4;
 
     if (direction == 1) {
         /* from RAM to device: just read and discard */
         for (uint32_t i = 0; i < total_words; i++) {
             (void)psx_read_word(addr);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
     } else {
         /* to RAM from device: write zeros (device not emulated) */
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, 0);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = dma_madr((addr + addr_step));
         }
     }
     channels[5].madr = addr;
@@ -1117,7 +1127,7 @@ void dma_advance(uint32_t cycles) {
             }
 
             uint32_t words_budget = a->cycles_accum / DMA_CDROM_CYCLES_PER_WORD;
-            uint32_t addr = channels[3].madr & 0x1FFFFCu;
+            uint32_t addr = dma_madr(channels[3].madr);
             uint32_t moved = 0;
             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
             g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
@@ -1128,7 +1138,7 @@ void dma_advance(uint32_t cycles) {
             if (a->remaining_words == a->total_words && words_budget > 0 &&
                 addr < 0x1C0000u) {
                 uint32_t bytes = a->total_words * 4u;
-                if (bytes > 0x200000u - addr) bytes = 0x200000u - addr;
+                if (bytes > dma_ram_remain(addr)) bytes = dma_ram_remain(addr);
                 overlay_capture_before_dma(addr, bytes);
             }
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
@@ -1137,7 +1147,7 @@ void dma_advance(uint32_t cycles) {
                 psx_write_word(addr, word);
                 record_cdrom_dma_word(word);
                 dirty_ram_mark_executable_range(addr, 4);
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = dma_madr((addr + addr_step));
                 a->remaining_words--;
                 words_budget--;
                 moved++;

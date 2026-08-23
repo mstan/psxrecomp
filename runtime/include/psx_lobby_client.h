@@ -16,6 +16,15 @@ extern "C" {
 #define PSX_LOBBY_MAX_MEMBERS 8
 #define PSX_LOBBY_MAX_LAN_EPS 4
 #define PSX_LOBBY_LANG_LEN 16
+#define PSX_LOBBY_MAX_MODS 12
+#define PSX_LOBBY_MOD_ID_LEN 96
+#define PSX_LOBBY_MOD_VER_LEN 32
+#define PSX_LOBBY_MOD_NAME_LEN 48
+/* Feature list per package: "feat[=opt~val[+opt~val]][,feat...]". Option
+ * values are part of the plan (two peers running the same feature with
+ * different options resolve different bytes), so this is sized for them —
+ * 96 silently truncated the moment options appeared. */
+#define PSX_LOBBY_MOD_FEATS_LEN 384
 
 #ifndef PSX_GAME_VERSION
 #define PSX_GAME_VERSION "dev"
@@ -29,6 +38,9 @@ typedef struct PsxLobbyRow {
     int      player_count;
     int      max_slots;
     int      has_password;
+    /* match_caps.lobby_kind echoed by newer servers (0 standard, 1 PSX-Link).
+     * Absent field parses as 0. */
+    int      lobby_kind;
     /* Host UDP endpoint from the server list (for one-shot latency probes). */
     char     host_endpoint[PSX_LOBBY_ENDPOINT_LEN];
     /* Legacy hub lan_endpoints (compat). Prefer local UDP beacon by lobby_id. */
@@ -37,6 +49,16 @@ typedef struct PsxLobbyRow {
     /* Round-trip ms to a reachable candidate; -1 unknown / timed out. */
     int      latency_ms;
 } PsxLobbyRow;
+
+/* One package the host requires, or one package a peer has installed. */
+typedef struct PsxLobbyModPkg {
+    char id[PSX_LOBBY_MOD_ID_LEN];
+    char ver[PSX_LOBBY_MOD_VER_LEN];
+    char name[PSX_LOBBY_MOD_NAME_LEN];   /* host required list (UI); empty on offers */
+    char feats[PSX_LOBBY_MOD_FEATS_LEN]; /* host enabled feature ids, comma-separated */
+    int  builtin;                        /* 1 = shipped with the title (still transferable) */
+    uint32_t size;                       /* archive bytes, 0 = unknown */
+} PsxLobbyModPkg;
 
 typedef struct PsxLobbyMember {
     int  slot;
@@ -48,7 +70,22 @@ typedef struct PsxLobbyMember {
     int  bios_can_openbios;   /* linked OpenBIOS backend */
     int  bios_can_scph1001;   /* linked retail + validated dump available */
     int  bios_prefer_openbios; /* explicit OpenBIOS pick (not retail) */
+    /* Peer installed-package catalog from set_ready mod_offer (0 if missing). */
+    int  mod_offer_valid;
+    int  mod_count;
+    PsxLobbyModPkg mods[PSX_LOBBY_MAX_MODS];
 } PsxLobbyMember;
+
+/*
+ * Local installed-package catalog advertised on join / set_ready. The host
+ * chooses which packages/features the match will run; missing guests are
+ * prompted to download before seating (online WS transfer).
+ */
+typedef struct PsxLobbyModOffer {
+    int  valid;
+    int  count;
+    PsxLobbyModPkg pkgs[PSX_LOBBY_MAX_MODS];
+} PsxLobbyModOffer;
 
 /*
  * Local BIOS capability advertised on set_ready (see docs/BIOS_SELECTION.md
@@ -80,9 +117,20 @@ typedef struct PsxLobbyMatchCaps {
     int  rollback;         /* 0/1 — invent/rollback netplay (default on) */
     /* DualShock-on-multitap-tap hack (0/1). Host-authoritative for the match. */
     int  multitap_analog;
+    /* Lobby kind: 0 = standard; 1 = PSX-Link (two consoles over the serial
+     * cable; 4 seats partitioned into console A = {0,1}, console B = {2,3}).
+     * Opaque to the server (rides match_caps). */
+    int  lobby_kind;
     char language[PSX_LOBBY_LANG_LEN];
     /* Settled match BIOS: "openbios" | "scph1001" | "" (unset / legacy). */
     char session_bios[16];
+    /* Host's portable mod-plan fingerprint (resolve digest, disc excluded).
+     * Peers compare after applying the plan and refuse to launch on a
+     * mismatch instead of desyncing on the first tick. Empty = not published. */
+    char mod_plan_fp[72];
+    /* Host-required packages (unique id+ver with any enabled feature). Empty = vanilla. */
+    int  mod_count;
+    PsxLobbyModPkg mods[PSX_LOBBY_MAX_MODS];
 } PsxLobbyMatchCaps;
 
 typedef struct PsxLobbyJoinInfo {
@@ -126,6 +174,8 @@ void psx_lobby_pump(void);
  */
 void psx_lobby_set_game_identity(const char *game_name, const char *game_version);
 const char *psx_lobby_game_version(void);
+/* 1 for the dev channel ("dev" or "dev+<tag>") — never a release pin. */
+int  psx_lobby_version_is_dev(const char *v);
 
 /*
  * TOC fingerprint (lowercase hex SHA-256 from DiscIdentity::disc_fp).
@@ -166,6 +216,20 @@ int  psx_lobby_kick(int slot);
 
 /* Host-only: swap/move a seated player between slots (server broadcasts update). */
 int  psx_lobby_move_member(int from_slot, int to_slot);
+/* Seat self-service (any seated player, not just the host). seat_move takes a
+ * FREE seat; taking an occupied one needs consent, so it is a request the
+ * occupant answers. The server arbitrates and broadcasts the new table. */
+int  psx_lobby_seat_move(int to_slot);
+int  psx_lobby_seat_swap_request(int target_slot);
+int  psx_lobby_seat_swap_answer(const char *asker_player_id, int accept);
+/* Incoming ask (1 = pending): who wants this player's seat. */
+int  psx_lobby_seat_swap_incoming(char *who, size_t who_cap,
+                                  char *asker_id, size_t asker_cap,
+                                  int *from_slot);
+void psx_lobby_seat_swap_incoming_clear(void);
+/* Outgoing verdict: 0 idle, 1 waiting, 2 accepted, -1 declined. */
+int  psx_lobby_seat_swap_outgoing(void);
+void psx_lobby_seat_swap_outgoing_clear(void);
 
 int  psx_lobby_in_lobby(void);
 int  psx_lobby_is_host(void);
@@ -236,12 +300,44 @@ int  psx_lobby_local_ready(void);
 /* True when every seated player is ready and player_count >= 2. */
 int  psx_lobby_all_ready(void);
 
-/* Toggle ready in the current lobby (attaches current bios_offer). */
+/* Toggle ready in the current lobby (attaches current bios_offer + mod_offer). */
 int  psx_lobby_set_ready(int ready);
 
 /* Local BIOS offer used on the next set_ready (and included in settle). */
 void psx_lobby_set_bios_offer(const PsxLobbyBiosOffer *offer);
 const PsxLobbyBiosOffer *psx_lobby_bios_offer(void);
+
+/* Local installed-package catalog attached to the next set_ready / join. */
+void psx_lobby_set_mod_offer(const PsxLobbyModOffer *offer);
+const PsxLobbyModOffer *psx_lobby_mod_offer(void);
+
+/* Pre-join missing-mod handshake (op:need_mods). Not seated until installed. */
+int  psx_lobby_need_mods_count(void);
+int  psx_lobby_need_mods_get(int index, PsxLobbyModPkg *out);
+int  psx_lobby_need_mods_can_transfer(void);
+const char *psx_lobby_need_mods_lobby_id(void);
+const char *psx_lobby_pending_join_password(void);
+const char *psx_lobby_pending_join_bind(void);
+/* Aim the mod transfer at the CURRENT lobby's host. The join-time need_mods
+ * rejection primes the same target; this covers the post-seat case (the host
+ * enabled a mod while everyone was already sitting in the room). 0 = primed. */
+int  psx_lobby_mod_xfer_prime_live(void);
+int  psx_lobby_mod_xfer_start(void);          /* guest: ask host to send missing pkgs */
+void psx_lobby_mod_xfer_cancel(void);
+int  psx_lobby_mod_xfer_progress(void);       /* -1 idle, -2 fail, 0..100 */
+int  psx_lobby_mod_xfer_failed(char *err, size_t err_cap);
+void psx_lobby_mod_xfer_note_fail(const char *err);
+int  psx_lobby_mod_xfer_pull(char *from, size_t from_cap,
+                             PsxLobbyModPkg *mods, int max);
+int  psx_lobby_mod_xfer_queue_pkg(const char *id, const char *ver, const char *sha256,
+                                  uint8_t *zip, uint32_t zip_len);
+int  psx_lobby_mod_xfer_queue_done(void);
+int  psx_lobby_mod_xfer_connected(void);
+int  psx_lobby_mod_xfer_send_idle(void);
+void psx_lobby_mod_xfer_send_fail(const char *to_player_id, const char *err);
+/* Guest: take a completed received package (caller frees *data). */
+int  psx_lobby_mod_package_take(PsxLobbyModPkg *meta, uint8_t **data, uint32_t *len);
+int  psx_lobby_mod_xfer_host_done(void); /* 1 after host sends the ICE end marker */
 
 /*
  * Settle session BIOS from seated peers' bios_offer (+ local offer):

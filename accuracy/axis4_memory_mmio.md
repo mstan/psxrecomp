@@ -147,6 +147,12 @@ noted for completeness, L856-879).
 - **Impact:** The serial SIO at 0x1050 is essentially unused by retail games, so
   near-zero practical exposure — but it is a structural inaccuracy (one handler for
   two devices) and 0x1050 reads return 0 vs Beetle's modeled values.
+- **RESOLVED:** `0x1F801050..0x105F` now routes to its own SIO1 device
+  (`runtime/src/sio1.c` + `sio1_runtime.c`, all six dispatchers in memory.c,
+  IRQ8 via `psx_irq_raise`, `BS_SEC_SIO1` snapshot). Full audit:
+  [`axis4_sio1_serial.md`](axis4_sio1_serial.md). Legacy decode retained
+  behind `PSX_SIO1_REGS=0`. The "near-zero exposure" premise had a
+  counter-example: WipEout 3 SE's libcomb link-cable driver.
 
 ### 2.6 Scratchpad write under IsC (Isolate Cache) is dropped — likely WRONG
 - **Ours:** `psx_write_*` early-out `if (sr_ptr && (*sr_ptr & 0x10000u)) return;`

@@ -838,11 +838,13 @@ void psx_fatal_halt(const char *reason) {
       debug_server_get_status(&listening, &port, &err);
       if (!listening) exit(1);
       extern void debug_server_poll(void);
-      fprintf(stderr,
-              "FATAL: %s — emulation halted; TCP debug server stays live "
-              "on port %d for post-mortem ring queries.\n",
-              g_psx_fatal_reason, port);
-      fflush(stderr);
+      /* stdout, not stderr: launcher captures redirect stdout only, and a
+       * fatal banner nobody can read is the same as no banner. This line is
+       * how an operator learns a "hung" process is really halt-and-serve. */
+      printf("FATAL: %s — emulation halted; TCP debug server stays live "
+             "on port %d for post-mortem ring queries.\n",
+             g_psx_fatal_reason, port);
+      fflush(stdout);
       for (;;) {
           debug_server_poll();
 #ifdef _WIN32

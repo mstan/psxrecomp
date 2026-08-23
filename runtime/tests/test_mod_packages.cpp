@@ -368,6 +368,54 @@ int main() {
           "is unavailable");
     check(reload.set_feature_enabled(
               "plugin.mod", "vblank", false, &error), error.c_str());
+
+    /* Function-entry plugins register callbacks in mod_runtime but must still
+     * appear in mod_plugin_registered so manifests can [[plugin]] them. */
+    mod_clear_plugins_for_tests();
+    check(mod_register_function_entry_plugin_id("test.fn-entry"),
+          "function-entry plugin id must register for resolve");
+    check(mod_plugin_registered("test.fn-entry"),
+          "function-entry id must count as a trusted plugin");
+    write_text(root / "packages/fnentry.mod/1.0.0/manifest.toml",
+               "format_version = 5\n"
+               "id = \"fnentry.mod\"\n"
+               "version = \"1.0.0\"\n"
+               "name = \"Fn Entry Mod\"\n"
+               "resolver = \"declarative\"\n"
+               "[[target]]\n"
+               "game_id = \"SLUS-TEST\"\n"
+               "[[feature]]\n"
+               "id = \"gate\"\n"
+               "name = \"Gate Entry\"\n"
+               "[[plugin]]\n"
+               "feature = \"gate\"\n"
+               "id = \"test.fn-entry\"\n");
+    check(reload.scan(&error), error.c_str());
+    check(reload.set_feature_enabled(
+              "fnentry.mod", "gate", true, &error), error.c_str());
+    ModResolution fnentry_resolution = reload.resolve("SLUS-TEST");
+    check(fnentry_resolution.ok && fnentry_resolution.plugins.size() == 1 &&
+              fnentry_resolution.plugins[0].id == "test.fn-entry",
+          "function-entry plugin id must resolve from the package plan");
+    check(reload.set_feature_enabled(
+              "fnentry.mod", "gate", false, &error), error.c_str());
+    mod_clear_plugins_for_tests();
+    check(reload.set_feature_enabled(
+              "fnentry.mod", "gate", true, &error), error.c_str());
+    ModResolution fnentry_unavailable = reload.resolve("SLUS-TEST");
+    check(!fnentry_unavailable.ok &&
+              std::any_of(
+                  fnentry_unavailable.errors.begin(),
+                  fnentry_unavailable.errors.end(),
+                  [](const std::string& item) {
+                      return item.find(
+                          "trusted plugin is unavailable: test.fn-entry") !=
+                          std::string::npos;
+                  }),
+          "function-entry plugin must fail closed when unregistered");
+    check(reload.set_feature_enabled(
+              "fnentry.mod", "gate", false, &error), error.c_str());
+
     write_text(root / "packages/features.mod/1.0.0/manifest.toml",
                manifest("features.mod", "1.0.0",
                    "\n[[feature]]\n"

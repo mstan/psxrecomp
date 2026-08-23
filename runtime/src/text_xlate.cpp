@@ -2,7 +2,9 @@
  * See text_xlate.h + docs/STRING_TRANSLATION.md. */
 
 #include "text_xlate.h"
+#include "netplay_ram_dirty.h"
 #include "cpu_state.h"
+#include "psx_ram.h"
 
 #include <cstdint>
 #include <cstring>
@@ -36,21 +38,23 @@ namespace {
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
-// Guest RAM access (little-endian, no swizzle). Main RAM is 2 MB, mirrored
-// across [0,0x800000). Returns 0 / no-op for out-of-range.
+// Guest RAM access (little-endian, no swizzle). Fold KUSEG/KSEG0/KSEG1 into
+// live DRAM (2 MB mirrors or unique 8 MB). Returns 0 / no-op for out-of-range.
 // ---------------------------------------------------------------------------
-constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
-
 inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
     uint32_t p = va & 0x1FFFFFFFu;
-    if (p < 0x00800000u) { *pa_out = p & (kRamSize - 1u); return true; }
+    if (p < 0x00800000u) { *pa_out = psx_ram_map_read(p); return true; }
     return false;  // I/O / BIOS / scratchpad — not translatable text storage
 }
 inline uint8_t grb(uint8_t* ram, uint32_t va) {
     uint32_t pa; return ram_fold(va, &pa) ? ram[pa] : 0u;
 }
 inline void gwb(uint8_t* ram, uint32_t va, uint8_t v) {
-    uint32_t pa; if (ram_fold(va, &pa)) ram[pa] = v;
+    uint32_t p = va & 0x1FFFFFFFu;
+    if (p >= 0x00800000u) return;
+    p = psx_ram_map_write(p);
+    ram[p] = v;
+    np_ram_dig_note_write(p);
 }
 inline bool va_in_ram(uint32_t va) { uint32_t pa; return ram_fold(va, &pa); }
 // Bless a just-written patch region into the text-image guard (see the extern
@@ -400,6 +404,7 @@ std::vector<GlyphLabel>                  g_glyph_labels;// per-glyph RAM patches
 std::atomic<int>                         g_glyph_pending{0}; // unpatched count (0 => idle)
 std::vector<VramPatch>                   g_vram_patches; // pre-rendered strip patches
 std::atomic<int>                         g_vram_patch_n{0};  // count (0 => upload hook idle)
+std::atomic<int>                         g_table_n{0};       // string entries (0 => dispatch scan idle)
 std::vector<MsgInplace>                  g_msg_inplace; // table-driven message RAM patches
 std::atomic<int>                         g_msg_inplace_pending{0}; // unpatched count (0 => idle)
 // Card-manager messages are packed into NUL-terminated *chunks*; within a chunk,
@@ -417,12 +422,24 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
-std::atomic<bool>     g_capture_on{false};    // inventory capture DEFAULT OFF:
-    // the always-on Shift-JIS string-inventory scan costs 26-35% of
-    // whole-lane throughput on streaming-heavy titles (measured across
-    // three GT2 race lanes; reproduced fleet-wide). Substitution (table +
-    // language armed) is unaffected; PSX_XLATE_CAPTURE=1 re-enables the
-    // scan for translation authoring.
+/* The capture inventory is an AUTHORING tool: it ingests every source string the
+ * game draws so a translator can enumerate them. It is not needed to APPLY a
+ * shipped translation (that is g_apply_armed, decided by the loaded tables).
+ *
+ * It is not free. text_xlate_on_dispatch runs at every dispatch, and with
+ * capture on it scans a0..a3, classifies each as text-ish, reads the record and
+ * hashes it. On the WipEout 3 ntscfull8 mod (~33k dispatches/frame) that was the
+ * single largest CPU consumer in the intro FMV — gprofng put it at 18.6% of
+ * samples, and disabling it measured +22% fps over guest frames 800-2200.
+ *
+ * So: on by default only where the rest of the authoring/debug tooling lives,
+ * off in a release build. PSX_XLATE_CAPTURE=1 turns it back on for authoring;
+ * PSX_XLATE_CAPTURE=0 turns it off in a debug-tools build. */
+#ifdef PSX_NO_DEBUG_TOOLS
+std::atomic<bool>     g_capture_on{false};    // release: authoring inventory off
+#else
+std::atomic<bool>     g_capture_on{true};     // debug-tools build: always-on
+#endif
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
@@ -479,6 +496,7 @@ void load_tables_locked() {
     g_glyph_pending.store(0, std::memory_order_relaxed);
     g_vram_patches.clear();
     g_vram_patch_n.store(0, std::memory_order_relaxed);
+    g_table_n.store(0, std::memory_order_relaxed);
     g_msg_inplace.clear();
     g_msg_inplace_pending.store(0, std::memory_order_relaxed);
     g_msg_seps.clear();
@@ -495,10 +513,11 @@ void load_tables_locked() {
         try { data = toml::parse(de.path().string()); }
         catch (...) { continue; }
         ++files;
-        if (!data.contains("entry")) continue;
-        const auto& arr = toml::find(data, "entry");
-        if (!arr.is_array()) continue;
-        for (const auto& e : arr.as_array()) {
+        /* A fixes-only file (vram_patch / glyph-label / msg blocks, no string
+         * table) is valid: gate each block on its own key, never the file. */
+        const auto arr = data.contains("entry") ? toml::find(data, "entry")
+                                                : toml::value(toml::array{});
+        if (arr.is_array()) for (const auto& e : arr.as_array()) {
             if (!e.contains("src_hex")) continue;
             std::string hex = toml::find_or<std::string>(e, "src_hex", "");
             auto bytes = hex_to_bytes(hex);
@@ -584,6 +603,7 @@ void load_tables_locked() {
             }
         }
     }
+    g_table_n.store((int)g_table.size(), std::memory_order_relaxed);
     g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
     g_vram_patch_n.store((int)g_vram_patches.size(), std::memory_order_relaxed);
     g_msg_inplace_pending.store((int)g_msg_inplace.size(), std::memory_order_relaxed);
@@ -821,6 +841,20 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
     const bool cap = g_capture_on.load(std::memory_order_relaxed);
     const bool app = g_apply_armed.load(std::memory_order_relaxed);
     if (!cap && !app) return;
+    /* g_apply_armed covers EVERY apply mechanism, but the only apply work this
+     * DISPATCH hook performs is string-arg swapping plus the throttled
+     * in-place RAM patches; vram_patch blocks apply through the VRAM upload
+     * hook instead. A fixes-only translation set (WipEout 3 ships one for the
+     * track palette gap) used to leave this armed with an EMPTY string table,
+     * and the a0..a3 record scan below then hashed four registers on every
+     * dispatch against a table that could never hit -- 20% of a stock FMV run.
+     * No dispatch-relevant work => stay out of the hot path entirely. */
+    if (!cap &&
+        g_table_n.load(std::memory_order_relaxed) == 0 &&
+        g_glyph_pending.load(std::memory_order_relaxed) <= 0 &&
+        g_msg_inplace_pending.load(std::memory_order_relaxed) <= 0 &&
+        g_msg_sep_pending.load(std::memory_order_relaxed) <= 0)
+        return;
     uint8_t* ram = memory_get_ram_ptr();
     if (!ram) return;
     uint64_t call_n = g_calls.fetch_add(1, std::memory_order_relaxed);
@@ -917,9 +951,9 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
     else if (language && *language) g_lang = language;
     if (project_root && *project_root)
         g_dir = (fs::path(project_root) / "translations").string();
+    /* Explicit env wins in both directions over the build-flavour default. */
     const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
-    if (capenv && capenv[0] == '0') g_capture_on.store(false);
-    else if (capenv && capenv[0] == '1') g_capture_on.store(true);
+    if (capenv && capenv[0]) g_capture_on.store(capenv[0] != '0');
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
 }

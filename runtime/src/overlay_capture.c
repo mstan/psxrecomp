@@ -3,6 +3,7 @@
 #include "dirty_ram_interp.h"
 #include "code_provider.h"
 #include "crc32.h"
+#include "psx_ram.h"   /* memory_get_ram_bytes — capture scope is live RAM size */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -355,11 +356,13 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
              * boot/overlay capture-window boundary is required: those windows
              * stabilize region keys, but they are not MIPS execution barriers.
              * Adjacent dirty pages were already folded into this run. */
-            const uint32_t ram_size = 2u * 1024u * 1024u;
+            const uint32_t ram_size = memory_get_ram_bytes();
             if (phys <= ram_size && size <= ram_size - phys &&
                 phys + size <= ram_size - 4u)
                 size += 4u;
-            uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
+            /* 8 MB mod: keep the real high-bank offset (0x781000 stays
+             * 0x80781000); the old 2 MiB mask folded it onto low RAM. */
+            uint32_t virt = 0x80000000u | (phys & 0x7FFFFFu);
             in_run = 0;
 
             /* Seeds: only per-PC interpreter hits — execution-verified. */
@@ -789,7 +792,7 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
                                    uint32_t scope_lo, uint32_t scope_hi,
                                    int include_halo)
 {
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = memory_get_ram_bytes();
     memset(bitmap, 0, (size_t)bw * sizeof(uint32_t));
     if (scope_hi > ram_size) scope_hi = ram_size;
     if (scope_lo >= scope_hi) return;
@@ -809,6 +812,25 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
         }
         if (observed && (page >> 5) < bw)
             bitmap[page >> 5] |= 1u << (page & 31u);
+    }
+    /* PSX_CAPTURE_DIAG=1: report how much executed-PC evidence this snapshot
+     * actually saw, split at the 2 MiB line, so a missing 8 MB high bank is
+     * attributable to evidence vs enumeration vs scope. */
+    if (getenv("PSX_CAPTURE_DIAG")) {
+        uint32_t lo_pages = 0, hi_pages = 0, hi_words = 0;
+        for (uint32_t page = 0; page < ram_size / 4096u; page++) {
+            if ((page >> 5) >= bw) break;
+            if ((bitmap[page >> 5] >> (page & 31u)) & 1u) {
+                if (page >= (0x200000u >> 12)) hi_pages++; else lo_pages++;
+            }
+        }
+        for (uint32_t w = (0x200000u >> 2); w < (ram_size >> 2); w++)
+            if ((exec_pc_bitmap[w >> 5] >> (w & 31u)) & 1u) hi_words++;
+        fprintf(stderr,
+            "psxrecomp: [capdiag] scope=0x%X-0x%X ram=0x%X pages: low=%u high=%u ; "
+            "exec_pc bits >=2MB = %u ; overlay_floor=0x%X\n",
+            scope_lo, scope_hi, ram_size, lo_pages, hi_pages, hi_words,
+            (unsigned)OVERLAY_REGION_FLOOR);
     }
 }
 
@@ -843,16 +865,17 @@ void overlay_capture_write_json(void)
      * can otherwise merge them into a giant region that changes every run.
      * Final/manual captures use the same executed-page scope as autocapture. */
     (void)overlay_capture_write_current("shutdown-or-manual",
-                                        0, 2u * 1024u * 1024u, 0);
+                                        0, memory_get_ram_bytes(), 0);
 }
 
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
 {
     if (!s_enabled || !s_active || size == 0) return;
-    uint32_t lo = load_addr & 0x1FFFFFu;
+    const uint32_t ram_size = memory_get_ram_bytes();
+    uint32_t lo = load_addr & 0x1FFFFFFFu;
     uint32_t hi = lo + size;
-    if (lo >= 2u * 1024u * 1024u) return;
-    if (hi > 2u * 1024u * 1024u || hi < lo) hi = 2u * 1024u * 1024u;
+    if (lo >= ram_size) return;
+    if (hi > ram_size || hi < lo) hi = ram_size;
 
     /* Snapshot complete pages touched by this DMA. Page scope prevents sticky
      * dirty runs from turning a small sector replacement into a multi-megabyte
@@ -947,6 +970,11 @@ int overlay_capture_count(void)
 #define AUTOCAP_COOLDOWN_MS     5000ull
 #define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
 #define AUTOCAP_WRITE_RETRY_MAX_FRAMES 60u /* cap failed-I/O retry at ~1 s */
+/* Failed provider requests before the compile trigger is treated as absent and
+ * the pending signature retired. Hosts without an in-process compiler spawn
+ * (Linux/macOS: autocompile_request() is Windows-only) would otherwise pin the
+ * pending flag forever and stall ALL periodic autocapture after the first fire. */
+#define AUTOCAP_PROVIDER_MAX_ATTEMPTS 8u
 
 static int      s_autocap_enabled    = 0;
 static uint64_t s_autocap_last_check = 0;
@@ -1153,6 +1181,32 @@ static int autocap_provider_request_try(const CodeProvider *cp, uint64_t frame)
         return 0;
     }
     s_autocap_provider_attempts++;
+    /* Bound the retries. A host with no in-process compiler spawn can NEVER
+     * satisfy this request — autocompile_request() is Windows-only and returns
+     * 0 on Linux/macOS, which use the manual compile_overlays.py flow — yet
+     * available() still reports configured, so the failure is indistinguishable
+     * from a transient one here. Retrying forever pinned
+     * s_autocap_provider_sig_pending set, and the periodic autocapture gate
+     * returns early whenever it is: exactly ONE snapshot was ever written per
+     * session and every later evidence epoch was discarded.
+     *
+     * The durable capture is already committed by this point; the request is
+     * only the compile trigger. After a bounded number of failures, retire the
+     * pending signature (with backoff) so periodic capture keeps converging for
+     * an offline compile. Measured on WipEout 3 ntscfull8: the mod installs its
+     * high bank with CPU stores, never CD DMA, so periodic executed-page
+     * autocapture is that code's ONLY capture path — with this stuck, 0 of 27
+     * captured regions were high-bank and the high bank interpreted forever. */
+    if (s_autocap_provider_attempts >= AUTOCAP_PROVIDER_MAX_ATTEMPTS) {
+        if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
+            s_autocap_backoff <<= 1;
+        s_autocap_next_ok = frame +
+            (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+        s_autocap_provider_sig_pending = 0;
+        s_autocap_provider_retry_frame = 0;
+        s_autocap_provider_attempts = 0;
+        return 0;
+    }
     s_autocap_provider_retry_frame = frame +
         autocap_write_retry_delay(s_autocap_provider_attempts);
     return 1;
@@ -1179,7 +1233,9 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
                                                 int scoped)
 {
     extern uint8_t *memory_get_ram_ptr(void);
-    const size_t ram_size = 2u * 1024u * 1024u;
+    /* Live size, not retail 2 MiB: high-bank regions (8 MB mod) must land in
+     * the snapshot copy or the formatter reads past the job buffer. */
+    const size_t ram_size = memory_get_ram_bytes();
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     AutocapWriteJob *job = (AutocapWriteJob *)calloc(1, sizeof(*job));
     if (!job) return NULL;
@@ -1217,7 +1273,7 @@ static int autocap_write_start(void)
      * RAM. Evidence-scoping keeps the background manifest proportional to live
      * coverage and avoids multi-megabyte rewrites every cooldown. */
     AutocapWriteJob *job = capture_snapshot_create(
-        0, 2u * 1024u * 1024u, 1);
+        0, memory_get_ram_bytes(), 1);
     if (!job) return 0;
     if (!autocap_write_launch(job)) {
         s_autocap_write_job = NULL;

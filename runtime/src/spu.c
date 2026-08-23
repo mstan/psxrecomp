@@ -32,7 +32,13 @@
 #define SPU_VOICE_COUNT    24
 #define SPU_BLOCK_SAMPLES  28
 
-static uint8_t  spu_ram[SPU_RAM_SIZE];
+/* SPU RAM banks — see memory.c's DRAM banks. `spu_ram` is the LIVE bank so a
+ * dual-console switch hands 512 KiB over by pointer instead of serializing it
+ * into every switch blob. Bank 0 is the only bank a single console has. */
+static uint8_t  spu_ram_bank0[SPU_RAM_SIZE];
+static uint8_t *spu_ram = spu_ram_bank0;
+static uint8_t *s_spu_banks[PSX_SPU_MAX_BANKS] = { spu_ram_bank0 };
+static int      s_spu_bank_live;
 static uint16_t spu_regs[SPU_REG_COUNT];
 static uint32_t transfer_addr;
 static uint32_t key_on_count;
@@ -948,7 +954,7 @@ static void key_off(uint32_t mask) {
 }
 
 void spu_init(void) {
-    memset(spu_ram, 0, sizeof(spu_ram));
+    memset(spu_ram, 0, SPU_RAM_SIZE);
     memset(spu_regs, 0, sizeof(spu_regs));
     memset(voices, 0, sizeof(voices));
     memset(s_events, 0, sizeof(s_events));
@@ -1783,7 +1789,26 @@ int spu_snapshot_read(const uint8_t *p, uint32_t len) {
     return 1;
 }
 uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }
-uint32_t  spu_get_ram_bytes(void){ return (uint32_t)sizeof(spu_ram); }
+uint32_t  spu_get_ram_bytes(void){ return (uint32_t)SPU_RAM_SIZE; }
+
+int spu_ram_bank_create(int slot) {
+    if (slot < 0 || slot >= PSX_SPU_MAX_BANKS) return 0;
+    if (s_spu_banks[slot]) return 1;
+    s_spu_banks[slot] = (uint8_t *)calloc(1, SPU_RAM_SIZE);
+    return s_spu_banks[slot] != NULL;
+}
+
+int spu_ram_bank_activate(int slot) {
+    if (slot < 0 || slot >= PSX_SPU_MAX_BANKS || !s_spu_banks[slot]) return 0;
+    spu_ram = s_spu_banks[slot];
+    s_spu_bank_live = slot;
+    return 1;
+}
+
+uint8_t *spu_ram_bank_ptr(int slot) {
+    if (slot < 0 || slot >= PSX_SPU_MAX_BANKS) return NULL;
+    return s_spu_banks[slot];
+}
 
 void spu_snapshot_part_digests(SpuSnapPartDigests *out)
 {

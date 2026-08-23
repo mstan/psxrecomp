@@ -50,7 +50,7 @@ int (*g_psx_bios_hle_hook)(struct CPUState* cpu, uint32_t phys) = NULL;
 
 static int s_call_hle_on     = 0;   /* service kernel calls in HLE */
 static int s_boot_skip_on    = 0;   /* one-shot shell intercept */
-static int s_shell_skipped   = 0;   /* boot skip already fired */
+static int s_shell_skipped[2] = { 0, 0 };  /* boot skip fired, per machine */
 
 /* Per-image anchors come from the LINKED recompiled BIOS itself
  * (psx_bios_image, emitted into <stem>_dispatch.c from the BIOS profile's
@@ -287,9 +287,17 @@ static int hle_service_b0(CPUState* cpu, uint32_t fn)
 
 static int hle_boot_shell_skip(CPUState* cpu)
 {
-    if (!s_boot_skip_on || s_shell_skipped || fntrace_is_game_started())
-        return 0;
-    s_shell_skipped = 1;
+    /* PER-MACHINE latch. Dual-console boots BOTH consoles through the BIOS, so
+     * a single global let machine 0 skip the shell and left machine 1 running
+     * the real one -- the whole SCEA intro animation, twice the boot cost, and
+     * a secondary that reaches the menu minutes late. */
+    {
+        extern int psx_dual_machine_live(void);
+        const int slot = (psx_dual_machine_live() == 1) ? 1 : 0;
+        if (!s_boot_skip_on || s_shell_skipped[slot] || fntrace_is_game_started())
+            return 0;
+        s_shell_skipped[slot] = 1;
+    }
     /* Return straight to LoadRunShell's call site: BIOS Main() proceeds to
      * step 8 (SYSTEM.CNF + game EXE load) exactly as if the shell had exited
      * immediately with no disc-menu interaction. Kernel state at this point
@@ -344,7 +352,7 @@ void psx_bios_hle_configure(int call_hle, int boot_skip)
     /* Rematch / session_reboot re-enters bring-up without process exit; the
      * shell-skip latch must arm again or peers run the interactive shell and
      * appear hung after netplay lockstep. */
-    s_shell_skipped = 0;
+    s_shell_skipped[0] = s_shell_skipped[1] = 0;
     g_psx_bios_hle_hook =
         (s_call_hle_on || s_boot_skip_on) ? &bios_hle_dispatch : NULL;
 }

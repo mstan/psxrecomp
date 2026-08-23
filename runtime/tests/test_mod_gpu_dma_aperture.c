@@ -1,8 +1,12 @@
 #include "mod_memory.h"
+#include "psx_ram.h"
 
 #include <stdio.h>
 
 static int failures;
+
+uint32_t g_psx_ram_size = PSX_RAM_2MB;
+uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
 
 static void check(int condition, const char *name) {
     if (condition) {
@@ -38,6 +42,16 @@ int main(void) {
     check(!psx_mod_gpu_dma_aperture_offset_for(
               0x00FFFFFCu, 8u, PSX_MOD_GPU_DMA_APERTURE_SIZE, &off),
           "cross-boundary access is rejected");
+
+    g_psx_ram_size = PSX_RAM_8MB;
+    g_psx_ram_mask = PSX_RAM_8MB - 1u;
+    check(psx_mod_gpu_dma_resolve_address_for(0x00200000u, 0u) == 0x00200000u,
+          "8 MB unique DRAM keeps addresses above 2 MiB");
+    check(psx_mod_gpu_dma_resolve_address_for(0x00A00000u, 0u) == 0x00200000u,
+          "8 MB DMA still folds the 24-bit window through the live mask");
+    check(psx_mod_gpu_dma_resolve_address_for(0x80F01234u, 0x20000u) ==
+              0x00F01234u,
+          "allocated aperture still survives 8 MB folding");
 
     return failures ? 1 : 0;
 }

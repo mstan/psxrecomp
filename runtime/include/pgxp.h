@@ -109,6 +109,7 @@ void pgxp_store_gte_reg(uint32_t addr, uint8_t reg);
 
 /* Address-keyed precise-word lookup (perspective texturing path). Returns
  * nonzero when the tracked word matches `packed` AND carries a depth. */
+int pgxp_debug_shadow_class(uint32_t addr, uint32_t packed);
 int pgxp_load_precise_word(uint32_t addr, uint32_t packed,
                            int32_t *x16, int32_t *y16, uint16_t *z);
 
