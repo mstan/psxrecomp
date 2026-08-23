@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Single source of truth for the DuckStation oracle pin.",
+    "setup.sh (Windows) and duckstation_oracle.py (Linux/macOS) both read this,",
+    "so the two platforms can never drift onto different upstream bases.",
+    "Bump upstream_base only together with a regenerated psxrecomp_oracle.patch:",
+    "  cd <checkout> && git diff <new base> > tools/duckstation/psxrecomp_oracle.patch"
+  ],
+  "upstream_url": "https://github.com/stenzek/duckstation.git",
+  "upstream_base": "ffb33c281d196eb8ee0f559085ca285de7cdd51b",
+  "patch": "psxrecomp_oracle.patch",
+  "oracle_port": 4371
+}

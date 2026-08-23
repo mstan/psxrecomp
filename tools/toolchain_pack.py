@@ -20,8 +20,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -860,6 +858,10 @@ def install_from_zip(
 
 
 def download_url(url: str, dest: Path, token: Optional[str] = None) -> None:
+    # Lazy: keep urllib off the import path so `python tools/…` still works when
+    # ambient PYTHONHOME breaks _socket (launcher clears PYTHONHOME on spawn).
+    import urllib.request
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "psxrecomp-toolchain"})
     if token:
@@ -876,6 +878,8 @@ def download_latest_pack(
     project_root: Optional[Path] = None,
     min_version: str = "",
 ) -> Path:
+    import urllib.error
+
     art = artifact or host_artifact()
     asset = _ASSET.get(art)
     if not asset:

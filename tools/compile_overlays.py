@@ -439,7 +439,10 @@ NON_AUTHORITY_MANIFEST_PROVENANCES = {
 HOSTED_MANIFEST_MARKER = (
     f'# psxrecomp overlay provenance {HOSTED_MANIFEST_PROVENANCE}')
 HOSTED_UNIQUE_GUARDED_BYTE_CAP = 1024 * 1024
-PSX_RAM_SIZE = 2 * 1024 * 1024
+# Full 8 MiB host capacity (PSX_RAM_CAPACITY): 8 MB-mod captures carry
+# high-bank enhancement code (e.g. WipEout 3 ntscfull8 at 0x781000+) and
+# their ranges must validate. Mirrors the runtime's OVERLAY_RAM_SIZE.
+PSX_RAM_SIZE = 8 * 1024 * 1024
 
 
 class ShardCandidateCapacityError(RuntimeError):
@@ -1306,7 +1309,39 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     }
 
 
-def _collect_toml_overlay_entries(toml_doc: dict, load_addr: int, crc32: int) -> set[int]:
+def _masked_region_crc(data: bytes, load_addr: int, ignore) -> int:
+    """CRC32 of a captured region with declared-volatile byte ranges zeroed.
+
+    A captured code region is not necessarily pure code. WipEout 3 SE's
+    enhancement engine at 0x80780000 interleaves 12 mutable 196-byte records
+    with its detour stubs, so the raw region CRC differed on every single one of
+    17 consecutive captures — a `bytes_crc` gate over the whole region can
+    therefore never match, silently detaching the declared entry list and
+    leaving the region on the interpreter forever. Masking the mutable bytes
+    yields one stable identity for the code (verified: all 17 captures agree).
+
+    Ranges are guest addresses, `end` exclusive, matching `producer_ranges`.
+    """
+    if not ignore:
+        return binascii.crc32(data) & 0xFFFFFFFF
+    buf = bytearray(data)
+    hi = load_addr + len(data)
+    for raw in ignore:
+        if isinstance(raw, dict):
+            start, end = _parse_addr(raw['start']), _parse_addr(raw['end'])
+        else:
+            raise RuntimeError(
+                'bytes_crc_ignore entries must be tables with start/end')
+        if not (load_addr <= start < end <= hi):
+            raise RuntimeError(
+                f'bytes_crc_ignore range 0x{start:08X}..0x{end:08X} outside '
+                f'capture 0x{load_addr:08X}..0x{hi:08X}')
+        buf[start - load_addr:end - load_addr] = b'\0' * (end - start)
+    return binascii.crc32(bytes(buf)) & 0xFFFFFFFF
+
+
+def _collect_toml_overlay_entries(toml_doc: dict, load_addr: int, crc32: int,
+                                  data: bytes = b'') -> set[int]:
     entries = set()
     for ov in toml_doc.get('overlays', []) or []:
         if not isinstance(ov, dict):
@@ -1315,8 +1350,16 @@ def _collect_toml_overlay_entries(toml_doc: dict, load_addr: int, crc32: int) ->
         if ov_load is not None and _parse_addr(ov_load) != load_addr:
             continue
         ov_crc = ov.get('bytes_crc') or ov.get('crc32') or ov.get('crc')
-        if ov_crc is not None and _parse_addr(ov_crc) != crc32:
-            continue
+        if ov_crc is not None:
+            ignore = ov.get('bytes_crc_ignore')
+            live = _masked_region_crc(data, load_addr, ignore) if ignore else crc32
+            if _parse_addr(ov_crc) != live:
+                print(f'  declared entries DETACHED for 0x{load_addr:08X}: '
+                      f'bytes_crc=0x{_parse_addr(ov_crc):08X} but region hashes '
+                      f'0x{live:08X}'
+                      f'{" (masked)" if ignore else ""} — update game.toml',
+                      file=sys.stderr)
+                continue
         for key in ('entry', 'entries', 'function_entry_pcs', 'function_entries'):
             if key not in ov:
                 continue
@@ -1412,7 +1455,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     captured_function_entries = _parse_addr_list(cap.get('function_entry_pcs', []))
     static_discovery_entries = _parse_addr_list(
         cap.get('static_discovery_entry_pcs', []))
-    toml_entries = _collect_toml_overlay_entries(toml_doc, load_addr, crc32)
+    toml_entries = _collect_toml_overlay_entries(toml_doc, load_addr, crc32, data)
     legacy_callable_seeds = {a for a in legacy_seeds
                              if region(a) and _callable_legacy_seed(data, load_addr, a)}
 
@@ -5259,6 +5302,19 @@ def main():
         if _env_cap != args.captures:
             print(f'[cache] PSX_OVERLAY_CAPTURES overrides --captures: {_env_cap}')
         args.captures = _env_cap
+    # Flavor is pinned by the spawning runtime the same way as the cache
+    # locations: --flavor defaults to 0 (play), so an instrumented (flavor 2)
+    # runtime used to spawn compiles whose shards its loader then rejected —
+    # every overlay ran interpreted on debug builds, silently.
+    _env_flavor = os.environ.get('PSX_OVERLAY_FLAVOR')
+    if _env_flavor:
+        try:
+            _fl = int(_env_flavor, 0)
+        except ValueError:
+            _fl = None
+        if _fl is not None and _fl != args.flavor:
+            print(f'[cache] PSX_OVERLAY_FLAVOR overrides --flavor: {_fl}')
+            args.flavor = _fl
     if not args.captures:
         ap.error('no captures file: set PSX_OVERLAY_CAPTURES (runtime injects it) '
                  'or pass --captures for manual/offline use')
@@ -6582,6 +6638,10 @@ def main():
         # interiors. Compile each as an isolated dispatch-root shard, then give
         # every block in those fragments the same universal resume treatment.
         unresolved = sorted(static_requested_entries - existing_entries)
+        # PSX_STATIC_NO_ISOLATED=1: A/B guard — skip the isolated-fragment pass
+        # entirely (its universal-resume treatment is the newest machinery).
+        if os.environ.get('PSX_STATIC_NO_ISOLATED'):
+            unresolved = []
         fragment_built = 0
         new_fragment_parts = []
         for entry in unresolved:

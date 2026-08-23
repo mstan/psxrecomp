@@ -10,7 +10,86 @@ PSXRecomp v4 uses a patched build of [stenzek/duckstation](https://github.com/st
 - **`tools/duckstation/build.sh`** — runs CMake (Visual Studio 17 2022, x64, Release) and MSBuild on `duckstation-qt`. Requires the Visual Studio 2022 "Desktop development with C++" workload (CMake + MSBuild come with it).
 - **`tools/fix_duckstation_deps_paths.py`** — helper used by `setup.sh` to rewrite stale `_IMPORT_PREFIX` values in the extracted prebuilt deps.
 
-## First-time setup
+## First-time setup — Linux / macOS
+
+Use `tools/duckstation_oracle.py`. It installs **outside any game repo**, into
+the shared RetComM data root, so one build serves every title:
+
+```
+~/.local/share/retcomm/oracle/duckstation/     ($RETCOMM_DATA_DIR, or $RETCOMM_ORACLE_DIR)
+  src/     pinned upstream checkout with the oracle patch applied
+  build/   cmake/ninja tree
+  app/     the portable install that actually gets run (~244 MB, self-contained)
+  oracle.json
+```
+
+```bash
+P=psxrecomp/tools
+python3 $P/duckstation_oracle.py doctor          # can this machine build it?
+python3 $P/duckstation_oracle.py all             # fetch + patch + build + install
+python3 $P/duckstation_oracle.py start --disc disc/game.cue
+python3 $P/duckstation_oracle.py status
+python3 $P/duckstation_oracle.py stop
+```
+
+`gpu_parity.py --start-oracle --disc <cue>` will do the `start` step for you
+when nothing is answering on 4371.
+
+### Arch, CachyOS, NixOS: the build runs in a container
+
+DuckStation's CMake **refuses to configure** on Arch-family and NixOS hosts
+(`CMakeModules/DuckStationBuildSummary.cmake` → `FATAL_ERROR "Unsupported
+environment."`), and the note above that check states you do not have permission
+to distribute patches modifying its build system. Its build scripts are
+CC-BY-NC-ND-4.0.
+
+So the tool does not patch the check out. It detects the refusal up front and
+builds in an environment upstream *does* support: `ubuntu:22.04` via
+podman/docker — the exact image its own CI uses
+(`.github/workflows/linux-appimage-build.yml`) — installing packages with
+upstream's own `scripts/appimage/install-packages.sh`, copied verbatim out of
+the pinned checkout. Ubuntu 22.04's glibc is older than any modern host's, so
+the binary produced there runs natively on the host afterwards; that is the same
+property upstream relies on to ship one AppImage for every distro.
+
+On a distro upstream accepts, the build runs directly on the host. Force either
+way with `build --container` / `build --no-container`.
+
+### Notes that cost an afternoon to find
+
+* **The binary's RUNPATH points at the build environment**, and Qt needs its
+  plugin tree. `install` copies `dep/prebuilt/<platform>/{lib,plugins}` next to
+  the binary and writes a `run-oracle` launcher that sets `LD_LIBRARY_PATH` and
+  `QT_PLUGIN_PATH`, then verifies with `ldd` that nothing is unresolved.
+* **An unofficial build shows a modal warning dialog before the core thread
+  starts.** Under `-nogui` it is invisible, so the process sits at one thread,
+  zero CPU, blocked in `ppoll`, with no port and no error. The fix is the key
+  the dialog itself writes — `[UI] UnofficialBuildWarningConfirmed = true` —
+  which `install` sets. It is a setting, not a patch. (Personal builds are
+  explicitly fine under that licence; redistributing one is not, which is why
+  this install stays on the machine that built it.)
+* **`install` seeds DuckStation's own default `settings.ini`** by running it
+  briefly, then merges only the handful of keys an oracle needs. The emulator
+  owns that schema; hand-writing the whole file means guessing at it.
+* **Wayland support is off by default** (`-DENABLE_WAYLAND=OFF`). It is the only
+  dependency the prebuilt bundle does not cover (needs `extra-cmake-modules`),
+  and an offscreen oracle never opens a Wayland surface. `build --wayland`
+  re-enables it.
+* **The oracle server only starts when a system boots.** The patch calls
+  `PSXRecompDebug::Initialize(4371)` from `System::BootSystem`, so an idle
+  DuckStation with nothing loaded will never open the port.
+
+### The pin
+
+`tools/duckstation/pin.json` is the single source of truth for the upstream
+base. Both this tool and the Windows `setup.sh` read it, so the two platforms
+cannot drift onto different trees — the oracle patch only applies to that one.
+The prebuilt-dependency version and its SHA-256 are **not** pinned here; they
+are read from the checkout's own `dep/PREBUILT-VERSION` and
+`dep/PREBUILT-SHA256SUMS`, so bumping the base cannot silently pair a new source
+tree with an old dependency set.
+
+## First-time setup — Windows
 
 ```bash
 cd <psxrecomp-v4>

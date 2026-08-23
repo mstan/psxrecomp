@@ -162,9 +162,12 @@ def _compact_region(region, drop_invalid_evidence=False):
     if len(image) != size:
         raise ValueError("capture size mismatch at 0x%08X: size=%d bytes=%d" %
                          (load, size, len(image)))
-    phys_lo = load & 0x1FFFFF
+    # 8 MB dev-RAM aware: titles running the 8MB enhancement stream code into
+    # the extended banks (0x200000..0x7FFFFF); the old 2 MB mask corrupted
+    # their capture addresses and the bound rejected legitimate regions.
+    phys_lo = load & 0x7FFFFF
     phys_hi = phys_lo + size
-    if phys_hi > 2 * 1024 * 1024:
+    if phys_hi > 8 * 1024 * 1024:
         raise ValueError("capture exceeds PSX RAM at 0x%08X" % load)
 
     parsed = {}
@@ -178,7 +181,7 @@ def _compact_region(region, drop_invalid_evidence=False):
         entries = []
         for value in values:
             address = _address(value, field)
-            phys = address & 0x1FFFFF
+            phys = address & 0x7FFFFF
             if phys < phys_lo or phys >= phys_hi or (phys & 3):
                 if not drop_invalid_evidence:
                     raise ValueError(

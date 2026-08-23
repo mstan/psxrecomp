@@ -1,0 +1,39 @@
+# Builder image for the DuckStation oracle.
+#
+# Why a container at all: DuckStation's CMake refuses to configure on
+# Arch-family and NixOS hosts (CMakeModules/DuckStationBuildSummary.cmake), and
+# upstream explicitly forbids distributing patches that modify its build system.
+# So instead of working around the check, we build somewhere it genuinely
+# supports -- ubuntu:22.04, the exact image its own Linux CI uses
+# (.github/workflows/linux-appimage-build.yml).
+#
+# Ubuntu 22.04's glibc is older than any modern host's, so the binary produced
+# here runs natively on the host afterwards. That is the same property upstream
+# relies on to ship one AppImage for every distro.
+#
+# The package list is upstream's own scripts/appimage/install-packages.sh,
+# copied verbatim out of the pinned checkout by duckstation_oracle.py. It is not
+# reproduced or modified here -- it is the authority on what the build needs.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+# linuxdeploy and appimagetool ship as AppImages and want FUSE, which a
+# container generally cannot give them. This is the AppImage runtime's own
+# supported escape hatch, not a modification of upstream's packaging script.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+# What upstream's install-packages.sh assumes is already present: it calls sudo
+# and apt-add-repository, neither of which a bare ubuntu image has.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget gnupg sudo software-properties-common \
+      git xz-utils file desktop-file-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY install-packages.sh /tmp/install-packages.sh
+RUN bash /tmp/install-packages.sh \
+ && rm -f /tmp/install-packages.sh \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /oracle

@@ -337,6 +337,29 @@ def build_cmd(args):
         if len(args) > 1:
             d["path"] = args[1]
         return d, pretty_json
+    elif cmd in ("screenshot_file", "shot_file"):
+        # Canonical native 15-bit VRAM frame (pre-compositor, pre-stretch).
+        # Takes a positional path like its two sibling capture commands.
+        d = {"cmd": "screenshot_file"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd in ("present_shot", "shot_present"):
+        # The composed renderer output -- what the window actually shows,
+        # including the logical-size aspect fit the buffer captures miss.
+        # Use this to verify anything aspect-shaped (widescreen, letterbox).
+        d = {"cmd": "present_shot"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "present_shot_seq":
+        return {"cmd": "present_shot_seq"}, pretty_json
+    elif cmd == "turbo":
+        if len(args) < 2:
+            return None, lambda _: "Usage: turbo <0|1>"
+        return {"cmd": "turbo", "enabled": int(args[1])}, pretty_json
+    elif cmd == "turbo_state":
+        return {"cmd": "turbo_state"}, pretty_json
     elif cmd == "bios_trace":
         d = {"cmd": "bios_trace"}
         if len(args) > 1:
