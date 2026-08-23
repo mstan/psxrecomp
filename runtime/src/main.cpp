@@ -1019,6 +1019,15 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
     mod_runtime_on_savestate_loaded();
+    /* The live host pad word is deliberately not part of the guest snapshot.
+     * A load can therefore leave the pre-load Start+Select chord latched until
+     * the next normal input sample, which reopens Hueponik's in-race menu even
+     * when the saved frame was captured with that menu hidden.  Drop every
+     * live pad word at the restore boundary; the normal sampler repopulates it
+     * after savestate_input_guard releases, so guest RAM/VRAM and timing remain
+     * exactly those of the saved state. */
+    for (int slot = 0; slot < PSX_MAX_PLAYERS; ++slot)
+        sio_set_pad_state_slot(slot, 0xFFFFu);
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -6255,8 +6264,13 @@ static int savestate_submit_slot(int slot, int save) {
         host_osd_push(msg, 1200);
         return 0;
     }
-    if (!save)
-        savestate_input_guard_arm();
+    /* The save-state menu is a host overlay, but its commit key is also a
+     * perfectly valid guest chord: Right Shift is Select and Enter is Start.
+     * Arm the same release guard for BOTH directions.  Without it, submitting
+     * a save with Shift+Enter closes the overlay and the very next pad sample
+     * presents Select+Start to the game, reopening Hueponik's menu (or allowing
+     * any other guest action bound to the host save gesture). */
+    savestate_input_guard_arm();
     if (psx_netplay_active()) {
         if (!psx_netplay_is_host()) {
             host_osd_push("Save states are host-only in netplay", 1500);

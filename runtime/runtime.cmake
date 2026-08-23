@@ -1868,6 +1868,7 @@ function(psxrecomp_add_game_runtime target)
         VERSION_FILE
         CODEGEN_SETUP_INCLUDE_DIR
         NETPLAY_LOBBY_URL
+        GAME_OVERLAY_STATIC_C
     )
     set(multiValueArgs GEN_FULL_GLOB CODEGEN_SETUP_SOURCES)
     cmake_parse_arguments(PSXG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -2024,6 +2025,10 @@ function(psxrecomp_add_game_runtime target)
         EXTRAS_SOURCES ${_psxg_extras}
         ${PSXG_UNPARSED_ARGUMENTS}
     )
+    if(PSXG_GAME_OVERLAY_STATIC_C)
+        list(APPEND _psxg_rt_args
+            GAME_OVERLAY_STATIC_C "${PSXG_GAME_OVERLAY_STATIC_C}")
+    endif()
 
     if(_psxg_has_game_c)
         message(STATUS
