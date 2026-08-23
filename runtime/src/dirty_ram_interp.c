@@ -2833,6 +2833,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
         g_dd_last_route = 3;
         if (psx_overlay_dispatch(cpu, addr)) return 1;
+#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
+        /* WipEout's PAL-x2 path relocates a hot continuation into high RAM.
+         * Keep its exact-range dispatcher in a separate translation unit so
+         * the established static corpus remains independently verifiable. */
+        extern int psx_overlay_dispatch_highram(CPUState *cpu, uint32_t addr);
+        if (psx_overlay_dispatch_highram(cpu, addr)) return 1;
+#endif
     }
 #endif
 

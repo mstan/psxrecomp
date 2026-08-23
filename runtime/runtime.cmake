@@ -865,6 +865,7 @@ function(psxrecomp_add_runtime_target target)
     set(oneValueArgs
         GAME_GENERATED_DISPATCH_C
         GAME_OVERLAY_STATIC_C
+        GAME_OVERLAY_EXTRA_STATIC_C
         BIOS_GENERATED_FULL_C
         BIOS_GENERATED_DISPATCH_C
         DEBUG_PORT
@@ -985,6 +986,12 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_OVERLAY_STATIC_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_STATIC_C}")
         set(has_overlay_dispatch TRUE)
+    endif()
+    if(PSXRT_GAME_OVERLAY_EXTRA_STATIC_C AND EXISTS "${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}")
+        set_source_files_properties("${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}" PROPERTIES GENERATED TRUE)
+        list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}")
+        set(has_overlay_dispatch TRUE)
+        set(has_overlay_extra_dispatch TRUE)
     endif()
 
     if(PSXRT_ORACLE)
@@ -1460,6 +1467,9 @@ function(psxrecomp_add_runtime_target target)
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
     endif()
+    if(has_overlay_extra_dispatch)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_EXTRA_DISPATCH=1)
+    endif()
 
     # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's
     # also visible to psx-beetle / non-runtime-helper targets.
@@ -1869,6 +1879,7 @@ function(psxrecomp_add_game_runtime target)
         CODEGEN_SETUP_INCLUDE_DIR
         NETPLAY_LOBBY_URL
         GAME_OVERLAY_STATIC_C
+        GAME_OVERLAY_EXTRA_STATIC_C
     )
     set(multiValueArgs GEN_FULL_GLOB CODEGEN_SETUP_SOURCES)
     cmake_parse_arguments(PSXG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -2028,6 +2039,10 @@ function(psxrecomp_add_game_runtime target)
     if(PSXG_GAME_OVERLAY_STATIC_C)
         list(APPEND _psxg_rt_args
             GAME_OVERLAY_STATIC_C "${PSXG_GAME_OVERLAY_STATIC_C}")
+    endif()
+    if(PSXG_GAME_OVERLAY_EXTRA_STATIC_C)
+        list(APPEND _psxg_rt_args
+            GAME_OVERLAY_EXTRA_STATIC_C "${PSXG_GAME_OVERLAY_EXTRA_STATIC_C}")
     endif()
 
     if(_psxg_has_game_c)

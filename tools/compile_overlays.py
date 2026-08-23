@@ -6820,6 +6820,31 @@ def main():
 
     # B-2: write combined static C file
     if args.static and static_parts:
+        # Identical capture rows can request the same exact image/function-set
+        # recipe more than once.  The namespace is intentionally deterministic
+        # for that recipe, so concatenating both source fragments would emit
+        # duplicate C definitions and make the combined translation unit
+        # uncompilable.  Keep one byte-identical part; fail closed if a
+        # supposedly identical namespace ever contains different generated C.
+        unique_static_parts = []
+        static_parts_by_namespace = {}
+        duplicate_static_parts = 0
+        for part in static_parts:
+            namespace = part['namespace']
+            previous = static_parts_by_namespace.get(namespace)
+            if previous is None:
+                static_parts_by_namespace[namespace] = part
+                unique_static_parts.append(part)
+                continue
+            if (previous['src'] != part['src'] or
+                    previous['variants'] != part['variants']):
+                raise RuntimeError(
+                    f'static namespace collision with divergent source: {namespace}')
+            duplicate_static_parts += 1
+        if duplicate_static_parts:
+            print(f'Static duplicate recipes removed: {duplicate_static_parts}')
+        static_parts = unique_static_parts
+
         # CPS can yield at every compiled block leader, not just leaders that a
         # particular capture happened to observe. Give every block in every
         # variant a content-gated resume wrapper. This makes static coverage
