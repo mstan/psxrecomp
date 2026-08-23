@@ -27,6 +27,19 @@ def region(load_addr, payload, executed=(), dispatch=(), functions=(), seeds=Non
 
 
 class AdditiveCaptureTests(unittest.TestCase):
+    def test_native_continuation_requires_exact_captured_prologue(self):
+        load = 0x80780000
+        data = bytearray(0x2004)
+        offset = compile_overlays.NATIVE_CONTINUATION_PC - load
+        data[offset:offset + 4] = compile_overlays.NATIVE_CONTINUATION_WORD.to_bytes(4, 'little')
+        self.assertTrue(compile_overlays._has_native_continuation_evidence(
+            bytes(data), load, len(data)))
+        data[offset] ^= 1
+        self.assertFalse(compile_overlays._has_native_continuation_evidence(
+            bytes(data), load, len(data)))
+        self.assertFalse(compile_overlays._has_native_continuation_evidence(
+            bytes(4), load, 4))
+
     def test_cached_bundle_pairs_preserves_logical_key_for_immutable_names(self):
         with tempfile.TemporaryDirectory() as td:
             logical = Path(td) / "00010000_DEADBEEF.dll"

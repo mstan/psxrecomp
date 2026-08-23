@@ -2161,6 +2161,62 @@ STATIC_PREAMBLE = """\
 
 """
 
+
+_CPS_SPLIT_TARGET_RE = re.compile(
+    r'\bcpu->pc\s*=\s*0x([0-9A-Fa-f]{8})u;\s*return;'
+    r'\s*/\*\s*CPS\b[^*]*\*/')
+
+
+def generated_cps_split_roots(src: str, data: bytes,
+                              load_addr: int, size: int) -> list[int]:
+    """Return same-image CPS targets that have no generated owner/label.
+
+    CPS tail transfers are normally either a block resume (handled by the
+    continuation-owner pass) or a transfer to another overlay function.  The
+    latter used to be emitted as ``cpu->pc = target`` without making ``target``
+    a recompiler root.  In a static build that silently sends the target to the
+    dirty interpreter; with fail-fast it eventually surfaces as an unknown
+    dispatch.  Only promote targets in this exact captured image, and only
+    when the capture contains a decodable first word.  Zero/data targets remain
+    fail-closed and are never made executable by this repair.
+    """
+    lo = load_addr & 0x1FFFFFFF
+    hi = lo + size
+    functions = {
+        (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        for match in re.finditer(
+            r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)$',
+            src, re.MULTILINE)
+    }
+    blocks = {
+        (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        for match in re.finditer(r'^block_([0-9A-Fa-f]{8}):', src,
+                                 re.MULTILINE)
+    }
+    roots = set()
+    for match in _CPS_SPLIT_TARGET_RE.finditer(src):
+        target = (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
+        phys = target & 0x1FFFFFFF
+        if not (lo <= phys < hi) or target in functions or target in blocks:
+            continue
+        word = _word_at(data, load_addr, target)
+        if word is None:
+            # Captures may describe the same image with a physical load
+            # address while the generated CPS target is KSEG1 (or vice
+            # versa).  Resolve the probe by physical offset before rejecting
+            # an otherwise valid same-image target.
+            load_phys = load_addr & 0x1FFFFFFF
+            target_phys = target & 0x1FFFFFFF
+            word = _word_at(data, load_addr,
+                            load_addr + target_phys - load_phys)
+        # A zero word decodes as NOP, but at a newly discovered dynamic target
+        # it is overwhelmingly a cleared/data slot.  Never turn that into an
+        # executable root merely because the decoder accepts NOP.
+        if word in (None, 0) or not _is_valid_mips_word(word):
+            continue
+        roots.add(target)
+    return sorted(roots)
+
 def patch_generated_c_static(src: str, load_addr: int, size: int) -> tuple:
     """
     Post-process psxrecomp-game's _full.c output for static binary compilation.
@@ -3396,6 +3452,21 @@ def merge_fragment_jobs_by_recipe(jobs: list[dict],
 
 def _canonical_guest_addr(addr: int) -> int:
     return (addr & 0x1FFFFFFF) | 0x80000000
+
+
+NATIVE_CONTINUATION_PC = 0x807814D0
+NATIVE_CONTINUATION_WORD = 0x27BDFFC0
+
+
+def _has_native_continuation_evidence(data: bytes, load_addr: int,
+                                      size: int) -> bool:
+    """Require the exact captured prologue before promoting the continuation."""
+    phys = NATIVE_CONTINUATION_PC & 0x1FFFFFFF
+    offset = phys - (load_addr & 0x1FFFFFFF)
+    return (0 <= offset and offset + 4 <= size and
+            offset + 4 <= len(data) and
+            int.from_bytes(data[offset:offset + 4], 'little') ==
+            NATIVE_CONTINUATION_WORD)
 
 
 def _normalized_func_identity(func_id) -> tuple:
@@ -5585,6 +5656,10 @@ def main():
                 for forced_entry in forced_interiors
                 if phys_addr <= (forced_entry & 0x1FFFFFFF) < region_hi
             )
+            # Promote only the audited continuation from matching capture data.
+            # A missing or changed prologue remains interpreter-only.
+            if _has_native_continuation_evidence(data, load_addr, size):
+                requested.add(NATIVE_CONTINUATION_PC)
             add_static_variant_request(
                 static_variant_requests, requested, data, load_addr, size,
                 phys_addr)
@@ -5670,63 +5745,96 @@ def main():
             with open(psx_path, 'wb') as f:
                 f.write(make_psxexe(load_addr, entry_pc, data))
 
-            # Write seeds file
-            seeds_path = os.path.join(tmp, 'seeds.txt')
-            with open(seeds_path, 'w') as f:
-                for s in seeds:
-                    f.write(s + '\n')
-
-            out_dir_tmp = os.path.join(tmp, 'out')
-            os.makedirs(out_dir_tmp)
-
             # Run psxrecomp-game in --overlay mode (always, for every overlay
             # input). Evidence-scoped discovery: compile only the proven entry
             # seeds and the code reachable from them; never whole-byte sweep
             # (which decodes embedded data tables as code). Branch/jump-table
             # targets stay as in-parent labels, not standalone functions. This
             # is the overlay-compilation contract, not a tunable.
-            cmd = [args.recompiler, psx_path,
-                   '--seeds', seeds_path,
-                   '--out-dir', out_dir_tmp,
-                   '--overlay',
-                   # Forward the [widescreen] site lists so overlay-resident
-                   # emits (backdrop screenX squash, and any sprite-tag/cull
-                   # sites that resolve into overlay code) are applied. --ws-config
-                   # only adopts the widescreen lists, not the game's exe/paths.
-                   '--ws-config', os.path.abspath(args.game_toml)]
-            cmd += recompiler_project_root_args(args)
-            print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             sub_env = dict(os.environ)
             if args.cps:
                 sub_env['PSX_CPS'] = '1'   # §25: emit continuation-passing overlay C
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               cwd=toml_dir, env=sub_env)
-            if r.returncode != 0:
-                print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
-                stats.add_fail(_label, 'recompiler', r.stderr or r.stdout)
-                return
-
-            # Find the generated _full.c
-            stem = os.path.basename(psx_path)
-            full_c = os.path.join(out_dir_tmp, stem + '_full.c')
-            if not os.path.exists(full_c):
-                # psxrecomp-game uses filename() not stem()
-                candidates = [f for f in os.listdir(out_dir_tmp) if f.endswith('_full.c')]
-                if not candidates:
-                    print(f'  ERROR: no _full.c in {out_dir_tmp}')
-                    stats.add_fail(_label, 'no_output', 'no _full.c emitted')
-                    return
-                full_c = os.path.join(out_dir_tmp, candidates[0])
-
-            with open(full_c) as f:
-                src = f.read()
-
+            known_seed_addrs = {
+                (int(seed, 16) & 0x1FFFFFFF) | 0x80000000
+                for seed in seeds
+                if re.fullmatch(r'0[xX][0-9A-Fa-f]+', seed.strip())
+            }
+            cps_promoted = set()
+            full_c = None
             ranges_src = None
-            for fn in os.listdir(out_dir_tmp):
-                if fn.endswith('_full.ranges'):
-                    ranges_src = os.path.join(out_dir_tmp, fn)
+            out_dir_tmp = None
+            for compile_pass in range(4):
+                # A CPS transfer can name a second function in the same
+                # captured image. Recompile once with those exact targets as
+                # roots, up to a small fixed point. This is deliberately
+                # bounded: a malformed image must fail the normal audit, not
+                # create an unbounded discovery loop.
+                seeds_path = os.path.join(tmp, f'seeds_{compile_pass}.txt')
+                with open(seeds_path, 'w') as f:
+                    for s in seeds:
+                        f.write(s + '\n')
+
+                out_dir_tmp = os.path.join(tmp, f'out_{compile_pass}')
+                os.makedirs(out_dir_tmp)
+                cmd = [args.recompiler, psx_path,
+                       '--seeds', seeds_path,
+                       '--out-dir', out_dir_tmp,
+                       '--overlay',
+                       # Forward the [widescreen] site lists so overlay-resident
+                       # emits (backdrop screenX squash, and any sprite-tag/cull
+                       # sites that resolve into overlay code) are applied. --ws-config
+                       # only adopts the widescreen lists, not the game's exe/paths.
+                       '--ws-config', os.path.abspath(args.game_toml)]
+                cmd += recompiler_project_root_args(args)
+                print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}'
+                      f'{" [CPS roots pass " + str(compile_pass) + "]" if compile_pass else ""}')
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   cwd=toml_dir, env=sub_env)
+                if r.returncode != 0:
+                    print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
+                    stats.add_fail(_label, 'recompiler', r.stderr or r.stdout)
+                    return
+
+                # Find the generated _full.c
+                stem = os.path.basename(psx_path)
+                full_c = os.path.join(out_dir_tmp, stem + '_full.c')
+                if not os.path.exists(full_c):
+                    # psxrecomp-game uses filename() not stem()
+                    candidates = [f for f in os.listdir(out_dir_tmp)
+                                  if f.endswith('_full.c')]
+                    if not candidates:
+                        print(f'  ERROR: no _full.c in {out_dir_tmp}')
+                        stats.add_fail(_label, 'no_output', 'no _full.c emitted')
+                        return
+                    full_c = os.path.join(out_dir_tmp, candidates[0])
+
+                with open(full_c) as f:
+                    src = f.read()
+
+                ranges_src = None
+                for fn in os.listdir(out_dir_tmp):
+                    if fn.endswith('_full.ranges'):
+                        ranges_src = os.path.join(out_dir_tmp, fn)
+                        break
+
+                if not args.cps:
                     break
+                new_cps = set(generated_cps_split_roots(
+                    src, data, load_addr, size)) - known_seed_addrs
+                new_cps -= cps_promoted
+                if not new_cps:
+                    break
+                cps_promoted.update(new_cps)
+                for target in sorted(new_cps):
+                    seeds.append(f'0x{target:08X}')
+                    known_seed_addrs.add(target)
+                sample = ', '.join(f'0x{a:08X}' for a in sorted(new_cps)[:8])
+                print(f'  promoted {len(new_cps)} CPS split root(s): {sample}')
+            else:
+                print('  ERROR: CPS root discovery did not converge in 4 passes\n')
+                stats.add_fail(_label, 'cps_roots', 'fixed-point limit exceeded')
+                return
 
             # Post-process
             if args.static:
