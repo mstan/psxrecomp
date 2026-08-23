@@ -11554,6 +11554,34 @@ static void handle_quit(int id, const char *json)
 static void handle_dispatch_stats(int id, const char *json)
 {
     (void)json;
+#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
+    {
+        uint64_t highram_checks = 0, highram_hits = 0;
+        uint64_t highram_variant_misses = 0, highram_address_misses = 0;
+        extern void psx_overlay_highram_get_stats(uint64_t *, uint64_t *,
+                                                   uint64_t *, uint64_t *);
+        psx_overlay_highram_get_stats(&highram_checks, &highram_hits,
+                                      &highram_variant_misses,
+                                      &highram_address_misses);
+        send_fmt("{\"id\":%d,\"ok\":true,"
+                 "\"static_hits\":%llu,"
+                 "\"miss_total\":%llu,"
+                 "\"miss_unique\":%d,"
+                 "\"highram_checks\":%llu,"
+                 "\"highram_hits\":%llu,"
+                 "\"highram_variant_misses\":%llu,"
+                 "\"highram_address_misses\":%llu}",
+                 id,
+                 (unsigned long long)g_dispatch_static_hits,
+                 (unsigned long long)s_unknown_seq,
+                 s_unknown_unique_count,
+                 (unsigned long long)highram_checks,
+                 (unsigned long long)highram_hits,
+                 (unsigned long long)highram_variant_misses,
+                 (unsigned long long)highram_address_misses);
+        return;
+    }
+#endif
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"static_hits\":%llu,"
              "\"miss_total\":%llu,"

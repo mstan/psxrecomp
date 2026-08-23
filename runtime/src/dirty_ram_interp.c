@@ -2838,7 +2838,21 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * Keep its exact-range dispatcher in a separate translation unit so
          * the established static corpus remains independently verifiable. */
         extern int psx_overlay_dispatch_highram(CPUState *cpu, uint32_t addr);
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Diagnostic-only control: the release path always dispatches the
+         * bounded high-RAM corpus. A control run can set this environment
+         * variable before boot to quantify the exact race cost without
+         * rebuilding or altering the generated payload. */
+        static int s_highram_dispatch_disabled = -1;
+        if (s_highram_dispatch_disabled < 0) {
+            const char *e = getenv("PSX_DISABLE_OVERLAY_EXTRA_DISPATCH");
+            s_highram_dispatch_disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (!s_highram_dispatch_disabled &&
+            psx_overlay_dispatch_highram(cpu, addr)) return 1;
+#else
         if (psx_overlay_dispatch_highram(cpu, addr)) return 1;
+#endif
 #endif
     }
 #endif
