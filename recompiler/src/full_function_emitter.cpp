@@ -171,17 +171,25 @@ bool FullFunctionEmitter::emit_function(
         const char* e = std::getenv("PSX_CPS");
         return e == nullptr || e[0] != '0';
     }();
+    /* Redirect-honoring checks — see CodeGenerator::emit_interrupt_check:
+     * an exception epilogue that publishes a resume PC different from this
+     * site's static continuation must surface to the trampoline, never be
+     * overwritten by the static transfer (the dropped-continuation class
+     * behind the WipEout 3 static-bake top-level PC=0 exit). */
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
+        uint32_t rt = bios_runtime_pc(resume_pc);
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
-                           bios_runtime_pc(resume_pc));
+               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", rt) + indent +
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n", rt);
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+               fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                           resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -1239,9 +1247,10 @@ bool FullFunctionEmitter::emit_function(
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
                 "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
+                "        if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume */\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally — unless this load's successor reads
@@ -2051,7 +2060,9 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * physical 0x30000-0x5AFFF. If the target belongs to the\n";
     out += "         * active game text range, route it through the game/dirty-RAM\n";
     out += "         * path before normalizing it to shell ROM. */\n";
-    out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
+    out += "        extern uint32_t psx_ram_canon_code_addr(uint32_t);\n";
+    out += "        uint32_t game_addr = psx_ram_canon_code_addr(addr);\n";
+    out += "        uint32_t game_phys = game_addr & 0x1FFFFFFFu;\n";
     out += "        /* Class-A shell-window collision fix: post-game-start the BIOS shell\n";
     out += "         * copy at RAM 0x30000-0x5AFFF is DEAD (overwritten by the game EXE,\n";
     out += "         * its runtime-loaded overlays, or CD streaming), so normalize()->shell\n";
@@ -2095,13 +2106,13 @@ void FullFunctionEmitter::emit_dispatch(
         out += fmt::format(
             "            game_phys >= 0x{:08X}u && game_phys <= 0x{:08X}u &&\n",
             addr_model().rom_keyed_ram_lo(), addr_model().rom_keyed_ram_hi_incl());
-        out += "            psx_game_address_in_text(addr) && dirty_ram_text_native_ok(game_phys);\n";
+        out += "            psx_game_address_in_text(game_addr) && dirty_ram_text_native_ok(game_phys);\n";
     } else {
         out += "        int game_text_in_shell_window = 0;\n";
     }
     out += "        if (!found && (game_shell_overlap || game_text_in_shell_window ||\n";
-    out += "            (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)))) {\n";
-    out += "            found = dirty_ram_dispatch(cpu, addr, stop_addr);\n";
+    out += "            (psx_game_address_in_text(game_addr) && dirty_ram_is_dirty(game_phys)))) {\n";
+    out += "            found = dirty_ram_dispatch(cpu, game_addr, stop_addr);\n";
     out += "        }\n";
     out += "#endif\n";
     out += "        uint32_t phys = normalize(addr);\n";

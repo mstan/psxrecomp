@@ -55,6 +55,47 @@ inline constexpr int VIDEO_RENDERER_OPENGL = 1;
 inline constexpr int VIDEO_RENDERER_VULKAN = 2;
 inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
 
+// Controller-hotkey bind encoding, mirroring recomp-ui's RECOMP_LAUNCHER_PAD_*
+// (recomp_launcher.h): 0 = unbound, 1..99 = button (1 + SDL button code),
+// 100..999 = axis, 1000+ = a CHORD, encoded as 1000 + a bitmask of SDL button
+// codes. Two buttons held together is the normal case (select+r3), so a real
+// value here is routinely five digits.
+//
+// The bound matters: a naive `< 256` check silently rejects every chord — which
+// is exactly what shipped, so a saved rewind_pad = 1272 was dropped on load and
+// the pad hotkeys were only ever configurable to single buttons. SDL defines
+// ~21 gamepad buttons, so cap the mask at 32 bits' worth and let the runtime
+// ignore bits no controller can produce.
+inline constexpr int PAD_BIND_MAX = 1000 + (1 << 21);
+inline bool pad_bind_value_ok(long long n) { return n >= 0 && n < PAD_BIND_MAX; }
+
+// FMV present reconstruction, ordered least → most smoothing. See
+// RuntimeConfig::video_fmv_filter for what each one does and why bicubic is
+// the default. Shared by game.toml/settings parsing and runtime startup.
+inline constexpr int VIDEO_FMV_FILTER_NEAREST  = 0;
+inline constexpr int VIDEO_FMV_FILTER_BILINEAR = 1;
+inline constexpr int VIDEO_FMV_FILTER_SHARP    = 2;
+inline constexpr int VIDEO_FMV_FILTER_BICUBIC  = 3;
+inline constexpr int VIDEO_FMV_FILTER_COUNT    = 4;
+inline constexpr int VIDEO_FMV_FILTER_DEFAULT  = VIDEO_FMV_FILTER_BICUBIC;
+
+// Canonical settings.toml / game.toml spelling for each value, and its parse.
+inline const char* video_fmv_filter_name(int v) {
+    switch (v) {
+        case VIDEO_FMV_FILTER_NEAREST:  return "nearest";
+        case VIDEO_FMV_FILTER_BILINEAR: return "bilinear";
+        case VIDEO_FMV_FILTER_SHARP:    return "sharp";
+        default:                        return "bicubic";
+    }
+}
+inline bool video_fmv_filter_parse(const std::string& s, int* out) {
+    if (s == "nearest")       { *out = VIDEO_FMV_FILTER_NEAREST;  return true; }
+    else if (s == "bilinear") { *out = VIDEO_FMV_FILTER_BILINEAR; return true; }
+    else if (s == "sharp")    { *out = VIDEO_FMV_FILTER_SHARP;    return true; }
+    else if (s == "bicubic")  { *out = VIDEO_FMV_FILTER_BICUBIC;  return true; }
+    return false;
+}
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
@@ -67,6 +108,31 @@ struct WidescreenCullKeepSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded SLT/SLTU/SLTI/SLTIU instruction
     uint32_t result = 0;   // forced comparison result (0 or 1)
+};
+
+// Screen-edge compare whose BOUND follows the live reveal margin, rather than
+// having its verdict pinned like a keep site.
+//
+// `keep` is right only for a separately proven binary decision. At a clip-code
+// packer it is wrong: pinning the classifier tells the clipper that nothing
+// crosses the screen edge, so crossing polygons are never subdivided, are
+// submitted with coordinates outside the GPU's legal primitive range, and the
+// hardware discards them whole. Moving the bound keeps the classification
+// honest and simply clips at the revealed edge.
+//
+// `mode` names which operand carries the bound and which way it travels. Every
+// mode is identity at margin 0, so 4:3 output stays bit-for-bit unchanged.
+enum class WsCullWidenMode {
+    ImmUpper,  // SLTI/SLTIU: coord < imm + m   (right/bottom edge)
+    ImmLower,  // SLTI/SLTIU: coord < imm - m   (left/top edge)
+    BoundRt,   // SLT/SLTU:   rs    < rt  + m   (coord in rs, bound in rt)
+    BoundRs,   // SLT/SLTU:   rs + m <  rt      (bound in rs, coord in rt)
+};
+
+struct WidescreenCullWidenSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded SLT/SLTU/SLTI/SLTIU instruction
+    WsCullWidenMode mode = WsCullWidenMode::ImmUpper;
 };
 
 // Aspect-scaled 12-bit angular half-extent. These sites load a positive angle
@@ -345,10 +411,54 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
+    // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+    // (a 320x192-class movie blown up to the window). Only consulted when
+    // antialiasing is on — AA off means nearest, as it does everywhere else.
+    //   0 nearest   point-sampled; hard pixels, uneven pixel widths at a
+    //               non-integer scale
+    //   1 bilinear  plain GL_LINEAR; smoothest, but blurs the whole texel
+    //   2 sharp     sharp-bilinear; flat texel interiors, ramp confined to a
+    //               one-output-pixel band at the boundary
+    //   3 bicubic   Catmull-Rom (default) — removes most of the staircase
+    //               while holding overall sharpness at the nearest level
+    int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
+
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
     // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
+
+    // hd_textures: load a Beetle PSX HW-format HD texture pack from
+    // <disc dir>/<disc stem>-texture-replacements/. See runtime/include/tex_pack.h.
+    bool                  video_hd_textures = false;
+
+    // hd_texture_dump: write every texture the game draws to
+    // <disc dir>/<disc stem>-texture-dump/ as <texhash>-<palhash>.png. The
+    // authoring path for new packs, and the instrument that proves our hashes
+    // match Beetle's (diff the two dumps' filename sets). Costs a synchronous
+    // PNG write per newly-seen texture, so it is a tool, not a play setting.
+    bool                  video_hd_texture_dump = false;
+
+    // [runtime] cpu_overclock — percent of stock CPU speed. 100 = stock.
+    // The guest runs as native code, so this scales the per-instruction cycle
+    // CHARGE down: the CPU completes more work inside the same CRTC period
+    // while timers, SPU, CDROM and refresh keep their real rates.
+    // hueponik's pal100full8 patch requires >900%.
+    uint32_t              runtime_cpu_overclock = 100;
+
+    // [video] bezel — a still image drawn behind the frame, filling whatever
+    // the letterbox or pillarbox leaves over, the way vertical shmups fill the
+    // dead space on a horizontal display. Never samples the frame, so unlike
+    // the edge fill it cannot smear moving content and needs no menu-vs-
+    // gameplay test. Relative paths resolve against the disc directory.
+    // Empty = none. For WipEout 3, the team wallpapers by MotorcycleEmptiness
+    // (awesome-wipeout.github.io) suit this exactly.
+    std::string           video_bezel;
+
+    // hd_texture_dir: parent directory for both folders above. Empty (default)
+    // means the directory the disc image lives in, which is where a pack
+    // authored for RetroArch already expects to sit.
+    std::string           video_hd_texture_dir;
 
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
@@ -386,6 +496,28 @@ struct RuntimeConfig {
     // geometry_correction, which has no control at all); per-game with
     // [video] perspective_texturing = true.
     bool                  video_perspective_texturing = false;
+
+    // pgxp_depth: depth-test polygons using PGXP's recovered per-vertex W
+    // instead of relying solely on the ordering table.
+    //
+    // The PS1 has no depth buffer. Primitives are linked into an ordering table
+    // indexed by ONE averaged depth per primitive (AVSZ3/AVSZ4), quantised into
+    // a fixed number of buckets, and drawn back to front. Two polygons that
+    // interpenetrate — or sit near-coplanar in the same bucket — therefore
+    // resolve by submission order. The hardware cannot express the right
+    // answer, so no amount of faithful emulation produces one; WipEout 3's
+    // trackside scenery shows it as pipes sorting through walls.
+    //
+    // PGXP already recovers a precise per-vertex W, and the textured path
+    // already carries it to the shader as a_q, so this writes a real depth
+    // buffer from data that is present rather than deriving anything new.
+    //
+    // Default OFF, and for a stronger reason than perspective_texturing: this
+    // one CHANGES WHICH PIXELS SURVIVE. A primitive without valid W (2D, UI,
+    // anything the provenance test rejects) must not participate at all, or it
+    // depth-tests against garbage and disappears. Opt-in per game with
+    // [video] pgxp_depth = true.
+    bool                  video_pgxp_depth = false;
 
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
@@ -574,6 +706,16 @@ struct RuntimeConfig {
     bool                  has_anti_deadzone = false;
     int                   anti_deadzone     = 0;
 
+    // [runtime.link]: SIO1 serial-link peer (docs/config_schema.md).
+    // `link_enabled` gates the PEER, not the register file -- the SIO1
+    // registers respond whether or not a cable is plugged in (see
+    // accuracy/axis4_sio1_serial.md). Default off => "null" endpoint
+    // (no cable: DSR/CTS low, TX discarded).
+    bool                  has_link            = false;
+    bool                  link_enabled        = false;
+    std::string           link_backend        = "null";
+    int                   link_latency_cycles = 0;
+    bool                  link_trace          = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].
@@ -703,6 +845,11 @@ struct GameConfig {
     bool                  has_netplay_required_leadout = false;
     uint32_t              netplay_required_leadout_lba = 0;
     std::string           netplay_required_disc_fp;  // lowercase hex SHA-256
+    bool                  netplay_link_lobby = false; // PSX-Link lobby type offered
+    // Shared dev channel tag. Local / unreleased builds advertise
+    // "dev+<tag>" instead of a release pin, so they find each other in the
+    // lobby browser and never appear to players on a versioned release.
+    std::string           netplay_dev_tag;
     // local_viewport = "vertical_split": while real netplay is active, crop
     // presentation to this peer's left/right split-screen half. This is a
     // presentation-only helper for titles that still render native split-screen
@@ -861,6 +1008,7 @@ struct GameConfig {
     // where maximal overdraw is preferable to range guessing. Each entry is
     // guarded by the complete MIPS word; 4:3 executes the vanilla comparison.
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<WidescreenCullWidenSite> ws_cull_widen_sites;
     // Exact 12-bit angular half-extents used by terrain-cell frusta.
     std::vector<WidescreenAngleSite> ws_cull_angle_sites;
     // Full-word-guarded model-participation cosine compares widened only in
@@ -1036,6 +1184,13 @@ struct GameConfig {
     // widest aspect this title offers.
     bool ws_adaptive_view = false;
 
+    // [widescreen] menu_edge_fill — fill the pillarbox margins of a 4:3-pinned
+    // present with the frame's own edge columns instead of black. A deliberate
+    // look for 2D screens on a very wide display, and WRONG whenever the edge
+    // columns carry picture (it smears them across the bars), so it is opt-in
+    // per title. Runtime-only (read at startup; no codegen impact).
+    bool ws_menu_edge_fill = false;
+
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;
     // ordinary widescreen offer remains the independent 16:9 choice.
@@ -1110,6 +1265,22 @@ struct UserSettings {
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    // HD texture pack. Persisted here (not only in game.toml) because both the
+    // in-exe recomp-ui toggle and retcomm-launcher's per-title pack manager need
+    // to write them, and settings.toml is the file both already co-own.
+    //
+    // hd_texture_pack is the ACTIVE PACK FOLDER itself, not a parent — that is
+    // what a manager selects, and a managed pack is named by its own id rather
+    // than after the disc. Empty falls back to the Beetle convention (a
+    // <disc stem>-texture-replacements folder beside the disc image), so a
+    // hand-dropped pack still works with nothing persisted here. Distinct from
+    // RuntimeConfig::video_hd_texture_dir, which relocates the whole convention
+    // (both pack and dump) and stays a game.toml/env developer knob.
+    bool has_hd_textures     = false; bool hd_textures = false;
+    bool has_hd_texture_pack = false; std::filesystem::path hd_texture_pack;
+    // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+    // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+    bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
     // Sub-pixel vertex precision / perspective-correct UVs (see RuntimeConfig).
     // Both default off — the faithful floor — and are player-selectable.
     bool has_geometry_correction   = false; bool geometry_correction   = false;
@@ -1159,7 +1330,7 @@ struct UserSettings {
     // 50 / 100 / 150 / 200 (default 50). Runtime clamps + snaps to those steps.
     bool has_rewind_depth   = false; int  rewind_depth   = 50;
     // [video] rewind_interval: frames between local rewind snaps. UI offers
-    // 1 / 4 / 8 / 12 / 15 (default 15).
+    // 1 / 4 / 8 / 12 / 15 / 30 (default 15; 8 MB soft-default is 30).
     bool has_rewind_interval = false; int rewind_interval = 15;
     // [hotkeys] controller-only host shortcuts. Values use recomp-ui's
     // RECOMP_LAUNCHER_PAD_* encoding (0 = unbound, 1+button, 100+axis).
@@ -1178,6 +1349,15 @@ struct UserSettings {
     bool has_memcard2_path    = false; std::filesystem::path memcard2_path;
     bool has_memcard1_enabled = false; bool memcard1_enabled = true;
     bool has_memcard2_enabled = false; bool memcard2_enabled = true;
+    // [savestate] dir — where slot .pst files live. Savestates used to be
+    // pinned to the memcard dir, which makes the two impossible to place
+    // independently. Two builds of one game (e.g. a stock 2 MB build and an
+    // 8 MB-mod build) want SHARED memory cards but SEPARATE savestates: the
+    // .pst name embeds only entry_pc, identical across builds, so a shared
+    // dir collides on filename and every cross-build load is refused by the
+    // boot_state codegen_hash guard. Unset => falls back to the memcard dir,
+    // preserving the historical layout for every existing project.
+    bool has_savestate_dir  = false; std::filesystem::path savestate_dir;
 
     // [controller] — per-player input device + pad type + deadzone.
     // device is one of:

@@ -21,7 +21,10 @@ bool apply_static_analysis_bound(PS1Executable& exe,
             "game.text_size 0x{:X} is not instruction-aligned", configured_size);
         return false;
     }
-    if (configured_end > 0x80200000ull) {
+    /* 8 MiB, not 2 MiB: the 8 MB hardware mod maps unique DRAM across the
+     * full window and overlay shards may live in the high banks (WipEout 3
+     * ntscfull8 trampolines at 0x80780000+). */
+    if (configured_end > 0x80800000ull) {
         error_msg = fmt::format(
             "game.text_size 0x{:X} extends past PS1 RAM", configured_size);
         return false;
@@ -101,9 +104,9 @@ bool PS1ExeParser::validate_header(const PS1ExeHeader& header, std::string& erro
         return false;
     }
 
-    if (header.file_size > 2 * 1024 * 1024) {  // > 2MB
+    if (header.file_size > 8 * 1024 * 1024) {  // > 8MB (8 MB-mod capacity)
         error_msg = fmt::format(
-            "Suspicious file size: {} bytes (> 2MB). PS1 only has 2MB RAM",
+            "Suspicious file size: {} bytes (> 8MB). PSX host RAM capacity is 8MB",
             header.file_size
         );
         return false;
@@ -111,9 +114,9 @@ bool PS1ExeParser::validate_header(const PS1ExeHeader& header, std::string& erro
 
     // Check load region doesn't overflow RAM
     uint32_t end_address = header.load_address + header.file_size;
-    if (end_address > 0x80200000) {  // Beyond 2MB RAM
+    if (end_address > 0x80800000) {  // Beyond 8MB host RAM capacity
         error_msg = fmt::format(
-            "Load region overflows RAM: 0x{:08X}-0x{:08X} (beyond 0x80200000)",
+            "Load region overflows RAM: 0x{:08X}-0x{:08X} (beyond 0x80800000)",
             header.load_address, end_address
         );
         return false;

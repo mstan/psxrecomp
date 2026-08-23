@@ -140,18 +140,34 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
     return ss.str();
 }
 
+/* Both check emitters honor an exception REDIRECT: when the delivery's
+ * epilogue publishes a resume PC different from this site's static
+ * continuation (guest RFE to a non-EPC target — longjmp-style handlers,
+ * SetCustomExitFromException, thread switch), the compiled code must
+ * surface it to the trampoline instead of overwriting it with the static
+ * transfer. This is the compiled analogue of the dirty interpreter's
+ * "Handler resumed elsewhere — surface to dispatch" contract; without it a
+ * baked/compiled leader silently drops the guest's continuation (WipEout 3
+ * static bake: deterministic top-level "execution completed, PC=0" ~10 s
+ * into boot, root-caused to redirects dropped at compiled leaders). A
+ * published pc equal to the static continuation falls through (same-thread
+ * restore publishes 0; the depth-guard rescue publishes the site PC). */
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
                                                 const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc) + indent +
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ 0x{:08X}u) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                       resume_pc);
 }
 
 std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
                                                      const std::string& indent) const {
     return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
            "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr) + indent +
+           fmt::format("if (cpu->pc != 0u) {{ if ((cpu->pc ^ ({})) & 0x1FFFFFFFu) return; cpu->pc = 0u; }}  /* IRQ redirect / consume same-site resume */\n",
+                       resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {
@@ -951,6 +967,55 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             "{} = psx_ws_cull_keep_result(({}), {}u);"
             "  /* ws maximal object/model participation */{}",
             reg_name(dst), vanilla, site.result, comment);
+    }
+
+    // Screen-edge compares whose BOUND follows the live reveal margin. Unlike a
+    // keep site this never pins the verdict, so a clip-code packer keeps
+    // classifying honestly and the clipper subdivides at the revealed edge
+    // instead of emitting a primitive the GPU will discard. Identity at 4:3.
+    for (const auto& site : config_.ws_cull_widen_sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: cull widen expected 0x{:08X} at 0x{:08X}, found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        const bool imm_mode = site.mode == PSXRecompV4::WsCullWidenMode::ImmUpper ||
+                              site.mode == PSXRecompV4::WsCullWidenMode::ImmLower;
+        uint32_t dst = 0;
+        std::string call;
+        if (imm_mode) {
+            if (!(opcode == 0x0A || opcode == 0x0B)) {
+                fmt::print(stderr,
+                           "ERROR: cull widen site 0x{:08X} imm mode on non-SLTI (0x{:08X})\n",
+                           addr, instr);
+                std::exit(1);
+            }
+            dst = get_rt(instr);
+            call = fmt::format(
+                "{}({}, {}u)",
+                site.mode == PSXRecompV4::WsCullWidenMode::ImmUpper ? "psx_ws_cull_slti"
+                                                       : "psx_ws_cull_slti_lower",
+                reg_name(get_rs(instr)), get_imm16(instr));
+        } else {
+            if (!(opcode == 0x00 && (funct == 0x2A || funct == 0x2B))) {
+                fmt::print(stderr,
+                           "ERROR: cull widen site 0x{:08X} bound mode on non-SLT (0x{:08X})\n",
+                           addr, instr);
+                std::exit(1);
+            }
+            dst = get_rd(instr);
+            call = fmt::format(
+                "psx_ws_cull_slt_widen({}, {}, {})",
+                reg_name(get_rs(instr)), reg_name(get_rt(instr)),
+                site.mode == PSXRecompV4::WsCullWidenMode::BoundRt ? 1 : 0);
+        }
+        return fmt::format(
+            "{} = (uint32_t){};"
+            "  /* ws cull bound follows reveal margin */{}",
+            reg_name(dst), call, comment);
     }
 
     // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
@@ -2639,11 +2704,23 @@ GeneratedFunction CodeGenerator::generate_function(
     }
     body_ss << "#endif\n";
 
+    // Cadence / RAM-prep mod hooks must run on CPS mid-function re-entry too:
+    // AOT interior blocks still `lw` guest RAM (e.g. SimVblankGate skip). Other
+    // entry hooks (debug log, widescreen) stay AFTER the switch so they only
+    // fire on a true prologue entry (cpu->pc == 0).
+    if (config_.mod_function_entry_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << fmt::format(
+                       "psx_mod_function_entry(cpu, 0x{:08X}u);"
+                       "  /* trusted opt-in game-mod hook (pre-CPS) */\n",
+                       func.start_addr);
+    }
+
     // CPS entry-switch: when the unified flat trampoline dispatches a
     // continuation address (a callee published cpu->pc = $ra back to us), route
-    // into the owning block. Emitted BEFORE the entry hooks so a continuation
-    // re-entry bypasses debug_server_log_call_entry / widescreen entry hooks
-    // (those must run only on a true function entry, cpu->pc == 0).
+    // into the owning block. Emitted before debug/widescreen entry hooks so a
+    // continuation re-entry bypasses those (true-entry only). mod_function_entry
+    // is intentionally above so cadence plugins still run.
     // Overlay mode must emit the cpu->pc guard even when the continuation set
     // is EMPTY: a range re-entry can still request an interior PC of a
     // single-block function, and without the guard the body runs from its top
@@ -2720,13 +2797,6 @@ GeneratedFunction CodeGenerator::generate_function(
                 << fmt::format("if (psx_datashard_enter(cpu, 0x{:08X}u)) return;"
                                "  /* data-shard: replay or arm capture */\n",
                                func.start_addr);
-    }
-    if (config_.mod_function_entry_funcs.count(func.start_addr)) {
-        body_ss << config_.indent
-                << fmt::format(
-                       "psx_mod_function_entry(cpu, 0x{:08X}u);"
-                       "  /* trusted opt-in game-mod hook */\n",
-                       func.start_addr);
     }
     if (config_.ws_sprite_tag_funcs.count(func.start_addr)) {
         body_ss << config_.indent
@@ -3197,6 +3267,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_slt_widen(uint32_t rs, uint32_t rt, int bound_is_rt); /* ws cull register-bound widen (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";

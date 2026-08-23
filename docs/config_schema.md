@@ -332,6 +332,33 @@ idle_skip = true
 turbo_audio_sink = true
 ```
 
+### SIO1 serial link (`[runtime.link]`)
+
+The SIO1 register file at `0x1F801050..0x105F` (link cable port) is always
+live — every PlayStation has the registers whether or not a cable is plugged
+in (`accuracy/axis4_sio1_serial.md`; env `PSX_SIO1_REGS=0` restores the legacy
+reads-0 decode for A/B). This block configures the **peer** on the far side of
+the cable, default none:
+
+```toml
+[runtime.link]
+enabled        = false     # attach a link peer (default off = no cable)
+backend        = "null"    # "null" | "loopback" | "crossover"
+latency_cycles = 0         # deterministic extra wire delay per character
+trace          = false     # reserved: SIO1 character trace ring
+```
+
+- `null` — no cable: DSR/CTS read low, TX shifts into the void.
+- `loopback` — self-wired test cable (TX→own RX, DTR→own DSR): validates a
+  title's link path without a second console.
+- `crossover` — reserved for the dual-console driver, which cross-wires two
+  in-process machines itself; selecting it without that driver behaves as
+  `null`.
+
+All backends are deterministic (no wall clock, no sockets on the sim path)
+and rollback/savestate-safe; wire state snapshots into `BS_SEC_SIO1`. Env
+overrides for A/B: `PSX_SIO1_BACKEND`, `PSX_SIO1_LATENCY`.
+
 ### `turbo_loads` / `offer_turbo_loads` — deprecated and ignored
 
 **Do not use these keys.** Load acceleration is owned by the Mods catalog:

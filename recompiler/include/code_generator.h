@@ -158,6 +158,12 @@ struct CodeGenConfig {
     // while widescreen reveals extra world. 4:3 evaluates the original compare.
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep_sites;
 
+    // Exact, full-word-guarded comparison sites whose BOUND follows the live
+    // reveal margin. Unlike a keep site the verdict is never pinned, so a
+    // clip-code packer keeps classifying honestly and simply rejects at the
+    // revealed edge. Identity at 4:3 in every mode.
+    std::vector<PSXRecompV4::WidescreenCullWidenSite> ws_cull_widen_sites;
+
     // Exact `addi[u] rt,zero,imm` 12-bit angular half-extents. The runtime
     // scales tan(angle) by the current horizontal reveal factor.
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle_sites;
