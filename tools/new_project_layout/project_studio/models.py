@@ -83,6 +83,8 @@ class MigrateOptions:
     boot_exe: str | None = None
     players: int = 2
     zip_prefix: str | None = None
+    github_owner: str | None = None
+    github_repo: str | None = None
     window_title: str | None = None
     enable_recomp_ui: bool = True
     enable_wizard: bool = True

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fill_tokens import derive_zip_prefix
+from fill_tokens import derive_zip_prefix, sanitize_github_name
 
 
 DEFAULT_LOBBY_HOST = "netplay.retcomm.net"
@@ -220,6 +220,8 @@ def build_token_map(
     enable_wizard: bool = True,
     enable_netplay: bool = False,
     has_boxart: bool = False,
+    github_owner: str | None = None,
+    github_repo: str | None = None,
 ) -> dict[str, str]:
     cmake_name = project_cmake_name(name)
     title = window_title or window_title_from_name(name)
@@ -294,6 +296,10 @@ def build_token_map(
         "ENV_PREFIX": env_prefix(cmake_name),
         "EXE_BASENAME": exe_basename(title),
         "ZIP_PREFIX": zp,
+        "GITHUB_OWNER": sanitize_github_name(
+            (github_owner or "").strip() or "TechnicallyComputers"
+        ),
+        "GITHUB_REPO": sanitize_github_name((github_repo or "").strip() or name),
         "DISC_HINT": f"your legally owned {game} disc",
         "GAME_TITLE": title,
         "PLAYERS": str(players),

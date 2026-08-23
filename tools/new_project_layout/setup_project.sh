@@ -9,11 +9,13 @@
 #   --stage-disc          Copy full cue+bins into repo disc/ (large; optional)
 #   --no-stage-disc       Default: probe in place, extract boot EXE only
 #   --psxrecomp-ref / --recomp-ui-ref / --recomp-net-ref / URLs
+#   --github-owner <org>  README download-badge owner (default TechnicallyComputers)
+#   --github-repo <name>  README download-badge repo (default project name)
 #
 # Everything else is prompted on a TTY (or passed via flags / --yes defaults):
-#   name, players (1–8, default 2), zip-prefix, marketing blurb, recomp-ui,
-#   wizard, netplay, lobby URL (if netplay), CI workflow, fetch-boxart,
-#   generate, build (if generate), GitHub repo (gh)
+#   name, players (1–8, default 2), zip-prefix, github owner/repo (README badges),
+#   marketing blurb, recomp-ui, wizard, netplay, lobby URL (if netplay), CI
+#   workflow, fetch-boxart, generate, build (if generate), GitHub repo (gh)
 #
 # Non-interactive: --yes (or PSXRECOMP_SETUP_YES=1) requires --name and --disc;
 #   boolean opts stay off unless explicitly flagged; lobby URL defaults to
@@ -55,6 +57,8 @@ DO_GENERATE=""
 DO_BUILD=""
 CREATE_GITHUB=""
 GITHUB_VISIBILITY="private"
+GITHUB_OWNER=""
+GITHUB_REPO=""
 BIOS_PATH=""
 LOBBY_URL=""
 DESCRIPTION=""
@@ -183,6 +187,8 @@ while [ $# -gt 0 ]; do
         --create-github) CREATE_GITHUB=1; SET_GITHUB=1; shift ;;
         --no-github) CREATE_GITHUB=0; SET_GITHUB=1; shift ;;
         --github-visibility) GITHUB_VISIBILITY=$2; shift 2 ;;
+        --github-owner) GITHUB_OWNER=$2; shift 2 ;;
+        --github-repo) GITHUB_REPO=$2; shift 2 ;;
         --description) DESCRIPTION=$2; SET_DESCRIPTION=1; shift 2 ;;
         --publisher) PUBLISHER=$2; SET_PUBLISHER=1; shift 2 ;;
         --year) YEAR=$2; SET_YEAR=1; shift 2 ;;
@@ -263,6 +269,28 @@ if [ -z "$ZIP_PREFIX" ]; then
         prompt_line "Zip / CI artifact prefix" ZIP_PREFIX "$_derived"
     fi
 fi
+
+if [ -z "$GITHUB_OWNER" ]; then
+    if [ "$YES_MODE" -eq 1 ] || ! is_tty; then
+        GITHUB_OWNER=TechnicallyComputers
+    else
+        prompt_line "GitHub owner / org (README download badges)" GITHUB_OWNER \
+            "TechnicallyComputers"
+    fi
+fi
+if [ -z "$GITHUB_REPO" ]; then
+    _derived_repo=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -c 'from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))' "$NAME")
+    if [ "$YES_MODE" -eq 1 ] || ! is_tty; then
+        GITHUB_REPO=$_derived_repo
+    else
+        prompt_line "GitHub repo name (README download badges)" GITHUB_REPO "$_derived_repo"
+    fi
+fi
+GITHUB_OWNER=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -c 'from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))' "$GITHUB_OWNER")
+GITHUB_REPO=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -c 'from fill_tokens import sanitize_github_name; import sys; print(sanitize_github_name(sys.argv[1]))' "$GITHUB_REPO")
 
 # Optional marketing (catalog_identity.json + README)
 if [ "$SET_DESCRIPTION" -eq 0 ]; then
@@ -448,10 +476,15 @@ if [ -z "$DESCRIPTION_MD" ]; then
     DESCRIPTION_MD="_Add a short pitch in catalog_identity.json / README._"
 fi
 
-ROOT=$(CDPATH= cd -- "$PARENT" && pwd)/"$NAME"
+# Folder = GitHub/catalog install_dir slug (hyphenated), not display $NAME with spaces.
+INSTALL_DIR_NAME="$GITHUB_REPO"
+ROOT=$(CDPATH= cd -- "$PARENT" && pwd)/"$INSTALL_DIR_NAME"
 if [ -e "$ROOT" ]; then
     echo "error: target already exists: $ROOT" >&2
     exit 1
+fi
+if [ "$INSTALL_DIR_NAME" != "$NAME" ]; then
+    echo "note: project folder is '$INSTALL_DIR_NAME' (catalog/GitHub slug; display name stays '$NAME')" >&2
 fi
 
 # --- CMake block files -----------------------------------------------------
@@ -527,6 +560,8 @@ fill_template() {
         --set "ENV_PREFIX=$ENV_PREFIX" \
         --set "EXE_BASENAME=$EXE_BASENAME" \
         --set "ZIP_PREFIX=$ZIP_PREFIX" \
+        --set "GITHUB_OWNER=$GITHUB_OWNER" \
+        --set "GITHUB_REPO=$GITHUB_REPO" \
         --set "DISC_HINT=$DISC_HINT" \
         --set "GAME_TITLE=$WINDOW_TITLE" \
         --set "PLAYERS=$PLAYERS" \
@@ -550,6 +585,7 @@ echo "== New Project Layout =="
 echo "  repo:       $ROOT"
 echo "  disc:       $DISC"
 echo "  zip prefix: $ZIP_PREFIX"
+echo "  gh slug:    $GITHUB_OWNER/$GITHUB_REPO"
 echo "  players:    $PLAYERS"
 echo "  recomp-ui:  $ENABLE_RECOMP_UI"
 echo "  wizard:     $ENABLE_WIZARD"
@@ -578,9 +614,12 @@ fill_template "$TEMPLATE_DIR/VERSION.in" "$ROOT/VERSION"
 fill_template "$TEMPLATE_DIR/README.md.in" "$ROOT/README.md"
 fill_template "$TEMPLATE_DIR/symbols.toml.in" "$ROOT/symbols.toml"
 mkdir -p "$ROOT/seeds" "$ROOT/launcher_assets/img" "$ROOT/scripts" "$ROOT/tools" \
-    "$ROOT/mods/preloaded/packages" "$ROOT/assets"
+    "$ROOT/mods/preloaded/packages" "$ROOT/assets" "$ROOT/.github"
 cp "$SCRIPT_DIR/sync_symbols.py" "$ROOT/tools/sync_symbols.py"
 chmod +x "$ROOT/tools/sync_symbols.py"
+if [ -f "$TEMPLATE_DIR/raid-discord.png" ]; then
+    cp "$TEMPLATE_DIR/raid-discord.png" "$ROOT/.github/raid-discord.png"
+fi
 # Empty mod catalog tree (runtime copies mods/preloaded → beside the exe as mods/).
 cat > "$ROOT/mods/preloaded/README.md" <<'EOF'
 # Preloaded mods
@@ -801,6 +840,11 @@ if [ "$FETCH_BOXART_FLAG" -eq 1 ]; then
             >"$BOXART_BLOCK_FILE"
         fill_template "$TEMPLATE_DIR/CMakeLists.txt.in" "$ROOT/CMakeLists.txt"
         echo "  wired LAUNCHER_BOXART in CMakeLists.txt"
+        PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+            'from pathlib import Path; import sys; from project_studio.readme_metrics import inject_readme_boxart; inject_readme_boxart(Path(sys.argv[1]), sys.argv[2])' \
+            "$ROOT/README.md" "$GAME_NAME" \
+            && echo "  injected boxart into README.md" \
+            || echo "warning: README boxart inject failed" >&2
     else
         echo "warning: boxart fetch failed — leave LAUNCHER_BOXART commented." >&2
     fi
@@ -813,8 +857,8 @@ echo "== Sync symbols header =="
 )
 
 git add CMakeLists.txt game.toml codegen_setup.c codegen_setup.h .gitignore VERSION README.md seeds scripts tools mods framework_pins.txt symbols.toml psx_symbols.h || true
-if [ -d "$ROOT/.github/workflows" ]; then
-    git add .github/workflows || true
+if [ -d "$ROOT/.github" ]; then
+    git add .github || true
 fi
 if [ -f "$ROOT/catalog_identity.json" ]; then
     git add catalog_identity.json || true
@@ -823,7 +867,7 @@ if [ -f "$ROOT/disc_probe.json" ]; then
     git add disc_probe.json || true
 fi
 if [ "$HAS_BOXART" -eq 1 ]; then
-    git add launcher_assets/img/boxart.tga launcher_assets/img/BOXART_SOURCE.txt || true
+    git add launcher_assets/img/boxart.tga launcher_assets/img/boxart.png launcher_assets/img/BOXART_SOURCE.txt || true
 fi
 COMMITTED=0
 if git -c user.email=setup@localhost -c user.name=setup \
@@ -847,14 +891,20 @@ if [ "${CREATE_GITHUB:-0}" -eq 1 ]; then
         VIS_FLAG="--private"
         [ "$GITHUB_VISIBILITY" = "public" ] && VIS_FLAG="--public"
         [ "$GITHUB_VISIBILITY" = "internal" ] && VIS_FLAG="--internal"
-        if gh repo create "$NAME" $VIS_FLAG --source="$ROOT" --remote=origin; then
+        GH_SLUG="$GITHUB_OWNER/$GITHUB_REPO"
+        GH_DESC=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -c 'from fill_tokens import GITHUB_ABOUT_DESCRIPTION; print(GITHUB_ABOUT_DESCRIPTION)')
+        GH_HOME=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -c 'from fill_tokens import GITHUB_ABOUT_HOMEPAGE; print(GITHUB_ABOUT_HOMEPAGE)')
+        if gh repo create "$GH_SLUG" $VIS_FLAG --source="$ROOT" --remote=origin \
+            --description "$GH_DESC" --homepage "$GH_HOME"; then
             echo "  created origin ($GITHUB_VISIBILITY); push deferred until end"
             GITHUB_CREATED=1
         else
             echo "warning: gh repo create failed — if the repo already exists," >&2
             echo "         add origin and push manually at the end." >&2
             if ! git remote get-url origin >/dev/null 2>&1; then
-                _gh_url=$(gh repo view "$NAME" --json url -q .url 2>/dev/null || true)
+                _gh_url=$(gh repo view "$GH_SLUG" --json url -q .url 2>/dev/null || true)
                 if [ -n "$_gh_url" ]; then
                     git remote add origin "$_gh_url"
                     echo "  attached existing origin → $_gh_url"
@@ -862,6 +912,13 @@ if [ "${CREATE_GITHUB:-0}" -eq 1 ]; then
                 fi
             else
                 GITHUB_CREATED=1
+            fi
+        fi
+        if [ "$GITHUB_CREATED" -eq 1 ]; then
+            if gh repo edit "$GH_SLUG" --description "$GH_DESC" --homepage "$GH_HOME"; then
+                echo "  GitHub About: R.A.I.D. description + Discord homepage"
+            else
+                echo "warning: gh repo edit (About) failed — set description/homepage by hand." >&2
             fi
         fi
     fi

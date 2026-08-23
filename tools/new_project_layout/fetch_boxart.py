@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Fetch PS1 Named_Boxarts from libretro-thumbnails and write launcher TGA.
+"""Fetch PS1 Named_Boxarts from libretro-thumbnails (PNG + launcher TGA).
 
 Sources (tried in order):
   https://thumbnails.libretro.com/Sony - PlayStation/Named_Boxarts/<name>.png
   https://raw.githubusercontent.com/libretro-thumbnails/Sony_-_PlayStation/master/Named_Boxarts/<name>.png
 
-Writes 32-bit uncompressed TGA (bottom-up BGRA) for recomp-ui LAUNCHER_BOXART.
-Also writes launcher_assets/img/BOXART_SOURCE.txt with URL + attribution.
+Writes the original PNG (README) and a 32-bit uncompressed TGA (bottom-up BGRA)
+for recomp-ui LAUNCHER_BOXART. Also writes launcher_assets/img/BOXART_SOURCE.txt
+with URL + attribution.
 
 Requires network. Prefer Pillow when installed; otherwise decodes common
 8-bit RGBA/RGB PNGs with the stdlib.
@@ -120,7 +121,7 @@ def try_fetch(names: list[str]) -> tuple[bytes, str, str]:
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError) as e:
                 last_err = e
                 continue
-    raise SystemExit(
+    raise FileNotFoundError(
         f"boxart not found for candidates {names[:8]}… ({last_err})"
     )
 
@@ -241,6 +242,40 @@ def write_tga_bgra(path: Path, width: int, height: int, rgba: bytes) -> None:
     path.write_bytes(bytes(header) + bytes(bgra))
 
 
+def fetch_to_paths(
+    tga_path: Path,
+    *,
+    cue_stem: str = "",
+    display_name: str = "",
+    extra_names: list[str] | None = None,
+    png_path: Path | None = None,
+) -> tuple[Path, Path, str]:
+    """Fetch libretro Named_Boxarts PNG, write PNG + TGA + BOXART_SOURCE.txt."""
+    names = candidate_names(cue_stem, display_name, *(extra_names or []))
+    if not names:
+        raise ValueError("pass cue_stem and/or display_name")
+    png, url, matched = try_fetch(names)
+    tga_path = Path(tga_path)
+    png_path = Path(png_path) if png_path else tga_path.with_suffix(".png")
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path.write_bytes(png)
+    try:
+        w, h, rgba = png_to_rgba(png)
+        write_tga_bgra(tga_path, w, h, rgba)
+    except SystemExit as exc:
+        raise RuntimeError(str(exc) or "PNG decode failed") from exc
+    src_path = tga_path.parent / "BOXART_SOURCE.txt"
+    src_path.write_text(
+        "Box art sourced from libretro-thumbnails (Named_Boxarts).\n"
+        f"Matched name: {matched}\n"
+        f"URL: {url}\n"
+        "https://github.com/libretro-thumbnails/libretro-thumbnails\n"
+        "PNG is for README; TGA is for recomp-ui LAUNCHER_BOXART.\n",
+        encoding="utf-8",
+    )
+    return tga_path, png_path, url
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -256,6 +291,11 @@ def main() -> int:
         default="",
         help="attribution file (default: next to TGA as BOXART_SOURCE.txt)",
     )
+    ap.add_argument(
+        "--png-out",
+        default="",
+        help="output PNG path (default: same stem as --out with .png)",
+    )
     args = ap.parse_args()
 
     names = candidate_names(args.cue_stem, args.display_name, *args.name)
@@ -264,24 +304,28 @@ def main() -> int:
         return 2
 
     print(f"  searching libretro boxart ({len(names)} candidates)…", file=sys.stderr)
-    png, url, matched = try_fetch(names)
-    print(f"  fetched {matched}", file=sys.stderr)
-    print(f"    {url}", file=sys.stderr)
-
-    w, h, rgba = png_to_rgba(png)
     out = Path(args.out)
-    write_tga_bgra(out, w, h, rgba)
-    print(f"  wrote {out} ({w}x{h})", file=sys.stderr)
-
+    png_out = Path(args.png_out) if args.png_out else out.with_suffix(".png")
+    try:
+        tga_path, png_path, url = fetch_to_paths(
+            out,
+            cue_stem=args.cue_stem,
+            display_name=args.display_name,
+            extra_names=list(args.name),
+            png_path=png_out,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(str(exc) or "boxart fetch failed", file=sys.stderr)
+        return 1
+    print(f"  wrote {png_path}", file=sys.stderr)
+    print(f"  wrote {tga_path}", file=sys.stderr)
+    print(f"    {url}", file=sys.stderr)
     src_path = Path(args.source_out) if args.source_out else out.parent / "BOXART_SOURCE.txt"
-    src_path.write_text(
-        "Box art sourced from libretro-thumbnails (Named_Boxarts).\n"
-        f"Matched name: {matched}\n"
-        f"URL: {url}\n"
-        "https://github.com/libretro-thumbnails/libretro-thumbnails\n"
-        "Convert: PNG → 32-bit TGA for recomp-ui LAUNCHER_BOXART.\n",
-        encoding="utf-8",
-    )
+    if args.source_out:
+        src_path.write_text(
+            (tga_path.parent / "BOXART_SOURCE.txt").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     print(f"  wrote {src_path}", file=sys.stderr)
     return 0
 
