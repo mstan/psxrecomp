@@ -1,4 +1,5 @@
 import argparse
+import binascii
 import sys
 import unittest
 from pathlib import Path
@@ -77,6 +78,34 @@ class StaticSymbolPrefixTests(unittest.TestCase):
         self.assertEqual(output.count('if (cpu->pc != 0u)'), 2)
         self.assertIn('case 0x80780004u: goto block_80780004;', output)
         self.assertIn('case 0x80780104u: goto block_80780104;', output)
+
+    def test_unresolved_static_requests_validate_only_demanded_addresses(self):
+        data = bytes.fromhex('0000000000000000')
+        crc = binascii.crc32(data[:4]) & 0xFFFFFFFF
+        request = {
+            'data': data,
+            'load_addr': 0x80780000,
+            'size': len(data),
+            'phys_addr': 0x00780000,
+            'image_crc': binascii.crc32(data) & 0xFFFFFFFF,
+            'entries': {0x80780000, 0x80780004},
+        }
+        parts = [{'variants': [{
+            'addr': 0x80780000,
+            'crc': crc,
+            'ranges': [(0x00780000, 4)],
+        }, {
+            # This unrelated malformed identity must never be inspected merely
+            # because it shares the aggregate static bundle.
+            'addr': 0x80780100,
+            'crc': 0,
+            'ranges': [(0x00790000, 4)],
+        }]}]
+
+        unresolved = compile_overlays.unresolved_static_variant_requests(
+            {(0x80780000, len(data), data): request}, parts)
+
+        self.assertEqual([entry for entry, _ in unresolved], [0x80780004])
 
 
 if __name__ == '__main__':
