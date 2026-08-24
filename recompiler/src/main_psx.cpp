@@ -1041,6 +1041,21 @@ int main(int argc, char** argv) {
             auto is_text_ptr = [&](uint32_t v) {
                 return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
             };
+            auto zero_filled_target = [&](uint32_t a) {
+                // Runtime-populated pointer/string tables are commonly zero in
+                // the executable image.  A pointer table can point into such a
+                // region that an unresolved host range happens to cover; NOP
+                // is a valid MIPS word, so the old single-word check promoted
+                // the zero storage as callable aliases.  Eight zero words are
+                // no callable-boundary evidence.  Trusted seeds bypass this
+                // guard and remain fail-closed diagnostics.
+                constexpr uint32_t kProbeWords = 8u;
+                if (a + kProbeWords * 4u > exe_hi) return false;
+                for (uint32_t i = 0; i < kProbeWords; ++i) {
+                    if (read_w(a + i * 4u) != 0u) return false;
+                }
+                return true;
+            };
             for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
                 if (containing(p)) continue;  // instruction word, not a data word
                 uint32_t w = read_w(p);
@@ -1061,6 +1076,7 @@ int main(int argc, char** argv) {
             bool promoted_new = false;
             for (const auto& [a, trusted, table_evidence] : candidates) {
                 if ((a & 3u) || a < exe_lo || a >= exe_hi) continue;
+                if (!trusted && zero_filled_target(a)) continue;
                 const PSXRecomp::Function* host = containing(a);
                 if (host && a == host->start_addr) continue;  // already an entry
                 uint32_t w = read_w(a);
