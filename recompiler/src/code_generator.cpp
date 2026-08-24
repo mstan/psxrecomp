@@ -3502,6 +3502,15 @@ std::string CodeGenerator::generate_file(
         // promotions and alias entries widened the function set.
         const int MAX_PASSES = 256;
         bool converged = false;
+        auto zero_filled_target = [&](uint32_t target) {
+            constexpr uint32_t kProbeWords = 8u;
+            if (target + kProbeWords * 4u > exe_end) return false;
+            for (uint32_t i = 0; i < kProbeWords; ++i) {
+                auto word = exe_.read_word(target + i * 4u);
+                if (!word.has_value() || *word != 0u) return false;
+            }
+            return true;
+        };
 
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
@@ -3515,6 +3524,11 @@ std::string CodeGenerator::generate_file(
                         if (known_addrs.count(target)) return;
                         if (target < exe_start || target >= exe_end) return;
                         if (target & 3) return;
+                        // Broad conservative host ranges may cover packed data
+                        // whose words decode as branches.  Never manufacture a
+                        // callable split at runtime-populated zero storage just
+                        // because a data word branches there syntactically.
+                        if (zero_filled_target(target)) return;
                         mid_targets.insert(target);
                     };
 

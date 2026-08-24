@@ -60,6 +60,9 @@ def make_psxexe():
     put32(text, 0x20, jal(LOAD + 0x400))
     for i, word in enumerate((0x27BDFFF0, 0x01000008, 0x00000000)):
         put32(text, 0x400 + i * 4, word)
+    # A branch-shaped data word in that broad host also targets the zero area.
+    # Mid-function splitting must apply the same zero-storage rejection.
+    put32(text, 0x420, 0x10000037)  # beq zero,zero,LOAD+0x500
     return bytes(header + text)
 
 
