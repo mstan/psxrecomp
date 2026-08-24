@@ -2379,6 +2379,73 @@ def add_cps_resume_cases(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
+def add_cps_resume_cases_by_host(src: str, requests) -> tuple:
+    """Plan all host resume edits against one shard and rebuild it once."""
+    definitions = list(re.finditer(
+        r'^void ([A-Za-z_][A-Za-z0-9_]*)\(CPUState\* cpu\)\n\{',
+        src, re.MULTILINE))
+    definitions_by_symbol = {
+        match.group(1): (match, definitions[index + 1].start()
+                         if index + 1 < len(definitions) else len(src))
+        for index, match in enumerate(definitions)
+    }
+    edits = []
+    admitted = set()
+    for host_symbol, host, entries in requests:
+        found = definitions_by_symbol.get(host_symbol)
+        if found is None:
+            continue
+        definition, end = found
+        segment = src[definition.start():end]
+        block_entries = {
+            int(value, 16) for value in re.findall(
+                r'^block_([0-9A-Fa-f]{8}):', segment, re.MULTILINE)
+        }
+        available = sorted(set(entries) & block_entries)
+        admitted.update(available)
+        missing = [entry for entry in available if
+                   f'case 0x{entry:08X}u: goto block_{entry:08X};'
+                   not in segment]
+        if not missing:
+            continue
+        hook = segment.find('debug_server_log_call_entry')
+        prologue = segment[:hook] if hook >= 0 else ''
+        default_match = re.search(r'^\s+default:', prologue, re.MULTILINE)
+        if 'if (cpu->pc != 0u)' in prologue and default_match:
+            position = definition.start() + default_match.start()
+            indent = re.match(
+                r'\s*', prologue[default_match.start():]).group(0)
+            text = ''.join(
+                f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
+                for entry in missing)
+        else:
+            position = definition.end()
+            cases = ''.join(
+                f'            case 0x{entry:08X}u: '
+                f'goto block_{entry:08X};\n' for entry in missing)
+            text = (
+                '\n    if (cpu->pc != 0u) {\n'
+                '        uint32_t _cont = cpu->pc; cpu->pc = 0;\n'
+                '        switch (_cont) {\n'
+                f'{cases}'
+                f'            case 0x{host:08X}u: break;  '
+                '/* entry at prologue */\n'
+                f'            default: cpu->pc = _cont; '
+                f'psx_native_bad_entry(cpu, 0x{host:08X}u, _cont); return;\n'
+                '        }\n'
+                '    }')
+        edits.append((position, text))
+    if not edits:
+        return src, admitted
+    pieces = []
+    cursor = 0
+    for position, text in sorted(edits):
+        pieces.extend((src[cursor:position], text))
+        cursor = position
+    pieces.append(src[cursor:])
+    return ''.join(pieces), admitted
+
+
 def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
     infix = f'_{symbol_prefix}' if symbol_prefix else ''
@@ -6887,14 +6954,16 @@ def main():
                             host in part['ids_by_addr']):
                         entries_by_host.setdefault(host, []).append(entry)
                 wrapper_parts = []
+                requests = [
+                    (part['symbols'][host], host, entries)
+                    for host, entries in sorted(entries_by_host.items())
+                ]
+                part['src'], admitted = add_cps_resume_cases_by_host(
+                    part['src'], requests)
                 for host, entries in sorted(entries_by_host.items()):
                     host_symbol = part['symbols'][host]
                     eligible = [entry for entry in sorted(entries)
-                                if entry in block_entries]
-                    part['src'], resume_ok = add_cps_resume_cases(
-                        part['src'], host_symbol, host, eligible)
-                    if not resume_ok:
-                        continue
+                                if entry in block_entries and entry in admitted]
                     for entry in eligible:
                         symbol = f'{part["namespace"]}_func_{entry:08X}'
                         wrapper_parts.append(
