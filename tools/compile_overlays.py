@@ -2321,6 +2321,15 @@ def parse_cps_continuation_owners(src: str) -> dict:
 def add_cps_resume_case(src: str, host_symbol: str,
                         host: int, entry: int) -> tuple:
     """Make ``entry`` a legal ``cpu->pc`` resume point in one native host."""
+    return add_cps_resume_cases(src, host_symbol, host, [entry])
+
+
+def add_cps_resume_cases(src: str, host_symbol: str,
+                         host: int, entries) -> tuple:
+    """Add several CPS resume points to one host with a single source copy."""
+    entries = sorted(set(entries))
+    if not entries:
+        return src, True
     definition = re.search(
         rf'^void {re.escape(host_symbol)}\(CPUState\* cpu\)\n\{{',
         src, re.MULTILINE)
@@ -2331,9 +2340,13 @@ def add_cps_resume_case(src: str, host_symbol: str,
     end = (definition.end() + next_definition.start()
            if next_definition else len(src))
     segment = src[definition.start():end]
-    if not re.search(rf'^block_{entry:08X}:', segment, re.MULTILINE):
+    available = [entry for entry in entries if re.search(
+        rf'^block_{entry:08X}:', segment, re.MULTILINE)]
+    if not available:
         return src, False
-    if f'case 0x{entry:08X}u: goto block_{entry:08X};' in segment:
+    missing = [entry for entry in available if
+               f'case 0x{entry:08X}u: goto block_{entry:08X};' not in segment]
+    if not missing:
         return src, True
 
     hook = segment.find('debug_server_log_call_entry')
@@ -2342,14 +2355,19 @@ def add_cps_resume_case(src: str, host_symbol: str,
     if 'if (cpu->pc != 0u)' in prologue and default_match:
         insert = definition.start() + default_match.start()
         indent = re.match(r'\s*', prologue[default_match.start():]).group(0)
-        arm = f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
-        return src[:insert] + arm + src[insert:], True
+        arms = ''.join(
+            f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
+            for entry in missing)
+        return src[:insert] + arms + src[insert:], True
 
+    case_text = ''.join(
+        f'            case 0x{entry:08X}u: goto block_{entry:08X};\n'
+        for entry in missing)
     prologue_text = (
         '\n    if (cpu->pc != 0u) {\n'
         '        uint32_t _cont = cpu->pc; cpu->pc = 0;\n'
         '        switch (_cont) {\n'
-        f'            case 0x{entry:08X}u: goto block_{entry:08X};\n'
+        f'{case_text}'
         f'            case 0x{host:08X}u: break;  /* entry at prologue */\n'
         f'            default: cpu->pc = _cont; psx_native_bad_entry(cpu, '
         f'0x{host:08X}u, _cont); return;\n'
@@ -6856,32 +6874,39 @@ def main():
             nonlocal synthesized
             for part in parts:
                 done = part.setdefault('resume_entries', set())
-                for entry, host in sorted(part['continuation_owners'].items()):
-                    if entry in part['func_addrs'] or entry in done:
-                        continue
-                    if host not in part['ids_by_addr']:
-                        continue
-                    symbol = f'{part["namespace"]}_func_{entry:08X}'
+                entries_by_host = {}
+                for entry, host in part['continuation_owners'].items():
+                    if (entry not in part['func_addrs'] and entry not in done and
+                            host in part['ids_by_addr']):
+                        entries_by_host.setdefault(host, []).append(entry)
+                wrapper_parts = []
+                for host, entries in sorted(entries_by_host.items()):
                     host_symbol = part['symbols'][host]
-                    part['src'], resume_ok = add_cps_resume_case(
-                        part['src'], host_symbol, host, entry)
+                    eligible = [entry for entry in sorted(entries) if re.search(
+                        rf'^block_{entry:08X}:', part['src'], re.MULTILINE)]
+                    part['src'], resume_ok = add_cps_resume_cases(
+                        part['src'], host_symbol, host, eligible)
                     if not resume_ok:
                         continue
-                    part['src'] += (
+                    for entry in eligible:
+                        symbol = f'{part["namespace"]}_func_{entry:08X}'
+                        wrapper_parts.append(
                         f'\n/* CPS block resume entry owned by 0x{host:08X}. */\n'
                         f'void {symbol}(CPUState* cpu)\n{{\n'
                         f'    cpu->pc = 0x{entry:08X}u;\n'
                         f'    {host_symbol}(cpu);\n'
                         f'}}\n')
-                    for code_crc, ranges in part['ids_by_addr'][host]:
-                        part['variants'].append({
-                            'addr': entry,
-                            'symbol': symbol,
-                            'crc': code_crc,
-                            'ranges': ranges,
-                        })
-                    done.add(entry)
-                    synthesized += 1
+                        for code_crc, ranges in part['ids_by_addr'][host]:
+                            part['variants'].append({
+                                'addr': entry,
+                                'symbol': symbol,
+                                'crc': code_crc,
+                                'ranges': ranges,
+                            })
+                        done.add(entry)
+                        synthesized += 1
+                if wrapper_parts:
+                    part['src'] += ''.join(wrapper_parts)
 
         synthesize_all_resume_wrappers(static_parts)
 
