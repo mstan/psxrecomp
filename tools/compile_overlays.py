@@ -2307,6 +2307,21 @@ def namespace_generated_static(src: str, namespace: str,
     return src, symbols
 
 
+def parse_static_symbol_prefix(value: str) -> str:
+    """Validate the optional identifier fragment used by static AOT bundles."""
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value or ''):
+        raise argparse.ArgumentTypeError(
+            '--static-symbol-prefix must be a non-empty C identifier fragment '
+            '([A-Za-z_][A-Za-z0-9_]*)')
+    return value
+
+
+def static_recipe_namespace(suffix: str, symbol_prefix: str = '') -> str:
+    """Return the deterministic private-symbol namespace for one recipe."""
+    infix = f'{symbol_prefix}_' if symbol_prefix else ''
+    return f'ov_{infix}{suffix}'
+
+
 def parse_cps_continuation_owners(src: str) -> dict:
     """Return compiled block entry -> owning function for generated CPS C.
 
@@ -2371,8 +2386,13 @@ def add_cps_resume_case(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
-def generate_overlay_dispatch(variants: list) -> str:
+def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
+    infix = f'_{symbol_prefix}' if symbol_prefix else ''
+    static_stem = f'psx_ov{infix}_static'
+    dispatch_symbol = f'psx_overlay_dispatch{infix}'
+    stats_symbol = (f'psx_overlay_{symbol_prefix}_get_stats'
+                    if symbol_prefix else 'psx_overlay_static_get_stats')
     unique = []
     seen = set()
     for variant in variants:
@@ -2389,7 +2409,7 @@ def generate_overlay_dispatch(variants: list) -> str:
     unique.sort(key=lambda v: (v['addr'], v['crc'], v['ranges'], v['symbol']))
     by_addr = {}
     for index, variant in enumerate(unique):
-        variant['range_symbol'] = f'psx_ov_static_ranges_{index:05d}'
+        variant['range_symbol'] = f'{static_stem}_ranges_{index:05d}'
         by_addr.setdefault(variant['addr'], []).append(variant)
 
     lines = [
@@ -2405,10 +2425,10 @@ def generate_overlay_dispatch(variants: list) -> str:
         '                                                uint32_t count,',
         '                                                uint32_t expected_crc,',
         '                                                uint32_t state[2]);',
-        'static uint64_t psx_ov_static_checks = 0;',
-        'static uint64_t psx_ov_static_hits = 0;',
-        'static uint64_t psx_ov_static_variant_misses = 0;',
-        'static uint64_t psx_ov_static_address_misses = 0;',
+        f'static uint64_t {static_stem}_checks = 0;',
+        f'static uint64_t {static_stem}_hits = 0;',
+        f'static uint64_t {static_stem}_variant_misses = 0;',
+        f'static uint64_t {static_stem}_address_misses = 0;',
         '',
     ]
     for variant in unique:
@@ -2423,16 +2443,16 @@ def generate_overlay_dispatch(variants: list) -> str:
 
     lines += [
         '',
-        'void psx_overlay_static_get_stats(uint64_t *checks, uint64_t *hits,',
+        f'void {stats_symbol}(uint64_t *checks, uint64_t *hits,',
         '                                  uint64_t *variant_misses,',
         '                                  uint64_t *address_misses) {',
-        '    if (checks) *checks = psx_ov_static_checks;',
-        '    if (hits) *hits = psx_ov_static_hits;',
-        '    if (variant_misses) *variant_misses = psx_ov_static_variant_misses;',
-        '    if (address_misses) *address_misses = psx_ov_static_address_misses;',
+        f'    if (checks) *checks = {static_stem}_checks;',
+        f'    if (hits) *hits = {static_stem}_hits;',
+        f'    if (variant_misses) *variant_misses = {static_stem}_variant_misses;',
+        f'    if (address_misses) *address_misses = {static_stem}_address_misses;',
         '}',
         '',
-        'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
+        f'int {dispatch_symbol}(CPUState *cpu, uint32_t addr) {{',
         '    const uint32_t key = (addr & 0x1FFFFFFFu) | 0x80000000u;',
         '    switch (key) {',
     ]
@@ -2441,20 +2461,20 @@ def generate_overlay_dispatch(variants: list) -> str:
         for variant in by_addr[addr]:
             count = len(variant['ranges'])
             lines += [
-                '            psx_ov_static_checks++;',
+                f'            {static_stem}_checks++;',
                 f'            if (psx_overlay_static_code_matches_memo('
                 f'{variant["range_symbol"]}, {count}u, '
                 f'0x{variant["crc"]:08X}u, {variant["range_symbol"]}_st)) {{',
-                '                psx_ov_static_hits++;',
+                f'                {static_stem}_hits++;',
                 f'                {variant["symbol"]}(cpu);',
                 '                return 1;',
                 '            }',
-                '            psx_ov_static_variant_misses++;',
+                f'            {static_stem}_variant_misses++;',
             ]
         lines.append('            return 0;')
     lines += [
         '        default:',
-        '            psx_ov_static_address_misses++;',
+        f'            {static_stem}_address_misses++;',
         '            return 0;',
         '    }',
         '}',
@@ -3175,8 +3195,9 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         entry = (interior & 0x1FFFFFFF) | 0x80000000
         if entry not in ids_by_addr or entry not in set(func_addrs):
             return None, 'requested-entry-not-emitted'
-        namespace = (f'ov_frag_{phys_addr:08X}_{image_crc:08X}_'
-                     f'{entry:08X}')
+        namespace = static_recipe_namespace(
+            f'frag_{phys_addr:08X}_{image_crc:08X}_{entry:08X}',
+            getattr(args, 'static_symbol_prefix', ''))
         continuation_owners = parse_cps_continuation_owners(src)
         src, symbols = namespace_generated_static(src, namespace, func_addrs)
         variants = []
@@ -5455,6 +5476,10 @@ def main():
                          'lost after a later capture)')
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
+    ap.add_argument('--static-symbol-prefix', type=parse_static_symbol_prefix,
+                    default='', metavar='IDENT',
+                    help='namespace static output symbols (for example, highram '
+                         'emits psx_overlay_dispatch_highram and ov_highram_*)')
     ap.add_argument('--flavor',          type=int, default=0,
                     help='codegen flavor id baked into overlay_abi() (0=base/master; '
                          'widescreen build passes 1). The loader rejects DLLs whose '
@@ -5472,6 +5497,8 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
+    if args.static_symbol_prefix and not args.static:
+        ap.error('--static-symbol-prefix requires --static')
     forced_interiors = {
         (int(v, 0) & 0x1FFFFFFF) | 0x80000000
         for v in args.force_interior
@@ -5873,7 +5900,9 @@ def main():
                 cov_blob = ','.join(f'{a:08X}'
                                     for a in sorted(func_addrs)).encode()
                 cov_crc = binascii.crc32(cov_blob) & 0xFFFFFFFF
-                namespace = f'ov_{phys_addr:08X}_{crc32:08X}_{cov_crc:08X}'
+                namespace = static_recipe_namespace(
+                    f'{phys_addr:08X}_{crc32:08X}_{cov_crc:08X}',
+                    args.static_symbol_prefix)
                 src, symbols = namespace_generated_static(src, namespace,
                                                           func_addrs)
                 variants = []
@@ -6944,7 +6973,8 @@ def main():
         for part in static_parts:
             combined += part['src']
             all_variants.extend(part['variants'])
-        combined += generate_overlay_dispatch(all_variants)
+        combined += generate_overlay_dispatch(
+            all_variants, args.static_symbol_prefix)
         with open(static_out, 'w') as f:
             f.write(combined)
         print(f'Static output: {static_out}  '
