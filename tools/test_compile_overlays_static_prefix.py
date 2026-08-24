@@ -50,6 +50,22 @@ class StaticSymbolPrefixTests(unittest.TestCase):
                     argparse.ArgumentTypeError):
                 compile_overlays.parse_static_symbol_prefix(value)
 
+    def test_resume_cases_are_inserted_in_one_host_update(self):
+        src = ('void ov_func_80780000(CPUState* cpu)\n{\n'
+               '    debug_server_log_call_entry(cpu);\n'
+               'block_80780004:\n    cpu->pc = 0;\n'
+               'block_80780008:\n    return;\n}\n')
+        output, ok = compile_overlays.add_cps_resume_cases(
+            src, 'ov_func_80780000', 0x80780000,
+            [0x80780008, 0x80780004])
+
+        self.assertTrue(ok)
+        self.assertEqual(output.count('if (cpu->pc != 0u)'), 1)
+        self.assertIn(
+            'case 0x80780004u: goto block_80780004;', output)
+        self.assertIn(
+            'case 0x80780008u: goto block_80780008;', output)
+
 
 if __name__ == '__main__':
     unittest.main()
