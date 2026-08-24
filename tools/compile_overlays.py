@@ -7037,13 +7037,24 @@ def main():
         if os.environ.get('PSX_STATIC_NO_ISOLATED'):
             unresolved = []
         fragment_built = 0
+        fragment_reused = 0
         byte_incoherent = 0
-        new_fragment_parts = []
+        fragment_variants_by_entry = {}
         for entry, request in unresolved:
             data = request['data']
             load_addr = request['load_addr']
             size = request['size']
             phys_addr = request['phys_addr']
+            # One isolated shard often satisfies the same dispatch entry in
+            # many full-region snapshots because its guarded code bytes are
+            # unchanged while unrelated data differs. Recheck fragments built
+            # earlier in this pass before invoking the recompiler again.
+            if any(current_variant_func_id_matches(
+                    (entry, variant['crc'], variant['ranges']),
+                    data, load_addr, size)
+                    for variant in fragment_variants_by_entry.get(entry, ())):
+                fragment_reused += 1
+                continue
             part, fragment_reason = generate_interior_fragment_static(
                 entry, data, load_addr, size, phys_addr, args)
             if part is None:
@@ -7056,16 +7067,22 @@ def main():
                     byte_incoherent += 1
                 continue
             static_parts.append(part)
-            new_fragment_parts.append(part)
+            # Synthesize and spool immediately so fragment source memory is
+            # bounded by one shard rather than the full unresolved demand set.
+            synthesize_all_resume_wrappers([part], spool=True)
+            for variant in part['variants']:
+                variant_entry = ((variant['addr'] & 0x1FFFFFFF) |
+                                 0x80000000)
+                fragment_variants_by_entry.setdefault(
+                    variant_entry, []).append(variant)
             fragment_built += 1
 
-        print('Static phase: synthesize and spool isolated shards', flush=True)
-        synthesize_all_resume_wrappers(new_fragment_parts, spool=True)
         print('Static phase: isolated shard spool complete', flush=True)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')
         print(f'Static isolated interior shards: {fragment_built}')
+        print(f'Static isolated fragment reuses: {fragment_reused}')
         print(f'Static byte-incoherent entries excluded: {byte_incoherent}')
         if unresolved:
             sample = ', '.join(
