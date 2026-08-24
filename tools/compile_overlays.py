@@ -6974,9 +6974,12 @@ def main():
         # variant a content-gated resume wrapper. This makes static coverage
         # independent of host timing / slice boundaries.
         synthesized = 0
+        static_spool_dir = os.path.join(args.out_dir, '.static_parts')
+        os.makedirs(static_spool_dir, exist_ok=True)
+        static_spool_index = 0
 
-        def synthesize_all_resume_wrappers(parts):
-            nonlocal synthesized
+        def synthesize_all_resume_wrappers(parts, spool=False):
+            nonlocal synthesized, static_spool_index
             for part in parts:
                 done = part.setdefault('resume_entries', set())
                 block_entries = {
@@ -7018,8 +7021,23 @@ def main():
                         synthesized += 1
                 if wrapper_parts:
                     part['src'] += ''.join(wrapper_parts)
+                if spool:
+                    # The aggregate static corpus can contain hundreds of MiB
+                    # of generated C. Keeping every post-synthesis string live
+                    # makes the per-shard reconstruction peak additive and can
+                    # trigger the Windows commit limit. Persist each completed
+                    # shard immediately; unresolved matching needs only compact
+                    # variant metadata, and final assembly streams these files.
+                    source_path = os.path.join(
+                        static_spool_dir,
+                        f'{static_spool_index:05d}_{part["namespace"]}.c')
+                    static_spool_index += 1
+                    with open(source_path, 'w') as source_file:
+                        source_file.write(part['src'])
+                    part['source_path'] = source_path
+                    del part['src']
 
-        synthesize_all_resume_wrappers(static_parts)
+        synthesize_all_resume_wrappers(static_parts, spool=True)
 
         # Captured entries not owned by any compiled host are genuine orphan
         # interiors for a particular byte recipe. Compile each against those
@@ -7055,7 +7073,7 @@ def main():
             new_fragment_parts.append(part)
             fragment_built += 1
 
-        synthesize_all_resume_wrappers(new_fragment_parts)
+        synthesize_all_resume_wrappers(new_fragment_parts, spool=True)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')
@@ -7087,7 +7105,13 @@ def main():
                     '--static ...\n')
             f.write(' */\n')
             for part in static_parts:
-                f.write(part['src'])
+                source_path = part.get('source_path')
+                if source_path:
+                    with open(source_path, 'r') as source_file:
+                        import shutil
+                        shutil.copyfileobj(source_file, f, length=1024 * 1024)
+                else:
+                    f.write(part['src'])
             f.write(generate_overlay_dispatch(
                 all_variants, args.static_symbol_prefix))
         print(f'Static output: {static_out}  '
