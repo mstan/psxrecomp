@@ -66,6 +66,18 @@ class StaticSymbolPrefixTests(unittest.TestCase):
         self.assertIn(
             'case 0x80780008u: goto block_80780008;', output)
 
+    def test_multiple_hosts_are_rebuilt_in_one_shard_edit(self):
+        src = ('void ov_a(CPUState* cpu)\n{\nblock_80780004:\n return;\n}\n'
+               'void ov_b(CPUState* cpu)\n{\nblock_80780104:\n return;\n}\n')
+        output, admitted = compile_overlays.add_cps_resume_cases_by_host(
+            src, [('ov_a', 0x80780000, [0x80780004]),
+                  ('ov_b', 0x80780100, [0x80780104])])
+
+        self.assertEqual(admitted, {0x80780004, 0x80780104})
+        self.assertEqual(output.count('if (cpu->pc != 0u)'), 2)
+        self.assertIn('case 0x80780004u: goto block_80780004;', output)
+        self.assertIn('case 0x80780104u: goto block_80780104;', output)
+
 
 if __name__ == '__main__':
     unittest.main()
