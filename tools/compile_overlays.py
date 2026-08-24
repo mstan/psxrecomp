@@ -6939,16 +6939,23 @@ def main():
                     'compiled body/owner')
 
         all_variants = []
-        combined = '/* Auto-generated overlay dispatch — do not edit.\n'
-        combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
-        combined += ' */\n'
+        # Static bundles can be hundreds of MiB. Repeated ``str +=`` copies the
+        # entire accumulated translation unit for every capture and can exhaust
+        # memory during the final combine even though every shard compiled.
+        # Collect references and join once so peak memory stays proportional to
+        # the output instead of the number of parts times the output size.
+        combined_parts = [
+            '/* Auto-generated overlay dispatch — do not edit.\n',
+            ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n',
+            ' */\n',
+        ]
         for part in static_parts:
-            combined += part['src']
+            combined_parts.append(part['src'])
             all_variants.extend(part['variants'])
-        combined += generate_overlay_dispatch(
-            all_variants, args.static_symbol_prefix)
+        combined_parts.append(generate_overlay_dispatch(
+            all_variants, args.static_symbol_prefix))
         with open(static_out, 'w') as f:
-            f.write(combined)
+            f.write(''.join(combined_parts))
         print(f'Static output: {static_out}  '
               f'({len(all_variants)} exact function identities total)')
 
