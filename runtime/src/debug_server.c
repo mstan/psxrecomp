@@ -5533,6 +5533,8 @@ static void handle_cdrom_state(int id, const char *json)
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
              "\"read_hold_cycles\":%llu,\"read_hold_events\":%llu,"
              "\"int1_pended\":%llu,\"int1_lost\":%llu,\"int1_pending_now\":%u,"
+             "\"accel_consumer_waits\":%llu,\"accel_consumer_wait_cycles\":%llu,"
+             "\"ring_starved\":%llu,\"ring_dropped\":%llu,"
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
@@ -5551,6 +5553,10 @@ static void handle_cdrom_state(int id, const char *json)
              (unsigned long long)s.int1_pended,
              (unsigned long long)s.int1_lost,
              s.int1_pending_now,
+             (unsigned long long)s.accel_consumer_waits,
+             (unsigned long long)s.accel_consumer_wait_cycles,
+             (unsigned long long)s.ring_starved,
+             (unsigned long long)s.ring_dropped,
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
@@ -5726,10 +5732,11 @@ static void handle_cdrom_command_history(int id, const char *json)
         if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
 
         pos += snprintf(buf + pos, bufsz - pos,
-                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\","
+                        "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"kind\":\"%s\","
                         "\"cmd\":\"0x%02X\",\"param_count\":%u,\"params\":[",
                         emitted ? "," : "",
-                        (unsigned long long)e->seq, e->frame,
+                        (unsigned long long)e->seq,
+                        (unsigned long long)e->cycle, e->frame,
                         cdrom_command_kind_name(e->kind),
                         e->cmd, e->param_count);
         for (uint8_t i = 0; i < e->param_count && i < 16 && pos < bufsz - 96; i++) {
@@ -11541,6 +11548,12 @@ static void handle_cd_read_log(int id, const char *json)
                                          uint32_t *dest, uint32_t *size);
 
     int tail = json_get_int(json, "tail", 256);
+    /* Optional LBA window + output cap, matching the oracle's cd_read_log so
+     * one call shape returns the same span from both emulators. */
+    int lba_lo = json_get_int(json, "lba_lo", -1);
+    int lba_hi = json_get_int(json, "lba_hi", -1);
+    int max_entries = json_get_int(json, "max_entries", 65536);
+    int emitted_rows = 0;
     uint32_t total = cd_dma_log_get_total();
     uint32_t cap   = 65536;
     uint32_t avail = total < cap ? total : cap;
@@ -11555,6 +11568,10 @@ static void handle_cd_read_log(int id, const char *json)
         int lba; uint32_t dest, size;
         cd_dma_log_get_entry(i, &lba, &dest, &size);
         if (lba < 0) continue;
+        if (emitted_rows >= max_entries) break;
+        if (lba_lo >= 0 && lba < lba_lo) continue;
+        if (lba_hi >= 0 && lba > lba_hi) continue;
+        emitted_rows++;
         send_fmt("%s{\"lba\":%d,\"dest\":\"0x%08X\",\"size\":%u}",
                  first ? "" : ",", lba, dest, size);
         first = 0;
@@ -11686,6 +11703,52 @@ static void handle_cdrom_timing(int id, const char *json)
     char stats[2048];
     cdrom_timing_stats_json(stats, (int)sizeof(stats));
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, stats);
+}
+
+/* cdrom_timing_dump: per-sector records from the L1.5 timing ring.
+ * Parameters: tail (default 1024), lba_lo / lba_hi (optional filter).
+ * One row per physical sector deadline: when it was due, when it landed in
+ * the buffer, when its INT1 was armed and presented to INTC, and the
+ * data/dma/pended/lost flags -- enough to see a single skipped sector and
+ * whether the guest or the drive was late around it. */
+static void handle_cdrom_timing_dump(int id, const char *json)
+{
+    int tail = json_get_int(json, "tail", 1024);
+    if (tail < 1) tail = 1;
+    if (tail > 4096) tail = 4096;
+    int lba_lo = json_get_int(json, "lba_lo", -1);
+    int lba_hi = json_get_int(json, "lba_hi", -1);
+
+    uint64_t total = cdrom_timing_total();
+    uint64_t start = total > (uint64_t)tail ? total - (uint64_t)tail : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+             id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        CdTimingPub r;
+        if (!cdrom_timing_record(seq, &r)) continue;
+        if (lba_lo >= 0 && r.lba < lba_lo) continue;
+        if (lba_hi >= 0 && r.lba > lba_hi) continue;
+        send_fmt("%s{\"seq\":%llu,\"lba\":%d,\"frame\":%u,"
+                 "\"due\":%llu,\"buffer\":%llu,\"irq_arm\":%llu,"
+                 "\"intc\":%llu,\"data\":%u,\"dma\":%u,"
+                 "\"pended\":%u,\"lost\":%u,\"irq_armed\":%u,"
+                 "\"intc_seen\":%u}",
+                 first ? "" : ",",
+                 (unsigned long long)r.seq, r.lba, r.frame,
+                 (unsigned long long)r.due_cycle,
+                 (unsigned long long)r.buffer_cycle,
+                 (unsigned long long)r.irq_arm_cycle,
+                 (unsigned long long)r.intc_cycle,
+                 (r.flags & 0x01u) ? 1 : 0,
+                 (r.flags & 0x02u) ? 1 : 0,
+                 (r.flags & 0x04u) ? 1 : 0,
+                 (r.flags & 0x08u) ? 1 : 0,
+                 (r.flags & 0x10u) ? 1 : 0,
+                 (r.flags & 0x20u) ? 1 : 0);
+        first = 0;
+    }
+    send_fmt("]}\n");
 }
 
 /* autocompile_status: variant-capture automation state — autocapture
@@ -13458,6 +13521,7 @@ static const CmdEntry s_commands[] = {
     { "wtrace_reset",        handle_wtrace_clear },
     { "wtrace_ranges",       handle_wtrace_ranges },
     { "wtrace_dump",         handle_wtrace_dump },
+    { "cdrom_timing_dump",   handle_cdrom_timing_dump },
     { "wtrace_stats",        handle_wtrace_stats },
     { "wtrace_boot_dump",    handle_wtrace_boot_dump },
     { "wtrace_boot_summary", handle_wtrace_boot_summary },
