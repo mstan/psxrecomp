@@ -2368,8 +2368,11 @@ def add_cps_resume_cases(src: str, host_symbol: str,
     end = (definition.end() + next_definition.start()
            if next_definition else len(src))
     segment = src[definition.start():end]
-    available = [entry for entry in entries if re.search(
-        rf'^block_{entry:08X}:', segment, re.MULTILINE)]
+    block_entries = {
+        int(value, 16) for value in
+        re.findall(r'^block_([0-9A-Fa-f]{8}):', segment, re.MULTILINE)
+    }
+    available = [entry for entry in entries if entry in block_entries]
     if not available:
         return src, False
     missing = [entry for entry in available if
@@ -6902,6 +6905,10 @@ def main():
             nonlocal synthesized
             for part in parts:
                 done = part.setdefault('resume_entries', set())
+                block_entries = {
+                    int(value, 16) for value in re.findall(
+                        r'^block_([0-9A-Fa-f]{8}):', part['src'], re.MULTILINE)
+                }
                 entries_by_host = {}
                 for entry, host in part['continuation_owners'].items():
                     if (entry not in part['func_addrs'] and entry not in done and
@@ -6910,8 +6917,8 @@ def main():
                 wrapper_parts = []
                 for host, entries in sorted(entries_by_host.items()):
                     host_symbol = part['symbols'][host]
-                    eligible = [entry for entry in sorted(entries) if re.search(
-                        rf'^block_{entry:08X}:', part['src'], re.MULTILINE)]
+                    eligible = [entry for entry in sorted(entries)
+                                if entry in block_entries]
                     part['src'], resume_ok = add_cps_resume_cases(
                         part['src'], host_symbol, host, eligible)
                     if not resume_ok:
