@@ -3107,11 +3107,16 @@ def unresolved_static_variant_requests(requests: dict,
     # exhaust memory at that point after all shards have already compiled.
     # Index original variant records by address once, then validate only the
     # handful of identities capable of satisfying each exact-image demand.
-    variants_by_entry = {}
+    demanded_entries = {
+        entry for request in requests.values()
+        for entry in request['entries']
+    }
+    variants_by_entry = {entry: [] for entry in demanded_entries}
     for part in static_parts:
         for variant in part['variants']:
             entry = (variant['addr'] & 0x1FFFFFFF) | 0x80000000
-            variants_by_entry.setdefault(entry, []).append(variant)
+            if entry in demanded_entries:
+                variants_by_entry[entry].append(variant)
     unresolved = []
     for request in requests.values():
         for entry in request['entries']:
