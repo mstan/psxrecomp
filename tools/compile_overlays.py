@@ -3072,23 +3072,30 @@ def add_static_variant_request(requests: dict, entries, data: bytes,
 def unresolved_static_variant_requests(requests: dict,
                                        static_parts: list) -> list:
     """Return demands with no body whose live range guard matches that image."""
-    func_ids = [
-        (variant['addr'], variant['crc'], variant['ranges'])
-        for part in static_parts
-        for variant in part['variants']
-    ]
+    # Only requested dispatch entries can affect this answer.  The previous
+    # implementation revalidated every identity in the aggregate bundle for
+    # every byte recipe, materializing a potentially huge valid-id list before
+    # reducing it back to a small address set.  The retained Wipeout corpus can
+    # exhaust memory at that point after all shards have already compiled.
+    # Index original variant records by address once, then validate only the
+    # handful of identities capable of satisfying each exact-image demand.
+    variants_by_entry = {}
+    for part in static_parts:
+        for variant in part['variants']:
+            entry = (variant['addr'] & 0x1FFFFFFF) | 0x80000000
+            variants_by_entry.setdefault(entry, []).append(variant)
     unresolved = []
     for request in requests.values():
-        matching = {
-            (entry & 0x1FFFFFFF) | 0x80000000
-            for entry, _crc, _ranges in current_variant_func_ids(
-                func_ids, request['data'], request['load_addr'], request['size'])
-        }
-        unresolved.extend(
-            (entry, request)
-            for entry in request['entries']
-            if entry not in matching
-        )
+        for entry in request['entries']:
+            candidates = variants_by_entry.get(entry, ())
+            func_ids = (
+                (entry, variant['crc'], variant['ranges'])
+                for variant in candidates
+            )
+            if not current_variant_func_ids(
+                    func_ids, request['data'], request['load_addr'],
+                    request['size']):
+                unresolved.append((entry, request))
     return sorted(unresolved, key=lambda item: (
         item[0], item[1]['load_addr'], item[1]['size'],
         item[1]['image_crc']))
