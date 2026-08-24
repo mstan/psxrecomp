@@ -675,31 +675,34 @@ int main() {
           thunk_starts.count(kLoad + 0x610),
           "packed BIOS thunk bounds the following frameless leaf");
 
-    // A data word can decode as a direct jump beyond the loaded image.  That
-    // jump alone must not make a forced/data-derived seed pass the clean-tail
-    // extent proof and hide the surrounding data behind a native code range.
+    // Return-shaped words in a data island can make the backward scan invent a
+    // function start.  An out-of-image jump at that start must not prove a
+    // clean tail, and the resulting scan-only data candidate must disappear
+    // rather than becoming a declaration/native-validity range.
     auto outside_jump_image = make_exe_buffer(0x1000);
+    put32(outside_jump_image, text + 0x3F8, 0x03E00008u);
+    put32(outside_jump_image, text + 0x3FC, 0x00000000u);
     for (size_t off = 0x400; off < 0x800; off += 4) {
         put32(outside_jump_image, text + off, 0x4C000000u); // invalid PS1 opcode
     }
     put32(outside_jump_image, text + 0x400,
           0x08000000u | ((0x80200000u >> 2) & 0x03FFFFFFu));
     put32(outside_jump_image, text + 0x404, 0x00000000u);
+    put32(outside_jump_image, text + 0x7F8, 0x03E00008u);
+    put32(outside_jump_image, text + 0x7FC, 0x00000000u);
     put32(outside_jump_image, text + 0x800, 0x27BDFFF0u);
     put32(outside_jump_image, text + 0x804, 0x03E00008u);
     put32(outside_jump_image, text + 0x808, 0x27BD0010u);
     auto outside_jump_exe = parse(outside_jump_image);
     PSXRecomp::FunctionAnalyzer outside_jump_analyzer(outside_jump_exe);
-    outside_jump_analyzer.add_forced_entry(kLoad + 0x400);
     const auto outside_jump_result = outside_jump_analyzer.analyze();
     auto outside_jump_func = std::find_if(
         outside_jump_result.functions.begin(), outside_jump_result.functions.end(),
         [](const PSXRecomp::Function& function) {
             return function.start_addr == kLoad + 0x400;
         });
-    CHECK(outside_jump_func != outside_jump_result.functions.end() &&
-          outside_jump_func->is_data_section,
-          "out-of-image direct jump alone cannot prove a clean code tail");
+    CHECK(outside_jump_func == outside_jump_result.functions.end(),
+          "scan-only data island is not emitted as a function");
 
     PSXRecomp::FunctionAnalyzer seeded_analyzer(exe);
     const auto seeded = starts(

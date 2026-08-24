@@ -1538,6 +1538,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
 
     uint32_t exe_start = exe_.header.load_address;
     uint32_t exe_end   = exe_.end_address();
+    std::set<uint32_t> direct_call_starts;
 
     for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
         auto word_opt = exe_.read_word(addr);
@@ -1561,6 +1562,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                         target = setup_start;
                     }
                 }
+                direct_call_starts.insert(target);
                 function_starts.insert(target);
             }
         }
@@ -2036,6 +2038,19 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
+        // A return-shaped word in arbitrary data can manufacture a start via
+        // the whole-image backward scan.  Once the candidate is positively
+        // classified as data, retain it only when execution evidence asked for
+        // that exact address: a configured/initial forced entry or a direct
+        // call target.  Those evidence-backed data entries remain fail-closed
+        // diagnostic stubs; scan-only data islands must not become functions,
+        // declarations, or native-validity ranges.
+        if (func.is_data_section &&
+            std::find(forced_entry_points_.begin(), forced_entry_points_.end(),
+                      func.start_addr) == forced_entry_points_.end() &&
+            !direct_call_starts.count(func.start_addr)) {
+            continue;
+        }
         result.functions.push_back(func);
     }
 
