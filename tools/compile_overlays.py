@@ -2965,25 +2965,32 @@ def load_region_current_variant_coverage(cache_dir: str, phys_addr: int,
     return entries, ranges_out
 
 
+def current_variant_func_id_matches(func_id, data: bytes,
+                                    load_addr: int, size: int) -> bool:
+    """Return whether one complete identity's guard matches this image."""
+    entry, expected_crc, ranges = func_id
+    ov_lo = load_addr & 0x1FFFFFFF
+    ov_hi = ov_lo + size
+    crc = 0
+    for start, length in ranges:
+        lo = start & 0x1FFFFFFF
+        if length <= 0 or lo < ov_lo or lo + length > ov_hi:
+            return False
+        crc = binascii.crc32(data[lo - ov_lo:lo - ov_lo + length], crc)
+    if (crc & 0xFFFFFFFF) != (expected_crc & 0xFFFFFFFF):
+        return False
+    return not audit_func_id_delay_slots(
+        [(entry, expected_crc, ranges)], data, load_addr)
+
+
 def current_variant_func_ids(func_ids: list, data: bytes,
                              load_addr: int, size: int) -> list:
     """Retain complete identities whose guarded bytes match this image."""
     valid_ids = []
-    ov_lo = load_addr & 0x1FFFFFFF
-    ov_hi = ov_lo + size
-    for entry, expected_crc, ranges in func_ids:
-        crc = 0
-        valid = True
-        for start, length in ranges:
-            lo = start & 0x1FFFFFFF
-            if length <= 0 or lo < ov_lo or lo + length > ov_hi:
-                valid = False
-                break
-            crc = binascii.crc32(data[lo - ov_lo:lo - ov_lo + length], crc)
-        if valid and (crc & 0xFFFFFFFF) == (expected_crc & 0xFFFFFFFF):
-            candidate = [(entry, expected_crc, ranges)]
-            if not audit_func_id_delay_slots(candidate, data, load_addr):
-                valid_ids.append((entry, expected_crc, ranges))
+    for func_id in func_ids:
+        if current_variant_func_id_matches(
+                func_id, data, load_addr, size):
+            valid_ids.append(func_id)
     return valid_ids
 
 
@@ -3093,13 +3100,10 @@ def unresolved_static_variant_requests(requests: dict,
     for request in requests.values():
         for entry in request['entries']:
             candidates = variants_by_entry.get(entry, ())
-            func_ids = (
-                (entry, variant['crc'], variant['ranges'])
-                for variant in candidates
-            )
-            if not current_variant_func_ids(
-                    func_ids, request['data'], request['load_addr'],
-                    request['size']):
+            if not any(current_variant_func_id_matches(
+                    (entry, variant['crc'], variant['ranges']),
+                    request['data'], request['load_addr'], request['size'])
+                    for variant in candidates):
                 unresolved.append((entry, request))
     return sorted(unresolved, key=lambda item: (
         item[0], item[1]['load_addr'], item[1]['size'],
@@ -7014,15 +7018,20 @@ def main():
                     part['source_path'] = source_path
                     del part['src']
 
+        print('Static phase: synthesize and spool primary shards', flush=True)
         synthesize_all_resume_wrappers(static_parts, spool=True)
+        print('Static phase: primary shard spool complete', flush=True)
 
         # Captured entries not owned by any compiled host are genuine orphan
         # interiors for a particular byte recipe. Compile each against those
         # exact bytes, then give every block in those fragments the same
         # universal resume treatment. An address-only body from another variant
         # cannot satisfy the demand: its live range CRC must match this image.
+        print('Static phase: resolve exact-image dispatch demands', flush=True)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
+        print(f'Static phase: {len(unresolved)} unresolved dispatch demands',
+              flush=True)
         # PSX_STATIC_NO_ISOLATED=1: A/B guard — skip the isolated-fragment pass
         # entirely (its universal-resume treatment is the newest machinery).
         if os.environ.get('PSX_STATIC_NO_ISOLATED'):
@@ -7050,7 +7059,9 @@ def main():
             new_fragment_parts.append(part)
             fragment_built += 1
 
+        print('Static phase: synthesize and spool isolated shards', flush=True)
         synthesize_all_resume_wrappers(new_fragment_parts, spool=True)
+        print('Static phase: isolated shard spool complete', flush=True)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')

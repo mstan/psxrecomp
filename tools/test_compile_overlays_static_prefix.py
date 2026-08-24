@@ -95,6 +95,12 @@ class StaticSymbolPrefixTests(unittest.TestCase):
             'crc': crc,
             'ranges': [(0x00780000, 4)],
         }, {
+            # Once a demanded address matches, later duplicate candidates are
+            # irrelevant and must not be materialized or validated.
+            'addr': 0x80780000,
+            'crc': 0,
+            'ranges': None,
+        }, {
             # This unrelated malformed identity must never be inspected merely
             # because it shares the aggregate static bundle.
             'addr': 0x80780100,
