@@ -796,6 +796,11 @@ static void heartbeat_write(void) {
          * work would advance dirty_insns. Checked only when frames are
          * advancing healthily (kinds 1/2/3 take precedence below). */
         int logic_pinned =
+            /* Kind 5 is a game-logic watchdog. BIOS/HLE wait vectors use
+             * low synthetic PCs (for example 0x00000F40) while the guest
+             * continues advancing frames; those are not game poll-loop
+             * wedges and must not poison release verification. */
+            (s_ring[newest_idx].current_func >= 0x80010000u) &&
             (s_ring[newest_idx].current_func    == s_ring[oldest_idx].current_func) &&
             (s_ring[newest_idx].last_store_pc   == s_ring[oldest_idx].last_store_pc) &&
             (s_ring[newest_idx].dirty_ram_insns == s_ring[oldest_idx].dirty_ram_insns);
