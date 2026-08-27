@@ -124,7 +124,10 @@ int psx_mod_set_fixed_display_aspect(uint32_t numerator,
  * plugin may select that first with psx_mod_set_fixed_display_aspect().
  */
 int psx_mod_set_adaptive_display_aspect(uint32_t max_numerator,
-                                        uint32_t max_denominator);
+                                         uint32_t max_denominator);
+/* Select margin artwork for the host presentation. A package may pass a
+ * catalog value such as "random", a team name, or "off". */
+int psx_mod_set_bezel(const char* selection);
 /*
  * Set the wall-clock cadence of simulated guest VBlanks. A value of zero
  * removes frontend pacing; 60 and higher request that many native guest
