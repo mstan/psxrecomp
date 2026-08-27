@@ -1368,6 +1368,16 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
     return 1;
 }
 
+extern "C" int psx_mod_set_bezel(const char* selection) {
+    if (!selection || !selection[0]) {
+        std::fprintf(stderr, "psxrecomp: mod rejected empty bezel selection\n");
+        return 0;
+    }
+    g_bezel_path = selection;
+    std::fprintf(stdout, "psxrecomp: mod selected bezel %s\n", selection);
+    return 1;
+}
+
 extern "C" int psx_mod_set_native_vblank_rate(
     uint32_t frames_per_second) {
     if (frames_per_second != 0 &&
