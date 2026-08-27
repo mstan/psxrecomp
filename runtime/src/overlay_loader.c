@@ -537,6 +537,7 @@ static void overlay_flush_leave(OverlayFlushFn prev) {
 
 extern uint8_t *memory_get_ram_ptr(void);
 extern uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len);
+extern uint32_t overlay_watch_pagegen(uint32_t phys);
 
 /* ---- Per-candidate hash / generation over its code ranges -------------- */
 
@@ -1514,7 +1515,7 @@ static void lazy_miss_invalidate_loader(void) {
 static int lazy_miss_cached(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     return e->phys == phys && e->code_gen == g_dirty_ram_code_gen &&
-           e->watched_code_gen == overlay_watch_pagegen_sum(phys & ~3u, 4u) &&
+           e->watched_code_gen == overlay_watch_pagegen(phys) &&
            e->loader_gen == s_lazy_loader_gen;
 }
 
@@ -1522,7 +1523,7 @@ static void lazy_miss_record(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     e->phys = phys;
     e->code_gen = g_dirty_ram_code_gen;
-    e->watched_code_gen = overlay_watch_pagegen_sum(phys & ~3u, 4u);
+    e->watched_code_gen = overlay_watch_pagegen(phys);
     e->loader_gen = s_lazy_loader_gen;
 }
 

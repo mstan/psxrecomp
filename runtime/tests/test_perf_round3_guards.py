@@ -44,8 +44,43 @@ def check_irq_writers() -> None:
         raise AssertionError(f"IRQ writer set changed (expected 19, found {seen}); audit it")
 
 
+def check_highram_static_generation_invalidation(memory: str, loader: str) -> None:
+    """Keep static high-RAM memo verdicts tied to the live DMA image.
+
+    The generated high-RAM dispatcher bypasses overlay_loader registration, so
+    this is intentionally a source-level contract check over the same reset,
+    write, and memo paths used by the runtime. It catches the regression where
+    every page generation remained zero and a cached matching variant survived
+    a later image replacement.
+    """
+    reset = function_body(memory, "dirty_ram_reset_for_boot")
+    arm = reset.find("overlay_watch_set_range(0x00780000u, 0x2004u);")
+    clear = reset.find("memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));")
+    if arm < 0:
+        raise AssertionError("pinned high-RAM static image is not generation-watched at boot")
+    if clear < 0 or arm < clear:
+        raise AssertionError("high-RAM watch arm must follow the boot generation reset")
+    if "0x00800000u" in reset[arm - 180:arm + 120]:
+        raise AssertionError("high-RAM invalidation watch widened beyond the pinned image")
+
+    note = function_body(memory, "overlay_watch_note_write")
+    watched = note.find("if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u)")
+    bump = note.find("overlay_page_gen[pg]++;")
+    if watched < 0 or bump < 0 or watched > bump:
+        raise AssertionError("writes in the pinned high-RAM image do not bump its page generation")
+
+    memo = function_body(loader, "psx_overlay_static_code_matches_memo")
+    pagegen = memo.find("overlay_watch_pagegen_sum(lo, len);")
+    fast = memo.find("if ((state[1] & 1u) && state[0] == gen_sum)")
+    crc = memo.find("uint32_t crc = 0xFFFFFFFFu;")
+    save = memo.find("state[0] = gen_sum;")
+    if min(pagegen, fast, crc, save) < 0 or not pagegen < fast < crc < save:
+        raise AssertionError("static memo can bypass rehash after a watched-page generation change")
+
+
 def main() -> None:
     memory = (ROOT / "runtime/src/memory.c").read_text(encoding="utf-8")
+    loader = (ROOT / "runtime/src/overlay_loader.c").read_text(encoding="utf-8")
     cycles = (ROOT / "runtime/src/psx_cycles.c").read_text(encoding="utf-8")
     cyc_steps = (ROOT / "runtime/src/psx_cyc_steps.c").read_text(encoding="utf-8")
     fntrace = (ROOT / "runtime/src/fntrace.c").read_text(encoding="utf-8")
@@ -54,6 +89,7 @@ def main() -> None:
     fullgen = (ROOT / "recompiler/src/full_function_emitter.cpp").read_text(encoding="utf-8")
 
     check_irq_writers()
+    check_highram_static_generation_invalidation(memory, loader)
 
     refresh = function_body(
         (ROOT / "runtime/src/interrupts.c").read_text(encoding="utf-8"),

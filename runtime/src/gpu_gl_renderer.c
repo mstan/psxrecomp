@@ -3271,6 +3271,7 @@ static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
 }
 
+
 static PsxPresentLayout present_layout(int ww, int wh, int content_4_3) {
     PsxPresentLayout layout;
     psx_present_layout_compute(ww, wh, s_aspect_num, s_aspect_den,
@@ -3687,16 +3688,32 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
         lw = (lw * content_w) / src_w;
         if (lw < 1) lw = 1;
     }
+    if (present_dump_active()) {
+        /* Source pixels, i.e. the frame BEFORE the present filter. */
+        if (src_w > 0 && src_h > 0) {
+            uint8_t *rgb = (uint8_t *)malloc((size_t)src_w * src_h * 3);
+            if (rgb) {
+                for (int i = 0; i < src_w * src_h; i++) {
+                    uint32_t p = pixels[i];          /* BGRA in memory */
+                    rgb[i * 3 + 0] = (uint8_t)(p >> 16);
+                    rgb[i * 3 + 1] = (uint8_t)(p >> 8);
+                    rgb[i * 3 + 2] = (uint8_t)(p);
+                }
+                present_dump_png("pres", rgb, src_w, src_h);
+                free(rgb);
+            }
+        }
+    }
     /* This is the low-res source path (24-bit FMV, and the forced-CPU present
      * diagnostic): a 320x192-class image blown up to fill the window, so how it
-     * is reconstructed is very visible. `linear` (the video AA setting) allows
-     * filtered reconstruction when [video] fmv_filter opts into it:
+     * is reconstructed is very visible. `linear` (the video AA setting) chooses
+     * filtered vs not; PSX_FMV_FILTER then picks which reconstruction:
      *
      *   nearest   hard pixels, uneven pixel widths at non-integer scale
      *   bilinear  plain GL_LINEAR — smoothest, but blurs the whole texel
      *   sharp     sharp-bilinear: flat texel interiors, ramp confined to a
      *             one-output-pixel band at the boundary
-     *   bicubic   Catmull-Rom
+     *   bicubic   Catmull-Rom (default)
      *
      * Measured on this intro at 1280x960 (fraction of adjacent pixel pairs
      * differing by >=24 luma = visible staircase, vs mean |dx| = overall

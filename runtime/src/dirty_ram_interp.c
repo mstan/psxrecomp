@@ -196,6 +196,24 @@ uint64_t g_pczero_count       = 0;
  * pc0 tripwire so a null-PC return names its producer. */
 uint32_t g_dd_last_route      = 0;
 
+#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
+/* Both top-level and mid-block routes use the same diagnostic gate.  This
+ * keeps the interpreter-control run from taking the extra native route only
+ * after a local branch. */
+static inline int psx_highram_dispatch_enabled(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *e = getenv("PSX_DISABLE_OVERLAY_EXTRA_DISPATCH");
+        disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return !disabled;
+#else
+    return 1;
+#endif
+}
+#endif
+
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
  * fields capture the most recent occurrence so a TCP query can see what
@@ -2838,21 +2856,19 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * Keep its exact-range dispatcher in a separate translation unit so
          * the established static corpus remains independently verifiable. */
         extern int psx_overlay_dispatch_highram(CPUState *cpu, uint32_t addr);
-#ifndef PSX_NO_DEBUG_TOOLS
         /* Diagnostic-only control: the release path always dispatches the
          * bounded high-RAM corpus. A control run can set this environment
          * variable before boot to quantify the exact race cost without
          * rebuilding or altering the generated payload. */
-        static int s_highram_dispatch_disabled = -1;
-        if (s_highram_dispatch_disabled < 0) {
-            const char *e = getenv("PSX_DISABLE_OVERLAY_EXTRA_DISPATCH");
-            s_highram_dispatch_disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
-        }
-        if (!s_highram_dispatch_disabled &&
+        /* The generated extra bundle is keyed to unique 8-MB RAM.  The host
+         * backing store is always 8 MB, so calling it in retail 2-MB mode
+         * would let a stale high-bank byte image accidentally satisfy an
+         * otherwise-valid static CRC.  Keep the fail-closed mode boundary at
+         * the dispatch gate rather than relying on the caller's mod setup. */
+        if (psx_highram_dispatch_enabled() &&
+            psx_ram_8mb_active() &&
+            phys >= 0x00780000u && phys < 0x00800000u &&
             psx_overlay_dispatch_highram(cpu, addr)) return 1;
-#else
-        if (psx_overlay_dispatch_highram(cpu, addr)) return 1;
-#endif
 #endif
     }
 #endif
@@ -3215,6 +3231,33 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 OV_FPLOG_RET1();
             }
             target = cpu->pc;
+#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
+            /* A dirty interpreter block can tail-transfer directly into a
+             * captured high-RAM root.  The entry gate above only sees the
+             * block leader; without this exact guarded handoff the remainder
+             * of the high-RAM page stays interpreted until another outer
+             * dispatch boundary.  This is intentionally address/range/CRC
+             * gated by the generated dispatcher, never a blanket high-RAM
+             * native fallback. */
+            {
+                extern int psx_overlay_dispatch_highram(CPUState *cpu,
+                                                         uint32_t addr);
+                uint32_t target_phys = target & 0x1FFFFFFFu;
+                if (psx_highram_dispatch_enabled() &&
+                    psx_ram_8mb_active() &&
+                    target_phys >= 0x00780000u &&
+                    target_phys < 0x00800000u &&
+                    target != 0u &&
+                    psx_overlay_dispatch_highram(cpu, target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry)
+                        pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+            }
+#endif
 #ifdef PSX_HAS_GAME_DISPATCH
             if (target != 0) {
                 /* §20 FIX — the long-run idle freeze. A guest TAIL-transfer (j/jr/

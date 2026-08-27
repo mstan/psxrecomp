@@ -969,6 +969,11 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
+/* Forward declaration: the optional bounded high-RAM static bundle is not
+ * registered through overlay_loader.c, but its memoized CRC identities still
+ * use these page generations for invalidation. */
+void overlay_watch_set_range(uint32_t phys, uint32_t len);
+
 void dirty_ram_reset_for_boot(void) {
     text_guard_global_changed();
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
@@ -981,6 +986,14 @@ void dirty_ram_reset_for_boot(void) {
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
     memset(g_dirty_ram_dispatch_pc_bitmap, 0,
            sizeof(g_dirty_ram_dispatch_pc_bitmap));
+#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
+    /* The pinned high-RAM bundle is generated from one exact DMA image at
+     * 0x00780000, 0x2004 bytes long. Arm precisely that image before guest
+     * writes begin so memoized static variants re-hash when the image is
+     * replaced. This is invalidation bookkeeping only; admission remains
+     * guarded by the generated address/range/CRC dispatcher. */
+    overlay_watch_set_range(0x00780000u, 0x2004u);
+#endif
     g_dirty_ram_code_gen++;
 }
 
@@ -1016,6 +1029,14 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
     uint32_t sum = 0;
     for (uint32_t pg = fp; pg <= lp; pg++) sum += overlay_page_gen[pg];
     return sum;
+}
+
+/* The negative miss cache keys one dispatch PC to the generation of exactly
+ * its containing page. Keep that hot lookup out of the general range walker:
+ * unlike candidate validation, it never needs cross-page accumulation. */
+uint32_t overlay_watch_pagegen(uint32_t phys) {
+    if (phys >= RAM_SIZE) return 0;
+    return overlay_page_gen[phys >> DIRTY_RAM_PAGE_SHIFT];
 }
 
 /* Savestate restores RAM via memcpy and never hits the store chokepoint that

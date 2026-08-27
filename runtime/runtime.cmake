@@ -1198,7 +1198,13 @@ function(psxrecomp_add_runtime_target target)
         foreach(_g IN LISTS _game_generated_check)
             file(APPEND "${_psxrt_gen_list}" "${_g}\n")
         endforeach()
-        add_custom_target(${target}_require_generated
+        # Give the verification a real output stamp.  A target-only custom
+        # command has no up-to-date state, so Ninja reruns it forever and can
+        # starve the actual compile/link step on Windows.
+        set(_psxrt_gen_stamp
+            "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated_sources.stamp")
+        add_custom_command(
+            OUTPUT "${_psxrt_gen_stamp}"
             COMMAND ${CMAKE_COMMAND}
                     "-DSOURCES_FILE=${_psxrt_gen_list}"
                     "-DTARGET=${target}"
@@ -1206,8 +1212,12 @@ function(psxrecomp_add_runtime_target target)
                     "-DRECOMPILER=${_psxrt_recompiler_hint}"
                     "-DDOC=psxrecomp/docs/BUILDING.md  (\"Build and run a game\")"
                     -P "${PSXRECOMP_ROOT}/runtime/check_generated_sources.cmake"
+            COMMAND ${CMAKE_COMMAND} -E touch "${_psxrt_gen_stamp}"
+            DEPENDS "${_psxrt_gen_list}"
             COMMENT "Verifying recompiled game C exists for ${target}"
             VERBATIM)
+        add_custom_target(${target}_require_generated
+            DEPENDS "${_psxrt_gen_stamp}")
         # Target-level dependency: this check runs to completion before ANY of
         # ${target}'s objects compile, so a missing generated source aborts with
         # our message rather than the compiler's.
