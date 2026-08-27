@@ -49,6 +49,7 @@ extern "C" int gpu_ws_precise_nclip_enabled(void) {
     return g_test_precise_nclip_enabled;
 }
 extern "C" void gpu_pgxp_rederive_enable(void) {}
+extern "C" void gpu_pgxp_vertex_cache_invalidate(void) {}
 extern "C" uint32_t memory_get_ram_bytes(void) { return 2u * 1024u * 1024u; }
 extern "C" void psx_ws_note_gte_project(int) {}
 extern "C" {
@@ -612,6 +613,9 @@ int test_precise_nclip_is_title_scoped() {
         gte_nclip_precise_bltz(1))
         return fail_value("stale precise NCLIP falls back natively", 0, 0x06u,
                           0, 1u, cpu.gte_data[24]);
+    if (!gte_nclip_precise_bltz(1) || gte_nclip_precise_bltz(2))
+        return fail_value("title-scoped precise NCLIP predicate", 0, 0x06u,
+                          0, 1u, 0u);
     return 0;
 }
 

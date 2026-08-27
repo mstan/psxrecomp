@@ -966,8 +966,13 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
     int32_t out = static_cast<int32_t>(mac0);
     s_nclip_last_native = out;
     s_nclip_last_precise_valid = false;
-    /* Compute an exact 16.16 determinant for configured branch consumers, but
-     * preserve native guest-visible MAC0 for every architectural reader. */
+    /* Precise NCLIP is observational only. MAC0 is guest-visible and games
+     * branch on its sign, so a host precision enhancement must never turn a
+     * hardware-visible face into a culled face (or vice versa). Compute the
+     * 16.16 determinant exactly for coverage/disagreement telemetry, but keep
+     * the integer GTE result bit-exact. Translated differences stay below
+     * 2^29 after the producer's +/-4096 px clamp, so the 2^59 determinant fits
+     * int64_t without floating-point cancellation. */
     int32_t px0, py0, px1, py1, px2, py2;
     if (gpu_ws_precise_nclip_enabled() &&
         !s_gte_replay_sandbox && s_speculative_depth == 0 &&
