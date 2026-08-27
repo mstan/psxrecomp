@@ -3457,6 +3457,7 @@ static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
 }
 
+
 static PsxPresentLayout present_layout(int ww, int wh, int content_4_3) {
     PsxPresentLayout layout;
     psx_present_layout_compute(ww, wh, s_aspect_num, s_aspect_den,

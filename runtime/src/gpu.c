@@ -6277,6 +6277,50 @@ void gpu_cosim_dump(char *out, int cap) {
     APPEND("%s", "\n");
 #undef APPEND
 }
+
+/* Clear host-only observations of the abandoned timeline after a savestate
+ * load.  These tags, prepass ranks, backdrop gates, and split-screen latches
+ * are not guest GPU state; retaining them lets the first restored menu/HUD
+ * packets inherit gameplay classification and get transformed or rejected.
+ * Persistent title configuration remains intact. */
+static void gpu_restore_transient_state(void) {
+    memset(ws_tags, 0, sizeof(ws_tags));
+    ws_last_tag_stamp = (uint32_t)-1000;
+    ws_last_3d_stamp = (uint32_t)-1000;
+    ws_ui_prepass_count = 0;
+    ws_ui_prepass_rank = 0xFFFFu;
+    ws_auto_ui_dense = 0;
+    ws_auto_ui_candidate_count = 0;
+    ws_auto_ui_transform_count = 0;
+    ws_gte_frame = (uint32_t)-1;
+    ws_gte_count = 0;
+    ws_last_gte_stamp = (uint32_t)-1000;
+    ws_gte_prev_verts = 0;
+    ws_last_world3d_stamp = (uint32_t)-1000;
+    ws_sust_world3d_stamp = (uint32_t)-1000;
+    ws_ovh_frame = (uint32_t)-1;
+    ws_ovh_count = 0;
+    ws_ovh_prev = 0;
+    ws_last_ovh_stamp = (uint32_t)-1000;
+    ws_sust_ovh_stamp = (uint32_t)-1000;
+    memset(ws_aspect_cone_state, 0, sizeof(ws_aspect_cone_state));
+    ws_aspect_cone_wide_latched = 0;
+    memset(ws_fb_base, 0, sizeof(ws_fb_base));
+    ws_fb_n = 0;
+    g_ws_backdrop_lo = 0;
+    g_ws_backdrop_hi = 0;
+    ws_nw_phase_backdrop = 0;
+    g_bdg_src_lo = 0xFFFFFFFFu;
+    g_bdg_src_hi = 0;
+    bdg_src_frame = 0xFFFFFFFFu;
+    split_trace_reset(&split_trace_this);
+    split_trace_reset(&split_trace_last);
+    split_recent_left_age = 255;
+    split_recent_right_age = 255;
+    split_recent_display_w = 0;
+    split_recent_display_h = 0;
+}
+
 int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     PstR r;
     if (len != gpu_snapshot_bytes()) return 0;
@@ -6289,6 +6333,16 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
      * on a stale draw area after savestate load. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
+    /* E2 is also renderer state: restoring only texture_window_value leaves
+     * indexed UI/font draws using the pre-load window until the guest happens
+     * to issue another E2 command. */
+    gr_set_texture_window(texture_window_value);
+    /* E5/E6 likewise have backend mirrors. A load can otherwise retain the
+     * old offset or mask-check gate and reject/shift only the following 2D
+     * primitives while unrelated world draws continue. */
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
+    gpu_restore_transient_state();
     ws_nw_sync_target();
     return 1;
 }
