@@ -806,6 +806,9 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
             if (regimm_op == 0x00 && config_.ws_cull_nclip_keep_sites.count(addr))
                 return fmt::format("psx_ws_x_margin() > 0 ? 0 : ((int32_t){} < 0) /* ws nclip keep */",
                                    reg_name(rs));
+            if (regimm_op == 0x00 && config_.ws_cull_nclip_exact_sites.count(addr))
+                return fmt::format("psx_ws_x_margin() > 0 ? gte_nclip_precise_bltz((int32_t){}) : ((int32_t){} < 0) /* ws exact nclip */",
+                                   reg_name(rs), reg_name(rs));
             return keep_branch_if_wide(
                 fmt::format("(int32_t){} < 0", reg_name(rs)));
         } else {                            // bgez family (incl. bgezal + undefined mirrors)

@@ -942,11 +942,19 @@ void gte_rtpt(GTEState* gte, uint32_t instr) {
 static uint64_t s_nclip_precise_hits = 0;
 static uint64_t s_nclip_fallbacks = 0;
 static uint64_t s_nclip_disagreements = 0;
+static int32_t s_nclip_last_native = 0;
+static int8_t s_nclip_last_precise_sign = 0;
+static bool s_nclip_last_precise_valid = false;
 extern "C" void gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
                                         uint64_t *disagreements) {
     if (hits) *hits = s_nclip_precise_hits;
     if (fallbacks) *fallbacks = s_nclip_fallbacks;
     if (disagreements) *disagreements = s_nclip_disagreements;
+}
+extern "C" int gte_nclip_precise_bltz(int32_t native_mac0) {
+    if (!s_nclip_last_precise_valid || native_mac0 != s_nclip_last_native)
+        return native_mac0 < 0;
+    return s_nclip_last_precise_sign < 0;
 }
 
 void gte_nclip(GTEState* gte, uint32_t instr) {
@@ -962,6 +970,8 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
                    (int64_t)sx2 * (sy0 - sy1);
     gte->check_mac0_overflow(mac0);
     int32_t out = static_cast<int32_t>(mac0);
+    s_nclip_last_native = out;
+    s_nclip_last_precise_valid = false;
     /* Precise NCLIP is observational only. MAC0 is guest-visible and games
      * branch on its sign, so a host precision enhancement must never turn a
      * hardware-visible face into a culled face (or vice versa). Compute the
@@ -981,6 +991,8 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
         const int64_t dx20 = (int64_t)px2 - px0;
         const int64_t dy20 = (int64_t)py2 - py0;
         const int64_t cross = dx10 * dy20 - dy10 * dx20;
+        s_nclip_last_precise_sign = cross < 0 ? -1 : (cross > 0 ? 1 : 0);
+        s_nclip_last_precise_valid = true;
         if ((cross > 0 && out <= 0) || (cross < 0 && out >= 0))
             s_nclip_disagreements++;
     } else if (gpu_ws_precise_nclip_enabled() &&

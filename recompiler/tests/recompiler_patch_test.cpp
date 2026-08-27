@@ -245,6 +245,15 @@ branch_keep_sites = ["0x80012340"]
               std::vector<uint32_t>{0x80012340u},
           "parser preserves branch keep sites");
 
+    const auto nclip_exact = write_config(root, "nclip-exact", R"toml(
+[widescreen.cull]
+nclip_exact_sites = ["0x80012340"]
+)toml");
+    const auto nclip_exact_config = PSXRecompV4::load_game_config(nclip_exact);
+    check(nclip_exact_config.ws_cull_nclip_exact_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves exact NCLIP branch sites");
+
     const auto vxrange = write_config(root, "vxrange", R"toml(
 [widescreen.cull]
 vxrange_sites = ["0x80012340"]
@@ -728,6 +737,16 @@ void codegen_tests() {
               std::string::npos &&
               branch_keep.find("ws branch keep") != std::string::npos,
           "codegen emits guarded branch keep predicate");
+
+    PSXRecomp::CodeGenConfig nclip_exact_config;
+    nclip_exact_config.ws_cull_nclip_exact_sites.insert(0x80010000u);
+    const std::string nclip_exact = generate_first_instruction(
+        0x04400002u, {}, false, nclip_exact_config); // bltz v0,+2
+    check(nclip_exact.find(
+              "gte_nclip_precise_bltz((int32_t)cpu->gpr[2])") !=
+              std::string::npos &&
+              nclip_exact.find("ws exact nclip") != std::string::npos,
+          "codegen emits title-scoped exact NCLIP predicate");
 
     PSXRecomp::CodeGenConfig plane_nx_config;
     plane_nx_config.ws_cull_plane_nx_sites.insert(0x80010000u);

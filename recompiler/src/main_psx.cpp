@@ -210,6 +210,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
     std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
     std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
+    std::set<uint32_t>    ws_cull_nclip_exact;  // [widescreen.cull] nclip_exact_sites
     std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
     std::vector<PSXRecompV4::WidescreenCullWidenSite> ws_cull_widen;
@@ -274,6 +275,7 @@ int main(int argc, char** argv) {
         ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
         ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_nclip_exact.insert(cfg.ws_cull_nclip_exact_sites.begin(), cfg.ws_cull_nclip_exact_sites.end());
         ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
         ws_cull_keep = cfg.ws_cull_keep_sites;
         ws_cull_widen = cfg.ws_cull_widen_sites;
@@ -370,6 +372,7 @@ int main(int argc, char** argv) {
         ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
         ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_nclip_exact.insert(wscfg.ws_cull_nclip_exact_sites.begin(), wscfg.ws_cull_nclip_exact_sites.end());
         ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
         if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
         if (ws_cull_widen.empty()) ws_cull_widen = wscfg.ws_cull_widen_sites;
@@ -1251,6 +1254,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
     codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
     codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
+    codegen_config.ws_cull_nclip_exact_sites = ws_cull_nclip_exact;
     codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
     codegen_config.ws_cull_keep_sites = ws_cull_keep;
     codegen_config.ws_cull_widen_sites = ws_cull_widen;
