@@ -24,6 +24,7 @@ _DEFAULT_LOG_HEIGHT = 160
 
 from .detect import audit_project
 from .models import CheckStatus, MigrateOptions
+from .newproject import MAX_DISCS as _MAX_DISCS
 from .ops import apply_plan
 from .plan import build_plan
 
@@ -437,6 +438,14 @@ class ProjectStudioApp:
             value=str(Path.home() / "Documents" / "GitHub")
         )
         self.np_disc_var = tk.StringVar()
+        # Multi-disc: np_disc_var stays disc 1 (the boot disc) so every existing
+        # use of it is unchanged; discs 2..MAX_DISCS get their own vars, and the
+        # count dropdown decides how many rows are shown.
+        self.np_disc_count_var = tk.StringVar(value="1")
+        self.np_extra_disc_vars = [
+            tk.StringVar() for _ in range(_MAX_DISCS - 1)
+        ]
+        self._np_extra_disc_rows: list = []
         self.np_bios_var = tk.StringVar()
         self.np_players_var = tk.StringVar(value="2")
         self.np_zip_var = tk.StringVar()
@@ -810,6 +819,22 @@ class ProjectStudioApp:
                 height=30,
             ).pack(side="left", fill="x", expand=True)
 
+        def disc_count_widgets(r):
+            ctk.CTkOptionMenu(
+                r,
+                values=[str(i) for i in range(1, _MAX_DISCS + 1)],
+                variable=self.np_disc_count_var,
+                width=72,
+                height=30,
+                command=self._np_on_disc_count_changed,
+            ).pack(side="left")
+            ctk.CTkLabel(
+                r,
+                text="Pass discs in order, boot disc first.",
+                text_color=("gray40", "gray65"),
+                anchor="w",
+            ).pack(side="left", padx=(12, 0))
+
         def disc_widgets(r):
             ctk.CTkEntry(r, textvariable=self.np_disc_var, height=30).pack(
                 side="left", fill="x", expand=True, padx=(0, 8)
@@ -838,7 +863,33 @@ class ProjectStudioApp:
 
         row(paths, "Parent dir", parent_widgets)
         row(paths, "Name", name_widgets)
-        row(paths, "Disc (.cue)", disc_widgets)
+        row(paths, "Discs", disc_count_widgets)
+        row(paths, "Disc 1 (.cue)", disc_widgets)
+
+        # Discs 2..MAX_DISCS live in their own container so showing and hiding
+        # them cannot reorder the rows around them. pack() appends, so the
+        # count handler always re-packs the visible rows in ascending order.
+        self._np_extra_discs_frame = ctk.CTkFrame(paths, fg_color="transparent")
+        self._np_extra_discs_frame.pack(fill="x")
+        self._np_extra_disc_rows = []
+        for i, var in enumerate(self.np_extra_disc_vars, start=2):
+            er = ctk.CTkFrame(self._np_extra_discs_frame, fg_color="transparent")
+            ctk.CTkLabel(er, text=f"Disc {i} (.cue)", width=110, anchor="w").pack(
+                side="left"
+            )
+            ctk.CTkEntry(er, textvariable=var, height=30).pack(
+                side="left", fill="x", expand=True, padx=(0, 8)
+            )
+            ctk.CTkButton(
+                er,
+                text="Browse…",
+                width=80,
+                height=30,
+                command=lambda idx=i: self._np_browse_extra_disc(idx),
+            ).pack(side="left")
+            self._np_extra_disc_rows.append(er)
+        self._np_on_disc_count_changed()
+
         row(paths, "BIOS", bios_widgets)
         ctk.CTkLabel(
             paths,
@@ -1222,6 +1273,51 @@ class ProjectStudioApp:
         if path:
             self.np_parent_var.set(path)
 
+    def _np_disc_count(self) -> int:
+        try:
+            n = int(self.np_disc_count_var.get() or "1")
+        except ValueError:
+            n = 1
+        return max(1, min(_MAX_DISCS, n))
+
+    def _np_on_disc_count_changed(self, _value: str | None = None) -> None:
+        """Show exactly (count - 1) extra disc rows, in order."""
+        n = self._np_disc_count()
+        for er in self._np_extra_disc_rows:
+            er.pack_forget()
+        for idx, er in enumerate(self._np_extra_disc_rows, start=2):
+            if idx <= n:
+                er.pack(fill="x", padx=12, pady=3)
+        # Dropping the count leaves the hidden rows populated; clear them so a
+        # stale path cannot be submitted from a row the user can no longer see.
+        for idx, var in enumerate(self.np_extra_disc_vars, start=2):
+            if idx > n:
+                var.set("")
+
+    def _np_browse_extra_disc(self, index: int) -> None:
+        """Browse for disc `index` (2-based) of a multi-disc set."""
+        pos = index - 2
+        if not 0 <= pos < len(self.np_extra_disc_vars):
+            return
+        var = self.np_extra_disc_vars[pos]
+        start = (
+            var.get().strip()
+            or self.np_disc_var.get().strip()
+            or self.np_parent_var.get().strip()
+            or None
+        )
+        if start and Path(start).is_file():
+            start = str(Path(start).parent)
+        path = _pick_open_file(
+            title=f"Select Redump .cue for disc {index}",
+            parent=self.root,
+            initialdir=start,
+            filetypes=[("Cue sheet", "*.cue"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        var.set(str(Path(path).expanduser().resolve()))
+
     def _np_browse_disc(self) -> None:
         start = self.np_disc_var.get().strip() or self.np_parent_var.get().strip() or None
         if start and Path(start).is_file():
@@ -1448,9 +1544,14 @@ class ProjectStudioApp:
             players = int(self.np_players_var.get() or "2")
         except ValueError:
             players = 2
+        n = self._np_disc_count()
+        extra_discs = [
+            v.get().strip() for v in self.np_extra_disc_vars[: max(0, n - 1)]
+        ]
         return NewProjectOptions(
             name=self.np_name_var.get().strip(),
             disc=self.np_disc_var.get().strip(),
+            extra_discs=extra_discs,
             parent_dir=self.np_parent_var.get().strip() or ".",
             bios=self.np_bios_var.get().strip(),
             players=players,
@@ -1506,7 +1607,15 @@ class ProjectStudioApp:
             if not messagebox.askyesno(
                 "Project Studio",
                 f"Create new project?\n\n{dest}\n\n"
-                f"disc={opts.disc}\n"
+                + (
+                    "".join(
+                        f"disc {i}={d}\n"
+                        for i, d in enumerate(opts.all_discs(), start=1)
+                    )
+                    if len(opts.all_discs()) > 1
+                    else f"disc={opts.disc}\n"
+                )
+                +
                 f"players={opts.players}  ui={opts.enable_recomp_ui}  "
                 f"wizard={opts.enable_wizard}  netplay={opts.enable_netplay}\n"
                 f"generate={opts.do_generate}  build={opts.do_build}  "

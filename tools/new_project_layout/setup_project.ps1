@@ -124,7 +124,16 @@ function Prompt-Yn([string]$Question, [bool]$DefaultYes) {
 
 # $Disc is an array (disc order, boot disc first). Everything downstream works
 # on the boot disc, so collapse to it once the whole set has been validated.
+#
+# A single element containing "|" is a packed list from a programmatic caller
+# (Project Studio). An array cannot survive `powershell -File` intact: the
+# caller's argument quoting collapses a comma-joined list with spaces in it
+# into one element. "|" is forbidden in Windows paths, so splitting on it is
+# unambiguous. A human typing -Disc a.cue,b.cue still gets a real array.
 $DiscAll = @($Disc)
+if ($DiscAll.Count -eq 1 -and $DiscAll[0] -like "*|*") {
+    $DiscAll = @($DiscAll[0].Split("|") | Where-Object { $_ -ne "" })
+}
 $DiscCount = $DiscAll.Count
 foreach ($_d in $DiscAll) {
     if (-not (Test-Path -LiteralPath $_d)) {

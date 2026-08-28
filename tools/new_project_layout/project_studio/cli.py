@@ -445,9 +445,12 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         validate_options,
     )
 
+    # --disc is action="append", so args.disc is a list in disc order.
+    _discs = [d.strip() for d in (args.disc or []) if (d or "").strip()]
     opts = NewProjectOptions(
         name=(args.name or "").strip(),
-        disc=(args.disc or "").strip(),
+        disc=_discs[0] if _discs else "",
+        extra_discs=_discs[1:],
         parent_dir=(args.dir or ".").strip(),
         bios=(getattr(args, "bios", None) or "").strip(),
         boot_exe=(getattr(args, "boot_exe", None) or "").strip(),
@@ -1712,7 +1715,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run setup_project.sh/.ps1 (OS-routed) then index the new repo",
     )
     p_np.add_argument("--name", required=True, help="Project folder / display name")
-    p_np.add_argument("--disc", required=True, help="Redump .cue path")
+    p_np.add_argument(
+        "--disc",
+        required=True,
+        action="append",
+        metavar="CUE",
+        help="Redump .cue path. Repeatable for a multi-disc title — pass in "
+             "disc order, boot disc first (max 4).",
+    )
     p_np.add_argument(
         "--dir",
         default=".",

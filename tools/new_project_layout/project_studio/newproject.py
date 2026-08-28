@@ -8,11 +8,16 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .gitops import CmdResult, switch_modules
 from .paths import toolkit_dir
+
+# Upper bound on a disc set. Four covers every PS1 release we know of; the
+# setup scripts have no limit of their own, so this is the one place that
+# decides how many rows the GUI offers.
+MAX_DISCS = 4
 
 
 @dataclass
@@ -21,6 +26,10 @@ class NewProjectOptions:
 
     name: str = ""
     disc: str = ""
+    # Discs 2..N of a multi-disc set, in disc order. `disc` stays the boot disc,
+    # so every single-disc caller is unaffected. setup_project verifies the set
+    # before creating anything and refuses one that needs N programs.
+    extra_discs: list[str] = field(default_factory=list)
     parent_dir: str = ""
     bios: str = ""
     boot_exe: str = ""
@@ -52,6 +61,20 @@ class NewProjectOptions:
     rbengine_ref: str = ""  # post-setup switch only (script has no flag)
 
     dry_run: bool = False
+
+    def all_discs(self) -> list[str]:
+        """Boot disc first, then discs 2..N. Blank rows are dropped."""
+        out = []
+        for d in [self.disc, *self.extra_discs]:
+            d = (d or "").strip()
+            if d:
+                out.append(d)
+        return out
+
+
+def resolved_discs(opts: NewProjectOptions) -> list[str]:
+    """all_discs() as absolute paths, ready to hand to the setup script."""
+    return [str(Path(d).expanduser().resolve()) for d in opts.all_discs()]
 
 
 def setup_script_paths() -> tuple[Path, Path]:
@@ -98,6 +121,32 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
         p = Path(disc).expanduser()
         if not p.is_file():
             errs.append(f"Disc not found: {disc}")
+
+    # Discs 2..N. A blank row is an error rather than a silent drop: the count
+    # the user picked is what they expect to be scaffolded.
+    extras = list(opts.extra_discs or [])
+    if len(extras) + 1 > MAX_DISCS:
+        errs.append(f"At most {MAX_DISCS} discs are supported")
+    for i, raw in enumerate(extras, start=2):
+        d = (raw or "").strip()
+        if not d:
+            errs.append(f"Disc {i} .cue path is required (or reduce the disc count)")
+            continue
+        if not Path(d).expanduser().is_file():
+            errs.append(f"Disc {i} not found: {d}")
+    seen: dict[str, int] = {}
+    for i, raw in enumerate([disc, *extras], start=1):
+        d = (raw or "").strip()
+        if not d:
+            continue
+        try:
+            key = str(Path(d).expanduser().resolve())
+        except OSError:
+            key = d
+        if key in seen:
+            errs.append(f"Disc {i} is the same file as disc {seen[key]}: {d}")
+        else:
+            seen[key] = i
     if opts.bios:
         bp = Path(opts.bios).expanduser()
         if not bp.is_file():
@@ -143,8 +192,15 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
             "Bypass",
             "-File",
             str(ps1),
+            # -Disc is [string[]], but an array cannot be passed reliably
+            # through `powershell -File`: subprocess quotes any argument
+            # containing a space, and PowerShell then binds the whole quoted
+            # token as ONE element. Disc paths routinely contain spaces, so a
+            # comma-joined list would silently become a single bogus path.
+            # The script splits a lone argument on "|", which is one of the
+            # characters Windows forbids in a path, so it cannot be ambiguous.
             "-Disc",
-            str(Path(opts.disc).expanduser().resolve()),
+            "|".join(resolved_discs(opts)),
             "-Name",
             opts.name.strip(),
             "-Yes",
@@ -201,8 +257,10 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
         "sh",
         str(sh),
         "--yes",
-        "--disc",
-        str(Path(opts.disc).expanduser().resolve()),
+    ]
+    for _d in resolved_discs(opts):
+        cmd += ["--disc", _d]
+    cmd += [
         "--name",
         opts.name.strip(),
         "--players",

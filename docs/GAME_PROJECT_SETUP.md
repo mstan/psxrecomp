@@ -161,6 +161,17 @@ than leaving a half-scaffolded directory. There are two outcomes:
 It also refuses a set that is incoherent: the same image passed twice, or discs
 from different releases (a serial-prefix mismatch, e.g. `SCUS` with `SCES`).
 
+The same set is reachable from Project Studio, which caps a set at **4 discs**:
+
+- **GUI** (New Project tab): a **Discs** dropdown (1–4) adds a `Disc N (.cue)`
+  row per disc, each with its own Browse…. Reducing the count clears the rows
+  it hides, so a path you can no longer see cannot be submitted.
+- **CLI**: `--disc` is repeatable —
+  `python3 -m project_studio new-project --name X --disc d1.cue --disc d2.cue`.
+
+Both refuse a blank row, a missing file, a duplicate, and more than four discs
+*before* invoking the setup script, so those never reach a disc probe.
+
 `game.toml` still describes the boot disc only — it keeps the singular `disc`
 key, because `psxrecomp_cli.py generate` reads only that. **Scaffolding a disc
 set is not the same as playing it:** the runtime mounts one disc and has no

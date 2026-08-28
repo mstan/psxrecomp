@@ -310,7 +310,8 @@ would feed is singular, and a scaffold that accepts three discs and then writes
 one program's project is worse than one that refuses.
 
 **Partially landed — the verification half only.** `--disc` is repeatable today
-(`-Disc a,b` on PowerShell, which has no repeatable parameters), and
+(`-Disc a,b` on PowerShell, which has no repeatable parameters; Project Studio
+offers a 1–4 dropdown in the GUI and a repeatable `--disc` on its CLI), and
 `verify_disc_set.py` probes every disc with `probe_disc.py --identity-only` and
 checks the set *before* `$ROOT` exists. A data-only set scaffolds its one
 program and records `disc_probe.N.json` + `disc_set.json`; an N-programs set,
@@ -373,8 +374,12 @@ Then the rest of the phase:
   programs.
 - `retcomm-catalog`: one entry declaring N disc requirements, so the storefront
   shows a single title.
-- `project_studio` is a fourth surface: `models.py:81` `disc: str | None` and the
-  GUI's single `disc_var` (`gui.py:388`).
+- `project_studio` carries the set too: a **Discs** dropdown (1–4) in the GUI's
+  New Project tab with a row per disc, and a repeatable `--disc` on its CLI.
+  `NewProjectOptions.extra_discs` holds discs 2..N; `disc` stays the boot disc.
+  Four is the cap, and `newproject.MAX_DISCS` is the single place that decides
+  it. (The migrate path's `models.py` `MigrateOptions.disc` is still singular —
+  it refreshes one existing project's probe and is not a set.)
 - `docs/GAME_PROJECT_SETUP.md` documents the singular probe contract and needs
   updating with it.
 
