@@ -2,7 +2,9 @@
 # New Project Layout scaffolding (Linux / macOS).
 #
 # Path flags (pass on the CLI — use your shell's path completion):
-#   --disc <cue>          REQUIRED legal Redump .cue (kept on your dump drive)
+#   --disc <cue>          REQUIRED legal Redump .cue (kept on your dump drive).
+#                         Repeatable for a multi-disc title — pass in disc order,
+#                         boot disc first. See "Multi-disc" below.
 #   --dir <parent>        Parent directory for the new repo (default: .)
 #   --bios <SCPH1001.BIN> Optional retail BIOS for --generate / generate prompt
 #   --boot-exe <name>     Optional override until disc probe runs
@@ -25,6 +27,15 @@
 #   only the small boot EXE is written under disc/. Use --stage-disc to copy
 #   the full multi-track dump into the repo (gitignored) instead.
 #
+# Multi-disc: pass --disc once per disc, in disc order. Every disc is probed and
+#   the set is checked before anything is created (verify_disc_set.py). A set
+#   whose discs each boot their own program is REFUSED — one binary linking N
+#   recompiled programs is P2 of docs/MULTI_DISC.md and does not exist yet.
+#   A set where every disc boots the same program scaffolds that one program and
+#   records each disc's identity in disc_probe.N.json + disc_set.json. Mounting
+#   the later discs at runtime still needs P1 + P3; the runtime mounts the boot
+#   disc only today.
+#
 # GitHub publish order (avoids competing "initial" commits / missing CI):
 #   scaffold + CI workflow → commit → gh repo create (no push) → generate/build
 #   → single git push -u origin HEAD → verify Actions workflows if CI enabled.
@@ -33,17 +44,23 @@
 #   sh tools/new_project_layout/setup_project.sh --disc /path/to/game.cue
 #   sh tools/new_project_layout/setup_project.sh --disc game.cue --name Foo --yes
 #   sh tools/new_project_layout/setup_project.sh --disc game.cue --stage-disc
+#   sh tools/new_project_layout/setup_project.sh --disc d1.cue --disc d2.cue
 
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TEMPLATE_DIR="$SCRIPT_DIR/templates"
 PROBE_DISC="$SCRIPT_DIR/probe_disc.py"
+VERIFY_DISC_SET="$SCRIPT_DIR/verify_disc_set.py"
 FILL_TOKENS="$SCRIPT_DIR/fill_tokens.py"
 FETCH_BOXART="$SCRIPT_DIR/fetch_boxart.py"
 
 NAME=""
 DISC=""
+# Extra discs, newline-delimited (disc 2..N). Cue paths routinely contain
+# spaces, so never word-split this — iterate with `while IFS= read -r`.
+EXTRA_DISCS=""
+DISC_COUNT=0
 PARENT="."
 BOOT_EXE="SLUS_01234"
 PLAYERS=""
@@ -164,7 +181,16 @@ normalize_lobby_url() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) NAME=$2; shift 2 ;;
-        --disc) DISC=$2; shift 2 ;;
+        --disc)
+            if [ -z "$DISC" ]; then
+                DISC=$2
+            else
+                EXTRA_DISCS="${EXTRA_DISCS}$2
+"
+            fi
+            DISC_COUNT=$((DISC_COUNT + 1))
+            shift 2
+            ;;
         --dir) PARENT=$2; shift 2 ;;
         --boot-exe) BOOT_EXE=$2; shift 2 ;;
         --players) PLAYERS=$2; shift 2 ;;
@@ -218,6 +244,20 @@ need_cmd() {
 need_cmd git
 need_cmd python3
 
+# Single owner for every temp path the script creates. The disc-set temp dir is
+# made long before the template block files, so one trap has to cover both.
+SET_TMP=""
+cleanup_tmp() {
+    [ -n "${SET_TMP:-}" ] && rm -rf "$SET_TMP"
+    for _f in "${NETPLAY_BLOCK_FILE:-}" "${WIZARD_BLOCK_FILE:-}" \
+              "${BOXART_BLOCK_FILE:-}" "${APP_ICON_BLOCK_FILE:-}" \
+              "${RECOMP_UI_BLOCK_FILE:-}" "${CODEGEN_ARG_FILE:-}"; do
+        [ -n "$_f" ] && rm -f "$_f"
+    done
+    return 0
+}
+trap cleanup_tmp EXIT INT TERM
+
 # --- Required path: disc ---------------------------------------------------
 if [ -z "$DISC" ]; then
     echo "error: --disc <path-to-game.cue> is required (use your shell to tab-complete the path)." >&2
@@ -227,6 +267,56 @@ fi
 if [ ! -f "$DISC" ]; then
     echo "error: --disc not found: $DISC" >&2
     exit 1
+fi
+printf '%s\n' "$EXTRA_DISCS" | while IFS= read -r _extra; do
+    [ -n "$_extra" ] || continue
+    if [ ! -f "$_extra" ]; then
+        echo "error: --disc not found: $_extra" >&2
+        exit 1
+    fi
+done || exit 1
+
+# --- Multi-disc: verify the whole set before creating anything -------------
+# Runs here, ahead of every prompt and before $ROOT exists, so a set we cannot
+# build refuses cleanly instead of leaving a half-scaffolded directory behind.
+DISC_SET_JSON=""
+if [ "$DISC_COUNT" -gt 1 ]; then
+    echo "== Verifying $DISC_COUNT-disc set (identity only) =="
+    SET_TMP=$(mktemp -d "${TMPDIR:-/tmp}/psxrecomp-discset.XXXXXX")
+    _i=1
+    if ! python3 "$PROBE_DISC" "$DISC" --identity-only \
+        --json-out "$SET_TMP/disc_probe.1.json" >/dev/null; then
+        echo "error: disc 1 failed to probe: $DISC" >&2
+        exit 1
+    fi
+    printf '%s\n' "$EXTRA_DISCS" | while IFS= read -r _extra; do
+        [ -n "$_extra" ] || continue
+        _i=$((_i + 1))
+        if ! python3 "$PROBE_DISC" "$_extra" --identity-only \
+            --json-out "$SET_TMP/disc_probe.$_i.json" >/dev/null; then
+            echo "error: disc $_i failed to probe: $_extra" >&2
+            exit 1
+        fi
+    done || exit 1
+    # Order matters — feed the verifier disc 1..N, not shell glob order.
+    _set_args=""
+    _n=1
+    while [ "$_n" -le "$DISC_COUNT" ]; do
+        if [ ! -f "$SET_TMP/disc_probe.$_n.json" ]; then
+            echo "error: disc $_n probe missing — aborting." >&2
+            exit 1
+        fi
+        _set_args="$_set_args $SET_TMP/disc_probe.$_n.json"
+        _n=$((_n + 1))
+    done
+    # shellcheck disable=SC2086
+    if ! python3 "$VERIFY_DISC_SET" $_set_args \
+        --json-out "$SET_TMP/disc_set.json"; then
+        echo >&2
+        echo "Nothing was created. See docs/MULTI_DISC.md for what this needs." >&2
+        exit 1
+    fi
+    DISC_SET_JSON="$SET_TMP/disc_set.json"
 fi
 
 # --- Interactive / flag config ---------------------------------------------
@@ -494,7 +584,7 @@ BOXART_BLOCK_FILE=$(mktemp)
 APP_ICON_BLOCK_FILE=$(mktemp)
 RECOMP_UI_BLOCK_FILE=$(mktemp)
 CODEGEN_ARG_FILE=$(mktemp)
-trap 'rm -f "$NETPLAY_BLOCK_FILE" "$WIZARD_BLOCK_FILE" "$BOXART_BLOCK_FILE" "$APP_ICON_BLOCK_FILE" "$RECOMP_UI_BLOCK_FILE" "$CODEGEN_ARG_FILE"' EXIT
+# cleanup_tmp (installed above) already covers these plus the disc-set temp dir.
 
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     printf '%s\n' '# recomp-ui submodule present (PSX_RECOMP_UI defaults ON).' \
@@ -584,6 +674,9 @@ fill_template() {
 echo "== New Project Layout =="
 echo "  repo:       $ROOT"
 echo "  disc:       $DISC"
+if [ "$DISC_COUNT" -gt 1 ]; then
+    echo "              (+$((DISC_COUNT - 1)) more; verified as one program)"
+fi
 echo "  zip prefix: $ZIP_PREFIX"
 echo "  gh slug:    $GITHUB_OWNER/$GITHUB_REPO"
 echo "  players:    $PLAYERS"
@@ -828,6 +921,25 @@ print(m.group(1) if m else "")
         ;;
 esac
 
+# --- Multi-disc: record the set alongside the boot disc's probe ------------
+# The scaffolded project is still one program (see the header note). These
+# files are the provenance of the other discs, so a later session does not have
+# to re-derive which images the set was verified against.
+if [ "$DISC_COUNT" -gt 1 ] && [ -n "$DISC_SET_JSON" ] && [ -f "$DISC_SET_JSON" ]; then
+    cp "$DISC_SET_JSON" "$ROOT/disc_set.json"
+    _n=2
+    while [ "$_n" -le "$DISC_COUNT" ]; do
+        if [ -f "$SET_TMP/disc_probe.$_n.json" ]; then
+            cp "$SET_TMP/disc_probe.$_n.json" "$ROOT/disc_probe.$_n.json"
+        fi
+        _n=$((_n + 1))
+    done
+    echo "== Multi-disc set recorded =="
+    echo "  disc_set.json + disc_probe.2..$DISC_COUNT.json"
+    echo "  game.toml describes the boot disc only — the runtime mounts one disc"
+    echo "  today (docs/MULTI_DISC.md P1 + P3 add the rest)."
+fi
+
 if [ "$FETCH_BOXART_FLAG" -eq 1 ]; then
     echo "== Fetching libretro boxart =="
     CUE_HINT="${DISC_BASENAME:-$GAME_NAME}"
@@ -865,6 +977,14 @@ if [ -f "$ROOT/catalog_identity.json" ]; then
 fi
 if [ -f "$ROOT/disc_probe.json" ]; then
     git add disc_probe.json || true
+fi
+if [ -f "$ROOT/disc_set.json" ]; then
+    git add disc_set.json || true
+    _n=2
+    while [ "$_n" -le "$DISC_COUNT" ]; do
+        [ -f "$ROOT/disc_probe.$_n.json" ] && git add "disc_probe.$_n.json" || true
+        _n=$((_n + 1))
+    done
 fi
 if [ "$HAS_BOXART" -eq 1 ]; then
     git add launcher_assets/img/boxart.tga launcher_assets/img/boxart.png launcher_assets/img/BOXART_SOURCE.txt || true

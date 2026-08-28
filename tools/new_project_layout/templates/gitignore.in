@@ -79,3 +79,7 @@ starvation_dump.jsonl
 /*.png
 !/catalog_identity.json
 !/disc_probe.json
+# Multi-disc: per-disc identity probes and the verified set verdict.
+!/disc_probe.[0-9].json
+!/disc_probe.[0-9][0-9].json
+!/disc_set.json

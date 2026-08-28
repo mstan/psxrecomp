@@ -1,7 +1,11 @@
 # New Project Layout scaffolding (Windows).
 #
 # Path params (pass on the CLI -- tab-complete in your shell):
-#   -Disc <cue>           REQUIRED legal Redump .cue (kept on your dump drive)
+#   -Disc <cue>[,<cue>]   REQUIRED legal Redump .cue (kept on your dump drive).
+#                         For a multi-disc title pass a comma-separated list in
+#                         disc order, boot disc first. PowerShell parameters
+#                         cannot be repeated, so this is the array form of the
+#                         shell script's repeated --disc. See "Multi-disc".
 #   -Dir <parent>         Parent directory (default: .)
 #   -Bios <SCPH1001.BIN>  Optional retail BIOS for Generate
 #   -StageDisc            Copy full cue+bins into repo disc/ (large; optional)
@@ -9,15 +13,24 @@
 #
 # Other options are prompted when interactive, or set via switches / -Yes.
 #
+# Multi-disc: every disc is probed and the set checked before anything is
+#   created (verify_disc_set.py). A set whose discs each boot their own program
+#   is REFUSED -- one binary linking N recompiled programs is P2 of
+#   docs/MULTI_DISC.md and does not exist yet. A set where every disc boots the
+#   same program scaffolds that one program and records each disc's identity in
+#   disc_probe.N.json + disc_set.json. Mounting the later discs at runtime still
+#   needs P1 + P3; the runtime mounts the boot disc only today.
+#
 # Usage:
 #   powershell -File setup_project.ps1 -Disc C:\dumps\game.cue
 #   powershell -File setup_project.ps1 -Disc game.cue -Name Foo -Yes
 #   powershell -File setup_project.ps1 -Disc game.cue -StageDisc
+#   powershell -File setup_project.ps1 -Disc d1.cue,d2.cue
 
 [CmdletBinding()]
 param(
     [string]$Name = "",
-    [Parameter(Mandatory = $true)][string]$Disc,
+    [Parameter(Mandatory = $true)][string[]]$Disc,
     [string]$Dir = ".",
     [string]$BootExe = "SLUS_01234",
     [int]$Players = 0,
@@ -60,6 +73,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TemplateDir = Join-Path $ScriptDir "templates"
 $ProbeDisc = Join-Path $ScriptDir "probe_disc.py"
+$VerifyDiscSet = Join-Path $ScriptDir "verify_disc_set.py"
 $FillTokens = Join-Path $ScriptDir "fill_tokens.py"
 $FetchBoxartPy = Join-Path $ScriptDir "fetch_boxart.py"
 $DefaultLobbyHost = "netplay.retcomm.net"
@@ -108,8 +122,44 @@ function Prompt-Yn([string]$Question, [bool]$DefaultYes) {
     }
 }
 
-if (-not (Test-Path -LiteralPath $Disc)) {
-    throw "-Disc not found: $Disc (pass the path on the CLI so your shell can tab-complete it)"
+# $Disc is an array (disc order, boot disc first). Everything downstream works
+# on the boot disc, so collapse to it once the whole set has been validated.
+$DiscAll = @($Disc)
+$DiscCount = $DiscAll.Count
+foreach ($_d in $DiscAll) {
+    if (-not (Test-Path -LiteralPath $_d)) {
+        throw "-Disc not found: $_d (pass the path on the CLI so your shell can tab-complete it)"
+    }
+}
+$Disc = $DiscAll[0]
+
+# --- Multi-disc: verify the whole set before creating anything -------------
+# Runs ahead of every prompt and before $Root exists, so a set we cannot build
+# refuses cleanly instead of leaving a half-scaffolded directory behind.
+$DiscSetTmp = ""
+$DiscSetJson = ""
+if ($DiscCount -gt 1) {
+    Write-Host "== Verifying $DiscCount-disc set (identity only) =="
+    $DiscSetTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("psxrecomp-discset-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $DiscSetTmp -Force | Out-Null
+    $setArgs = @()
+    for ($i = 0; $i -lt $DiscCount; $i++) {
+        $probeOut = Join-Path $DiscSetTmp ("disc_probe." + ($i + 1) + ".json")
+        $probeCue = $DiscAll[$i]
+        & python $ProbeDisc $probeCue --identity-only --json-out $probeOut | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Remove-Item -Recurse -Force $DiscSetTmp -ErrorAction SilentlyContinue
+            throw ("disc " + ($i + 1) + " failed to probe: " + $DiscAll[$i])
+        }
+        $setArgs += $probeOut
+    }
+    $DiscSetJson = Join-Path $DiscSetTmp "disc_set.json"
+    & python $VerifyDiscSet @setArgs --json-out $DiscSetJson
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -Recurse -Force $DiscSetTmp -ErrorAction SilentlyContinue
+        Write-Host ""
+        throw "Nothing was created. See docs/MULTI_DISC.md for what this needs."
+    }
 }
 
 $interactive = Test-Interactive
@@ -365,6 +415,9 @@ function Fill-Template([string]$src, [string]$dst) {
 Write-Host "== New Project Layout =="
 Write-Host "  repo:       $Root"
 Write-Host "  disc:       $Disc"
+if ($DiscCount -gt 1) {
+    Write-Host ("              (+" + ($DiscCount - 1) + " more; verified as one program)")
+}
 Write-Host "  zip prefix: $ZipPrefix"
 Write-Host "  gh slug:    $GithubOwner/$GithubRepo"
 Write-Host "  players:    $Players"
@@ -619,6 +672,27 @@ if ($doBoxart) {
     }
 }
 
+# --- Multi-disc: record the set alongside the boot disc's probe ------------
+# The scaffolded project is still one program. These files are the provenance
+# of the other discs, so a later session does not have to re-derive which
+# images the set was verified against.
+if ($DiscCount -gt 1 -and $DiscSetJson -and (Test-Path -LiteralPath $DiscSetJson)) {
+    Copy-Item -LiteralPath $DiscSetJson -Destination (Join-Path $Root "disc_set.json") -Force
+    for ($i = 2; $i -le $DiscCount; $i++) {
+        $src = Join-Path $DiscSetTmp ("disc_probe.$i.json")
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $Root "disc_probe.$i.json") -Force
+        }
+    }
+    Write-Host "== Multi-disc set recorded =="
+    Write-Host "  disc_set.json + disc_probe.2..$DiscCount.json"
+    Write-Host "  game.toml describes the boot disc only — the runtime mounts one disc"
+    Write-Host "  today (docs/MULTI_DISC.md P1 + P3 add the rest)."
+}
+if ($DiscSetTmp -and (Test-Path -LiteralPath $DiscSetTmp)) {
+    Remove-Item -Recurse -Force $DiscSetTmp -ErrorAction SilentlyContinue
+}
+
 Write-Host "== Sync symbols header =="
 Push-Location $Root
 try { python tools/sync_symbols.py --game $GameName } catch { Write-Warning "sync_symbols failed" }
@@ -633,6 +707,14 @@ if (Test-Path (Join-Path $Root "catalog_identity.json")) {
 }
 if (Test-Path (Join-Path $Root "disc_probe.json")) {
     git add disc_probe.json 2>$null
+}
+if (Test-Path (Join-Path $Root "disc_set.json")) {
+    git add disc_set.json 2>$null
+    for ($i = 2; $i -le $DiscCount; $i++) {
+        if (Test-Path (Join-Path $Root "disc_probe.$i.json")) {
+            git add "disc_probe.$i.json" 2>$null
+        }
+    }
 }
 if ($HasBoxart) {
     git add launcher_assets/img/boxart.tga launcher_assets/img/boxart.png launcher_assets/img/BOXART_SOURCE.txt 2>$null

@@ -107,8 +107,8 @@ What runs after answers:
    the scaffold force-publishes when visibility is public and nudges with a
    tiny follow-up commit that retouches the workflow file.
 
-Standalone helpers: `probe_disc.py`, `fetch_boxart.py`, `fill_tokens.py`,
-`sync_symbols.py`.
+Standalone helpers: `probe_disc.py`, `verify_disc_set.py`, `fetch_boxart.py`,
+`fill_tokens.py`, `sync_symbols.py`.
 
 ### Disc autofill (`probe_disc.py`)
 
@@ -133,6 +133,39 @@ python3 tools/new_project_layout/probe_disc.py disc/game.cue \
   --write-seeds seeds/ghidra_funcs.txt \
   --disc-rel disc/game.cue --out-dir disc --players 2
 ```
+
+`--identity-only` skips the data-track md5/sha1 pass for a fast identity read.
+It cannot be combined with `--write-game-toml` / `--write-catalog`, which need
+those digests.
+
+### Multi-disc titles
+
+Pass `--disc` once per disc, in disc order, boot disc first (PowerShell has no
+repeatable parameters, so the `.ps1` takes the array form
+`-Disc d1.cue,d2.cue`):
+
+```bash
+sh tools/new_project_layout/setup_project.sh --name "My Game" \
+  --disc "My Game (Disc 1).cue" --disc "My Game (Disc 2).cue"
+```
+
+Every disc is probed and the set checked by `verify_disc_set.py` **before
+anything is created**, so a set that cannot be built refuses cleanly rather
+than leaving a half-scaffolded directory. There are two outcomes:
+
+| Set | What happens |
+| --- | --- |
+| Every disc boots the **same** program (data-only) | Scaffolds that one program from the boot disc. Each disc's identity is recorded in `disc_probe.N.json`, and the verdict in `disc_set.json`. |
+| Each disc boots **its own** program | **Refused by name.** One binary linking N recompiled programs is P2 of [`MULTI_DISC.md`](MULTI_DISC.md); the game emitter still emits unprefixed symbols that would collide at link. Scaffold the boot disc alone until that lands. |
+
+It also refuses a set that is incoherent: the same image passed twice, or discs
+from different releases (a serial-prefix mismatch, e.g. `SCUS` with `SCES`).
+
+`game.toml` still describes the boot disc only — it keeps the singular `disc`
+key, because `psxrecomp_cli.py generate` reads only that. **Scaffolding a disc
+set is not the same as playing it:** the runtime mounts one disc and has no
+lid/shell state machine, so swapping discs at runtime needs P1 and P3 of
+[`MULTI_DISC.md`](MULTI_DISC.md).
 
 Prefer a **full multi-track** Redump cue. A single-TRACK dump will warn and will
 fail online multi-track gates (see `[NETPLAY.md](NETPLAY.md)`).

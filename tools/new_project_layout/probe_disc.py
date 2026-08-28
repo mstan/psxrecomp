@@ -324,17 +324,25 @@ def display_name_from_cue(cue_path: Path, volume_id: str) -> str:
     return name.strip() or stem
 
 
-def probe(cue_path: Path) -> DiscProbe:
+def probe(cue_path: Path, *, identity_only: bool = False) -> DiscProbe:
     cue_path = cue_path.resolve()
     if cue_path.suffix.lower() != ".cue":
         raise SystemExit("probe_disc expects a .cue (Redump multi-track layout)")
 
     tracks, files_order = parse_cue(cue_path)
     bin_path = first_binary_bin(cue_path, files_order, tracks)
-    md5, sha1, size = file_hashes(bin_path)
+    if identity_only:
+        md5, sha1, size = "", "", bin_path.stat().st_size
+    else:
+        md5, sha1, size = file_hashes(bin_path)
 
     warnings: list[str] = []
     notes: list[str] = []
+    if identity_only:
+        notes.append(
+            "identity-only probe: data-track md5/sha1 skipped. Not usable for "
+            "[prepare_disc] digests or the catalog."
+        )
     if len(tracks) == 1:
         warnings.append(
             "cue has only 1 TRACK — Track-01-only dumps fail multi-track "
@@ -624,14 +632,28 @@ def main() -> int:
     ap.add_argument("--publisher", default="", help="marketing publisher")
     ap.add_argument("--year", default="", help="marketing year (string ok)")
     ap.add_argument("--region", default="", help="marketing region (e.g. USA)")
+    ap.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="skip the data-track md5/sha1 pass (fast identity check; not "
+             "usable with --write-game-toml / --write-catalog)",
+    )
     args = ap.parse_args()
+
+    if args.identity_only and (args.write_game_toml or args.write_catalog):
+        print(
+            "--identity-only cannot be combined with --write-game-toml / "
+            "--write-catalog: both need the data-track digests it skips.",
+            file=sys.stderr,
+        )
+        return 2
 
     cue = Path(args.cue).expanduser()
     if not cue.is_file():
         print(f"cue not found: {cue}", file=sys.stderr)
         return 1
 
-    p = probe(cue)
+    p = probe(cue, identity_only=args.identity_only)
     if args.display_name:
         p.display_name = args.display_name
 

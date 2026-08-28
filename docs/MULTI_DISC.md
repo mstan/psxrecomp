@@ -309,6 +309,17 @@ do first. Resist that: the flag is the *last* five percent. Everything the flag
 would feed is singular, and a scaffold that accepts three discs and then writes
 one program's project is worse than one that refuses.
 
+**Partially landed — the verification half only.** `--disc` is repeatable today
+(`-Disc a,b` on PowerShell, which has no repeatable parameters), and
+`verify_disc_set.py` probes every disc with `probe_disc.py --identity-only` and
+checks the set *before* `$ROOT` exists. A data-only set scaffolds its one
+program and records `disc_probe.N.json` + `disc_set.json`; an N-programs set,
+a duplicate image, or a mixed-release set is refused by name with nothing
+created. `game.toml` still carries the singular `disc` key, so `generate` is
+unaffected and single-disc scaffolding is byte-identical to before. **None of
+the generation half below has landed** — no per-disc `[[game.disc]]`, no
+per-program seeds, no N-program build.
+
 **The arg parsing is genuinely cheap.** There is no interactive disc prompt to
 extend — the disc is a hard CLI requirement checked before prompting begins
 (`setup_project.sh:221-230`), deliberately excluded from the `prompt_line` flow
