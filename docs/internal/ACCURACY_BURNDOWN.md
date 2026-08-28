@@ -171,6 +171,10 @@ bug**, not timing.
   Beetle spu.cpp; psx-spx "SPU"; validate by audio-sample diff.
 - [ ] **CDROM**: command set, response timing, sector read (data/XA/CD-DA), seek,
   shell/lid — Beetle cdrom.cpp; psx-spx "CDROM"; validate by sector/response diff.
+  - shell/lid is entirely absent today (`CDSTAT_SHELL` is a pure function of
+    `has_disc()`, no open transition / no latch / no INT5-while-open). It is
+    planned as P3 of `../MULTI_DISC.md`; update this item there, not in a
+    parallel record.
   - **KNOWN OK-TO-DIVERGE (we are MORE faithful than the oracle) — from PR #9:**
     Suppressed in `tools/devtrace_diff.py` (`KNOWN_DIVERGENCES["cdrom"]`; use
     `--strict` to see raw). Beetle stays the independent oracle (unpatched); the

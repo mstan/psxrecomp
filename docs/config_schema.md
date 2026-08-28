@@ -106,7 +106,7 @@ respective files.
 | `text_size` | both | hex string, size in bytes of the static region. For games this also bounds main-EXE analysis and establishes the overlay floor. A smaller-than-header bound must be verified non-code and 4 KiB aligned. |
 | `stack_base` | game | hex string, initial `$sp` value for the game |
 | `disc` | game (single-disc) | path to .cue, relative to project root |
-| `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]` |
+| `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]`. Parsed today, but the runtime mounts `discs.front()` and drops the rest — see [`MULTI_DISC.md`](MULTI_DISC.md) |
 
 ## Recompiler block
 
@@ -443,8 +443,8 @@ to_lo       = "0x..."           # target start offset (phys = phys - from_lo + t
 
 These are noted here so future work knows where to slot them:
 
-- Game `discs` field (Phase D). For now Tomba uses `disc = "..."`.
-- `[runtime] disc_swap_command` — runtime-side disc swap (Phase D).
+- `[runtime] disc_swap_command` — runtime-side disc swap. See
+  [`MULTI_DISC.md`](MULTI_DISC.md) for the disc-set design this belongs to.
 - `[recompiler] seeds` as an array of paths (currently single file;
   Phase A might allow multiple).
 - `[program] type` explicit discriminator (currently inferred from
