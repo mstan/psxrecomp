@@ -86,6 +86,16 @@ depending on what P0 observes.
 Everything downstream is shaped by facts we do not have yet. Get them from the
 oracle, not from reasoning about them.
 
+**Use Syphon Filter 2, not FF7, as the P0 subject.** `syphon-filter-2-recompiled`
+is already a port in this workspace, and its README claims "Disc 1 and Disc 2
+gameplay verified" while its `game.toml` names only Disc 1
+(`id = "SCUS-94451"`, one `exe`, one `disc`) and the runtime mounts
+`discs.front()`. Either that claim rests on a swap path nobody has written down,
+or SF2 is the data-only case and disc 2 runs disc 1's program. **Which it is, is
+unknown and is the single most useful thing P0 can settle** — it decides whether
+the first real consumer needs the flat `discs` form or the full `[[game.disc]]`
+registry, and it is answerable today against a title we have.
+
 - Drive a real multi-disc title on `psx-beetle` to its disc-change prompt and
   capture the full CD command/response trace across the swap: which commands are
   issued, what the status byte does, whether the shell bit latches until read,
@@ -294,16 +304,74 @@ named reason. Silent wrong-disc state is the failure mode to design out.
 
 *After P6.*
 
-- `setup_project.sh` / `.ps1`: `--disc` becomes repeatable; `probe_disc.py` runs
-  per disc and writes one `[[game.disc]]` block each, with per-program seed
-  lists.
+Making `--disc` repeatable is the small part of this phase and it is tempting to
+do first. Resist that: the flag is the *last* five percent. Everything the flag
+would feed is singular, and a scaffold that accepts three discs and then writes
+one program's project is worse than one that refuses.
+
+**The arg parsing is genuinely cheap.** There is no interactive disc prompt to
+extend — the disc is a hard CLI requirement checked before prompting begins
+(`setup_project.sh:221-230`), deliberately excluded from the `prompt_line` flow
+because `read` gives no tab completion. `--yes` mode imposes nothing extra. So
+the shell side is an accumulator in the arg loop (`:164-206`) plus the
+`DISC`→`DISC_ABS` block (`:728-743`); `setup_project.ps1:20` becomes
+`[string[]]$Disc`, which PowerShell supports natively. Note it must be written
+twice — the `.ps1` mirrors the `.sh` argument-for-argument, including the probe
+invocation (`sh:779-792` ≡ `ps1:543-556`).
+
+**What actually blocks it — every downstream artifact is singular:**
+
+- `probe_disc.py` **clobbers rather than merges.** `render_game_toml`
+  (`:478-534`) builds a file from scratch and `:659` `write_text`s it. A second
+  disc overwrites disc 1's `game.toml`, `catalog_identity.json` (`:673`),
+  `disc_probe.json` (`:648`, and it is the one probe artifact that gets
+  committed) and `seeds/ghidra_funcs.txt` (`:690-707`, `write_text`, not
+  append). Only `--write-boot-exe` (`:666`) escapes, and only by luck — it names
+  the file after the on-disc boot EXE, so two discs that reuse a boot-EXE name
+  silently last-write-wins.
+- It emits singular `disc = "..."` at `:490` and has no `discs` codepath at all,
+  even though `config_loader.cpp:1217` has accepted the array form all along.
+  **The consumer already accepts what the scaffolding refuses to emit.**
+- `[recompiler] seeds` is written as one hardcoded path (`:510`), so per-program
+  seed lists need the schema change flagged in `config_schema.md`'s "not yet"
+  list.
+- Templates bake one program in four load-bearing places: `CMakeLists.txt.in:32-33`
+  (`GEN_MARKER` + `GEN_FULL_GLOB` keyed to `@BOOT_EXE@`), `codegen_setup.c.in:16`
+  (the setup-host's "is it generated yet?" marker), and `symbols.toml.in:6-11`
+  (a single `[[func]] BootEntry`). `fill_tokens.py` does scalar `@TOKEN@`
+  substitution with no list support.
+- `runtime.cmake:1709` has `GEN_MARKER` in `oneValueArgs`, and `:1827-1831`
+  makes a missing one a `FATAL_ERROR`; that single marker is what decides
+  setup-host vs. full runtime (`:1838-1841`).
+- **Hard blocker even for the data-only case:** `psxrecomp_cli.py:968-972` —
+  the `generate` the scaffold itself invokes — reads only `game.get("disc")` and
+  errors `no --disc and game.disc empty`. A `game.toml` carrying only `discs`
+  fails to generate. `disc` has to stay as a first-disc alias, or `generate`
+  learns the array.
+
+**Precedents to copy rather than invent:** `GEN_FULL_GLOB` is already
+`multiValueArgs` and accumulated with `foreach` (`runtime.cmake:1715, 1875-1881`),
+so the *sources* side already tolerates N programs; `symbols.toml.in`'s
+`[[func]]` is already an array-of-tables; and `[[runtime.warm_cd_routes]]`
+(`config_loader.cpp:431-447`) is a clean, bounded, per-entry-error-context parse
+to model `[[game.disc]]` on.
+
+Then the rest of the phase:
+
 - Packaging and the setup-host zip ask for N discs and stage N generated
   programs.
 - `retcomm-catalog`: one entry declaring N disc requirements, so the storefront
   shows a single title.
+- `project_studio` is a fourth surface: `models.py:81` `disc: str | None` and the
+  GUI's single `disc_var` (`gui.py:388`).
+- `docs/GAME_PROJECT_SETUP.md` documents the singular probe contract and needs
+  updating with it.
 
 > **Gate.** A fresh three-disc project scaffolds, generates, builds and ships as
 > one entry, with no hand-editing of generated output anywhere in the path.
+> Specifically: no probe output is overwritten by a later disc, and a scaffold
+> given N discs that the pipeline cannot yet build **refuses by name** rather
+> than quietly producing a one-program project.
 
 ---
 
