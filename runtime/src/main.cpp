@@ -2790,7 +2790,23 @@ static int present_should_wall_pace(void) {
     if (g_frame_interpolation && g_gl_active &&
         gl_renderer_interpolation_owns_cadence())
         return 0;
-    return g_frame_period_ms > 0.0 && !present_vsync_owns_cadence();
+    /* Run the pacer even when driver vsync is SUPPOSED to own the cadence.
+     *
+     * Skipping it here trusts the swap to block, and a swap that does not
+     * block leaves the guest with NO speed limit at all -- the game simply
+     * free-runs. Measured on NVIDIA GL under a compositing WM: 45 s of
+     * gameplay produced 4771 guest frames (~106 fps, 1.77x) with vsync
+     * "owning" cadence, against 2651 (~58.9 fps, 1.00x) with PSX_VSYNC=0
+     * forcing this pacer on. Nothing was held; it looked exactly like a stuck
+     * fast-forward.
+     *
+     * This is safe to run alongside a vsync that DOES block, because
+     * frame_pacer_wait() is deadline-based rather than a fixed sleep: if the
+     * swap already consumed the period, `now >= next_deadline` and it returns
+     * immediately after advancing the deadline. So it costs nothing where
+     * vsync works and supplies the cap where it does not, which also means it
+     * cannot add latency to the healthy path. */
+    return g_frame_period_ms > 0.0;
 }
 
 static void apply_present_cadence(void) {
@@ -2808,9 +2824,15 @@ static void apply_present_cadence(void) {
 
 static void log_present_cadence(void) {
     if (present_vsync_owns_cadence()) {
-        std::printf("psxrecomp: present cadence: driver vsync (%.1f Hz panel, "
-                    "wall-clock pacer skipped)\n",
-                    g_host_refresh_hz);
+        /* The pacer still runs underneath as a deadline cap (see
+         * present_should_wall_pace) -- a no-op whenever the swap actually
+         * blocks, and the only speed limit when it does not. Say so: this
+         * line is how a bring-up session decides whether pacing is accounted
+         * for, and "skipped" sent this one hunting a phantom stuck
+         * fast-forward instead of an unpaced present. */
+        std::printf("psxrecomp: present cadence: driver vsync (%.1f Hz panel; "
+                    "wall-clock cap %.4f ms/frame)\n",
+                    g_host_refresh_hz, g_frame_period_ms);
     } else if (g_frame_period_ms > 0.0) {
         if (g_video_vsync != 0 && !g_frame_interpolation &&
             !g_netplay_vsync_forced_off) {
