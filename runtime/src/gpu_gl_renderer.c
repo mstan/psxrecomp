@@ -2495,8 +2495,13 @@ static void depth24_upload_policy(void) {
         s_up_nrects = 0;
         rect_clear(&s_d24_skip_fb);
     } else if (!d24 && s_depth24_skip_up) {
-        s_up_nrects = 0;
+        /* Small texture uploads are still queued while depth24 scanout uses
+         * the CPU mirror. Clear only the skipped movie band first, then land
+         * those newer uploads so texture pages which overlap that band win in
+         * PS1 command order. Dropping the queue here loses GT2's boot menu
+         * atlas; flushing before the clear would wipe it again. */
         depth24_clear_skipped_fb();
+        flush_cpu_upload();
         gpu_depth24_upload_span_reset();
         /* Force a fresh present after FMV→15-bit so menus/loading screens
          * are not held as a stale depth24 frame. */

@@ -357,6 +357,12 @@ if(BUILD_TESTING)
     target_include_directories(frame_pacing_test PRIVATE include)
     add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 
+    add_executable(freeze_dump_policy_test
+        tests/test_freeze_dump_policy.c
+        src/freeze_dump_policy.c)
+    target_include_directories(freeze_dump_policy_test PRIVATE src)
+    add_test(NAME freeze_dump_policy_test COMMAND freeze_dump_policy_test)
+
     add_executable(frame_interpolation_schedule_test
         tests/test_frame_interpolation_schedule.c
         src/frame_interpolation.c)
@@ -492,6 +498,9 @@ if(BUILD_TESTING)
         add_test(NAME screenshot_hires_pitch_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_screenshot_hires_pitch.py)
+        add_test(NAME gl_depth24_upload_order_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_depth24_upload_order.py)
     endif()
 
     # Full card protocol regression: read, write, address echo, per-slot state,

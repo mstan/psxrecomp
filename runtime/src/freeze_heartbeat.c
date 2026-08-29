@@ -1,6 +1,7 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "freeze_heartbeat.h"
+#include "freeze_dump_policy.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -164,10 +165,9 @@ static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
 static uint32_t    s_ring_count = 0;
 
-/* Wedge detection state.
- *   s_dump_armed - 1 if a wedge dump is allowed to fire; cleared after
- *                  firing, re-armed when the wedge clears (healthy tick). */
-static int      s_dump_armed = 1;
+/* Automatic full dumps are bounded independently from deliberate fatal dumps.
+ * The heartbeat JSON reports both written and suppressed event counts. */
+static FreezeDumpPolicy s_dump_policy = {0};
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
 
 #ifdef _WIN32
@@ -314,6 +314,7 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
  * main thread mid-dump (2026-06-10 chest-freeze postmortem). First dump
  * in wins; the loser skips (same rings either way). */
 static volatile long s_dump_in_progress = 0;
+static uint32_t s_dump_sequence = 0;  /* protected by s_dump_in_progress */
 
 static void freeze_dump_unlock(void) {
 #ifdef _WIN32
@@ -458,14 +459,14 @@ static int hb_format_cpu_scratchpad(char *out, size_t cap) {
     return n;
 }
 
-static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
-                              uint64_t exc_reentry, uint32_t cur_fn,
-                              uint32_t last_store, uint32_t i_stat_v,
-                              uint32_t i_mask_v, int in_exc,
-                              uint64_t total_checks, uint32_t dispatch_count,
-                              uint64_t exc_entries,
-                              uint16_t sio_stat_v, uint16_t sio_ctrl_v,
-                              int sio_card_active, int mc_max, int tx_writes)
+static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
+                             uint64_t exc_reentry, uint32_t cur_fn,
+                             uint32_t last_store, uint32_t i_stat_v,
+                             uint32_t i_mask_v, int in_exc,
+                             uint64_t total_checks, uint32_t dispatch_count,
+                             uint64_t exc_entries,
+                             uint16_t sio_stat_v, uint16_t sio_ctrl_v,
+                             int sio_card_active, int mc_max, int tx_writes)
 {
     /* Snapshot the kind at entry — the global can be flipped mid-write by
      * the other thread, which is what sent the fatal (kind 4) path into
@@ -474,18 +475,21 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
 #ifdef _WIN32
     if (InterlockedCompareExchange((volatile LONG *)&s_dump_in_progress, 1, 0) != 0)
-        return;
+        return 0;
 #else
     if (__sync_lock_test_and_set(&s_dump_in_progress, 1) != 0)
-        return;
+        return 0;
 #endif
 
     char path[128];
-    snprintf(path, sizeof(path),
-             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
+    uint32_t sequence = s_dump_sequence++;
+    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
+        freeze_dump_unlock();
+        return 0;
+    }
 
     FILE *f = fopen(path, "wb");
-    if (!f) { freeze_dump_unlock(); return; }
+    if (!f) { freeze_dump_unlock(); return 0; }
 
     /* Large stdio buffer so multi-MB JSON arrays write efficiently. */
     static char io_buf[1 << 16];
@@ -657,8 +661,11 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     }
 
     fputs("}\n", f);
-    fclose(f);
+    int written = !ferror(f);
+    if (fclose(f) != 0) written = 0;
+    if (!written) (void)remove(path);
     freeze_dump_unlock();
+    return written;
 }
 
 /* Full ring dump for deliberate fatal sites (psx_fatal_halt). Runs ON the
@@ -694,14 +701,13 @@ void freeze_heartbeat_fatal_dump(const char *reason) {
                         &sio_stat, &sio_ctrl, &card_active);
 
     s_last_wedge_kind = 4;
-    s_dump_armed = 0;  /* the watchdog must not overwrite the fatal dump */
-    freeze_dump_write((long long)time(NULL), s_frame_count,
-                      psx_get_cycle_count(), exc_reentry,
-                      g_debug_current_func_addr, g_debug_last_store_pc,
-                      i_stat, i_mask, in_exc, total_checks,
-                      dispatch_count, exc_entries,
-                      sio_stat, sio_ctrl, card_active,
-                      sio_get_mc_max_state(), sio_get_tx_writes());
+    (void)freeze_dump_write((long long)time(NULL), s_frame_count,
+                            psx_get_cycle_count(), exc_reentry,
+                            g_debug_current_func_addr, g_debug_last_store_pc,
+                            i_stat, i_mask, in_exc, total_checks,
+                            dispatch_count, exc_entries,
+                            sio_stat, sio_ctrl, card_active,
+                            sio_get_mc_max_state(), sio_get_tx_writes());
 }
 
 static void heartbeat_write(void) {
@@ -757,15 +763,16 @@ static void heartbeat_write(void) {
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
-    /* ---- Wedge detection: arm-once auto-dump ----
+    /* ---- Wedge detection: bounded automatic dump ----
      * Walk back WEDGE_WINDOW_TICKS in the heartbeat ring (just pushed
      * above) and compute deltas. Trigger if any of:
      *   A. frame_count delta == 0                  (hard freeze)
      *   B. exc_reentry delta PER FRAME > threshold (reentry storm)
      *   C. frame_count delta < slow-frames floor   (host-side stall)
      *
-     * Only fires once the ring has enough history. When the wedge clears
-     * (a healthy tick), re-arm. */
+     * Only fires once the ring has enough history. The dump policy requires
+     * a sustained healthy interval before it accepts a new event, and bounds
+     * automatic full dumps for the process. Deliberate fatal dumps bypass it. */
     uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames */
     if (s_ring_count >= WEDGE_WINDOW_TICKS) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
@@ -803,19 +810,15 @@ static void heartbeat_write(void) {
             wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
     }
 
-    if (wedge_kind != 0) {
-        if (s_dump_armed) {
-            s_dump_armed = 0;
-            s_last_wedge_kind = wedge_kind;
-            freeze_dump_write(wall, frame, cyc, exc_reentry, cur_fn, last_store,
-                              i_stat, i_mask, in_exc, total_checks,
-                              dispatch_count, exc_entries,
-                              sio_stat, sio_ctrl, card_active,
-                              mc_max, tx_writes);
-        }
-    } else {
-        /* Healthy tick: re-arm for the next wedge. */
-        s_dump_armed = 1;
+    if (freeze_dump_policy_observe(&s_dump_policy, wedge_kind,
+                                   g_psx_fatal_reason != NULL)) {
+        s_last_wedge_kind = wedge_kind;
+        int written = freeze_dump_write(
+            wall, frame, cyc, exc_reentry, cur_fn, last_store,
+            i_stat, i_mask, in_exc, total_checks,
+            dispatch_count, exc_entries,
+            sio_stat, sio_ctrl, card_active, mc_max, tx_writes);
+        freeze_dump_policy_record_result(&s_dump_policy, written);
     }
 
     /* Timer1/RootCounter1 decode (Tomba 2 RCnt-wait diagnosis): if the game
@@ -915,6 +918,10 @@ static void heartbeat_write(void) {
         "  \"bail_resolved\":%llu,\n"
         "  \"bail_flattened\":%llu,\n"
         "  \"bail_anomaly\":%llu,\n"
+        "  \"automatic_freeze_dumps\":%u,\n"
+        "  \"failed_freeze_dumps\":%u,\n"
+        "  \"suppressed_freeze_events\":%u,\n"
+        "  \"automatic_freeze_dump_limit\":%u,\n"
         "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
@@ -974,6 +981,10 @@ static void heartbeat_write(void) {
         (unsigned long long)g_psx_bail_resolved,
         (unsigned long long)g_psx_bail_flattened,
         (unsigned long long)g_psx_bail_anomaly,
+        s_dump_policy.automatic_dumps,
+        s_dump_policy.failed_dumps,
+        s_dump_policy.suppressed_events,
+        (unsigned)FREEZE_DUMP_AUTO_LIMIT,
         g_psx_fatal_reason ? "\"" : "",
         g_psx_fatal_reason ? fatal_esc : "null",
         g_psx_fatal_reason ? "\"" : "");

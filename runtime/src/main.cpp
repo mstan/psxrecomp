@@ -2701,8 +2701,40 @@ static int host_refresh_is_approx_60hz(void) {
     return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
 }
 
+static int host_driver_vsync_unreliable(void) {
+#ifdef _WIN32
+    return 0;
+#else
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    if (const char *e = std::getenv("PSX_TRUST_DRIVER_VSYNC");
+        e && e[0] && e[0] != '0') {
+        cached = 0;
+        return cached;
+    }
+    if (std::getenv("WSL_INTEROP") || std::getenv("WSL_DISTRO_NAME")) {
+        cached = 1;
+        return cached;
+    }
+    cached = 0;
+    if (FILE *f = std::fopen("/proc/version", "rb")) {
+        char buf[512];
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        buf[n] = '\0';
+        if (std::strstr(buf, "Microsoft") || std::strstr(buf, "microsoft") ||
+            std::strstr(buf, "WSL") || std::strstr(buf, "wsl"))
+            cached = 1;
+    }
+    return cached;
+#endif
+}
+
 static int present_vsync_owns_cadence(void) {
     if (g_video_vsync == 0 || g_present_vsync_disabled)
+        return 0;
+    if (host_driver_vsync_unreliable())
         return 0;
     if (g_frame_period_ms <= 0.0)
         return 0;
@@ -2755,7 +2787,11 @@ static void log_present_cadence(void) {
     } else if (g_frame_period_ms > 0.0) {
         if (g_video_vsync != 0 && !g_frame_interpolation &&
             !g_netplay_vsync_forced_off) {
-            if (g_host_refresh_hz > 0.0) {
+            if (host_driver_vsync_unreliable()) {
+                std::printf("psxrecomp: present cadence: wall-clock pacer "
+                            "(%.4f ms/frame); driver vsync off under WSL\n",
+                            g_frame_period_ms);
+            } else if (g_host_refresh_hz > 0.0) {
                 std::printf("psxrecomp: present cadence: wall-clock pacer "
                             "(%.4f ms/frame); driver vsync off on %.0f Hz panel\n",
                             g_frame_period_ms, g_host_refresh_hz);
@@ -10625,8 +10661,8 @@ namespace {
 
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 #if defined(RECOMP_LAUNCHER)
@@ -13205,11 +13241,11 @@ session_reboot:
             g_host_refresh_hz = host_hz;
             if (host_hz >= 58.8 && host_hz <= 61.2) {
                 g_frame_period_ms = 1000.0 / host_hz;
-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
-                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %.1f Hz panel "
+                            "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
             } else {
-                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
-                            "59.94 Hz pacing\n", dm.refresh_rate);
+                std::printf("psxrecomp: host panel %.1f Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", host_hz);
             }
         }
     }
