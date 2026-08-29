@@ -573,6 +573,30 @@ static void fps_telemetry_toggle(void) {
     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
 }
 
+/* Hold-to-act host hotkeys must not fire while the game window does not hold
+ * keyboard focus.
+ *
+ * SDL_GetKeyboardState() returns a CACHED array that SDL updates from events.
+ * A key whose key-UP is delivered to some other window stays latched in that
+ * array with nothing to clear it -- and the canonical way to move focus away
+ * is Alt+TAB, where TAB is exactly the fast-forward bind. The game then runs
+ * at the fast-forward multiplier with no key held, indefinitely. Regaining
+ * focus makes SDL reconcile the array, which is why the symptom "stops" the
+ * moment you click back into the window and press anything.
+ *
+ * Gating on real input focus fixes that and is independently correct: a
+ * hold-to-turbo must not run while the player is typing in another
+ * application. Edge-triggered hotkeys are unaffected -- they go through
+ * host_keymap_match() on real key EVENTS, which are only delivered to the
+ * focused window in the first place.
+ *
+ * No window (headless, or before the window exists) means focus is not a
+ * concept here; do not suppress in that case. */
+static bool host_hotkey_input_focused(void) {
+    if (!sdl_window) return true;
+    return (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
 static int manual_fast_forward_multiplier(void) {
     static int value = -2; /* -2 = unread, -1 = max/unbounded */
     if (value == -2) {
@@ -6601,7 +6625,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         static int turbo_skip = 0;
         static int turbo_was_down = 0;
-        if (host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
+        if (host_hotkey_input_focused() &&
+            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
