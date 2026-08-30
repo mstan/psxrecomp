@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
 RUNTIME = Path(__file__).resolve().parents[1]
 REPO = RUNTIME.parent
 SCRIPT = RUNTIME / "hash_codegen.cmake"
