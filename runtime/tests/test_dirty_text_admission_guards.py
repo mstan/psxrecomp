@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Keep CPU text writes separate from explicit overlay admission."""
 
-from pathlib import Path
 import argparse
+import re
 import sys
+from pathlib import Path
 
 
 def function_body(source: str, signature: str) -> str:
@@ -42,7 +43,13 @@ def main() -> int:
     read = cd_slice.index("uint32_t word = cdrom_dma_read();")
     store = cd_slice.index("psx_write_word(addr, word);", read)
     admit = cd_slice.index("dirty_ram_mark_executable_range(addr, 4);", store)
-    advance = cd_slice.index("addr = (addr + addr_step)", admit)
+    advance_match = re.search(
+        r"addr\s*=\s*dma_madr\s*\(\s*\(\s*addr\s*\+\s*addr_step\s*\)\s*\)\s*;",
+        cd_slice[admit:],
+    )
+    if advance_match is None:
+        raise AssertionError("CD DMA address no longer advances through dma_madr")
+    advance = admit + advance_match.start()
     if not read < store < admit < advance:
         raise AssertionError("CD DMA overlay admission is not coupled to each RAM word")
 
