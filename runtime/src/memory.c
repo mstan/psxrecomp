@@ -25,6 +25,7 @@
 #include "psx_cycles.h"
 #include "starvation_ring.h"
 #include "psx_ram.h"
+#include "psx_ram_profile.h"
 #include "pgxp.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -39,10 +40,10 @@
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
 static uint8_t ram[RAM_SIZE];
-static int s_ram_8mb_requested;
+static PSXRamSizeRequest s_ram_request = PSX_RAM_SIZE_REQUEST_INITIALIZER;
 
-uint32_t g_psx_ram_size = PSX_RAM_2MB;
-uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
+uint32_t g_psx_ram_size = PSX_MAIN_RAM_BYTES;
+uint32_t g_psx_ram_mask = PSX_MAIN_RAM_BYTES - 1u;
 
 /* High-bank pages registered as unique DRAM in 8 MB mode (enhancement heaps).
  * Index 0 = page 512 (phys 0x200000). Unregistered high banks keep 2 MiB fold.
@@ -206,13 +207,13 @@ uint32_t memory_get_ram_bytes(void) { return g_psx_ram_size; }
 int      psx_ram_8mb_active(void) { return g_psx_ram_size > PSX_RAM_2MB; }
 
 void psx_ram_reset_size_request(void) {
-    s_ram_8mb_requested = 0;
+    psx_ram_size_request_reset(&s_ram_request);
     memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
 }
 
 int psx_mod_set_main_ram_8mb(int enabled) {
-    s_ram_8mb_requested = enabled ? 1 : 0;
-    if (enabled) {
+    psx_ram_size_request_set_mod(&s_ram_request, enabled);
+    if (s_ram_request.expanded) {
         /* Full high window unique (DuckStation-style). Required for Wipeout
          * enhanced heaps that write through the top bank; partial aliasing
          * folded those stores onto overlay RAM and crashed race start. */
@@ -236,14 +237,11 @@ static int psx_ram_any_high_registered(void) {
 }
 
 static void psx_ram_apply_size_request(void) {
-    if (s_ram_8mb_requested) {
-        g_psx_ram_size = PSX_RAM_8MB;
-        g_psx_ram_mask = PSX_RAM_8MB - 1u;
+    g_psx_ram_size = psx_ram_size_request_bytes(&s_ram_request);
+    g_psx_ram_mask = g_psx_ram_size - 1u;
+    if (g_psx_ram_size > PSX_RAM_2MB) {
         if (!psx_ram_any_high_registered())
             psx_ram_register_unique(PSX_RAM_2MB, PSX_RAM_8MB - PSX_RAM_2MB);
-    } else {
-        g_psx_ram_size = PSX_RAM_2MB;
-        g_psx_ram_mask = PSX_RAM_2MB - 1u;
     }
 }
 
