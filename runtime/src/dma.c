@@ -156,14 +156,15 @@ static uint32_t dicr;  /* 0x1F8010F4: DMA interrupt control */
 #define DICR_WRITE_MASK 0x00FF807Fu
 #define DICR_RESET_MASK 0x7F000000u
 
+static uint32_t dicr_read_value(uint32_t v);
+
+#ifndef PSX_NO_DEBUG_TOOLS
 static DMATraceEntry dma_trace[DMA_TRACE_CAP];
 static uint64_t dma_trace_seq;
 static DMACDROMHistoryEntry cdrom_dma_history[DMA_CDROM_HISTORY_CAP];
 static uint64_t cdrom_dma_history_seq;
 static DMACDROMHistoryEntry cdrom_dma_active_entry;
 static uint8_t cdrom_dma_history_active;
-
-static uint32_t dicr_read_value(uint32_t v);
 
 static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
                       uint32_t dicr_before, uint32_t i_stat_before) {
@@ -211,6 +212,10 @@ static void trace_dma_reg_write(uint32_t addr, uint32_t val, uint32_t mask,
     e->func = g_debug_current_func_addr;
     e->pc = g_debug_last_store_pc;
 }
+#else
+#define trace_dma(kind, ch, total_words, dicr_before, i_stat_before) ((void)0)
+#define trace_dma_reg_write(addr, val, mask, dicr_before, i_stat_before) ((void)0)
+#endif
 
 /* ---- Helpers ---- */
 
@@ -243,6 +248,7 @@ static void raise_dma_irq_on_master_edge(uint32_t before) {
     }
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static void start_cdrom_dma_capture(uint32_t requested_words) {
     CDROMDebugState s;
     cdrom_debug_snapshot(&s);
@@ -310,6 +316,11 @@ static void finish_cdrom_dma_capture(uint32_t final_addr, uint8_t completed) {
         cdrom_dma_active_entry;
     cdrom_dma_history_active = 0;
 }
+#else
+#define start_cdrom_dma_capture(requested_words) ((void)0)
+#define record_cdrom_dma_word(word) ((void)0)
+#define finish_cdrom_dma_capture(final_addr, completed) ((void)0)
+#endif
 
 static int channel_enabled(int ch) {
     /* DPCR: each channel has 4 bits, bit 3 of each group is enable.
@@ -1303,25 +1314,39 @@ void dma_write(uint32_t addr, uint32_t val) {
 }
 
 uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (out_entries) *out_entries = NULL;
+    return 0;
+#else
     if (out_entries) *out_entries = dma_trace;
     return dma_trace_seq;
+#endif
 }
 
 void dma_debug_clear_trace(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(dma_trace, 0, sizeof(dma_trace));
     dma_trace_seq = 0;
+#endif
 }
 
 uint64_t dma_debug_get_cdrom_history(const DMACDROMHistoryEntry** out_entries) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (out_entries) *out_entries = NULL;
+    return 0;
+#else
     if (out_entries) *out_entries = cdrom_dma_history;
     return cdrom_dma_history_seq;
+#endif
 }
 
 void dma_debug_clear_cdrom_history(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(cdrom_dma_history, 0, sizeof(cdrom_dma_history));
     memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
     cdrom_dma_history_seq = 0;
     cdrom_dma_history_active = 0;
+#endif
 }
 
 void dma_debug_get_state(DMADebugState* out) {
