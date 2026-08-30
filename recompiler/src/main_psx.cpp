@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cerrno>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -82,7 +83,7 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 
 } // namespace
 
-int main(int argc, char** argv) {
+static int psxrecomp_main(int argc, char** argv) {
     const auto print_usage = [&]() {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
         fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
@@ -1728,4 +1729,16 @@ int main(int argc, char** argv) {
     }
 
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return psxrecomp_main(argc, argv);
+    } catch (const std::exception& e) {
+        fmt::print(stderr, "psxrecomp-game: {}\n", e.what());
+        return 1;
+    } catch (...) {
+        fmt::print(stderr, "psxrecomp-game: unknown fatal error\n");
+        return 1;
+    }
 }
