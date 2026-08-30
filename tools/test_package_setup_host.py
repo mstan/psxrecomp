@@ -64,6 +64,22 @@ def _write_host_fixture(root: Path, version: str = "1.2.3") -> None:
     (build / "psx_game_version.txt").write_text(version + "\n", encoding="utf-8")
 
 
+def _write_windows_host_fixture(root: Path, payload: bytes = b"unstripped-host") -> Path:
+    _write_host_fixture(root)
+    (root / "VERSION").write_text("1.2.3\n", encoding="utf-8")
+    host = root / "build/Host.exe"
+    host.write_bytes(payload)
+    (root / "build/Host").unlink()
+    return host
+
+
+def _write_strip_fixture(root: Path, body: str) -> Path:
+    tool = root / "fixture-strip"
+    tool.write_text("#!/bin/sh\n" + body, encoding="utf-8", newline="\n")
+    tool.chmod(0o755)
+    return tool
+
+
 def test_rejects_path_bearing_output_slugs_before_deletion(tmp_path: Path) -> None:
     sentinel = tmp_path / "sentinel"
     sentinel.mkdir()
@@ -160,3 +176,54 @@ def test_packaging_does_not_rewrite_source_version(tmp_path: Path) -> None:
         text=True,
     )
     assert status.stdout.strip() == "M VERSION"
+
+
+def test_windows_host_is_stripped_only_after_copy(
+    tmp_path: Path,
+) -> None:
+    source = _write_windows_host_fixture(tmp_path)
+    source_payload = source.read_bytes()
+    strip_tool = _write_strip_fixture(
+        tmp_path,
+        '[ "$1" = "--strip-all" ] || exit 9\nprintf "stripped-host" >"$2"\n',
+    )
+
+    result = _run(
+        tmp_path,
+        "--strip-tool",
+        _bash_path(strip_tool),
+        "--project-file",
+        "VERSION",
+    )
+
+    assert result.returncode == 1
+    assert "stripped staged release host" in result.stdout
+    assert "psxrecomp missing" in result.stderr
+    assert source.read_bytes() == source_payload
+    staged = tmp_path / "dist/stage-setup-linux-x64/Host.exe"
+    assert staged.read_bytes() == b"stripped-host"
+
+
+def test_windows_host_packaging_fails_when_stripping_fails(
+    tmp_path: Path,
+) -> None:
+    source = _write_windows_host_fixture(tmp_path)
+    source_payload = source.read_bytes()
+    strip_tool = _write_strip_fixture(tmp_path, "exit 7\n")
+
+    result = _run(tmp_path, "--strip-tool", _bash_path(strip_tool))
+
+    assert result.returncode == 1
+    assert "failed to strip staged release host" in result.stderr
+    assert "psxrecomp missing" not in result.stderr
+    assert source.read_bytes() == source_payload
+
+
+def test_explicit_missing_strip_tool_is_fatal(tmp_path: Path) -> None:
+    _write_windows_host_fixture(tmp_path)
+
+    result = _run(tmp_path, "--strip-tool", "/definitely/missing/strip")
+
+    assert result.returncode == 1
+    assert "configured strip tool is not executable" in result.stderr
+    assert "psxrecomp missing" not in result.stderr
