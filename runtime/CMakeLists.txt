@@ -547,6 +547,12 @@ if(BUILD_TESTING)
     add_test(NAME overlay_store_cycle_barrier_test
              COMMAND overlay_store_cycle_barrier_test)
 
+    add_executable(overlay_cycle_retirement_test
+        tests/test_overlay_cycle_retirement.c)
+    target_include_directories(overlay_cycle_retirement_test PRIVATE include)
+    add_test(NAME overlay_cycle_retirement_test
+             COMMAND overlay_cycle_retirement_test)
+
     add_executable(psx_cycle_event_boundaries_test
         tests/test_psx_cycle_event_boundaries.c
         src/psx_cycles.c)
