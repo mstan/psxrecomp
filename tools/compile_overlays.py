@@ -5607,7 +5607,7 @@ def main():
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
     ap.add_argument('--static-symbol-prefix', type=parse_static_symbol_prefix,
-                    default='', metavar='IDENT',
+                    default=None, metavar='IDENT',
                     help='namespace static output symbols (for example, highram '
                          'emits psx_overlay_dispatch_highram and ov_highram_*)')
     ap.add_argument('--flavor',          type=int, default=0,
