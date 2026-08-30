@@ -631,6 +631,11 @@ int psx_irq_resume_context_snapshot_site(void)
     return g_cosim_dirty_pump_site;
 }
 
+uint32_t psx_irq_resume_context_snapshot_pc(void)
+{
+    return g_dirty_safe_resume_pc;
+}
+
 int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc)
 {
     if (g_cosim_dirty_pump_site == 0)

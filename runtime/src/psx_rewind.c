@@ -321,16 +321,20 @@ static int resume_pc_ok(uint32_t pc)
  * savestate_resolve_resume_pc / selfcheck sc_pick_snap_pc. */
 static uint32_t rewind_resolve_resume_pc(const CPUState *cpu, uint32_t hint)
 {
-    const uint32_t cands[6] = {
-        hint,
-        cpu ? cpu->pc : 0u,
-        psx_compiled_irq_resume_pc(),
-        psx_last_irq_check_pc(),
-        psx_netplay_rb_sticky_bb_pc(),
-        cpu ? cpu->gpr[31] : 0u,
-    };
+    uint32_t cands[7];
+    int n = 0;
     int i;
-    for (i = 0; i < 6; ++i) {
+
+    if (psx_irq_resume_context_snapshot_site() != 0)
+        cands[n++] = psx_irq_resume_context_snapshot_pc();
+    cands[n++] = hint;
+    cands[n++] = cpu ? cpu->pc : 0u;
+    cands[n++] = psx_compiled_irq_resume_pc();
+    cands[n++] = psx_last_irq_check_pc();
+    cands[n++] = psx_netplay_rb_sticky_bb_pc();
+    cands[n++] = cpu ? cpu->gpr[31] : 0u;
+
+    for (i = 0; i < n; ++i) {
         if (resume_pc_ok(cands[i]))
             return cands[i];
     }

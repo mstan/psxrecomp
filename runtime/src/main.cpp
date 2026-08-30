@@ -5946,15 +5946,6 @@ static void savestate_menu_close(void) {
     host_osd_push("Save states closed", 800);
 }
 
-static int savestate_menu_available(void) {
-    if (psx_rewind_enabled())
-        return 1;
-    host_osd_push(g_rewind_enabled
-        ? "Save states unavailable"
-        : "Save states off - enable Rewind in Settings", 1800);
-    return 0;
-}
-
 static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
     if (psx_rewind_is_open())
         return;
@@ -5962,8 +5953,6 @@ static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
         savestate_menu_close();
         return;
     }
-    if (!savestate_menu_available())
-        return;
     savestate_menu_open = 1;
     savestate_menu_ignore_toggle_release = 1;
     savestate_menu_open_key = opened_by_key;
@@ -5980,8 +5969,6 @@ static void savestate_menu_move(int delta) {
 }
 
 static int savestate_submit_slot(int slot, int save) {
-    if (!psx_netplay_active() && !savestate_menu_available())
-        return 0;
     if (!save && !savestate_slot_exists(slot)) {
         char msg[32];
         snprintf(msg, sizeof(msg), "Slot %d is empty", slot + 1);
