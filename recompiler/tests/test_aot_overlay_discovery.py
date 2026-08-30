@@ -28,6 +28,43 @@ EXTRACT_SPEC.loader.exec_module(EXTRACT)
 LOAD = 0x80010000
 
 
+def find_host_gcc():
+    """Prefer the configured host compiler, with MSYS2 as a last resort."""
+    configured = os.environ.get('CC')
+    if configured:
+        candidate = configured.strip()
+        if (len(candidate) >= 2 and candidate[0] == candidate[-1] and
+                candidate[0] in ('"', "'")):
+            candidate = candidate[1:-1]
+        resolved = shutil.which(candidate)
+        if not resolved and pathlib.Path(candidate).is_file():
+            resolved = candidate
+        if not resolved:
+            raise AssertionError(
+                'CC must name one compiler executable without arguments: '
+                f'{configured!r}')
+        return resolved
+
+    candidates = [
+        shutil.which('gcc'),
+        shutil.which('cc'),
+        (r'C:\msys64\mingw64\bin\gcc.exe' if os.name == 'nt' else None),
+    ]
+    for candidate in candidates:
+        if candidate and pathlib.Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def compile_test_dll(gcc, source, output):
+    """Compile a test DLL with the compiler's runtime directory on PATH."""
+    env, _toolchain_dir = MOD._toolchain_env(gcc)
+    result = subprocess.run(
+        [gcc, '-shared', str(source), '-o', str(output)],
+        env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def put(data, offset, word):
     struct.pack_into("<I", data, offset, word)
 
@@ -1494,8 +1531,8 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
             import _ctypes
             import ctypes
             import shutil
-            gcc = r'C:\msys64\mingw64\bin\gcc.exe'
-            assert os.path.isfile(gcc), "real loaded-DLL regression needs MinGW gcc"
+            gcc = find_host_gcc()
+            assert gcc, "real loaded-DLL regression needs a host gcc/cc"
             with tempfile.TemporaryDirectory() as tmp:
                 # The actual host compiler must export the same 64-bit identity
                 # serialized in P; this catches width/decorated-name mistakes
@@ -1510,8 +1547,7 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                     '__declspec(dllexport) void overlay_flush_cycles(void) {}\n' +
                     '__declspec(dllexport) void func_80010000(void *p) {(void)p;}\n' +
                     MOD.add_overlay_pair_export('', pair_id))
-                subprocess.run([gcc, '-shared', str(pair_source), '-o', pair_dll],
-                               check=True, capture_output=True, text=True)
+                compile_test_dll(gcc, pair_source, pair_dll)
                 pair_func_ids = [(0x80010000, 0xDEADBEEF,
                                   [(0x80010000, 0x10)])]
                 pathlib.Path(pair_dll).with_suffix('.ranges').write_text(
@@ -1541,8 +1577,7 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                 staged = str(pathlib.Path(tmp) / ".new.dll")
                 staged_ranges = str(pathlib.Path(tmp) / ".new.ranges")
                 source.write_text("__declspec(dllexport) int loaded(void) { return 7; }\n")
-                subprocess.run([gcc, '-shared', str(source), '-o', final],
-                               check=True, capture_output=True, text=True)
+                compile_test_dll(gcc, source, final)
                 pathlib.Path(ranges).write_text("OLD-RANGES\n")
                 shutil.copyfile(final, staged)
                 pathlib.Path(staged_ranges).write_text("NEW-RANGES\n")
@@ -2198,8 +2233,8 @@ def check_candidate_capacity_publication():
     if os.name == 'nt':
         # Exact pairs racing to distinct names may both commit: the namespace
         # lock makes the second writer observe the first pair's dedup identity.
-        gcc = r'C:\msys64\mingw64\bin\gcc.exe'
-        assert os.path.isfile(gcc)
+        gcc = find_host_gcc()
+        assert gcc, "candidate publication regression needs a host gcc/cc"
         with tempfile.TemporaryDirectory() as tmp:
             pair_id = 0x1020304050607080
             source = pathlib.Path(tmp) / 'capacity.c'
@@ -2212,9 +2247,7 @@ def check_candidate_capacity_publication():
                 '__declspec(dllexport) void overlay_init(const void*p){(void)p;}\n'
                 '__declspec(dllexport) void overlay_flush_cycles(void){}\n'
                 '__declspec(dllexport) void func_80010000(void*p){(void)p;}\n')
-            subprocess.run(
-                [gcc, '-shared', str(source), '-o', str(template)],
-                check=True, capture_output=True, text=True)
+            compile_test_dll(gcc, source, template)
             partial_manifest = MOD.overlay_ranges_text([
                 (LOAD, 1, ((LOAD, 4),)),
                 (LOAD + 4, 2, ((LOAD + 4, 4),)),
@@ -2272,9 +2305,7 @@ except m.ShardCandidateCapacityError:
                     '__declspec(dllexport) void overlay_init(const void*p){(void)p;}\n'
                     '__declspec(dllexport) void overlay_flush_cycles(void){}\n'
                     '__declspec(dllexport) void func_80010000(void*p){(void)p;}\n')
-                subprocess.run(
-                    [gcc, '-shared', str(source), '-o', str(template)],
-                    check=True, capture_output=True, text=True)
+                compile_test_dll(gcc, source, template)
                 staged_ranges = pathlib.Path(tmp) / f'.distinct-{index}.ranges'
                 staged_ranges.write_text(MOD.overlay_ranges_text(
                     [(LOAD, 1, ((LOAD, 4),))], pair_id))
@@ -2977,7 +3008,16 @@ def check_interior_fragment_contract():
                 f"P {pair_id:016X}\nF {entry:08X} {code_crc:08X} junk\n"
                 f"R {entry:08X} 8\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
-            outside = 0x80200000
+            # Manifests cover the full 8 MiB host capacity so expanded-RAM
+            # enhancement code in the high banks remains eligible even for a
+            # title whose retail memory profile defaults to 2 MiB.
+            high_bank = 0x80200000
+            ranges.write_text(
+                f"P {pair_id:016X}\nF {high_bank:08X} {code_crc:08X}\n"
+                f"R {high_bank:08X} 4\n")
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                high_bank & 0x1FFFFFFF}
+            outside = 0x80800000
             ranges.write_text(
                 f"P {pair_id:016X}\nF {outside:08X} {code_crc:08X}\n"
                 f"R {outside:08X} 4\n")
@@ -3096,9 +3136,7 @@ def check_tcc_runtime_define_parity():
 
 def check_real_batched_fragment_publication(recompiler):
     """A poorer same-byte pair stays intact while one richer supplement wins."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_host_gcc()
     if not gcc:
         return
 
@@ -3182,9 +3220,7 @@ def check_real_batched_fragment_publication(recompiler):
 
 def check_real_hosted_fragment_publication(recompiler):
     """Only exact cached-owner identity may authorize a hosted alias pair."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_host_gcc()
     if not gcc:
         return
     data = bytearray(0x100)
@@ -3334,9 +3370,7 @@ def check_real_hosted_fragment_publication(recompiler):
 
 def check_full_hosted_fixed_point(recompiler):
     """A clean two-variant CLI build must make its second run a true no-op."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_host_gcc()
     if not gcc:
         return
     host = LOAD
@@ -3446,9 +3480,7 @@ def check_full_hosted_fixed_point(recompiler):
 
 def check_full_candidate_cli_fastpath(recompiler):
     """An already-full single-tier cache must bypass every compile recipe."""
-    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
-           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
-           else shutil.which('gcc'))
+    gcc = find_host_gcc()
     if not gcc:
         return
     with tempfile.TemporaryDirectory() as td:
@@ -3465,7 +3497,8 @@ def check_full_candidate_cli_fastpath(recompiler):
         game_toml = ROOT / 'tools' / 'cycle_testrom' / 'game.toml'
         cache_root = tmp / 'cache'
         # MUST match compile_overlays.py's cache_dir exactly, including the
-        # _gc<config-hash> component — a prefill staged one directory off is
+        # _gc<config-hash> and _f<flavor> components — a prefill staged one
+        # directory off is
         # simply not found, and the run then compiles for real instead of
         # taking the fast path this test exists to assert. This drifted when
         # the config hash was added to the cache path and went unnoticed
@@ -3474,7 +3507,8 @@ def check_full_candidate_cli_fastpath(recompiler):
         leaf = (cache_root / 'CYCT-00101' / 'gcc' / MOD.cache_arch_abi() /
                 f'cg{MOD.codegen_ver(str(runtime_include))}_'
                 f'{MOD.codegen_hash(str(runtime_include)):08x}_'
-                f'gc{MOD.overlay_config_hash(recompiler, str(game_toml)):08x}')
+                f'gc{MOD.overlay_config_hash(recompiler, str(game_toml)):08x}_'
+                'f0')
         leaf.mkdir(parents=True)
         pair_id = 0x123456789ABCDEF0
         captured_bytes = b'\x08\x00\xE0\x03\x00\x00\x00\x00'
@@ -3496,9 +3530,7 @@ def check_full_candidate_cli_fastpath(recompiler):
             'EX void overlay_flush_cycles(void){}\n'
             'EX void func_80010000(void*p){(void)p;}\n',
             encoding='utf-8')
-        subprocess.run(
-            [gcc, '-shared', str(source), '-o', str(dll)],
-            check=True, capture_output=True, text=True)
+        compile_test_dll(gcc, source, dll)
         manifest = dll.with_suffix('.ranges')
         manifest.write_text(MOD.overlay_ranges_text([
             (LOAD, code_crc, ((LOAD, 8),)),
