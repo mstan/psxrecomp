@@ -4143,8 +4143,9 @@ typedef struct {
     uint32_t out_regs[34];   /* r0..r31, hi, lo at exit                        */
 } FpEnt;
 #define FP_CAP (1u << 16)   /* ~19 MB with full reg files; ~65K executions     */
-static FpEnt    s_fp[FP_CAP];
+static FpEnt   *s_fp = NULL;
 static uint64_t s_fp_seq = 0;
+static int      s_fp_enabled = -1;
 
 int overlay_loader_is_candidate(uint32_t phys) {
     if (!s_active) return 0;
@@ -4152,12 +4153,19 @@ int overlay_loader_is_candidate(uint32_t phys) {
 }
 
 int overlay_fp_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
+    if (s_fp_enabled < 0) {
         const char *e = getenv("PSX_OVERLAY_FP_LOG");
-        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        s_fp_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (s_fp_enabled) {
+            s_fp = (FpEnt *)malloc(sizeof(*s_fp) * FP_CAP);
+            if (!s_fp) {
+                s_fp_enabled = 0;
+                loader_log("PSX_OVERLAY_FP_LOG disabled: cannot allocate %llu-byte ring",
+                           (unsigned long long)(sizeof(*s_fp) * FP_CAP));
+            }
+        }
     }
-    return enabled;
+    return s_fp_enabled;
 }
 
 /* ---- Same-state native↔interp differential (confident measurement) ------ */
@@ -4776,6 +4784,7 @@ static uint32_t regs34_crc(const uint32_t *r) {
 void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                     const CPUState *cpu, int native) {
     extern uint64_t psx_get_cycle_count(void);
+    if (!overlay_fp_enabled()) return;
     uint64_t s = s_fp_seq++;
     FpEnt *e = &s_fp[s & (FP_CAP - 1u)];
     e->seq = s; e->cycle = psx_get_cycle_count();
@@ -4829,7 +4838,7 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
 int overlay_loader_write_fp_file(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    uint64_t total = s_fp_seq;
+    uint64_t total = s_fp ? s_fp_seq : 0;
     uint64_t start = (total > FP_CAP) ? (total - FP_CAP) : 0;
     fputc('[', f);
     int first = 1, count = 0;
