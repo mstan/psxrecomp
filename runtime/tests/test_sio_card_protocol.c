@@ -83,6 +83,9 @@ void psx_irq_raise(uint32_t bit, uint32_t detail) {
     (void)detail;
     i_stat |= 1u << bit;
 }
+void psx_irq_refresh_cause_ip2(void) {}
+uint32_t gpu_vblank_period_cycles(void) { return 564480u; }
+uint32_t gpu_get_crtc_refresh_multiplier(void) { return 1u; }
 
 /* ---- Test harness ---- */
 
