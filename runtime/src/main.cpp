@@ -14889,12 +14889,13 @@ session_reboot:
             std::fprintf(tf, "{\n  \"final_pc\": \"0x%08X\",\n  \"final_ra\": \"0x%08X\",\n"
                             "  \"final_sp\": \"0x%08X\",\n  \"fntrace_seq\": %llu,\n  \"tail\": [\n",
                          cpu.pc, cpu.gpr[31], cpu.gpr[29],
-                         (unsigned long long)g_fntrace_seq);
-            uint64_t seq = g_fntrace_seq;
+                         (unsigned long long)fntrace_total());
+            uint64_t seq = fntrace_total();
             uint32_t n = seq < 128u ? (uint32_t)seq : 128u;
             for (uint32_t i = 0; i < n; i++) {
                 uint64_t idx = seq - n + i;
-                const FntraceEntry* e = &g_fntrace_ring[idx % FNTRACE_RING_CAP];
+                const FntraceEntry* e = fntrace_get(idx);
+                if (!e) continue;
                 std::fprintf(tf,
                     "    {\"seq\":%llu,\"frame\":%u,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
                     "\"sp\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\"}%s\n",

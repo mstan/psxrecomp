@@ -58,6 +58,16 @@
 #error DEFAULT_DEBUG_PORT must be defined by the runtime target.
 #endif
 
+/* Play builds keep the public debug/freeze APIs link-compatible, but their
+ * producers are compiled as no-ops and the TCP server is never started.  Keep
+ * a single legal ring slot so the retained serializers remain safe without
+ * reserving hundreds of MiB for data that cannot be produced. */
+#ifdef PSX_NO_DEBUG_TOOLS
+#  define PSX_DEBUG_RING_CAP(debug_cap_) 1u
+#else
+#  define PSX_DEBUG_RING_CAP(debug_cap_) (debug_cap_)
+#endif
+
 /* ---- Platform sockets ---- */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -171,7 +181,7 @@ uint64_t g_fp_mmio_hash  = 1469598103934665603ULL;  /* SEPARATE: device-register
 uint64_t g_fp_mmio_count = 0;
 uint64_t g_fp_sp_hash    = 1469598103934665603ULL;  /* SEPARATE: scratchpad (0x1F8000xx) writes */
 uint64_t g_fp_sp_count   = 0;
-#define FP_RING_CAP 32768
+#define FP_RING_CAP PSX_DEBUG_RING_CAP(32768u)
 typedef struct { uint32_t frame; uint64_t wr_hash; uint64_t pc_hash; uint64_t wcount;
                  uint64_t mmio_hash; uint64_t mmio_count;
                  uint64_t sp_hash; uint64_t sp_count; uint64_t cyc; } FpEntry;
@@ -248,7 +258,7 @@ static void fp_snapshot(uint32_t frame)
  * writes (previously the blind spot), MMIO writes, and MMIO reads. The literal
  * first divergent ACCESS (read or write) is the first index whose tuple differs
  * between two runs. */
-#define REC_CAP 400000
+#define REC_CAP PSX_DEBUG_RING_CAP(400000u)
 #define REC_KIND_RAM_W   0   /* main-RAM write   */
 #define REC_KIND_SP_W    1   /* scratchpad write */
 #define REC_KIND_MMIO_W  2   /* device-register write */
@@ -362,7 +372,7 @@ static PSX_BSS Watchpoint s_watchpoints[MAX_WATCHPOINTS];
  * to 256K-entry caps unless an explicit need for more arises — at 60Hz
  * and ~thousand events/frame that's still ~4 sec of coverage per ring,
  * and total runtime memory stays under ~100 MB worst-case. */
-#define WRITE_TRACE_CAP (1 << 18)
+#define WRITE_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 18)
 typedef struct {
     uint64_t seq;        /* monotonic sequence number */
     uint32_t addr;       /* physical RAM address */
@@ -404,7 +414,7 @@ static uint32_t s_wtrace_head = 0;
  * first writes to a few high-value startup ranges and then stops, so late
  * probes can answer "what initialized/reset this?" even after the normal trace
  * has rolled. */
-#define WRITE_TRACE_BOOT_CAP (1 << 18)
+#define WRITE_TRACE_BOOT_CAP PSX_DEBUG_RING_CAP(1u << 18)
 static WriteTraceEntry *s_wtrace_boot = NULL;
 static uint64_t s_wtrace_boot_total = 0;  /* matching writes ever seen */
 static uint32_t s_wtrace_boot_count = 0;  /* entries retained */
@@ -425,7 +435,7 @@ static int s_wtrace_range_count = 0;
  * a range. Lean record (no register window) keeps 4M entries at ~128 MB;
  * this is intentionally large enough to retain Tomba's boot-to-OPTIONS
  * window for post-hoc initialization questions. */
-#define WRITE_TRACE_ALL_CAP (1 << 22)
+#define WRITE_TRACE_ALL_CAP PSX_DEBUG_RING_CAP(1u << 22)
 typedef struct {
     uint64_t seq;
     uint32_t addr;
@@ -445,7 +455,7 @@ static uint32_t s_wtrace_all_head = 0;
  * roll it before a boot-to-menu transition is diagnosed. This ring keeps a
  * long-lived timeseries for high-value scheduler/render state by recording only
  * writes whose value changed. */
-#define WRITE_TRACE_TRANS_CAP (1 << 20)
+#define WRITE_TRACE_TRANS_CAP PSX_DEBUG_RING_CAP(1u << 20)
 #define WTRACE_TRANS_MAX_RANGES 16
 typedef struct {
     uint64_t seq;
@@ -491,7 +501,7 @@ uint64_t g_dispatch_static_hits = 0;
  * 1<<22 entries x 32 bytes = 128 MiB. This is intentionally much larger
  * than the old 64K ring because BIOS pad/card polling can burn through
  * tens of thousands of MMIO writes before a useful post-failure query. */
-#define SIO_PC_TRACE_CAP (1 << 18)
+#define SIO_PC_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 18)
 typedef struct {
     uint64_t seq;
     uint32_t pc;            /* g_debug_last_store_pc at the moment of write */
@@ -508,7 +518,7 @@ static uint64_t s_sio_pc_trace_seq = 0;
 /* Compact register sidecar for SIO_CTRL writes.  The broad SIO PC ring keeps
  * the long timeline; this smaller ring carries the CPU state needed to explain
  * BIOS chain-driver branch decisions around SELECT resets. */
-#define SIO_CTRL_REG_TRACE_CAP (1 << 16)
+#define SIO_CTRL_REG_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t pc;
@@ -540,7 +550,7 @@ static uint64_t s_sio_ctrl_reg_trace_seq = 0;
  * the high-volume SIO/MMIO rings show what happened on the bus, while this
  * ring shows whether exception nonlocal control flow skipped a callback's
  * normal return-value cleanup. */
-#define RESTORE_TRACE_CAP (1 << 16)
+#define RESTORE_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t kind;
@@ -571,7 +581,7 @@ typedef struct {
 static PSX_BSS RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
 static uint64_t s_restore_trace_seq = 0;
 
-#define THREAD_TRACE_CAP (1 << 16)
+#define THREAD_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t kind;
@@ -620,7 +630,7 @@ typedef struct {
 static PSX_BSS ThreadTraceEntry s_thread_trace[THREAD_TRACE_CAP];
 static uint64_t s_thread_trace_seq = 0;
 
-#define SREG_TRACE_CAP (1 << 18)
+#define SREG_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 18)
 typedef struct {
     uint64_t seq;
     uint32_t tcb;
@@ -651,7 +661,7 @@ static PSX_BSS SregTraceEntry s_sreg_trace[SREG_TRACE_CAP];
 static uint64_t s_sreg_trace_seq = 0;
 static SregLastEntry s_sreg_last[32];
 
-#define PROBE_TRACE_CAP (1 << 16)
+#define PROBE_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t pc;
@@ -707,12 +717,9 @@ void debug_server_log_probe(uint32_t pc, CPUState *cpu)
 #endif /* PSX_NO_DEBUG_TOOLS */
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val)
 {
-#ifdef PSX_NO_DEBUG_TOOLS
-    (void)kind; (void)target_pc; (void)jmp_val;
-    return;
-#endif
     RestoreTraceEntry *e =
         &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
     CPUState *cpu = s_cpu;
@@ -741,6 +748,7 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     e->frame         = (uint32_t)s_frame_count;
     e->in_exception  = (uint8_t)psx_get_in_exception();
 }
+#endif
 
 extern uint16_t psx_read_half(uint32_t addr);
 static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
@@ -890,15 +898,12 @@ static void sreg_trace_record(uint32_t func_addr)
     memcpy(last->s, cur, sizeof(cur));
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t current_tcb,
                                    uint32_t target_tcb,
                                    uint32_t target_pc)
 {
-#ifdef PSX_NO_DEBUG_TOOLS
-    (void)kind; (void)cpu; (void)current_tcb; (void)target_tcb; (void)target_pc;
-    return;
-#endif
     if (!cpu) return;
     ThreadTraceEntry *e =
         &s_thread_trace[s_thread_trace_seq % THREAD_TRACE_CAP];
@@ -947,6 +952,7 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
     e->frame           = (uint32_t)s_frame_count;
     e->in_exception    = (uint8_t)psx_get_in_exception();
 }
+#endif
 
 static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
                                            uint32_t byte_seq) {
@@ -976,11 +982,8 @@ static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
     e->counter_7514 = psx_read_byte(0x7514);
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
-#ifdef PSX_NO_DEBUG_TOOLS
-    (void)addr; (void)value; (void)width;
-    return;
-#endif
     SioPcTraceEntry *e = &s_sio_pc_trace[s_sio_pc_trace_seq % SIO_PC_TRACE_CAP];
     uint32_t byte_seq = sio_get_seq();
     e->seq      = s_sio_pc_trace_seq++;
@@ -993,11 +996,12 @@ void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
     if (addr == 0x1F80104Au)
         debug_server_log_sio_ctrl_regs(value, width, byte_seq);
 }
+#endif
 
 /* ---- Dispatch trace ring buffer ----
  * Records every dispatched function address for post-mortem analysis.
  * 64K entries, stack-allocated (256 KB). */
-#define DISPATCH_TRACE_CAP (1 << 16)
+#define DISPATCH_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 static PSX_BSS uint32_t s_dispatch_ring[DISPATCH_TRACE_CAP];
 static uint64_t s_dispatch_seq = 0;
 
@@ -1006,7 +1010,7 @@ static uint64_t s_dispatch_seq = 0;
  * generated function AND doesn't match any trampoline pattern in
  * traps.c. Used to identify functions the recompiler missed.
  * 64K entries × 32 bytes = 2 MB. Replaces the prior file-based log. */
-#define UNKNOWN_DISPATCH_CAP (1 << 16)
+#define UNKNOWN_DISPATCH_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t addr;
@@ -1027,7 +1031,7 @@ UnknownDispatchEntry crash_trace_unknown_get(uint64_t seq) {
 }
 uint64_t crash_trace_unknown_seq_get(void) { return s_unknown_seq; }
 /* Per-target hit count — bounded set, ~N unique targets typically. */
-#define UNKNOWN_UNIQUE_CAP 1024
+#define UNKNOWN_UNIQUE_CAP PSX_DEBUG_RING_CAP(1024u)
 typedef struct { uint32_t phys; uint64_t count; } UnknownUniqueEntry;
 static PSX_BSS UnknownUniqueEntry s_unknown_unique[UNKNOWN_UNIQUE_CAP];
 static int s_unknown_unique_count = 0;
@@ -1070,7 +1074,7 @@ uint64_t crash_trace_dispatch_seq_get(void) { return s_dispatch_seq; }
 
 /* Unique dispatch set — tracks every unique function address ever dispatched.
  * Simple hash set with linear probing. */
-#define DISPATCH_UNIQUE_CAP 4096
+#define DISPATCH_UNIQUE_CAP PSX_DEBUG_RING_CAP(4096u)
 static PSX_BSS uint32_t s_dispatch_unique[DISPATCH_UNIQUE_CAP];
 static int s_dispatch_unique_count = 0;
 
@@ -1104,7 +1108,7 @@ static int dispatch_trace_contains(uint32_t target) {
  * read or 1..4 detection). Other dispatches go through trace_dispatch
  * untouched. */
 /* 64K entries × ~24 B ≈ 1.5 MB; holds tens of minutes of chain transitions. */
-#define CHAIN_TRACE_CAP (1 << 16)
+#define CHAIN_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq;
     uint32_t prev_target;     /* phys addr of the dispatch that just returned */
@@ -1148,8 +1152,8 @@ static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state ad
  * ≈ 7 GB.  Lazily resident — only pages actually written use RAM, so the
  * footprint grows from 0 toward the cap as the ring fills.
  * Exit ring stays modest (1<<22, ~192 MB) — exits are auxiliary.  */
-#define FN_TRACE_CAP        (1 << 18)
-#define FN_EXIT_TRACE_CAP   (1 << 18)
+#define FN_TRACE_CAP        PSX_DEBUG_RING_CAP(1u << 18)
+#define FN_EXIT_TRACE_CAP   PSX_DEBUG_RING_CAP(1u << 18)
 #define FN_STACK_DEPTH 4096
 
 typedef struct {
@@ -1184,7 +1188,7 @@ static uint64_t      s_fn_exit_seq   = 0;
  * involved in NEW GAME / LOAD GAME / OPTIONS transitions. The generic function
  * ring is either filtered or too hot; this ring preserves the boot-to-menu
  * call history without one-shot arming. */
-#define CALL_FOCUS_CAP (1 << 20)
+#define CALL_FOCUS_CAP PSX_DEBUG_RING_CAP(1u << 20)
 typedef struct {
     uint64_t seq;
     uint32_t func_addr;
@@ -1233,7 +1237,7 @@ static uint64_t s_call_focus_seq = 0;
  * during Tomba title/menu polling, so it rotates away the card-read setup
  * before we can inspect a later hang. This ring records only the BIOS public
  * card state machine and the low-level RAM card service boundary. */
-#define CARD_MGR_TRACE_CAP 65536
+#define CARD_MGR_TRACE_CAP PSX_DEBUG_RING_CAP(65536u)
 typedef struct {
     uint64_t seq;
     uint32_t func_addr;
@@ -1300,7 +1304,7 @@ static uint64_t     s_fn_tail_calls        = 0;
  * Memory: 256 snapshots × ~960B = ~240 KB. */
 #define EVCB_DELIVER_EVENT_ADDR 0x00001B44u  /* func_00001B44, RAM */
 /* 4096 snapshots × 32 entries × ~28 B ≈ 3.7 MB — holds many minutes. */
-#define EVCB_RING_CAP           4096
+#define EVCB_RING_CAP           PSX_DEBUG_RING_CAP(4096u)
 #define EVCB_MAX_ENTRIES        32
 #define EVCB_ENTRY_SIZE         28           /* sizeof EvCB on real PSX */
 
@@ -1936,7 +1940,7 @@ uint32_t g_psx_recursion_func = 0;
  * low => the native-guard tripped on a BAD TEB read (raw base/dealloc/sp at the
  * trip are dumped to verify the math). Defined always; fed only under the guard. */
 typedef struct { uint32_t frame; uint32_t entries; uint32_t max_kb; uint32_t max_func; } CeSum;
-#define CE_CAP 512u
+#define CE_CAP PSX_DEBUG_RING_CAP(512u)
 static PSX_BSS CeSum    s_ce[CE_CAP];
 static uint64_t s_ce_seq = 0;
 static uint32_t s_ce_frame = 0xFFFFFFFFu, s_ce_entries = 0, s_ce_max_kb = 0, s_ce_max_func = 0;
@@ -2121,7 +2125,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 
 /* Always-on A0/B0/C0 BIOS-call ring (ported from ape-fw for good-vs-bad
  * event-delivery comparison). Recorded at the central dispatch chokepoint. */
-#define BIOSCALL_RING_CAP (1 << 16)
+#define BIOSCALL_RING_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq; uint32_t table_base; uint32_t index; uint32_t func_ptr;
     uint32_t a0, a1, a2, a3; uint32_t ra; uint32_t current_func; uint32_t frame;
@@ -2134,7 +2138,7 @@ static uint64_t s_bioscall_seq = 0;
  * ring and starves the poll-based command path at a freeze. Arm via `event_hook`
  * only for the window of interest. */
 int g_event_hook_armed = 0;
-#define BIOSCALL_UNIQUE_CAP 2048
+#define BIOSCALL_UNIQUE_CAP PSX_DEBUG_RING_CAP(2048u)
 typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
 static PSX_BSS BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
 static int s_bioscall_unique_count = 0;
@@ -2190,7 +2194,7 @@ void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
  *
  * Default-off, additive: when g_cyc_watch_armed == 0 the observe hook is a
  * single load + compare and records nothing — zero behavior change. */
-#define CYC_WATCH_RING_CAP 1024
+#define CYC_WATCH_RING_CAP PSX_DEBUG_RING_CAP(1024u)
 typedef struct {
     uint32_t hit_index;       /* 0-based ordinal of this anchor hit */
     uint32_t pc;              /* matched physical block-leader PC */
@@ -2277,7 +2281,7 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys)
  * Samples $t0/$fp/$v0/frame at matched leaders. Disarmed = one branch.
  * nd_intro=2 also fills mode/depth/ot_base/ot_index from GP + game struct. */
 #define PC_PROBE_MAX_PCS   16
-#define PC_PROBE_SAMPLE_CAP 64
+#define PC_PROBE_SAMPLE_CAP PSX_DEBUG_RING_CAP(64u)
 typedef struct {
     uint32_t pc;
     uint64_t count;
@@ -3472,7 +3476,7 @@ static void handle_fntrace_dump(int id, const char *json)
     if (count < 1) count = 1;
     if (count > (int)FNTRACE_RING_CAP) count = FNTRACE_RING_CAP;
 
-    uint64_t total = g_fntrace_seq;
+    uint64_t total = fntrace_total();
     uint64_t avail = (total < FNTRACE_RING_CAP) ? total : FNTRACE_RING_CAP;
     uint64_t oldest = total - avail;
     if (have_seq_window) {
@@ -3498,7 +3502,8 @@ static void handle_fntrace_dump(int id, const char *json)
     uint64_t scan_count = have_seq_window ? (seq_hi - seq_lo) : avail;
     for (uint64_t i = 0; i < scan_count && emitted < count; i++) {
         uint64_t seq = have_seq_window ? (seq_lo + i) : (total - 1 - i);
-        FntraceEntry *e = &g_fntrace_ring[seq & (FNTRACE_RING_CAP - 1u)];
+        const FntraceEntry *e = fntrace_get(seq);
+        if (!e) continue;
         if (e->target < target_lo || e->target >= target_hi) continue;
         if (pos > BUF_SZ - 256) break;
         pos += snprintf(out + pos, BUF_SZ - pos,
@@ -4613,7 +4618,7 @@ static void handle_probe_clear(int id, const char *json)
  * 1<<22 entries, heap-allocated in debug_server_init().
  * Kept in step with the SIO PC trace so generic MMIO history has enough
  * retention for post-failure queries. */
-#define MMIO_TRACE_CAP (1 << 18)
+#define MMIO_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 18)
 typedef struct {
     uint64_t seq;
     uint32_t addr;       /* 0x1F801xxx */
@@ -4647,7 +4652,7 @@ static uint32_t s_mmio_trace_head = 0;
  * so 512K entries ≈ 15 minutes — enough to attribute a boot window from
  * well after the title screen. ~40 MB heap.
  * Same entry layout as the general ring; dumped via `gp1_dump`. */
-#define GP1_TRACE_CAP (1 << 19)
+#define GP1_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 19)
 static MmioTraceEntry *s_gp1_trace = NULL;
 static uint64_t s_gp1_trace_seq  = 0;
 static uint32_t s_gp1_trace_head = 0;
@@ -8737,7 +8742,7 @@ static void handle_get_snapshots(int id, const char *json)
  * GL reads GPU-side truth via the fbo peek; software reads CPU VRAM (its
  * authoritative surface). depth24 scanout frames are tagged and refused
  * (15-bit only). */
-#define DISP_RING_CAP   64    /* full-VRAM entries are 1MB each; 32 frames of
+#define DISP_RING_CAP   PSX_DEBUG_RING_CAP(64u) /* full-VRAM entries are 1MB each; 32 frames of
                                * lookback (~0.3-0.5s) for exact-frame forensics */
 #define DISP_RING_MAX_W 640
 #define DISP_RING_MAX_H 256
@@ -9607,7 +9612,7 @@ void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu) {
  * comparison): card state table 0x9F20, result flags 0xB9D0, byte counter 0x72F0,
  * chain success 0x7520, chain ptrs 0x7528, and the EvCB card-event entries
  * 0xE044-0xE0D0 (status/spec/mode). Sparse => no eviction over a session. */
-#define CARD_TRACE_CAP (1u << 16)
+#define CARD_TRACE_CAP PSX_DEBUG_RING_CAP(1u << 16)
 typedef struct {
     uint64_t seq; uint32_t phys; uint32_t old_val; uint32_t new_val;
     uint32_t pc; uint32_t cpu_pc; uint32_t ra; uint32_t func; uint32_t frame;
