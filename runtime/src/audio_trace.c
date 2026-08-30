@@ -1,82 +1,17 @@
 /*
- * audio_trace.c - debug-build audio observability rings. See audio_trace.h.
+ * audio_trace.c - always-on audio observability rings. See audio_trace.h.
  *
- * Memory: 4 PCM taps x 2^22 stereo frames x 4 bytes = 64 MiB static, plus a
+ * Memory: 3 PCM taps x 2^22 stereo frames x 4 bytes = 48 MiB static, plus a
  * 2^19-entry event ring (16 MiB). Static BSS, zero cost until touched; the
- * recording hot path is per-sample work in debug builds. PSX_NO_DEBUG_TOOLS
- * keeps only small zero-result ABI stubs, with no rings or counters.
+ * recording hot path is a memcpy per audio block and is compiled into
+ * Release/production builds too (always-on ring-buffer discipline — probes
+ * query history, they never arm recording).
  */
-#define PSX_AUDIO_TRACE_IMPLEMENTATION 1
 #include "audio_trace.h"
-
-#include <string.h>
-
-#ifdef PSX_NO_DEBUG_TOOLS
-
-void audio_trace_init(void) {}
-
-void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
-{
-    (void)tap;
-    (void)stereo;
-    (void)frames;
-}
-
-void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
-{
-    (void)kind;
-    (void)a;
-    (void)b;
-}
-
-void audio_trace_note_frame(uint32_t frame) { (void)frame; }
-
-void audio_trace_get_stats(AudioTraceStats *out)
-{
-    if (out) memset(out, 0, sizeof(*out));
-}
-
-uint64_t audio_trace_tap_total(int tap)
-{
-    (void)tap;
-    return 0;
-}
-
-uint64_t audio_trace_events_total(void) { return 0; }
-
-void audio_trace_set_tap_rate(int tap, uint32_t rate)
-{
-    (void)tap;
-    (void)rate;
-}
-
-uint32_t audio_trace_tap_rate(int tap)
-{
-    (void)tap;
-    return 44100u;
-}
-
-uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max)
-{
-    (void)out;
-    (void)max;
-    return 0;
-}
-
-int64_t audio_trace_dump_wav(int tap, const char *path,
-                             int64_t start, uint64_t count)
-{
-    (void)tap;
-    (void)path;
-    (void)start;
-    (void)count;
-    return -1;
-}
-
-#else
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
 
 /* 2^22 frames @ 44100 ~= 95 s per tap. Power of two so wrap is a mask. */
 #define PCM_RING_FRAMES (1u << 22)
@@ -326,5 +261,3 @@ int64_t audio_trace_dump_wav(int tap, const char *path,
     fclose(fp);
     return (int64_t)count;
 }
-
-#endif /* PSX_NO_DEBUG_TOOLS */

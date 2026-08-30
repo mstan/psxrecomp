@@ -1,6 +1,5 @@
 #include <cstdio>
 #include <cerrno>
-#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -83,7 +82,7 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 
 } // namespace
 
-static int psxrecomp_main(int argc, char** argv) {
+int main(int argc, char** argv) {
     const auto print_usage = [&]() {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
         fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
@@ -211,7 +210,6 @@ static int psxrecomp_main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
     std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
     std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
-    std::set<uint32_t>    ws_cull_nclip_exact;  // [widescreen.cull] nclip_exact_sites
     std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
     std::vector<PSXRecompV4::WidescreenCullWidenSite> ws_cull_widen;
@@ -276,7 +274,6 @@ static int psxrecomp_main(int argc, char** argv) {
         ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
         ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
-        ws_cull_nclip_exact.insert(cfg.ws_cull_nclip_exact_sites.begin(), cfg.ws_cull_nclip_exact_sites.end());
         ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
         ws_cull_keep = cfg.ws_cull_keep_sites;
         ws_cull_widen = cfg.ws_cull_widen_sites;
@@ -373,7 +370,6 @@ static int psxrecomp_main(int argc, char** argv) {
         ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
         ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
-        ws_cull_nclip_exact.insert(wscfg.ws_cull_nclip_exact_sites.begin(), wscfg.ws_cull_nclip_exact_sites.end());
         ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
         if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
         if (ws_cull_widen.empty()) ws_cull_widen = wscfg.ws_cull_widen_sites;
@@ -1042,21 +1038,6 @@ static int psxrecomp_main(int argc, char** argv) {
             auto is_text_ptr = [&](uint32_t v) {
                 return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
             };
-            auto zero_filled_target = [&](uint32_t a) {
-                // Runtime-populated pointer/string tables are commonly zero in
-                // the executable image.  A pointer table can point into such a
-                // region that an unresolved host range happens to cover; NOP
-                // is a valid MIPS word, so the old single-word check promoted
-                // the zero storage as callable aliases.  Eight zero words are
-                // no callable-boundary evidence.  Trusted seeds bypass this
-                // guard and remain fail-closed diagnostics.
-                constexpr uint32_t kProbeWords = 8u;
-                if (a + kProbeWords * 4u > exe_hi) return false;
-                for (uint32_t i = 0; i < kProbeWords; ++i) {
-                    if (read_w(a + i * 4u) != 0u) return false;
-                }
-                return true;
-            };
             for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
                 if (containing(p)) continue;  // instruction word, not a data word
                 uint32_t w = read_w(p);
@@ -1077,7 +1058,6 @@ static int psxrecomp_main(int argc, char** argv) {
             bool promoted_new = false;
             for (const auto& [a, trusted, table_evidence] : candidates) {
                 if ((a & 3u) || a < exe_lo || a >= exe_hi) continue;
-                if (!trusted && zero_filled_target(a)) continue;
                 const PSXRecomp::Function* host = containing(a);
                 if (host && a == host->start_addr) continue;  // already an entry
                 uint32_t w = read_w(a);
@@ -1255,7 +1235,6 @@ static int psxrecomp_main(int argc, char** argv) {
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
     codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
     codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
-    codegen_config.ws_cull_nclip_exact_sites = ws_cull_nclip_exact;
     codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
     codegen_config.ws_cull_keep_sites = ws_cull_keep;
     codegen_config.ws_cull_widen_sites = ws_cull_widen;
@@ -1717,16 +1696,4 @@ static int psxrecomp_main(int argc, char** argv) {
     }
 
     return 0;
-}
-
-int main(int argc, char** argv) {
-    try {
-        return psxrecomp_main(argc, argv);
-    } catch (const std::exception& e) {
-        fmt::print(stderr, "psxrecomp-game: {}\n", e.what());
-        return 1;
-    } catch (...) {
-        fmt::print(stderr, "psxrecomp-game: unknown fatal error\n");
-        return 1;
-    }
 }

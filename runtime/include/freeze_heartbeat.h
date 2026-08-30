@@ -7,9 +7,6 @@
  *
  * Reader: any external process that reads the file. The file is
  * overwritten in place — no log growth, no CLAUDE.md §3 violation.
- * Large wedge/fatal dumps stay in the current directory by default and keep
- * the newest four. PSX_FREEZE_DUMP_DIR selects another directory and
- * PSX_FREEZE_DUMP_KEEP selects a bounded count from 1 through 64.
  *
  * Not a fix for anything. Pure observability so we can see what state
  * the runtime was in just before it stalled.

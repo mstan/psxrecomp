@@ -129,16 +129,13 @@ runtime targets; use the CLI generator for game projects.
 
 ### Check the build
 
-The normal build graph leaves tests out. Reconfigure the recompiler with the
-explicit test opt-in — no BIOS or disc is needed — then verify the tree:
+After step 1 above — no BIOS or disc needed — verify the tree is sane:
 
 ```sh
-cmake -S recompiler -B recompiler/build -DBUILD_TESTING=ON
-cmake --build recompiler/build
 cd recompiler/build && ctest --output-on-failure
 ```
 
-The hermetic suite runs in seconds. See [`TESTING.md`](TESTING.md).
+38 tests, under five seconds. See [`TESTING.md`](TESTING.md).
 
 On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generator
 (e.g. `-G "Unix Makefiles"`); everything else is identical.

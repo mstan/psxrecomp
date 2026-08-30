@@ -1,7 +1,6 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "freeze_heartbeat.h"
-#include "freeze_artifacts.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -481,15 +480,9 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         return;
 #endif
 
-    char artifact_dir[1024];
-    char path[1200];
-    unsigned artifact_keep;
-    freeze_artifacts_config(artifact_dir, sizeof(artifact_dir), &artifact_keep);
-    if (!freeze_artifacts_dump_path(path, sizeof(path), artifact_dir,
-                                    s_backend, wall)) {
-        freeze_dump_unlock();
-        return;
-    }
+    char path[128];
+    snprintf(path, sizeof(path),
+             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
 
     FILE *f = fopen(path, "wb");
     if (!f) { freeze_dump_unlock(); return; }
@@ -665,9 +658,6 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
     fputs("}\n", f);
     fclose(f);
-    /* Best-effort bounded retention. The just-closed dump participates in the
-     * ordering, so the newest evidence is preserved even after long soaks. */
-    (void)freeze_artifacts_prune(artifact_dir, artifact_keep);
     freeze_dump_unlock();
 }
 
@@ -799,11 +789,6 @@ static void heartbeat_write(void) {
          * work would advance dirty_insns. Checked only when frames are
          * advancing healthily (kinds 1/2/3 take precedence below). */
         int logic_pinned =
-            /* Kind 5 is a game-logic watchdog. BIOS/HLE wait vectors use
-             * low synthetic PCs (for example 0x00000F40) while the guest
-             * continues advancing frames; those are not game poll-loop
-             * wedges and must not poison release verification. */
-            (s_ring[newest_idx].current_func >= 0x80010000u) &&
             (s_ring[newest_idx].current_func    == s_ring[oldest_idx].current_func) &&
             (s_ring[newest_idx].last_store_pc   == s_ring[oldest_idx].last_store_pc) &&
             (s_ring[newest_idx].dirty_ram_insns == s_ring[oldest_idx].dirty_ram_insns);

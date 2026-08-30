@@ -178,11 +178,7 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
 {
     i_stat |= (1u << bit);
     psx_irq_refresh_cause_ip2();
-#if DEVICE_TRACE_ENABLED
     device_trace_note(bit, detail);
-#else
-    (void)detail;
-#endif
 }
 
 /* Dispatch counter for vblank scheduling. */

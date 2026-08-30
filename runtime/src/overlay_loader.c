@@ -537,7 +537,6 @@ static void overlay_flush_leave(OverlayFlushFn prev) {
 
 extern uint8_t *memory_get_ram_ptr(void);
 extern uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len);
-extern uint32_t overlay_watch_pagegen(uint32_t phys);
 
 /* ---- Per-candidate hash / generation over its code ranges -------------- */
 
@@ -1515,7 +1514,7 @@ static void lazy_miss_invalidate_loader(void) {
 static int lazy_miss_cached(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     return e->phys == phys && e->code_gen == g_dirty_ram_code_gen &&
-           e->watched_code_gen == overlay_watch_pagegen(phys) &&
+           e->watched_code_gen == overlay_watch_pagegen_sum(phys & ~3u, 4u) &&
            e->loader_gen == s_lazy_loader_gen;
 }
 
@@ -1523,7 +1522,7 @@ static void lazy_miss_record(uint32_t phys) {
     LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
     e->phys = phys;
     e->code_gen = g_dirty_ram_code_gen;
-    e->watched_code_gen = overlay_watch_pagegen(phys);
+    e->watched_code_gen = overlay_watch_pagegen_sum(phys & ~3u, 4u);
     e->loader_gen = s_lazy_loader_gen;
 }
 
@@ -2446,9 +2445,6 @@ static void init_callbacks(void) {
                 psx_pgxp_muldiv,
                 psx_pgxp_cop2,
                 psx_pgxp_gpr_write,
-                psx_pgxp_load_delayed,
-                psx_pgxp_load_commit,
-                psx_pgxp_load_cancel,
             };
             s_callbacks.pgxp = &pgxp_hooks_table;
         }
@@ -4143,9 +4139,8 @@ typedef struct {
     uint32_t out_regs[34];   /* r0..r31, hi, lo at exit                        */
 } FpEnt;
 #define FP_CAP (1u << 16)   /* ~19 MB with full reg files; ~65K executions     */
-static FpEnt   *s_fp = NULL;
+static FpEnt    s_fp[FP_CAP];
 static uint64_t s_fp_seq = 0;
-static int      s_fp_enabled = -1;
 
 int overlay_loader_is_candidate(uint32_t phys) {
     if (!s_active) return 0;
@@ -4153,19 +4148,12 @@ int overlay_loader_is_candidate(uint32_t phys) {
 }
 
 int overlay_fp_enabled(void) {
-    if (s_fp_enabled < 0) {
+    static int enabled = -1;
+    if (enabled < 0) {
         const char *e = getenv("PSX_OVERLAY_FP_LOG");
-        s_fp_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
-        if (s_fp_enabled) {
-            s_fp = (FpEnt *)malloc(sizeof(*s_fp) * FP_CAP);
-            if (!s_fp) {
-                s_fp_enabled = 0;
-                loader_log("PSX_OVERLAY_FP_LOG disabled: cannot allocate %llu-byte ring",
-                           (unsigned long long)(sizeof(*s_fp) * FP_CAP));
-            }
-        }
+        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
-    return s_fp_enabled;
+    return enabled;
 }
 
 /* ---- Same-state native↔interp differential (confident measurement) ------ */
@@ -4784,7 +4772,6 @@ static uint32_t regs34_crc(const uint32_t *r) {
 void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                     const CPUState *cpu, int native) {
     extern uint64_t psx_get_cycle_count(void);
-    if (!overlay_fp_enabled()) return;
     uint64_t s = s_fp_seq++;
     FpEnt *e = &s_fp[s & (FP_CAP - 1u)];
     e->seq = s; e->cycle = psx_get_cycle_count();
@@ -4838,7 +4825,7 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
 int overlay_loader_write_fp_file(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    uint64_t total = s_fp ? s_fp_seq : 0;
+    uint64_t total = s_fp_seq;
     uint64_t start = (total > FP_CAP) ? (total - FP_CAP) : 0;
     fputc('[', f);
     int first = 1, count = 0;

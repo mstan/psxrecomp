@@ -17,7 +17,6 @@
 #     [--project-file REL]... [--project-dir REL]... \
 #     [--disc-hint "your legally owned disc"] \
 #     [--version-env BPE_RELEASE_VERSION] \
-#     [--strip-tool /path/to/x86_64-w64-mingw32-strip] \
 #     [--embed-toolchain]   # optional: copy PSXRECOMP_TOOLCHAIN_DIR into zip
 #
 # Env:
@@ -25,7 +24,6 @@
 #   PSXRECOMP_TOOLCHAIN_DIR | TOOLCHAIN_DIR | BPE_TOOLCHAIN_DIR  (only with --embed-toolchain)
 #   PSXRECOMP_EMBED_TOOLCHAIN=1  same as --embed-toolchain
 #   PSXRECOMP_RUNTIME_BIN_DIR | BPE_RUNTIME_BIN_DIR  (Windows MinGW DLL search)
-#   PSXRECOMP_STRIP  strip executable to use for staged Windows hosts
 #
 # Lobby pin: the host exe must have been built with current runtime.cmake so
 # $<TARGET_FILE_DIR>/psx_game_version.txt exists. This script refuses to ship a
@@ -47,7 +45,6 @@ PROJECT_FILES=()
 PROJECT_DIRS=()
 RUNTIME_BIN_DIR="${PSXRECOMP_RUNTIME_BIN_DIR:-${BPE_RUNTIME_BIN_DIR:-/usr/x86_64-w64-mingw32/bin}}"
 EMBED_TOOLCHAIN=0
-STRIP_TOOL="${PSXRECOMP_STRIP:-}"
 if [[ "${PSXRECOMP_EMBED_TOOLCHAIN:-0}" == "1" ]]; then
   EMBED_TOOLCHAIN=1
 fi
@@ -71,7 +68,6 @@ while [[ $# -gt 0 ]]; do
     --project-file) PROJECT_FILES+=("${2:?}"); shift 2 ;;
     --project-dir) PROJECT_DIRS+=("${2:?}"); shift 2 ;;
     --runtime-bin) RUNTIME_BIN_DIR="${2:?}"; shift 2 ;;
-    --strip-tool) STRIP_TOOL="${2:?}"; shift 2 ;;
     --root) ROOT="${2:?}"; shift 2 ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
     --no-embed-toolchain) EMBED_TOOLCHAIN=0; shift ;;
@@ -91,6 +87,14 @@ if [[ -z "${DISPLAY_NAME}" ]]; then
 fi
 
 ROOT="$(cd "${ROOT}" && pwd)"
+if [[ -d "${ROOT}/${BUILD_DIR}" ]]; then
+  BUILD_DIR="$(cd "${ROOT}/${BUILD_DIR}" && pwd)"
+elif [[ -d "${BUILD_DIR}" ]]; then
+  BUILD_DIR="$(cd "${BUILD_DIR}" && pwd)"
+else
+  echo "error: build dir not found: ${BUILD_DIR}" >&2
+  exit 1
+fi
 
 # Defaults for a typical title if caller passed none.
 # Codegen host sources live in psxrecomp/host/ (copied with the framework tree).
@@ -106,130 +110,6 @@ if [[ ${#PROJECT_FILES[@]} -eq 0 && ${#PROJECT_DIRS[@]} -eq 0 ]]; then
       PROJECT_FILES+=("${f}")
     fi
   done
-fi
-
-validate_slug() {
-  local label="$1" value="$2"
-  if [[ -z "${value}" || "${value}" == "." || "${value}" == ".." ||
-        "${value}" == *'.' || ! "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "error: ${label} must be a path-free slug: '${value}'" >&2
-    exit 2
-  fi
-  local stem="${value%%.*}"
-  stem="${stem,,}"
-  case "${stem}" in
-    aux|con|nul|prn|com[1-9]|lpt[1-9])
-      echo "error: ${label} must not use a Windows device name: '${value}'" >&2
-      exit 2
-      ;;
-  esac
-}
-
-validate_project_relpath() {
-  local rel="$1" label="$2"
-  if [[ -z "${rel}" || "${rel}" == /* || "${rel}" == \\* ||
-        "${rel}" == *:* || "${rel}" == *\\* ]]; then
-    echo "error: ${label} must be a project-relative path: '${rel}'" >&2
-    exit 2
-  fi
-  local component component_stem
-  local -a components
-  IFS='/' read -r -a components <<<"${rel}"
-  for component in "${components[@]}"; do
-    if [[ -z "${component}" || "${component}" == "." || "${component}" == ".." ||
-          "${component}" =~ [[:cntrl:]] || "${component}" == *[[:space:]] ||
-          "${component}" == *'.' ]]; then
-      echo "error: ${label} has an unsafe path component: '${rel}'" >&2
-      exit 2
-    fi
-    component_stem="${component%%.*}"
-    component_stem="${component_stem,,}"
-    case "${component_stem}" in
-      aux|con|nul|prn|com[1-9]|lpt[1-9])
-        echo "error: ${label} has a Windows device path component: '${rel}'" >&2
-        exit 2
-        ;;
-    esac
-  done
-}
-
-validate_slug "--artifact" "${ARTIFACT}"
-validate_slug "--zip-prefix" "${ZIP_PREFIX}"
-for f in "${PROJECT_FILES[@]}"; do
-  validate_project_relpath "${f}" "--project-file"
-done
-for d in "${PROJECT_DIRS[@]}"; do
-  validate_project_relpath "${d}" "--project-dir"
-done
-
-ROOT_IS_GIT=0
-if git -C "${ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  ROOT_TOP="$(git -C "${ROOT}" rev-parse --show-toplevel)"
-  ROOT_TOP="$(cd "${ROOT_TOP}" && pwd)"
-  if [[ "${ROOT_TOP}" != "${ROOT}" ]]; then
-    echo "error: --root must be the Git worktree root: ${ROOT}" >&2
-    exit 1
-  fi
-  ROOT_IS_GIT=1
-elif [[ -e "${ROOT}/.git" || -L "${ROOT}/.git" ]]; then
-  echo "error: cannot inspect Git metadata for project root ${ROOT}" >&2
-  exit 1
-fi
-
-if [[ "${ROOT_IS_GIT}" -eq 1 ]]; then
-  PROJECT_PATHS=("${PROJECT_FILES[@]}" "${PROJECT_DIRS[@]}")
-  CLEAN_PROJECT_PATHS=("${PROJECT_DIRS[@]}")
-  for f in "${PROJECT_FILES[@]}"; do
-    # Release jobs intentionally stamp VERSION before the build. Its content is
-    # checked against the baked binary stamp below; every other input is clean.
-    if [[ "${f}" != "VERSION" ]]; then
-      CLEAN_PROJECT_PATHS+=("${f}")
-    fi
-  done
-  if [[ ${#CLEAN_PROJECT_PATHS[@]} -gt 0 ]]; then
-    if ! git -C "${ROOT}" diff --quiet -- "${CLEAN_PROJECT_PATHS[@]}" ||
-       ! git -C "${ROOT}" diff --cached --quiet -- "${CLEAN_PROJECT_PATHS[@]}"; then
-      echo "error: refusing to package dirty or untracked title rebuild inputs" >&2
-      exit 1
-    fi
-  fi
-  if [[ ${#PROJECT_PATHS[@]} -gt 0 ]]; then
-    PROJECT_UNTRACKED="$(git -C "${ROOT}" ls-files --others --exclude-standard -- "${PROJECT_PATHS[@]}")"
-    if [[ -n "${PROJECT_UNTRACKED}" ]]; then
-      echo "error: refusing to package dirty or untracked title rebuild inputs" >&2
-      printf '%s\n' "${PROJECT_UNTRACKED}" >&2
-      exit 1
-    fi
-  fi
-  for f in "${PROJECT_FILES[@]}"; do
-    if [[ ! -f "${ROOT}/${f}" && ! -L "${ROOT}/${f}" ]]; then
-      echo "error: title rebuild file is missing or is not a file: ${f}" >&2
-      exit 1
-    elif ! git -C "${ROOT}" ls-files --error-unmatch -- "${f}" >/dev/null 2>&1; then
-      echo "error: title rebuild file is not tracked: ${f}" >&2
-      exit 1
-    fi
-  done
-  for d in "${PROJECT_DIRS[@]}"; do
-    if [[ ! -d "${ROOT}/${d}" ]]; then
-      echo "error: title rebuild directory is missing or is not a directory: ${d}" >&2
-      exit 1
-    fi
-    TRACKED_IN_DIR="$(git -C "${ROOT}" ls-files -- "${d}")"
-    if [[ -z "${TRACKED_IN_DIR}" ]]; then
-      echo "error: title rebuild directory has no tracked files: ${d}" >&2
-      exit 1
-    fi
-  done
-fi
-
-if [[ -d "${ROOT}/${BUILD_DIR}" ]]; then
-  BUILD_DIR="$(cd "${ROOT}/${BUILD_DIR}" && pwd)"
-elif [[ -d "${BUILD_DIR}" ]]; then
-  BUILD_DIR="$(cd "${BUILD_DIR}" && pwd)"
-else
-  echo "error: build dir not found: ${BUILD_DIR}" >&2
-  exit 1
 fi
 
 # Resolve *requested* version from env / VERSION file (may be empty until stamp).
@@ -252,32 +132,14 @@ REQUESTED="${REQUESTED#v}"
 DIST="${ROOT}/dist"
 STAGE="${DIST}/stage-setup-${ARTIFACT}"
 
+rm -rf "${STAGE}"
+mkdir -p "${STAGE}" "${DIST}"
+
 EXE=""
-if [[ "${EXE_NAME,,}" == *.exe ]]; then
-  EXE_CANDIDATES=(
-    "${BUILD_DIR}/${EXE_NAME}"
-    "${BUILD_DIR}/Release/${EXE_NAME}"
-  )
-else
-  EXE_CANDIDATES=()
-  for candidate_dir in "${BUILD_DIR}" "${BUILD_DIR}/Release"; do
-    extensionless="${candidate_dir}/${EXE_NAME}"
-    windows_exe="${extensionless}.exe"
-    if [[ -f "${extensionless}" ]]; then
-      # MSYS suffix aliases make `Host` appear present when only Host.exe
-      # exists. Identity distinguishes that alias from a real Linux Host that
-      # happens to live beside a distinct Windows build.
-      if [[ -f "${windows_exe}" && "${extensionless}" -ef "${windows_exe}" ]]; then
-        EXE_CANDIDATES+=("${windows_exe}")
-      else
-        EXE_CANDIDATES+=("${extensionless}")
-      fi
-    elif [[ -f "${windows_exe}" ]]; then
-      EXE_CANDIDATES+=("${windows_exe}")
-    fi
-  done
-fi
-for cand in "${EXE_CANDIDATES[@]}"
+for cand in \
+  "${BUILD_DIR}/${EXE_NAME}" \
+  "${BUILD_DIR}/${EXE_NAME}.exe" \
+  "${BUILD_DIR}/Release/${EXE_NAME}.exe"
 do
   if [[ -f "${cand}" ]]; then
     EXE="${cand}"
@@ -324,72 +186,19 @@ if [[ -n "${REQUESTED}" && "${REQUESTED}" != "${BUILT}" ]]; then
   exit 1
 fi
 VERSION="${BUILT}"
-validate_slug "release version" "${VERSION}"
-for f in "${PROJECT_FILES[@]}"; do
-  if [[ "${f}" == "VERSION" ]]; then
-    SOURCE_VERSION="$(normalize_ver "$(cat "${ROOT}/VERSION")")"
-    if [[ "${SOURCE_VERSION}" != "${VERSION}" ]]; then
-      echo "error: source VERSION=${SOURCE_VERSION} but binary stamp=${VERSION}" >&2
-      exit 1
-    fi
-  fi
-done
+printf '%s\n' "${VERSION}" >"${ROOT}/VERSION"
 ZIP_NAME="${ZIP_PREFIX}-${VERSION}-${ARTIFACT}.zip"
-rm -rf "${STAGE}"
-mkdir -p "${STAGE}" "${DIST}"
 rm -f "${DIST}/${ZIP_NAME}"
 
-EXE_BASENAME="$(basename "${EXE}")"
-EXE_DIR="$(dirname "${EXE}")"
-# Dereference a symlinked build output so release-only transforms below can
-# never follow the staged path back into the canonical build tree.
-cp -L "${EXE}" "${STAGE}/${EXE_BASENAME}"
+cp -a "${EXE}" "${STAGE}/"
 # Ship the stamp beside the exe so installers / RetComM can prefer it over VERSION.
 if [[ -f "$(dirname "${EXE}")/psx_game_version.txt" ]]; then
   cp -a "$(dirname "${EXE}")/psx_game_version.txt" "${STAGE}/psx_game_version.txt"
 else
   printf '%s\n' "${VERSION}" >"${STAGE}/psx_game_version.txt"
 fi
-strip_staged_windows_host() {
-  local staged_exe="$1"
-  local strip_tool="${STRIP_TOOL}"
-
-  if [[ -n "${strip_tool}" ]]; then
-    if [[ "${strip_tool}" == */* ]]; then
-      if [[ ! -x "${strip_tool}" ]]; then
-        echo "error: configured strip tool is not executable: ${strip_tool}" >&2
-        exit 1
-      fi
-    elif ! command -v "${strip_tool}" >/dev/null 2>&1; then
-      echo "error: configured strip tool was not found on PATH: ${strip_tool}" >&2
-      exit 1
-    fi
-  else
-    local candidate
-    for candidate in x86_64-w64-mingw32-strip llvm-strip strip; do
-      if command -v "${candidate}" >/dev/null 2>&1; then
-        strip_tool="${candidate}"
-        break
-      fi
-    done
-  fi
-
-  if [[ -z "${strip_tool}" ]]; then
-    echo "error: no PE-capable strip tool found for release host ${EXE_BASENAME}" >&2
-    echo "  Install x86_64-w64-mingw32-strip/llvm-strip, set PSXRECOMP_STRIP," >&2
-    echo "  or pass --strip-tool explicitly." >&2
-    exit 1
-  fi
-  if ! "${strip_tool}" --strip-all "${staged_exe}"; then
-    echo "error: failed to strip staged release host with ${strip_tool}: ${staged_exe}" >&2
-    exit 1
-  fi
-  echo "stripped staged release host with ${strip_tool}: ${EXE_BASENAME}"
-}
-
-if [[ "${EXE_BASENAME,,}" == *.exe ]]; then
-  strip_staged_windows_host "${STAGE}/${EXE_BASENAME}"
-fi
+EXE_BASENAME="$(basename "${EXE}")"
+EXE_DIR="$(dirname "${EXE}")"
 
 # Windows: CMake may already have placed imported runtime DLLs (zlib1.dll)
 # next to the host. Copy siblings into the stage before MinGW bundling —
@@ -416,37 +225,6 @@ if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/b
   cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
 fi
 
-# Product runtime resources are generated/staged beside the executable by
-# CMake. They are intentionally copied from the build output, not from the
-# repository's development tree: the latter can contain retired packages and
-# other authoring leftovers. Never copy settings.toml, bios.cfg, disc.cfg,
-# saves, or other machine/user state into a portable release.
-if [[ -d "${EXE_DIR}/bezels" ]]; then
-  cp -a "${EXE_DIR}/bezels" "${STAGE}/"
-fi
-if [[ -d "${EXE_DIR}/mods/packages" ]]; then
-  mkdir -p "${STAGE}/mods"
-  if [[ -f "${EXE_DIR}/mods/state.toml" ]]; then
-    mkdir -p "${STAGE}/mods/packages"
-    # The build directory can retain disabled catalog entries from an older
-    # configure. The portable release should contain only packages named by
-    # the authoritative state file, so the launcher cannot show stale mods.
-    while IFS= read -r package_id; do
-      [[ -n "${package_id}" && -d "${EXE_DIR}/mods/packages/${package_id}" ]] || continue
-      cp -a "${EXE_DIR}/mods/packages/${package_id}" "${STAGE}/mods/packages/"
-    done < <(awk -F'"' '/^\[\[package\]\]/{in_pkg=1; next} in_pkg && /^id[[:space:]]*=/ {print $2; in_pkg=0}' "${EXE_DIR}/mods/state.toml")
-    cp -a "${EXE_DIR}/mods/state.toml" "${STAGE}/mods/"
-  else
-    cp -a "${EXE_DIR}/mods/packages" "${STAGE}/mods/"
-  fi
-  if [[ -f "${EXE_DIR}/mods/README.md" ]]; then
-    cp -a "${EXE_DIR}/mods/README.md" "${STAGE}/mods/"
-  fi
-fi
-if [[ -f "${EXE_DIR}/game_options.toml" ]]; then
-  cp -a "${EXE_DIR}/game_options.toml" "${STAGE}/"
-fi
-
 copy_proj() {
   local rel="$1"
   if [[ -e "${ROOT}/${rel}" ]]; then
@@ -458,63 +236,17 @@ copy_proj() {
   fi
 }
 
-if [[ "${ROOT_IS_GIT}" -eq 1 ]]; then
-  TRACKED_PROJECT_INPUTS="$(mktemp)"
-  git -C "${ROOT}" ls-files -z -- "${PROJECT_FILES[@]}" "${PROJECT_DIRS[@]}" \
-    >"${TRACKED_PROJECT_INPUTS}"
-  while IFS= read -r -d '' rel; do
-    if [[ ! -e "${ROOT}/${rel}" && ! -L "${ROOT}/${rel}" ]]; then
-      echo "error: tracked title rebuild input disappeared: ${rel}" >&2
-      rm -f "${TRACKED_PROJECT_INPUTS}"
-      exit 1
-    fi
-    mkdir -p "$(dirname "${STAGE}/${rel}")"
-    cp -a "${ROOT}/${rel}" "${STAGE}/${rel}"
-  done <"${TRACKED_PROJECT_INPUTS}"
-  rm -f "${TRACKED_PROJECT_INPUTS}"
-else
-  for f in "${PROJECT_FILES[@]}"; do
-    copy_proj "${f}"
-  done
-  for d in "${PROJECT_DIRS[@]}"; do
-    copy_proj "${d}"
-  done
-fi
+for f in "${PROJECT_FILES[@]}"; do
+  copy_proj "${f}"
+done
+for d in "${PROJECT_DIRS[@]}"; do
+  copy_proj "${d}"
+done
 
 copy_tree_filtered() {
   local src="$1" dest="$2"
   shift 2
   mkdir -p "${dest}"
-  if git -C "${src}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if ! git -C "${src}" diff --quiet --ignore-submodules=none -- ||
-       ! git -C "${src}" diff --cached --quiet --ignore-submodules=none --; then
-      echo "error: refusing to package dirty tracked framework tree ${src}" >&2
-      exit 1
-    fi
-    local tracked
-    tracked="$(mktemp)"
-    git -C "${src}" ls-files -z --recurse-submodules >"${tracked}"
-    if command -v rsync >/dev/null 2>&1; then
-      rsync -a --from0 --files-from="${tracked}" "${src}/" "${dest}/"
-    else
-      local rel
-      while IFS= read -r -d '' rel; do
-        if [[ ! -e "${src}/${rel}" && ! -L "${src}/${rel}" ]]; then
-          echo "error: tracked framework input disappeared: ${src}/${rel}" >&2
-          rm -f "${tracked}"
-          exit 1
-        fi
-        mkdir -p "$(dirname "${dest}/${rel}")"
-        cp -a "${src}/${rel}" "${dest}/${rel}"
-      done <"${tracked}"
-    fi
-    rm -f "${tracked}"
-    return
-  fi
-  if [[ -e "${src}/.git" || -L "${src}/.git" ]]; then
-    echo "error: cannot inspect Git metadata for framework tree ${src}" >&2
-    exit 1
-  fi
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "$@" "${src}/" "${dest}/"
   else
@@ -536,8 +268,8 @@ fi
 
 copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude '.git' \
-  --exclude '/recompiler/build' \
-  --exclude '/generated' \
+  --exclude 'recompiler/build' \
+  --exclude 'generated' \
   --exclude '__pycache__' \
   --exclude 'build' \
   --exclude 'build-*'
@@ -603,26 +335,15 @@ EOF
 
 find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {} +
 
-ZIP_HELPER="${SCRIPT_DIR}/create_release_zip.py"
-if [[ ! -f "${ZIP_HELPER}" ]]; then
-  echo "error: missing canonical release ZIP helper: ${ZIP_HELPER}" >&2
-  exit 1
-fi
-PYTHON_BIN=""
-for candidate in python3 python; do
-  if command -v "${candidate}" >/dev/null 2>&1 &&
-     "${candidate}" -c 'import zipfile' >/dev/null 2>&1; then
-    PYTHON_BIN="${candidate}"
-    break
+(
+  cd "${STAGE}"
+  if command -v zip >/dev/null 2>&1; then
+    zip -r -q "${DIST}/${ZIP_NAME}" .
+  else
+    echo "error: zip not found" >&2
+    exit 1
   fi
-done
-if [[ -z "${PYTHON_BIN}" ]]; then
-  echo "error: Python 3 with zipfile is required to create a canonical setup ZIP" >&2
-  exit 1
-fi
-"${PYTHON_BIN}" "${ZIP_HELPER}" \
-  --source "${STAGE}" \
-  --output "${DIST}/${ZIP_NAME}"
+)
 
 echo "Wrote ${DIST}/${ZIP_NAME}"
 du -h "${DIST}/${ZIP_NAME}"

@@ -1,31 +1,10 @@
 /* device_trace.c — general two-process device-event cycle ring.
  * See device_trace.h. Self-contained (no runtime internals) so the SAME TU
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
-#define PSX_DEVICE_TRACE_IMPLEMENTATION 1
 #include "device_trace.h"
 #include <string.h>
 
-#ifdef PSX_NO_DEBUG_TOOLS
-
-void device_trace_arm(int on) { (void)on; }
-void device_trace_reset(void) {}
-int device_trace_is_armed(void) { return 0; }
-void device_trace_note(uint32_t source, uint32_t detail)
-{
-    (void)source;
-    (void)detail;
-}
-uint32_t device_trace_get(DevEvent* out, uint32_t max_rows)
-{
-    (void)out;
-    (void)max_rows;
-    return 0;
-}
-uint64_t device_trace_total(void) { return 0; }
-
-#else
-
-#define DEVTRACE_RING_CAP (1u << 20)  /* 1M events (32 MiB with current ABI); covers the whole
+#define DEVTRACE_RING_CAP (1u << 20)  /* 1M events (~24 MB); covers the whole
                                        * boot->wedge window so the divergent
                                        * event is in-window, never evicted. */
 
@@ -43,6 +22,24 @@ void device_trace_arm(int on)     { s_armed = on ? 1u : 0u; }
 void device_trace_reset(void)     { s_seq = 0; memset(s_ring, 0, sizeof(s_ring)); }
 int  device_trace_is_armed(void)  { return (int)s_armed; }
 uint64_t device_trace_total(void) { return s_seq; }
+
+const char* device_source_str(uint32_t source)
+{
+    switch (source) {
+        case DEV_IRQ_VBLANK: return "vblank";
+        case DEV_IRQ_GPU:    return "gpu";
+        case DEV_IRQ_CDROM:  return "cdrom";
+        case DEV_IRQ_DMA:    return "dma";
+        case DEV_IRQ_TIMER0: return "timer0";
+        case DEV_IRQ_TIMER1: return "timer1";
+        case DEV_IRQ_TIMER2: return "timer2";
+        case DEV_IRQ_SIO0:   return "sio0";
+        case DEV_IRQ_SIO1:   return "sio1";
+        case DEV_IRQ_SPU:    return "spu";
+        case DEV_IRQ_PIO:    return "pio";
+        default:             return "?";
+    }
+}
 
 void device_trace_note(uint32_t source, uint32_t detail)
 {
@@ -66,24 +63,4 @@ uint32_t device_trace_get(DevEvent* out, uint32_t max_rows)
     for (uint32_t i = 0; i < n; i++)
         out[i] = s_ring[(start + i) & (DEVTRACE_RING_CAP - 1u)];
     return n;
-}
-
-#endif /* PSX_NO_DEBUG_TOOLS */
-
-const char* device_source_str(uint32_t source)
-{
-    switch (source) {
-        case DEV_IRQ_VBLANK: return "vblank";
-        case DEV_IRQ_GPU:    return "gpu";
-        case DEV_IRQ_CDROM:  return "cdrom";
-        case DEV_IRQ_DMA:    return "dma";
-        case DEV_IRQ_TIMER0: return "timer0";
-        case DEV_IRQ_TIMER1: return "timer1";
-        case DEV_IRQ_TIMER2: return "timer2";
-        case DEV_IRQ_SIO0:   return "sio0";
-        case DEV_IRQ_SIO1:   return "sio1";
-        case DEV_IRQ_SPU:    return "spu";
-        case DEV_IRQ_PIO:    return "pio";
-        default:             return "?";
-    }
 }
