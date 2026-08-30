@@ -2,11 +2,13 @@
 #include "psx_ram.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 
 uint32_t g_psx_ram_size = PSX_RAM_2MB;
 uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
+uint32_t g_psx_ram_high_unique[PSX_RAM_HIGH_BITWORDS];
 
 static void check(int condition, const char *name) {
     if (condition) {
@@ -45,10 +47,15 @@ int main(void) {
 
     g_psx_ram_size = PSX_RAM_8MB;
     g_psx_ram_mask = PSX_RAM_8MB - 1u;
+    memset(g_psx_ram_high_unique, 0xff, sizeof(g_psx_ram_high_unique));
     check(psx_mod_gpu_dma_resolve_address_for(0x00200000u, 0u) == 0x00200000u,
           "8 MB unique DRAM keeps addresses above 2 MiB");
     check(psx_mod_gpu_dma_resolve_address_for(0x00A00000u, 0u) == 0x00200000u,
           "8 MB DMA still folds the 24-bit window through the live mask");
+    g_psx_ram_high_unique[0] &= ~1u;
+    check(psx_mod_gpu_dma_resolve_address_for(0x00A00000u, 0u) == 0u,
+          "wrapped DMA addresses still honor aliased high pages");
+    g_psx_ram_high_unique[0] |= 1u;
     check(psx_mod_gpu_dma_resolve_address_for(0x80F01234u, 0x20000u) ==
               0x00F01234u,
           "allocated aperture still survives 8 MB folding");

@@ -40,7 +40,11 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
     if (psx_mod_gpu_dma_aperture_offset_for(
             canonical, 4u, used, (uint32_t *)0))
         return canonical;
-    return psx_ram_map_read(canonical) & ~3u;
+    /* DMA tags wrap through the installed RAM width before the high-page
+     * uniqueness map is consulted.  The general CPU mapper deliberately
+     * preserves non-RAM physical addresses, so passing the raw 24-bit tag to
+     * it would leave addresses above the 8 MiB RAM window unfolded. */
+    return psx_ram_map_read(canonical & g_psx_ram_mask) & ~3u;
 }
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);
