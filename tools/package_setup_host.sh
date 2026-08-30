@@ -413,6 +413,32 @@ copy_tree_filtered() {
   local src="$1" dest="$2"
   shift 2
   mkdir -p "${dest}"
+  if git -C "${src}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git -C "${src}" diff --quiet --ignore-submodules=none -- ||
+       ! git -C "${src}" diff --cached --quiet --ignore-submodules=none --; then
+      echo "error: refusing to package dirty tracked framework tree ${src}" >&2
+      exit 1
+    fi
+    local tracked
+    tracked="$(mktemp)"
+    git -C "${src}" ls-files -z --recurse-submodules >"${tracked}"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --from0 --files-from="${tracked}" "${src}/" "${dest}/"
+    else
+      local rel
+      while IFS= read -r -d '' rel; do
+        if [[ ! -e "${src}/${rel}" && ! -L "${src}/${rel}" ]]; then
+          echo "error: tracked framework input disappeared: ${src}/${rel}" >&2
+          rm -f "${tracked}"
+          exit 1
+        fi
+        mkdir -p "$(dirname "${dest}/${rel}")"
+        cp -a "${src}/${rel}" "${dest}/${rel}"
+      done <"${tracked}"
+    fi
+    rm -f "${tracked}"
+    return
+  fi
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "$@" "${src}/" "${dest}/"
   else
@@ -434,8 +460,8 @@ fi
 
 copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude '.git' \
-  --exclude 'recompiler/build' \
-  --exclude 'generated' \
+  --exclude '/recompiler/build' \
+  --exclude '/generated' \
   --exclude '__pycache__' \
   --exclude 'build' \
   --exclude 'build-*'
