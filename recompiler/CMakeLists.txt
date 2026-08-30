@@ -224,58 +224,73 @@ if(PSXRECOMP_STATIC_CLI AND WIN32 AND (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "C
     endforeach()
 endif()
 
-# BIOS address-model equivalence test — sweeps every 4-byte address through
-# the profile-driven BiosAddressModel and compares against verbatim copies of
-# the pre-refactor hardcoded SCPH1001 helpers; also exercises the from_config
-# invariants. Run from the framework root: recompiler/build/bios_address_model_test
-add_executable(bios_address_model_test
-    tests/bios_address_model_test.cpp
-    src/bios_address_model.cpp
-    src/config_loader.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(bios_address_model_test PRIVATE
-    include
-    src
-    lib/fmt/include
-    lib/toml11
-)
-target_link_libraries(bios_address_model_test PRIVATE fmt)
-
-# L1 decoder conformance test — compares MipsDecoder against Rabbitizer
-# oracle for every instruction in SCPH1001.BIN code regions.
-add_executable(l1_decoder_test
-    tests/l1_decoder_test.cpp
-    src/mips_decoder.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(l1_decoder_test PRIVATE
-    include
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
-)
-target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
-
-# L2 structural codegen test — verifies StrictTranslator output patterns
-# for each MIPS instruction form.
-add_executable(l2_structural_test
-    tests/l2_structural_test.cpp
-    src/mips_decoder.cpp
-    src/ps1_exe_parser.cpp
-    src/strict_translator.cpp
-    src/pgxp_hook_emitter.cpp
-)
-target_include_directories(l2_structural_test PRIVATE
-    include
-    src
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
-)
-target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
-
 if(BUILD_TESTING)
+    # BIOS address-model equivalence test — sweeps every 4-byte address through
+    # the profile-driven BiosAddressModel and compares against verbatim copies of
+    # the pre-refactor hardcoded SCPH1001 helpers; also exercises the from_config
+    # invariants. Run from the framework root: recompiler/build/bios_address_model_test
+    add_executable(bios_address_model_test
+        tests/bios_address_model_test.cpp
+        src/bios_address_model.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(bios_address_model_test PRIVATE
+        include
+        src
+        lib/fmt/include
+        lib/toml11
+    )
+    target_link_libraries(bios_address_model_test PRIVATE fmt)
+
+    # L1 decoder conformance requires a user-supplied SCPH1001.BIN, so keep it
+    # visible to test configurations without making either the default build or
+    # ordinary CTest runs depend on a copyrighted external asset. To run it,
+    # build l1_decoder_test explicitly and pass --rom PATH.
+    add_executable(l1_decoder_test EXCLUDE_FROM_ALL
+        tests/l1_decoder_test.cpp
+        src/mips_decoder.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(l1_decoder_test PRIVATE
+        include
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+    )
+    target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
+
+    # L2 structural codegen test — verifies StrictTranslator output patterns
+    # for each MIPS instruction form.
+    add_executable(l2_structural_test
+        tests/l2_structural_test.cpp
+        src/mips_decoder.cpp
+        src/ps1_exe_parser.cpp
+        src/strict_translator.cpp
+        src/pgxp_hook_emitter.cpp
+    )
+    target_include_directories(l2_structural_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+    )
+    target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
+
+    # Reachable main-EXE discovery test: parser-bound validation plus exact-entry
+    # analysis behavior for direct, indirect, seeded, and out-of-bound targets.
+    add_executable(reachable_discovery_test
+        tests/reachable_discovery_test.cpp
+        src/function_analysis.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(reachable_discovery_test PRIVATE
+        include
+        lib/fmt/include
+    )
+    target_link_libraries(reachable_discovery_test PRIVATE fmt)
+
     add_executable(debug_trace_ranges_test
         ../runtime/tests/test_debug_trace_ranges.c
         ../runtime/src/debug_trace_ranges.c
@@ -375,6 +390,11 @@ if(BUILD_TESTING)
     # add_test() entries ctest could neither run nor fail them.
     add_test(NAME l2_structural_test COMMAND l2_structural_test)
     add_test(NAME reachable_discovery_test COMMAND reachable_discovery_test)
+
+    add_test(NAME l1_decoder_test
+             COMMAND l1_decoder_test --rom
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../bios/SCPH1001.BIN)
+    set_tests_properties(l1_decoder_test PROPERTIES DISABLED TRUE)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
@@ -535,19 +555,6 @@ if(BUILD_TESTING)
         endforeach()
     endif()
 endif()
-
-# Reachable main-EXE discovery test: parser-bound validation plus exact-entry
-# analysis behavior for direct, indirect, seeded, and out-of-bound targets.
-add_executable(reachable_discovery_test
-    tests/reachable_discovery_test.cpp
-    src/function_analysis.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(reachable_discovery_test PRIVATE
-    include
-    lib/fmt/include
-)
-target_link_libraries(reachable_discovery_test PRIVATE fmt)
 
 # ---- test-registration completeness guard -----------------------------------
 # Reads both CMakeLists.txt files as text, so it catches an orphan in either
