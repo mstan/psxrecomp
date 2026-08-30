@@ -10,6 +10,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
 
+option(PSXRECOMP_BUILD_ORACLE
+    "Build the standalone first-divergence oracle runtime"
+    OFF)
+
 psxrecomp_add_runtime_target(psx-runtime
     DEBUG_PORT 4370
     WINDOW_TITLE "psxrecomp - BIOS"
@@ -67,7 +71,7 @@ if(BUILD_TESTING)
     # separate target (not a ctest): it runs a fixed generated-style guest
     # workload so IPO/native-code build options can be measured without
     # launching a game or changing guest code.
-    add_executable(psx_runtime_hotpath_bench
+    add_executable(psx_runtime_hotpath_bench EXCLUDE_FROM_ALL
         tests/bench_psx_runtime_hotpath.c
         src/psx_cyc_steps.c
         src/psx_icache.c)
@@ -556,7 +560,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/check_test_registration.cmake)
 psxrecomp_check_all_tests_registered()
 
-if(NOT MSVC)
+if(PSXRECOMP_BUILD_ORACLE AND NOT MSVC)
     psxrecomp_add_runtime_target(psx-oracle
         ORACLE
         DEBUG_PORT 4371
