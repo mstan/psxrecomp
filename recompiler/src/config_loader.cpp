@@ -73,7 +73,6 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
     h.words("cull_plane_nx", c.ws_cull_plane_nx_sites);
     h.words("cull_xclip_load", c.ws_cull_xclip_load_sites);
     h.words("cull_nclip_keep", c.ws_cull_nclip_keep_sites);
-    h.words("cull_nclip_exact", c.ws_cull_nclip_exact_sites);
     h.words("cull_branch_keep", c.ws_cull_branch_keep_sites);
     h.words("cull_w_imms", c.ws_cull_w_imms);
     h.words("cull_h_imms", c.ws_cull_h_imms);
@@ -1681,7 +1680,6 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_plane_nx_sites;
     std::vector<uint32_t> ws_cull_xclip_load_sites;
     std::vector<uint32_t> ws_cull_nclip_keep_sites;
-    std::vector<uint32_t> ws_cull_nclip_exact_sites;
     std::vector<uint32_t> ws_cull_branch_keep_sites;
     std::vector<WidescreenCullKeepSite> ws_cull_keep_sites;
     std::vector<WidescreenCullWidenSite> ws_cull_widen_sites;
@@ -1718,7 +1716,6 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("plane_nx_sites", ws_cull_plane_nx_sites);
             load_sites("xclip_load_sites", ws_cull_xclip_load_sites);
             load_sites("nclip_keep_sites", ws_cull_nclip_keep_sites);
-            load_sites("nclip_exact_sites", ws_cull_nclip_exact_sites);
             load_sites("branch_keep_sites", ws_cull_branch_keep_sites);
             if (cull.contains("keep")) {
                 std::set<uint32_t> seen;
@@ -2198,7 +2195,6 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_plane_nx_sites*/ ws_cull_plane_nx_sites,
         /*ws_cull_xclip_load_sites*/ ws_cull_xclip_load_sites,
         /*ws_cull_nclip_keep_sites*/ ws_cull_nclip_keep_sites,
-        /*ws_cull_nclip_exact_sites*/ ws_cull_nclip_exact_sites,
         /*ws_cull_branch_keep_sites*/ ws_cull_branch_keep_sites,
         /*ws_cull_keep_sites*/    ws_cull_keep_sites,
         /*ws_cull_widen_sites*/   ws_cull_widen_sites,

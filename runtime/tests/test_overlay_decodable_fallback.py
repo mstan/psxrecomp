@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Structural regression test for unmarked post-EXE code discovery."""
 
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "runtime" / "src" / "dirty_ram_interp.c"
 
 
 def function_body(source: str, name: str) -> str:
-    match = re.search(rf"\bstatic\s+int\s+{re.escape(name)}\s*\([^;]*?\)\s*\{{", source, re.DOTALL)
+    match = re.search(rf"\bstatic\s+int\s+{re.escape(name)}\s*\([^;]*?\)\s*\{{", source, re.S)
     if not match:
         raise AssertionError(f"missing function definition: {name}")
     start = match.end()
@@ -30,14 +31,13 @@ def main() -> int:
     body = function_body(source, "dirty_ram_dispatch_inner")
 
     dirty_gate = body.find("!dirty_ram_is_dirty(phys) && !clean_game_text_miss")
-    region_gate = body.find("phys_is_overlay_region(phys)", dirty_gate)
-    ram_gate = body.find("phys < (8u * 1024u * 1024u)", dirty_gate)
+    floor_gate = body.find("phys >= g_overlay_region_floor", dirty_gate)
+    ram_gate = body.find("phys < (2u * 1024u * 1024u)", dirty_gate)
     decode_gate = body.find("dirty_ram_word_looks_decodable(fetch_word(phys))", dirty_gate)
     mark = body.find("dirty_ram_mark_executable_range(phys, 4u)", dirty_gate)
-    if min(dirty_gate, region_gate, ram_gate, decode_gate, mark) < 0:
-        raise AssertionError("missing dirty/overlay-region/RAM/decode/mark fallback chain")
-    if not (dirty_gate < region_gate < decode_gate < mark and
-            dirty_gate < ram_gate < mark):
+    if min(dirty_gate, floor_gate, ram_gate, decode_gate, mark) < 0:
+        raise AssertionError("missing dirty/floor/RAM/decode/mark fallback chain")
+    if not (dirty_gate < floor_gate < decode_gate < mark and dirty_gate < ram_gate < mark):
         raise AssertionError("fallback checks or executable marking are out of order")
 
     fallback = body[dirty_gate:mark + 200]

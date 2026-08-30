@@ -1,6 +1,5 @@
 #include "mod_runtime.h"
 #include "mod_packages.h"
-#include "psx_lobby_client.h"
 #include "psx_sha256.h"
 
 #include <array>
@@ -58,10 +57,6 @@ extern "C" uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t, uint32_t) {
     return 0;
 }
 extern "C" int psx_ws_x_margin(void) { return 0; }
-extern "C" int psx_lobby_in_lobby(void) { return 0; }
-extern "C" const PsxLobbyMatchCaps* psx_lobby_match_caps(void) {
-    return nullptr;
-}
 
 extern "C" void dirty_ram_mark_executable_range(uint32_t, uint32_t) {}
 extern "C" int fntrace_is_game_started(void) { return 1; }

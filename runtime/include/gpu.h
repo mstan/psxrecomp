@@ -57,9 +57,6 @@ void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
                               uint64_t *promoted_from_native,
                               uint64_t *demoted_to_native,
                               uint64_t *cache_overflow);
-/* Frame-local PGXP vertex canonicalization is invalid after a reset or
- * savestate timeline jump, even when the restored frame number matches. */
-void gpu_pgxp_vertex_cache_invalidate(void);
 /* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
@@ -134,9 +131,9 @@ typedef struct {
 void gpu_arm_shaded_quad_capture(void);
 int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out);
 
-/* Per-frame GP0 command ring (debug-tools builds; play-build accessors are
- * ABI-compatible zero-result stubs).
- * Each entry records the GP0 command header + up to 11 payload words.
+/* Per-frame GP0 command ring (always-on; query via debug server).
+ * Each entry records the GP0 command header + up to 6 payload words
+ * (longer commands like 0x3C shaded textured quad are truncated to 6).
  * Stamped with the s_frame_count value at issue time so a debug
  * client can pull all commands for any frame in the ring window. */
 #define GPU_GP0_RING_MAX_WORDS 12

@@ -38,8 +38,6 @@ extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
 
-void gpu_pgxp_vertex_cache_invalidate(void);
-
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
@@ -55,9 +53,7 @@ typedef enum {
 
 static Gp0State gp0_state;
 static uint64_t gp0_write_count;
-#ifndef PSX_NO_DEBUG_TOOLS
 static uint64_t gp0_nop_count, gp0_fill_count, gp0_draw_count, gp0_env_count, gp0_copy_count;
-#endif
 static uint32_t gp0_cmd_buf[16];   /* max fixed-length command is 12 words */
 static int      gp0_words_collected;
 static int      gp0_words_needed;
@@ -2694,7 +2690,6 @@ uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank 
 /* ---- Initialization ---- */
 
 static void gpu_reset_state(int clear_vram) {
-    gpu_pgxp_vertex_cache_invalidate();
     if (clear_vram) {
         memset(vram, 0, sizeof(vram));
         gpu_vram_dirty_mark_all();
@@ -3475,10 +3470,6 @@ static struct {
 
 static PgxpVertexCache s_pgxp_vertex_cache;
 
-void gpu_pgxp_vertex_cache_invalidate(void) {
-    pgxp_vertex_cache_reset(&s_pgxp_vertex_cache);
-}
-
 void gpu_pgxp_primitive_stats(uint64_t *primitives_armed,
                               uint64_t *rejected_incomplete_position,
                               uint64_t *rejected_incomplete_depth,
@@ -3536,11 +3527,6 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
         }
         int canonical_precise_count = 0;
         for (int i = 0; i < count; i++) {
-            const int index = indices[i];
-            const uint32_t addr = (gp0_cmd_source_addr == 0xFFFFFFFFu)
-                                      ? 0xFFFFFFFFu
-                                      : gp0_cmd_source_addr +
-                                            (uint32_t)index * 4u;
             const int candidate_precise =
                 decision->cls[i] != PGXP_SRC_NATIVE && decision->cls[i] != 3u;
             int32_t candidate_x16 =
@@ -3556,19 +3542,12 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
                     (int64_t)(vy[i] - decision->raw_y[i]) * 65536);
             }
             int canonical_precise = 0;
-            int cache_result = PGXP_VERTEX_CACHE_OVERFLOW;
-            if (addr != 0xFFFFFFFFu) {
-                cache_result = pgxp_vertex_cache_resolve(
-                    &s_pgxp_vertex_cache, s_frame_count, addr,
-                    vx[i], vy[i], candidate_precise,
-                    candidate_x16, candidate_y16, &decision->precise_x[i],
-                    &decision->precise_y[i], &canonical_precise);
-            } else {
-                decision->precise_x[i] = (int32_t)((int64_t)vx[i] * 65536);
-                decision->precise_y[i] = (int32_t)((int64_t)vy[i] * 65536);
-            }
-            if (cache_result == PGXP_VERTEX_CACHE_OVERFLOW &&
-                addr != 0xFFFFFFFFu)
+            const int cache_result = pgxp_vertex_cache_resolve(
+                &s_pgxp_vertex_cache, s_frame_count,
+                vx[i], vy[i], candidate_precise,
+                candidate_x16, candidate_y16, &decision->precise_x[i],
+                &decision->precise_y[i], &canonical_precise);
+            if (cache_result == PGXP_VERTEX_CACHE_OVERFLOW)
                 s_pgxp_primitive_stats.vertex_cache_overflow++;
             if (canonical_precise) canonical_precise_count++;
             if (!candidate_precise && canonical_precise)
@@ -3576,11 +3555,7 @@ static void prepare_pgxp_primitive(PgxpPrimitiveDecision *decision,
             if (candidate_precise && !canonical_precise)
                 s_pgxp_primitive_stats.vertices_demoted_to_native++;
         }
-        /* Never feed a mixed primitive to a precise renderer.  Native fallback
-         * vertices are not guaranteed to share the PGXP projection's affine
-         * basis, so arming on only one corner creates shearing/jitter at the
-         * exact seam this correction is meant to remove. */
-        decision->position_armed = canonical_precise_count == count;
+        decision->position_armed = canonical_precise_count != 0;
         if (canonical_precise_count != count)
             s_pgxp_primitive_stats
                 .primitives_rejected_incomplete_position++;
@@ -5261,31 +5236,25 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
     }
 }
 
-/* Per-opcode execution counters (exposed via gpu_get_opcode_stats). Play
- * builds have no consumer for these counters, so do not pay their per-command
- * write or retain their storage there. */
-#ifndef PSX_NO_DEBUG_TOOLS
+/* Per-opcode execution counters (exposed via gpu_get_opcode_stats) */
 static uint32_t gp0_opcode_count[256];
 
 uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
-#else
-uint32_t gpu_get_opcode_count(uint8_t op) { (void)op; return 0; }
-#endif
 
-/* ---- Per-frame GP0 command ring (debug-tools builds only) --------------- */
-/* We record every GP0 command (header + up to 11 payload words) with the
+/* ---- Per-frame GP0 command ring (always-on, queried via debug server) ---- */
+/* We record every GP0 command (header + up to 6 payload words) with the
  * frame number it was issued in. Per CLAUDE.md ring-buffer rule: capture
  * is continuous and observers query a window of interest later, not arm-
- * then-record. ~104 MiB at 1,048,576 entries. Polyline / long commands get the
- * first 11 payload words; that's enough for every fixed-length GP0 command
+ * then-record. ~34 MB at 1M entries. Polyline / long commands get the
+ * first 6 payload words; that's enough for the header + first vertex pair
  * + first uv/color word for diagnosing per-primitive state. */
 
-#ifndef PSX_NO_DEBUG_TOOLS
+extern uint64_t s_frame_count;  /* defined in debug_server.c */
 extern uint32_t g_debug_last_store_pc;  /* defined in debug_server.c */
 extern uint32_t g_debug_current_func_addr;  /* defined in debug_server.c */
 uint32_t debug_guest_ra(void);  /* accessor in debug_server.c (guest $ra) */
 uint32_t debug_guest_sp(void);  /* accessor in debug_server.c (guest $sp) */
-extern uint8_t *memory_get_ram_ptr(void); /* raw main-RAM backing (no lockstep) */
+extern uint8_t *memory_get_ram_ptr(void); /* raw 2MB main-RAM base (no lockstep) */
 
 /* Bounded guest-stack unwind for VRAM-copy builder attribution. Scans the live
  * stack for words that are valid return addresses (main-RAM code range, and the
@@ -5356,6 +5325,11 @@ static void gp0_ring_record(const uint32_t *words, int n) {
 /* Public accessors for debug_server.c */
 uint64_t gpu_gp0_ring_total(void)    { return gp0_ring_seq; }
 uint32_t gpu_gp0_ring_capacity(void) { return GP0_RING_CAP; }
+uint32_t gpu_gp0_ring_max_words(void){ return GPU_GP0_RING_MAX_WORDS; }
+
+void gpu_set_gp0_source(uint32_t addr) {
+    gp0_next_source_addr = addr;
+}
 
 /* Fill `out[0..max_out-1]` with entries from the requested frame; returns
  * count. Walks from oldest in-buffer to newest so iteration order matches
@@ -5386,31 +5360,6 @@ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
     uint32_t newest_idx = (start + avail - 1) % GP0_RING_CAP;
     if (out_oldest) *out_oldest = gp0_ring[start].frame;
     if (out_newest) *out_newest = gp0_ring[newest_idx].frame;
-}
-#else
-uint64_t gpu_gp0_ring_total(void) { return 0; }
-uint32_t gpu_gp0_ring_capacity(void) { return 0; }
-
-int gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out) {
-    (void)frame;
-    (void)out;
-    (void)max_out;
-    return 0;
-}
-
-void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
-    if (out_oldest) *out_oldest = 0;
-    if (out_newest) *out_newest = 0;
-}
-#endif
-
-/* This is a wire-protocol/type constant, not retained diagnostic state. */
-uint32_t gpu_gp0_ring_max_words(void) { return GPU_GP0_RING_MAX_WORDS; }
-
-/* Source provenance remains functional in play builds: widescreen and PGXP
- * decisions consume gp0_cmd_source_addr independently of the debug ring. */
-void gpu_set_gp0_source(uint32_t addr) {
-    gp0_next_source_addr = addr;
 }
 
 /* ---- Draw census ring (ALWAYS-ON) -----------------------------------------
@@ -5543,10 +5492,8 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
 /* Execute a fully-collected GP0 command */
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
-#ifndef PSX_NO_DEBUG_TOOLS
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
-#endif
     extern void ws_bg_phase_note(uint32_t op);
     ws_bg_phase_note(opcode);   /* native-wide 2D-backdrop stretch: background-phase latch */
 
@@ -5559,13 +5506,11 @@ static void gp0_execute_command(void) {
     }
 
     /* Categorize for diagnostics */
-#ifndef PSX_NO_DEBUG_TOOLS
     if (opcode <= 0x01) gp0_nop_count++;
     else if (opcode == 0x02) gp0_fill_count++;
     else if (opcode >= 0x20 && opcode <= 0x7F) gp0_draw_count++;
     else if (opcode >= 0x80 && opcode <= 0xDF) gp0_copy_count++;
     else if (opcode >= 0xE1 && opcode <= 0xE6) gp0_env_count++;
-#endif
 
     switch (opcode) {
         case 0x00:
@@ -5760,16 +5705,8 @@ static void gp0_execute_command(void) {
 uint64_t gpu_get_gp0_count(void) { return gp0_write_count; }
 
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy) {
-#ifndef PSX_NO_DEBUG_TOOLS
     *nop = gp0_nop_count; *fill = gp0_fill_count;
     *draw = gp0_draw_count; *env = gp0_env_count; *copy = gp0_copy_count;
-#else
-    if (nop) *nop = 0;
-    if (fill) *fill = 0;
-    if (draw) *draw = 0;
-    if (env) *env = 0;
-    if (copy) *copy = 0;
-#endif
 }
 
 void gpu_get_draw_area(GpuDrawArea* out) {
@@ -5944,16 +5881,12 @@ static void gpu_write_gp0_body(uint32_t val) {
         polyline_has_prev = 0;
         gr_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
         gp0_state = shaded ? GP0_POLYLINE_SHADED : GP0_POLYLINE_MONO;
-#ifndef PSX_NO_DEBUG_TOOLS
         gp0_draw_count++;
-#endif
         /* Record polyline header (variable-length body not captured;
          * just enough so per-frame stream shows the polyline existed). */
-#ifndef PSX_NO_DEBUG_TOOLS
         gp0_opcode_count[opcode]++;
         uint32_t hdr_only[1] = { val };
         gp0_ring_record(hdr_only, 1);
-#endif
         return;
     }
 
@@ -6321,72 +6254,15 @@ void gpu_cosim_dump(char *out, int cap) {
     APPEND("%s", "\n");
 #undef APPEND
 }
-
-/* Clear host-only observations of the abandoned timeline after a savestate
- * load.  These tags, prepass ranks, backdrop gates, and split-screen latches
- * are not guest GPU state; retaining them lets the first restored menu/HUD
- * packets inherit gameplay classification and get transformed or rejected.
- * Persistent title configuration remains intact. */
-static void gpu_restore_transient_state(void) {
-    memset(ws_tags, 0, sizeof(ws_tags));
-    ws_last_tag_stamp = (uint32_t)-1000;
-    ws_last_3d_stamp = (uint32_t)-1000;
-    ws_ui_prepass_count = 0;
-    ws_ui_prepass_rank = 0xFFFFu;
-    ws_auto_ui_dense = 0;
-    ws_auto_ui_candidate_count = 0;
-    ws_auto_ui_transform_count = 0;
-    ws_gte_frame = (uint32_t)-1;
-    ws_gte_count = 0;
-    ws_last_gte_stamp = (uint32_t)-1000;
-    ws_gte_prev_verts = 0;
-    ws_last_world3d_stamp = (uint32_t)-1000;
-    ws_sust_world3d_stamp = (uint32_t)-1000;
-    ws_ovh_frame = (uint32_t)-1;
-    ws_ovh_count = 0;
-    ws_ovh_prev = 0;
-    ws_last_ovh_stamp = (uint32_t)-1000;
-    ws_sust_ovh_stamp = (uint32_t)-1000;
-    memset(ws_aspect_cone_state, 0, sizeof(ws_aspect_cone_state));
-    ws_aspect_cone_wide_latched = 0;
-    memset(ws_fb_base, 0, sizeof(ws_fb_base));
-    ws_fb_n = 0;
-    g_ws_backdrop_lo = 0;
-    g_ws_backdrop_hi = 0;
-    ws_nw_phase_backdrop = 0;
-    g_bdg_src_lo = 0xFFFFFFFFu;
-    g_bdg_src_hi = 0;
-    bdg_src_frame = 0xFFFFFFFFu;
-    split_trace_reset(&split_trace_this);
-    split_trace_reset(&split_trace_last);
-    split_recent_left_age = 255;
-    split_recent_right_age = 255;
-    split_recent_display_w = 0;
-    split_recent_display_h = 0;
-}
-
 int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     PstR r;
     if (len != gpu_snapshot_bytes()) return 0;
     pst_r_init(&r, p, len);
     if (!gpu_snap_parse(&r)) return 0;
-    /* A restore can rewind to the same frame number.  Do not let canonical
-     * sub-pixel positions from the abandoned timeline leak into replay. */
-    gpu_pgxp_vertex_cache_invalidate();
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
-    /* E2 is also renderer state: restoring only texture_window_value leaves
-     * indexed UI/font draws using the pre-load window until the guest happens
-     * to issue another E2 command. */
-    gr_set_texture_window(texture_window_value);
-    /* E5/E6 likewise have backend mirrors. A load can otherwise retain the
-     * old offset or mask-check gate and reject/shift only the following 2D
-     * primitives while unrelated world draws continue. */
-    gr_set_draw_offset(draw_offset_x, draw_offset_y);
-    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
-    gpu_restore_transient_state();
     ws_nw_sync_target();
     return 1;
 }

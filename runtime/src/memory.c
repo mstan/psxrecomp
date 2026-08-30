@@ -25,7 +25,6 @@
 #include "psx_cycles.h"
 #include "starvation_ring.h"
 #include "psx_ram.h"
-#include "psx_ram_profile.h"
 #include "pgxp.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -40,10 +39,10 @@
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
 static uint8_t ram[RAM_SIZE];
-static PSXRamSizeRequest s_ram_request = PSX_RAM_SIZE_REQUEST_INITIALIZER;
+static int s_ram_8mb_requested;
 
-uint32_t g_psx_ram_size = PSX_MAIN_RAM_BYTES;
-uint32_t g_psx_ram_mask = PSX_MAIN_RAM_BYTES - 1u;
+uint32_t g_psx_ram_size = PSX_RAM_2MB;
+uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
 
 /* High-bank pages registered as unique DRAM in 8 MB mode (enhancement heaps).
  * Index 0 = page 512 (phys 0x200000). Unregistered high banks keep 2 MiB fold.
@@ -207,13 +206,13 @@ uint32_t memory_get_ram_bytes(void) { return g_psx_ram_size; }
 int      psx_ram_8mb_active(void) { return g_psx_ram_size > PSX_RAM_2MB; }
 
 void psx_ram_reset_size_request(void) {
-    psx_ram_size_request_reset(&s_ram_request);
+    s_ram_8mb_requested = 0;
     memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
 }
 
 int psx_mod_set_main_ram_8mb(int enabled) {
-    psx_ram_size_request_set_mod(&s_ram_request, enabled);
-    if (s_ram_request.expanded) {
+    s_ram_8mb_requested = enabled ? 1 : 0;
+    if (enabled) {
         /* Full high window unique (DuckStation-style). Required for Wipeout
          * enhanced heaps that write through the top bank; partial aliasing
          * folded those stores onto overlay RAM and crashed race start. */
@@ -237,11 +236,14 @@ static int psx_ram_any_high_registered(void) {
 }
 
 static void psx_ram_apply_size_request(void) {
-    g_psx_ram_size = psx_ram_size_request_bytes(&s_ram_request);
-    g_psx_ram_mask = g_psx_ram_size - 1u;
-    if (g_psx_ram_size > PSX_RAM_2MB) {
+    if (s_ram_8mb_requested) {
+        g_psx_ram_size = PSX_RAM_8MB;
+        g_psx_ram_mask = PSX_RAM_8MB - 1u;
         if (!psx_ram_any_high_registered())
             psx_ram_register_unique(PSX_RAM_2MB, PSX_RAM_8MB - PSX_RAM_2MB);
+    } else {
+        g_psx_ram_size = PSX_RAM_2MB;
+        g_psx_ram_mask = PSX_RAM_2MB - 1u;
     }
 }
 
@@ -993,11 +995,6 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
-/* Forward declaration: the optional bounded high-RAM static bundle is not
- * registered through overlay_loader.c, but its memoized CRC identities still
- * use these page generations for invalidation. */
-void overlay_watch_set_range(uint32_t phys, uint32_t len);
-
 void dirty_ram_reset_for_boot(void) {
     text_guard_global_changed();
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
@@ -1010,14 +1007,6 @@ void dirty_ram_reset_for_boot(void) {
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
     memset(g_dirty_ram_dispatch_pc_bitmap, 0,
            sizeof(g_dirty_ram_dispatch_pc_bitmap));
-#ifdef PSX_HAS_OVERLAY_EXTRA_DISPATCH
-    /* The pinned high-RAM bundle is generated from one exact DMA image at
-     * 0x00780000, 0x2004 bytes long. Arm precisely that image before guest
-     * writes begin so memoized static variants re-hash when the image is
-     * replaced. This is invalidation bookkeeping only; admission remains
-     * guarded by the generated address/range/CRC dispatcher. */
-    overlay_watch_set_range(0x00780000u, 0x2004u);
-#endif
     g_dirty_ram_code_gen++;
 }
 
@@ -1053,14 +1042,6 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
     uint32_t sum = 0;
     for (uint32_t pg = fp; pg <= lp; pg++) sum += overlay_page_gen[pg];
     return sum;
-}
-
-/* The negative miss cache keys one dispatch PC to the generation of exactly
- * its containing page. Keep that hot lookup out of the general range walker:
- * unlike candidate validation, it never needs cross-page accumulation. */
-uint32_t overlay_watch_pagegen(uint32_t phys) {
-    if (phys >= RAM_SIZE) return 0;
-    return overlay_page_gen[phys >> DIRTY_RAM_PAGE_SHIFT];
 }
 
 /* Savestate restores RAM via memcpy and never hits the store chokepoint that

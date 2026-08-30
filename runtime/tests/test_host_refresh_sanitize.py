@@ -60,22 +60,11 @@ LIVE = MAIN[LIVE_BEGIN:LIVE_END]
 assert "apply_present_cadence();" in LIVE, (
     "a live CRTC transition must update the renderer, not only the wall period"
 )
-NATIVE_ACTIVATION = (
-    "if (g_mod_native_vblank_rate && !g_mod_native_vblank_active &&\n"
-    "        gpu_display_mode_is_programmed() && is_pal) {\n"
-    "        gpu_set_crtc_refresh_multiplier(g_mod_pending_crtc_multiplier);\n"
-    "        g_mod_native_vblank_active = true;"
+assert "gpu_set_crtc_refresh_multiplier" not in LIVE, (
+    "host cadence reconciliation must observe, never overwrite, plugin timing"
 )
-assert NATIVE_ACTIVATION in LIVE, (
-    "the deferred native-rate multiplier must activate only after the guest "
-    "programs PAL display mode"
-)
-assert LIVE.count("gpu_set_crtc_refresh_multiplier(") == 1, (
-    "live cadence reconciliation may apply only the deferred native-rate "
-    "multiplier; it must not otherwise overwrite plugin timing"
-)
-assert "if (!(g_mod_native_vblank_rate && g_mod_native_vblank_active))" in LIVE, (
-    "an activated native-VBlank mod must remain the pacing authority"
+assert "if (!g_mod_native_vblank_rate)" in LIVE, (
+    "an explicit native-VBlank mod must remain the pacing authority"
 )
 assert (
     "return g_frame_period_ms > 0.0 && !present_vsync_owns_cadence();" in MAIN

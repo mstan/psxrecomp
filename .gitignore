@@ -24,7 +24,6 @@ ghidra/
 .worktrees/
 
 # Build artifacts
-/build-*/
 recompiler/build/
 recompiler/build-asan/
 recompiler/build-asan2/

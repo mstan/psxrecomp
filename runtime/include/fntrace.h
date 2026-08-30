@@ -6,9 +6,11 @@
  * so cross-process tools that already speak Beetle's protocol work
  * unchanged against psx-runtime.
  *
- * Debug builds can arm selected targets or opt into recording every dispatch,
- * then inspect the retained ring without attaching a debugger. Play builds
- * preserve the callable and link-visible API but do not retain trace entries.
+ * Why "always-on" rather than arm-then-record: see CLAUDE.md global
+ * rule "Never time/attach for observability". The ring captures every
+ * dispatch from boot; arming only narrows what the dump command
+ * reports, never what is recorded. To investigate a window of
+ * interest, fntrace_dump it after the fact.
  *
  * Coverage: every psx_dispatch entry — both static-recompiled targets
  * (ROM functions, shell-relocated functions) and dirty-RAM dispatches.
@@ -25,7 +27,7 @@
 extern "C" {
 #endif
 
-/* 4M entries × 36 bytes = 144 MiB RAM. At ~580K dispatches/s peak (boot)
+/* 4M entries × 32 bytes = 128 MB RAM.  At ~580K dispatches/s peak (boot)
  * that's ~7s; at ~10K/s during modal idle, ~400s.  Sized for press-
  * window retrospectives without per-second eviction.
  * Definition uses PSX_BSS so the zeros stay out of the PE image (MinGW+LTO
@@ -44,18 +46,8 @@ typedef struct {
     uint32_t sp;        /* cpu->gpr[29] — for func_8001A954 SP/RA-lifecycle oracle */
 } FntraceEntry;
 
-#ifndef PSX_NO_DEBUG_TOOLS
-/* Raw storage is a debug-build implementation detail. Lean consumers use the
- * accessors below and cannot accidentally index storage that is not present. */
 extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 extern uint64_t     g_fntrace_seq;     /* monotonic; index into ring = seq % CAP */
-#endif
-
-/* Read-only ring access keeps consumers independent of the backing storage.
- * Play builds report an empty trace without allocating the 144 MiB diagnostic
- * ring. */
-uint64_t fntrace_total(void);
-const FntraceEntry* fntrace_get(uint64_t seq);
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ──────────────────
  * One entry per dispatch whose guest SP crossed a 64 KB domain since the

@@ -157,54 +157,21 @@ extern uint32_t g_debug_last_store_pc;
 /* SIO write PC tracer ring — records (pc, addr, value, byte_seq) for every
  * write to SIO_DATA / SIO_CTRL / SIO_STAT.  Always-on; pulled via TCP cmd
  * "sio_pc_trace". */
-#ifdef PSX_NO_DEBUG_TOOLS
-static inline void debug_server_log_sio_write(uint32_t addr, uint32_t value,
-                                              uint8_t width) {
-    (void)addr;
-    (void)value;
-    (void)width;
-}
-#else
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width);
-#endif
 
 /* Targeted generated-PC probe ring used for narrow control-flow diagnostics. */
 void debug_server_log_probe(uint32_t pc, CPUState *cpu);
 
 /* RestoreState / exception longjmp tracer. Records nonlocal exception
  * control-flow events that can skip normal function epilogues. */
-#ifdef PSX_NO_DEBUG_TOOLS
-static inline void debug_server_log_restore_event(uint32_t kind,
-                                                  uint32_t target_pc,
-                                                  uint32_t jmp_val) {
-    (void)kind;
-    (void)target_pc;
-    (void)jmp_val;
-}
-#else
-void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc,
-                                    uint32_t jmp_val);
-#endif
+void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val);
 
 /* BIOS ChangeThread / TCB context tracer. Records runtime thread switches
  * and the saved register block belonging to the selected TCB. */
-#ifdef PSX_NO_DEBUG_TOOLS
-static inline void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
-                                                 uint32_t current_tcb,
-                                                 uint32_t target_tcb,
-                                                 uint32_t target_pc) {
-    (void)kind;
-    (void)cpu;
-    (void)current_tcb;
-    (void)target_tcb;
-    (void)target_pc;
-}
-#else
 void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t current_tcb,
                                    uint32_t target_tcb,
                                    uint32_t target_pc);
-#endif
 void debug_server_log_thread_event_ex(uint32_t kind, CPUState *cpu,
                                       uint32_t current_tcb,
                                       uint32_t target_tcb,

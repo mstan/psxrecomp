@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 INCLUDE = ROOT / "runtime" / "include"
 
@@ -15,12 +16,9 @@ INCLUDE = ROOT / "runtime" / "include"
 def find_gcc() -> str:
     candidates = [
         os.environ.get("CC"),
+        r"C:\msys64\mingw64\bin\gcc.exe" if os.name == "nt" else None,
         shutil.which("gcc"),
         shutil.which("cc"),
-        # Last-resort compatibility path for developers whose MSYS2 compiler
-        # is not exposed through PATH.  Prefer the configured/PATH compiler:
-        # an unrelated or partially upgraded MSYS2 install must not shadow it.
-        r"C:\msys64\mingw64\bin\gcc.exe" if os.name == "nt" else None,
     ]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).is_file():
@@ -66,7 +64,7 @@ void func_80010000(CPUState *cpu) {
         command.extend([
             str(c_path), "-o", str(out_path), f"-I{INCLUDE}", "-lm",
         ])
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             sys.stderr.write(result.stdout)
             sys.stderr.write(result.stderr)

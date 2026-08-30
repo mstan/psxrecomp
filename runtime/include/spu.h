@@ -84,10 +84,9 @@ void spu_get_global_state(SpuGlobalState* out);
 /* Debug peek into SPU sample RAM (spu_ram TCP command). */
 uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len);
 
-/* ---- Per-voice diagnostic event ring. Records KEYON, KEYOFF, voice
- * end-flag-stop and end-flag-loop events with a frame timestamp. Debug builds
- * record continuously. PSX_NO_DEBUG_TOOLS builds retain this API and its
- * types, but omit the backing ring and report no captured events. */
+/* ---- Always-on per-voice event ring. Records KEYON, KEYOFF, voice
+ * end-flag-stop and end-flag-loop events with a frame timestamp. Allocated
+ * at spu_init; never armed/disarmed. Query the window of interest. */
 typedef enum {
     SPU_EV_KEYON     = 1,
     SPU_EV_KEYOFF    = 2,

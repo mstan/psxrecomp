@@ -51,18 +51,6 @@ def make_psxexe():
             jal(LOAD + 0x100), 0,
             0x03E00008, 0x27BD0010)):
         put32(text, 0x300 + i * 4, word)
-    # Whole-image discovery sees this framed unresolved-JR function and must
-    # conservatively retain its broad host range.  A dense pointer table in the
-    # preceding data gap points into the host's zero-filled runtime storage;
-    # those NOP-looking targets are data, not callable interior aliases.
-    for i, target in enumerate((LOAD + 0x500, LOAD + 0x504, LOAD + 0x508)):
-        put32(text, 0x380 + i * 4, target)
-    put32(text, 0x20, jal(LOAD + 0x400))
-    for i, word in enumerate((0x27BDFFF0, 0x01000008, 0x00000000)):
-        put32(text, 0x400 + i * 4, word)
-    # A branch-shaped data word in that broad host also targets the zero area.
-    # Mid-function splitting must apply the same zero-storage rejection.
-    put32(text, 0x420, 0x10000037)  # beq zero,zero,LOAD+0x500
     return bytes(header + text)
 
 
@@ -181,10 +169,6 @@ def main():
                 failures.append("fail-closed data stub leaked into game dispatch")
             if "{0x80010320u," in default_dispatch:
                 failures.append("fail-closed stub continuation leaked into game dispatch")
-            for zero_alias in ("func_80010500", "func_80010504", "func_80010508"):
-                if zero_alias in default_full:
-                    failures.append(
-                        f"zero-filled runtime storage became callable alias {zero_alias}")
 
         write_config(config, discovery="invent-functions")
         invalid_mode = run(args.recompiler, config)

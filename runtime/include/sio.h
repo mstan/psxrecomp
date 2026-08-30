@@ -166,9 +166,7 @@ int sio_get_pad_analog(int slot);
 void sio_get_pad_sticks(int slot, uint8_t out[4]);
 
 /* ---- SIO byte-level trace ring buffer ----
- * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history.
- * PSX_NO_DEBUG_TOOLS builds retain the types and accessors for API stability,
- * but omit the backing ring and report no captured entries. */
+ * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
 #define SIO_TRACE_CAP (1 << 20)
 
 typedef struct {
@@ -194,13 +192,10 @@ typedef struct {
 } SioTraceEntry;
 
 /* Get pointer to ring buffer and current write index.
- * Returns number of entries ever written (seq of next write).  In
- * PSX_NO_DEBUG_TOOLS builds this returns 0, sets *buf_out to NULL, and sets
- * *write_idx_out to 0. */
+ * Returns number of entries ever written (seq of next write). */
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
 
-/* Current SIO byte sequence — used by SIO PC tracer for cross-referencing and
- * by runtime progress guards.  This counter remains active in lean builds. */
+/* Current SIO byte sequence — used by SIO PC tracer for cross-referencing. */
 uint32_t sio_get_seq(void);
 
 /* Returns 1 if a memcard protocol exchange is in progress on either
@@ -269,9 +264,8 @@ void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
 /* ---- Card transaction ring buffer ----
  *
  * One entry per card protocol transaction (0x81 → terminal state / abort).
- * Debug builds retain 64K entries × ~544 B ≈ 35 MB. Builds with
- * PSX_NO_DEBUG_TOOLS keep the public types/getters for ABI compatibility but
- * do not allocate or record the historical ring. */
+ * Always-on.  64K entries × ~544 B ≈ 35 MB — holds tens of minutes of card
+ * activity at typical detection-cycle rates. */
 #define SIO_TXN_CAP        (1 << 16)
 #define SIO_TXN_MAX_BYTES  256
 
@@ -314,9 +308,8 @@ const SioTxnEntry *sio_get_card_txn_live(void);
 
 /* ---- SIO IRQ #7 delivery ring ----
  *
- * Captures every time IRQ #7 (SIO0) is raised into I_STAT. Debug builds retain
- * 1M entries. Builds with PSX_NO_DEBUG_TOOLS keep the public types/getter for
- * ABI compatibility but do not allocate or record the historical ring. */
+ * Captures every time IRQ #7 (SIO0) is raised into I_STAT.  Always-on.
+ * 1M entries × ~64 B ≈ 64 MB — holds tens of minutes of IRQ history. */
 #define SIO_IRQ_RING_CAP (1 << 20)
 
 typedef enum {

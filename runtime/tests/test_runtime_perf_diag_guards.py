@@ -47,10 +47,7 @@ def main():
         "uint64_t perf_start = runtime_perf_section_begin();", capture, provider)
     provider_end = main_cpp.index(
         "&g_runtime_perf.provider_poll_ticks);", provider)
-    pacer = main_cpp.index(
-        "frame_pacer_wait(&s_frame_pacer, present_frame_period_ms());",
-        provider,
-    )
+    pacer = main_cpp.index("frame_pacer_wait(&pacer, g_frame_period_ms);", provider)
     if not (begin < diag < capture < provider_begin < provider <
             provider_end < pacer):
         raise AssertionError("vblank telemetry boundaries are out of order")

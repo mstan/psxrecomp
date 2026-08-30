@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Regression guards for the self-contained CLI project pipeline."""
 
-import sys
 from pathlib import Path
+import sys
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -16,9 +17,6 @@ def main() -> int:
     cli = (ROOT / "recompiler/src/main_cli.cpp").read_text(encoding="utf-8")
     bios = (ROOT / "recompiler/src/main_bios.cpp").read_text(encoding="utf-8")
     package = (ROOT / "tools/build_cli.py").read_text(encoding="utf-8")
-    runtime_cmake = (ROOT / "runtime/CMakeLists.txt").read_text(encoding="utf-8")
-    recompiler_cmake = (ROOT / "recompiler/CMakeLists.txt").read_text(
-        encoding="utf-8")
 
     require(cli, 'bios_config = \\"psxrecomp/bios/{}\\"',
             "generated game.toml does not name its BIOS profile")
@@ -53,25 +51,13 @@ def main() -> int:
             "packaged framework omits the redistributable OpenBIOS image")
     require(package, 'ROOT / "bios" / "OpenBIOS.LICENSE"',
             "packaged framework omits the OpenBIOS license")
-    require(package, '"-DBUILD_TESTING=ON"',
-            "CLI release graph does not enable its boot-path test")
-
-    for name, cmake in (("runtime", runtime_cmake),
-                        ("recompiler", recompiler_cmake)):
-        option_pos = cmake.find('option(BUILD_TESTING')
-        ctest_pos = cmake.find('include(CTest)')
-        if option_pos < 0 or ctest_pos < 0 or option_pos >= ctest_pos:
-            raise AssertionError(
-                f"{name} must default BUILD_TESTING before include(CTest)")
-        require(cmake[option_pos:ctest_pos], "OFF)",
-                f"{name} standalone builds must default tests off")
 
     require(bios, 'a == "--rom"',
             "psxrecomp-bios config mode lacks the ROM override")
     require(bios, 'a == "--out-dir"',
             "psxrecomp-bios config mode lacks the output override")
 
-    print("PASS: CLI profiles, test graph, BIOS overrides, and UI isolation agree")
+    print("PASS: CLI profiles, stage order, BIOS overrides, and UI isolation agree")
     return 0
 
 

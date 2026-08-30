@@ -2133,62 +2133,6 @@ STATIC_PREAMBLE = """\
 
 """
 
-
-_CPS_SPLIT_TARGET_RE = re.compile(
-    r'\bcpu->pc\s*=\s*0x([0-9A-Fa-f]{8})u;\s*return;'
-    r'\s*/\*\s*CPS\b[^*]*\*/')
-
-
-def generated_cps_split_roots(src: str, data: bytes,
-                              load_addr: int, size: int) -> list[int]:
-    """Return same-image CPS targets that have no generated owner/label.
-
-    CPS tail transfers are normally either a block resume (handled by the
-    continuation-owner pass) or a transfer to another overlay function.  The
-    latter used to be emitted as ``cpu->pc = target`` without making ``target``
-    a recompiler root.  In a static build that silently sends the target to the
-    dirty interpreter; with fail-fast it eventually surfaces as an unknown
-    dispatch.  Only promote targets in this exact captured image, and only
-    when the capture contains a decodable first word.  Zero/data targets remain
-    fail-closed and are never made executable by this repair.
-    """
-    lo = load_addr & 0x1FFFFFFF
-    hi = lo + size
-    functions = {
-        (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
-        for match in re.finditer(
-            r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)$',
-            src, re.MULTILINE)
-    }
-    blocks = {
-        (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
-        for match in re.finditer(r'^block_([0-9A-Fa-f]{8}):', src,
-                                 re.MULTILINE)
-    }
-    roots = set()
-    for match in _CPS_SPLIT_TARGET_RE.finditer(src):
-        target = (int(match.group(1), 16) & 0x1FFFFFFF) | 0x80000000
-        phys = target & 0x1FFFFFFF
-        if not (lo <= phys < hi) or target in functions or target in blocks:
-            continue
-        word = _word_at(data, load_addr, target)
-        if word is None:
-            # Captures may describe the same image with a physical load
-            # address while the generated CPS target is KSEG1 (or vice
-            # versa).  Resolve the probe by physical offset before rejecting
-            # an otherwise valid same-image target.
-            load_phys = load_addr & 0x1FFFFFFF
-            target_phys = target & 0x1FFFFFFF
-            word = _word_at(data, load_addr,
-                            load_addr + target_phys - load_phys)
-        # A zero word decodes as NOP, but at a newly discovered dynamic target
-        # it is overwhelmingly a cleared/data slot.  Never turn that into an
-        # executable root merely because the decoder accepts NOP.
-        if word in (None, 0) or not _is_valid_mips_word(word):
-            continue
-        roots.add(target)
-    return sorted(roots)
-
 def patch_generated_c_static(src: str, load_addr: int, size: int) -> tuple:
     """
     Post-process psxrecomp-game's _full.c output for static binary compilation.
@@ -2279,21 +2223,6 @@ def namespace_generated_static(src: str, namespace: str,
     return src, symbols
 
 
-def parse_static_symbol_prefix(value: str) -> str:
-    """Validate the optional identifier fragment used by static AOT bundles."""
-    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value or ''):
-        raise argparse.ArgumentTypeError(
-            '--static-symbol-prefix must be a non-empty C identifier fragment '
-            '([A-Za-z_][A-Za-z0-9_]*)')
-    return value
-
-
-def static_recipe_namespace(suffix: str, symbol_prefix: str = '') -> str:
-    """Return the deterministic private-symbol namespace for one recipe."""
-    infix = f'{symbol_prefix}_' if symbol_prefix else ''
-    return f'ov_{infix}{suffix}'
-
-
 def parse_cps_continuation_owners(src: str) -> dict:
     """Return compiled block entry -> owning function for generated CPS C.
 
@@ -2321,15 +2250,6 @@ def parse_cps_continuation_owners(src: str) -> dict:
 def add_cps_resume_case(src: str, host_symbol: str,
                         host: int, entry: int) -> tuple:
     """Make ``entry`` a legal ``cpu->pc`` resume point in one native host."""
-    return add_cps_resume_cases(src, host_symbol, host, [entry])
-
-
-def add_cps_resume_cases(src: str, host_symbol: str,
-                         host: int, entries) -> tuple:
-    """Add several CPS resume points to one host with a single source copy."""
-    entries = sorted(set(entries))
-    if not entries:
-        return src, True
     definition = re.search(
         rf'^void {re.escape(host_symbol)}\(CPUState\* cpu\)\n\{{',
         src, re.MULTILINE)
@@ -2340,16 +2260,9 @@ def add_cps_resume_cases(src: str, host_symbol: str,
     end = (definition.end() + next_definition.start()
            if next_definition else len(src))
     segment = src[definition.start():end]
-    block_entries = {
-        int(value, 16) for value in
-        re.findall(r'^block_([0-9A-Fa-f]{8}):', segment, re.MULTILINE)
-    }
-    available = [entry for entry in entries if entry in block_entries]
-    if not available:
+    if not re.search(rf'^block_{entry:08X}:', segment, re.MULTILINE):
         return src, False
-    missing = [entry for entry in available if
-               f'case 0x{entry:08X}u: goto block_{entry:08X};' not in segment]
-    if not missing:
+    if f'case 0x{entry:08X}u: goto block_{entry:08X};' in segment:
         return src, True
 
     hook = segment.find('debug_server_log_call_entry')
@@ -2358,19 +2271,14 @@ def add_cps_resume_cases(src: str, host_symbol: str,
     if 'if (cpu->pc != 0u)' in prologue and default_match:
         insert = definition.start() + default_match.start()
         indent = re.match(r'\s*', prologue[default_match.start():]).group(0)
-        arms = ''.join(
-            f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
-            for entry in missing)
-        return src[:insert] + arms + src[insert:], True
+        arm = f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
+        return src[:insert] + arm + src[insert:], True
 
-    case_text = ''.join(
-        f'            case 0x{entry:08X}u: goto block_{entry:08X};\n'
-        for entry in missing)
     prologue_text = (
         '\n    if (cpu->pc != 0u) {\n'
         '        uint32_t _cont = cpu->pc; cpu->pc = 0;\n'
         '        switch (_cont) {\n'
-        f'{case_text}'
+        f'            case 0x{entry:08X}u: goto block_{entry:08X};\n'
         f'            case 0x{host:08X}u: break;  /* entry at prologue */\n'
         f'            default: cpu->pc = _cont; psx_native_bad_entry(cpu, '
         f'0x{host:08X}u, _cont); return;\n'
@@ -2379,80 +2287,8 @@ def add_cps_resume_cases(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
-def add_cps_resume_cases_by_host(src: str, requests) -> tuple:
-    """Plan all host resume edits against one shard and rebuild it once."""
-    definitions = list(re.finditer(
-        r'^void ([A-Za-z_][A-Za-z0-9_]*)\(CPUState\* cpu\)\n\{',
-        src, re.MULTILINE))
-    definitions_by_symbol = {
-        match.group(1): (match, definitions[index + 1].start()
-                         if index + 1 < len(definitions) else len(src))
-        for index, match in enumerate(definitions)
-    }
-    edits = []
-    admitted = set()
-    for host_symbol, host, entries in requests:
-        found = definitions_by_symbol.get(host_symbol)
-        if found is None:
-            continue
-        definition, end = found
-        segment = src[definition.start():end]
-        block_entries = {
-            int(value, 16) for value in re.findall(
-                r'^block_([0-9A-Fa-f]{8}):', segment, re.MULTILINE)
-        }
-        available = sorted(set(entries) & block_entries)
-        admitted.update(available)
-        missing = [entry for entry in available if
-                   f'case 0x{entry:08X}u: goto block_{entry:08X};'
-                   not in segment]
-        if not missing:
-            continue
-        hook = segment.find('debug_server_log_call_entry')
-        prologue = segment[:hook] if hook >= 0 else ''
-        default_match = re.search(r'^\s+default:', prologue, re.MULTILINE)
-        if 'if (cpu->pc != 0u)' in prologue and default_match:
-            position = definition.start() + default_match.start()
-            indent = re.match(
-                r'\s*', prologue[default_match.start():]).group(0)
-            text = ''.join(
-                f'{indent}case 0x{entry:08X}u: goto block_{entry:08X};\n'
-                for entry in missing)
-        else:
-            position = definition.end()
-            cases = ''.join(
-                f'            case 0x{entry:08X}u: '
-                f'goto block_{entry:08X};\n' for entry in missing)
-            text = (
-                '\n    if (cpu->pc != 0u) {\n'
-                '        uint32_t _cont = cpu->pc; cpu->pc = 0;\n'
-                '        switch (_cont) {\n'
-                f'{cases}'
-                f'            case 0x{host:08X}u: break;  '
-                '/* entry at prologue */\n'
-                f'            default: cpu->pc = _cont; '
-                f'psx_native_bad_entry(cpu, 0x{host:08X}u, _cont); return;\n'
-                '        }\n'
-                '    }')
-        edits.append((position, text))
-    if not edits:
-        return src, admitted
-    pieces = []
-    cursor = 0
-    for position, text in sorted(edits):
-        pieces.extend((src[cursor:position], text))
-        cursor = position
-    pieces.append(src[cursor:])
-    return ''.join(pieces), admitted
-
-
-def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
+def generate_overlay_dispatch(variants: list) -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
-    infix = f'_{symbol_prefix}' if symbol_prefix else ''
-    static_stem = f'psx_ov{infix}_static'
-    dispatch_symbol = f'psx_overlay_dispatch{infix}'
-    stats_symbol = (f'psx_overlay_{symbol_prefix}_get_stats'
-                    if symbol_prefix else 'psx_overlay_static_get_stats')
     unique = []
     seen = set()
     for variant in variants:
@@ -2469,7 +2305,7 @@ def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
     unique.sort(key=lambda v: (v['addr'], v['crc'], v['ranges'], v['symbol']))
     by_addr = {}
     for index, variant in enumerate(unique):
-        variant['range_symbol'] = f'{static_stem}_ranges_{index:05d}'
+        variant['range_symbol'] = f'psx_ov_static_ranges_{index:05d}'
         by_addr.setdefault(variant['addr'], []).append(variant)
 
     lines = [
@@ -2485,10 +2321,10 @@ def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
         '                                                uint32_t count,',
         '                                                uint32_t expected_crc,',
         '                                                uint32_t state[2]);',
-        f'static uint64_t {static_stem}_checks = 0;',
-        f'static uint64_t {static_stem}_hits = 0;',
-        f'static uint64_t {static_stem}_variant_misses = 0;',
-        f'static uint64_t {static_stem}_address_misses = 0;',
+        'static uint64_t psx_ov_static_checks = 0;',
+        'static uint64_t psx_ov_static_hits = 0;',
+        'static uint64_t psx_ov_static_variant_misses = 0;',
+        'static uint64_t psx_ov_static_address_misses = 0;',
         '',
     ]
     for variant in unique:
@@ -2503,16 +2339,16 @@ def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
 
     lines += [
         '',
-        f'void {stats_symbol}(uint64_t *checks, uint64_t *hits,',
+        'void psx_overlay_static_get_stats(uint64_t *checks, uint64_t *hits,',
         '                                  uint64_t *variant_misses,',
         '                                  uint64_t *address_misses) {',
-        f'    if (checks) *checks = {static_stem}_checks;',
-        f'    if (hits) *hits = {static_stem}_hits;',
-        f'    if (variant_misses) *variant_misses = {static_stem}_variant_misses;',
-        f'    if (address_misses) *address_misses = {static_stem}_address_misses;',
+        '    if (checks) *checks = psx_ov_static_checks;',
+        '    if (hits) *hits = psx_ov_static_hits;',
+        '    if (variant_misses) *variant_misses = psx_ov_static_variant_misses;',
+        '    if (address_misses) *address_misses = psx_ov_static_address_misses;',
         '}',
         '',
-        f'int {dispatch_symbol}(CPUState *cpu, uint32_t addr) {{',
+        'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
         '    const uint32_t key = (addr & 0x1FFFFFFFu) | 0x80000000u;',
         '    switch (key) {',
     ]
@@ -2521,20 +2357,20 @@ def generate_overlay_dispatch(variants: list, symbol_prefix: str = '') -> str:
         for variant in by_addr[addr]:
             count = len(variant['ranges'])
             lines += [
-                f'            {static_stem}_checks++;',
+                '            psx_ov_static_checks++;',
                 f'            if (psx_overlay_static_code_matches_memo('
                 f'{variant["range_symbol"]}, {count}u, '
                 f'0x{variant["crc"]:08X}u, {variant["range_symbol"]}_st)) {{',
-                f'                {static_stem}_hits++;',
+                '                psx_ov_static_hits++;',
                 f'                {variant["symbol"]}(cpu);',
                 '                return 1;',
                 '            }',
-                f'            {static_stem}_variant_misses++;',
+                '            psx_ov_static_variant_misses++;',
             ]
         lines.append('            return 0;')
     lines += [
         '        default:',
-        f'            {static_stem}_address_misses++;',
+        '            psx_ov_static_address_misses++;',
         '            return 0;',
         '    }',
         '}',
@@ -2965,32 +2801,25 @@ def load_region_current_variant_coverage(cache_dir: str, phys_addr: int,
     return entries, ranges_out
 
 
-def current_variant_func_id_matches(func_id, data: bytes,
-                                    load_addr: int, size: int) -> bool:
-    """Return whether one complete identity's guard matches this image."""
-    entry, expected_crc, ranges = func_id
-    ov_lo = load_addr & 0x1FFFFFFF
-    ov_hi = ov_lo + size
-    crc = 0
-    for start, length in ranges:
-        lo = start & 0x1FFFFFFF
-        if length <= 0 or lo < ov_lo or lo + length > ov_hi:
-            return False
-        crc = binascii.crc32(data[lo - ov_lo:lo - ov_lo + length], crc)
-    if (crc & 0xFFFFFFFF) != (expected_crc & 0xFFFFFFFF):
-        return False
-    return not audit_func_id_delay_slots(
-        [(entry, expected_crc, ranges)], data, load_addr)
-
-
 def current_variant_func_ids(func_ids: list, data: bytes,
                              load_addr: int, size: int) -> list:
     """Retain complete identities whose guarded bytes match this image."""
     valid_ids = []
-    for func_id in func_ids:
-        if current_variant_func_id_matches(
-                func_id, data, load_addr, size):
-            valid_ids.append(func_id)
+    ov_lo = load_addr & 0x1FFFFFFF
+    ov_hi = ov_lo + size
+    for entry, expected_crc, ranges in func_ids:
+        crc = 0
+        valid = True
+        for start, length in ranges:
+            lo = start & 0x1FFFFFFF
+            if length <= 0 or lo < ov_lo or lo + length > ov_hi:
+                valid = False
+                break
+            crc = binascii.crc32(data[lo - ov_lo:lo - ov_lo + length], crc)
+        if valid and (crc & 0xFFFFFFFF) == (expected_crc & 0xFFFFFFFF):
+            candidate = [(entry, expected_crc, ranges)]
+            if not audit_func_id_delay_slots(candidate, data, load_addr):
+                valid_ids.append((entry, expected_crc, ranges))
     return valid_ids
 
 
@@ -3079,32 +2908,23 @@ def add_static_variant_request(requests: dict, entries, data: bytes,
 def unresolved_static_variant_requests(requests: dict,
                                        static_parts: list) -> list:
     """Return demands with no body whose live range guard matches that image."""
-    # Only requested dispatch entries can affect this answer.  The previous
-    # implementation revalidated every identity in the aggregate bundle for
-    # every byte recipe, materializing a potentially huge valid-id list before
-    # reducing it back to a small address set.  The retained Wipeout corpus can
-    # exhaust memory at that point after all shards have already compiled.
-    # Index original variant records by address once, then validate only the
-    # handful of identities capable of satisfying each exact-image demand.
-    demanded_entries = {
-        entry for request in requests.values()
-        for entry in request['entries']
-    }
-    variants_by_entry = {entry: [] for entry in demanded_entries}
-    for part in static_parts:
-        for variant in part['variants']:
-            entry = (variant['addr'] & 0x1FFFFFFF) | 0x80000000
-            if entry in demanded_entries:
-                variants_by_entry[entry].append(variant)
+    func_ids = [
+        (variant['addr'], variant['crc'], variant['ranges'])
+        for part in static_parts
+        for variant in part['variants']
+    ]
     unresolved = []
     for request in requests.values():
-        for entry in request['entries']:
-            candidates = variants_by_entry.get(entry, ())
-            if not any(current_variant_func_id_matches(
-                    (entry, variant['crc'], variant['ranges']),
-                    request['data'], request['load_addr'], request['size'])
-                    for variant in candidates):
-                unresolved.append((entry, request))
+        matching = {
+            (entry & 0x1FFFFFFF) | 0x80000000
+            for entry, _crc, _ranges in current_variant_func_ids(
+                func_ids, request['data'], request['load_addr'], request['size'])
+        }
+        unresolved.extend(
+            (entry, request)
+            for entry in request['entries']
+            if entry not in matching
+        )
     return sorted(unresolved, key=lambda item: (
         item[0], item[1]['load_addr'], item[1]['size'],
         item[1]['image_crc']))
@@ -3271,9 +3091,8 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         entry = (interior & 0x1FFFFFFF) | 0x80000000
         if entry not in ids_by_addr or entry not in set(func_addrs):
             return None, 'requested-entry-not-emitted'
-        namespace = static_recipe_namespace(
-            f'frag_{phys_addr:08X}_{image_crc:08X}_{entry:08X}',
-            getattr(args, 'static_symbol_prefix', ''))
+        namespace = (f'ov_frag_{phys_addr:08X}_{image_crc:08X}_'
+                     f'{entry:08X}')
         continuation_owners = parse_cps_continuation_owners(src)
         src, symbols = namespace_generated_static(src, namespace, func_addrs)
         variants = []
@@ -3549,21 +3368,6 @@ def merge_fragment_jobs_by_recipe(jobs: list[dict],
 
 def _canonical_guest_addr(addr: int) -> int:
     return (addr & 0x1FFFFFFF) | 0x80000000
-
-
-NATIVE_CONTINUATION_PC = 0x807814D0
-NATIVE_CONTINUATION_WORD = 0x27BDFFC0
-
-
-def _has_native_continuation_evidence(data: bytes, load_addr: int,
-                                      size: int) -> bool:
-    """Require the exact captured prologue before promoting the continuation."""
-    phys = NATIVE_CONTINUATION_PC & 0x1FFFFFFF
-    offset = phys - (load_addr & 0x1FFFFFFF)
-    return (0 <= offset and offset + 4 <= size and
-            offset + 4 <= len(data) and
-            int.from_bytes(data[offset:offset + 4], 'little') ==
-            NATIVE_CONTINUATION_WORD)
 
 
 def _normalized_func_identity(func_id) -> tuple:
@@ -5344,29 +5148,6 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
     return True
 
 
-@contextmanager
-def _quiet_windows_loader_errors():
-    """Prevent invalid cache shards from opening interactive system dialogs."""
-    if os.name != 'nt':
-        yield
-        return
-
-    import ctypes
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    set_thread_error_mode = kernel32.SetThreadErrorMode
-    set_thread_error_mode.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
-    set_thread_error_mode.restype = ctypes.c_bool
-    previous = ctypes.c_uint()
-    # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX. Thread scope avoids
-    # changing loader behavior for other work running in this Python process.
-    changed = set_thread_error_mode(0x0001 | 0x8000, ctypes.byref(previous))
-    try:
-        yield
-    finally:
-        if changed:
-            set_thread_error_mode(previous.value, None)
-
-
 def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
     """Read overlay_abi from one loaded image, then release it immediately."""
     import _ctypes
@@ -5376,8 +5157,7 @@ def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
         # Shards are generated as ordinary C (cdecl). ctypes.WinDLL selects
         # stdcall and can corrupt a 32-bit Windows caller's stack; CDLL is the
         # correct loader on every supported host (x64 merely masks the error).
-        with _quiet_windows_loader_errors():
-            library = ctypes.CDLL(dll_path)
+        library = ctypes.CDLL(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -5400,8 +5180,7 @@ def _dll_pair_id_matches(dll_path: str, expected_pair_id: int) -> bool:
     import ctypes
     library = None
     try:
-        with _quiet_windows_loader_errors():
-            library = ctypes.CDLL(dll_path)
+        library = ctypes.CDLL(dll_path)
         pair_fn = library.overlay_pair_id
         pair_fn.argtypes = []
         pair_fn.restype = ctypes.c_uint64
@@ -5426,8 +5205,7 @@ def _dll_runtime_exports_match(dll_path: str, expected_abi: int | None,
     import ctypes
     library = None
     try:
-        with _quiet_windows_loader_errors():
-            library = ctypes.CDLL(dll_path)
+        library = ctypes.CDLL(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -5578,10 +5356,6 @@ def main():
                          'lost after a later capture)')
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
-    ap.add_argument('--static-symbol-prefix', type=parse_static_symbol_prefix,
-                    default=None, metavar='IDENT',
-                    help='namespace static output symbols (for example, highram '
-                         'emits psx_overlay_dispatch_highram and ov_highram_*)')
     ap.add_argument('--flavor',          type=int, default=0,
                     help='codegen flavor id baked into overlay_abi() (0=base/master; '
                          'widescreen build passes 1). The loader rejects DLLs whose '
@@ -5599,8 +5373,6 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
-    if args.static_symbol_prefix and not args.static:
-        ap.error('--static-symbol-prefix requires --static')
     forced_interiors = {
         (int(v, 0) & 0x1FFFFFFF) | 0x80000000
         for v in args.force_interior
@@ -5785,10 +5557,6 @@ def main():
                 for forced_entry in forced_interiors
                 if phys_addr <= (forced_entry & 0x1FFFFFFF) < region_hi
             )
-            # Promote only the audited continuation from matching capture data.
-            # A missing or changed prologue remains interpreter-only.
-            if _has_native_continuation_evidence(data, load_addr, size):
-                requested.add(NATIVE_CONTINUATION_PC)
             add_static_variant_request(
                 static_variant_requests, requested, data, load_addr, size,
                 phys_addr)
@@ -5874,96 +5642,63 @@ def main():
             with open(psx_path, 'wb') as f:
                 f.write(make_psxexe(load_addr, entry_pc, data))
 
+            # Write seeds file
+            seeds_path = os.path.join(tmp, 'seeds.txt')
+            with open(seeds_path, 'w') as f:
+                for s in seeds:
+                    f.write(s + '\n')
+
+            out_dir_tmp = os.path.join(tmp, 'out')
+            os.makedirs(out_dir_tmp)
+
             # Run psxrecomp-game in --overlay mode (always, for every overlay
             # input). Evidence-scoped discovery: compile only the proven entry
             # seeds and the code reachable from them; never whole-byte sweep
             # (which decodes embedded data tables as code). Branch/jump-table
             # targets stay as in-parent labels, not standalone functions. This
             # is the overlay-compilation contract, not a tunable.
+            cmd = [args.recompiler, psx_path,
+                   '--seeds', seeds_path,
+                   '--out-dir', out_dir_tmp,
+                   '--overlay',
+                   # Forward the [widescreen] site lists so overlay-resident
+                   # emits (backdrop screenX squash, and any sprite-tag/cull
+                   # sites that resolve into overlay code) are applied. --ws-config
+                   # only adopts the widescreen lists, not the game's exe/paths.
+                   '--ws-config', os.path.abspath(args.game_toml)]
+            cmd += recompiler_project_root_args(args)
+            print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             sub_env = dict(os.environ)
             if args.cps:
                 sub_env['PSX_CPS'] = '1'   # §25: emit continuation-passing overlay C
-            known_seed_addrs = {
-                (int(seed, 16) & 0x1FFFFFFF) | 0x80000000
-                for seed in seeds
-                if re.fullmatch(r'0[xX][0-9A-Fa-f]+', seed.strip())
-            }
-            cps_promoted = set()
-            full_c = None
-            ranges_src = None
-            out_dir_tmp = None
-            for compile_pass in range(4):
-                # A CPS transfer can name a second function in the same
-                # captured image. Recompile once with those exact targets as
-                # roots, up to a small fixed point. This is deliberately
-                # bounded: a malformed image must fail the normal audit, not
-                # create an unbounded discovery loop.
-                seeds_path = os.path.join(tmp, f'seeds_{compile_pass}.txt')
-                with open(seeds_path, 'w') as f:
-                    for s in seeds:
-                        f.write(s + '\n')
-
-                out_dir_tmp = os.path.join(tmp, f'out_{compile_pass}')
-                os.makedirs(out_dir_tmp)
-                cmd = [args.recompiler, psx_path,
-                       '--seeds', seeds_path,
-                       '--out-dir', out_dir_tmp,
-                       '--overlay',
-                       # Forward the [widescreen] site lists so overlay-resident
-                       # emits (backdrop screenX squash, and any sprite-tag/cull
-                       # sites that resolve into overlay code) are applied. --ws-config
-                       # only adopts the widescreen lists, not the game's exe/paths.
-                       '--ws-config', os.path.abspath(args.game_toml)]
-                cmd += recompiler_project_root_args(args)
-                print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}'
-                      f'{" [CPS roots pass " + str(compile_pass) + "]" if compile_pass else ""}')
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   cwd=toml_dir, env=sub_env)
-                if r.returncode != 0:
-                    print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
-                    stats.add_fail(_label, 'recompiler', r.stderr or r.stdout)
-                    return
-
-                # Find the generated _full.c
-                stem = os.path.basename(psx_path)
-                full_c = os.path.join(out_dir_tmp, stem + '_full.c')
-                if not os.path.exists(full_c):
-                    # psxrecomp-game uses filename() not stem()
-                    candidates = [f for f in os.listdir(out_dir_tmp)
-                                  if f.endswith('_full.c')]
-                    if not candidates:
-                        print(f'  ERROR: no _full.c in {out_dir_tmp}')
-                        stats.add_fail(_label, 'no_output', 'no _full.c emitted')
-                        return
-                    full_c = os.path.join(out_dir_tmp, candidates[0])
-
-                with open(full_c) as f:
-                    src = f.read()
-
-                ranges_src = None
-                for fn in os.listdir(out_dir_tmp):
-                    if fn.endswith('_full.ranges'):
-                        ranges_src = os.path.join(out_dir_tmp, fn)
-                        break
-
-                if not args.cps:
-                    break
-                new_cps = set(generated_cps_split_roots(
-                    src, data, load_addr, size)) - known_seed_addrs
-                new_cps -= cps_promoted
-                if not new_cps:
-                    break
-                cps_promoted.update(new_cps)
-                for target in sorted(new_cps):
-                    seeds.append(f'0x{target:08X}')
-                    known_seed_addrs.add(target)
-                sample = ', '.join(f'0x{a:08X}' for a in sorted(new_cps)[:8])
-                print(f'  promoted {len(new_cps)} CPS split root(s): {sample}')
-            else:
-                print('  ERROR: CPS root discovery did not converge in 4 passes\n')
-                stats.add_fail(_label, 'cps_roots', 'fixed-point limit exceeded')
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               cwd=toml_dir, env=sub_env)
+            if r.returncode != 0:
+                print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
+                stats.add_fail(_label, 'recompiler', r.stderr or r.stdout)
                 return
+
+            # Find the generated _full.c
+            stem = os.path.basename(psx_path)
+            full_c = os.path.join(out_dir_tmp, stem + '_full.c')
+            if not os.path.exists(full_c):
+                # psxrecomp-game uses filename() not stem()
+                candidates = [f for f in os.listdir(out_dir_tmp) if f.endswith('_full.c')]
+                if not candidates:
+                    print(f'  ERROR: no _full.c in {out_dir_tmp}')
+                    stats.add_fail(_label, 'no_output', 'no _full.c emitted')
+                    return
+                full_c = os.path.join(out_dir_tmp, candidates[0])
+
+            with open(full_c) as f:
+                src = f.read()
+
+            ranges_src = None
+            for fn in os.listdir(out_dir_tmp):
+                if fn.endswith('_full.ranges'):
+                    ranges_src = os.path.join(out_dir_tmp, fn)
+                    break
 
             # Post-process
             if args.static:
@@ -6002,9 +5737,7 @@ def main():
                 cov_blob = ','.join(f'{a:08X}'
                                     for a in sorted(func_addrs)).encode()
                 cov_crc = binascii.crc32(cov_blob) & 0xFFFFFFFF
-                namespace = static_recipe_namespace(
-                    f'{phys_addr:08X}_{crc32:08X}_{cov_crc:08X}',
-                    args.static_symbol_prefix)
+                namespace = f'ov_{phys_addr:08X}_{crc32:08X}_{cov_crc:08X}'
                 src, symbols = namespace_generated_static(src, namespace,
                                                           func_addrs)
                 variants = []
@@ -6951,136 +6684,64 @@ def main():
 
     # B-2: write combined static C file
     if args.static and static_parts:
-        # Identical capture rows can request the same exact image/function-set
-        # recipe more than once.  The namespace is intentionally deterministic
-        # for that recipe, so concatenating both source fragments would emit
-        # duplicate C definitions and make the combined translation unit
-        # uncompilable.  Keep one byte-identical part; fail closed if a
-        # supposedly identical namespace ever contains different generated C.
-        unique_static_parts = []
-        static_parts_by_namespace = {}
-        duplicate_static_parts = 0
-        for part in static_parts:
-            namespace = part['namespace']
-            previous = static_parts_by_namespace.get(namespace)
-            if previous is None:
-                static_parts_by_namespace[namespace] = part
-                unique_static_parts.append(part)
-                continue
-            if (previous['src'] != part['src'] or
-                    previous['variants'] != part['variants']):
-                raise RuntimeError(
-                    f'static namespace collision with divergent source: {namespace}')
-            duplicate_static_parts += 1
-        if duplicate_static_parts:
-            print(f'Static duplicate recipes removed: {duplicate_static_parts}')
-        static_parts = unique_static_parts
-
         # CPS can yield at every compiled block leader, not just leaders that a
         # particular capture happened to observe. Give every block in every
         # variant a content-gated resume wrapper. This makes static coverage
         # independent of host timing / slice boundaries.
         synthesized = 0
-        static_spool_dir = os.path.join(args.out_dir, '.static_parts')
-        os.makedirs(static_spool_dir, exist_ok=True)
-        static_spool_index = 0
 
-        def synthesize_all_resume_wrappers(parts, spool=False):
-            nonlocal synthesized, static_spool_index
+        def synthesize_all_resume_wrappers(parts):
+            nonlocal synthesized
             for part in parts:
                 done = part.setdefault('resume_entries', set())
-                block_entries = {
-                    int(value, 16) for value in re.findall(
-                        r'^block_([0-9A-Fa-f]{8}):', part['src'], re.MULTILINE)
-                }
-                entries_by_host = {}
-                for entry, host in part['continuation_owners'].items():
-                    if (entry not in part['func_addrs'] and entry not in done and
-                            host in part['ids_by_addr']):
-                        entries_by_host.setdefault(host, []).append(entry)
-                wrapper_parts = []
-                requests = [
-                    (part['symbols'][host], host, entries)
-                    for host, entries in sorted(entries_by_host.items())
-                ]
-                part['src'], admitted = add_cps_resume_cases_by_host(
-                    part['src'], requests)
-                for host, entries in sorted(entries_by_host.items()):
+                for entry, host in sorted(part['continuation_owners'].items()):
+                    if entry in part['func_addrs'] or entry in done:
+                        continue
+                    if host not in part['ids_by_addr']:
+                        continue
+                    symbol = f'{part["namespace"]}_func_{entry:08X}'
                     host_symbol = part['symbols'][host]
-                    eligible = [entry for entry in sorted(entries)
-                                if entry in block_entries and entry in admitted]
-                    for entry in eligible:
-                        symbol = f'{part["namespace"]}_func_{entry:08X}'
-                        wrapper_parts.append(
+                    part['src'], resume_ok = add_cps_resume_case(
+                        part['src'], host_symbol, host, entry)
+                    if not resume_ok:
+                        continue
+                    part['src'] += (
                         f'\n/* CPS block resume entry owned by 0x{host:08X}. */\n'
                         f'void {symbol}(CPUState* cpu)\n{{\n'
                         f'    cpu->pc = 0x{entry:08X}u;\n'
                         f'    {host_symbol}(cpu);\n'
                         f'}}\n')
-                        for code_crc, ranges in part['ids_by_addr'][host]:
-                            part['variants'].append({
-                                'addr': entry,
-                                'symbol': symbol,
-                                'crc': code_crc,
-                                'ranges': ranges,
-                            })
-                        done.add(entry)
-                        synthesized += 1
-                if wrapper_parts:
-                    part['src'] += ''.join(wrapper_parts)
-                if spool:
-                    # The aggregate static corpus can contain hundreds of MiB
-                    # of generated C. Keeping every post-synthesis string live
-                    # makes the per-shard reconstruction peak additive and can
-                    # trigger the Windows commit limit. Persist each completed
-                    # shard immediately; unresolved matching needs only compact
-                    # variant metadata, and final assembly streams these files.
-                    source_path = os.path.join(
-                        static_spool_dir,
-                        f'{static_spool_index:05d}_{part["namespace"]}.c')
-                    static_spool_index += 1
-                    with open(source_path, 'w') as source_file:
-                        source_file.write(part['src'])
-                    part['source_path'] = source_path
-                    del part['src']
+                    for code_crc, ranges in part['ids_by_addr'][host]:
+                        part['variants'].append({
+                            'addr': entry,
+                            'symbol': symbol,
+                            'crc': code_crc,
+                            'ranges': ranges,
+                        })
+                    done.add(entry)
+                    synthesized += 1
 
-        print('Static phase: synthesize and spool primary shards', flush=True)
-        synthesize_all_resume_wrappers(static_parts, spool=True)
-        print('Static phase: primary shard spool complete', flush=True)
+        synthesize_all_resume_wrappers(static_parts)
 
         # Captured entries not owned by any compiled host are genuine orphan
         # interiors for a particular byte recipe. Compile each against those
         # exact bytes, then give every block in those fragments the same
         # universal resume treatment. An address-only body from another variant
         # cannot satisfy the demand: its live range CRC must match this image.
-        print('Static phase: resolve exact-image dispatch demands', flush=True)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
-        print(f'Static phase: {len(unresolved)} unresolved dispatch demands',
-              flush=True)
         # PSX_STATIC_NO_ISOLATED=1: A/B guard — skip the isolated-fragment pass
         # entirely (its universal-resume treatment is the newest machinery).
         if os.environ.get('PSX_STATIC_NO_ISOLATED'):
             unresolved = []
         fragment_built = 0
-        fragment_reused = 0
         byte_incoherent = 0
-        fragment_variants_by_entry = {}
+        new_fragment_parts = []
         for entry, request in unresolved:
             data = request['data']
             load_addr = request['load_addr']
             size = request['size']
             phys_addr = request['phys_addr']
-            # One isolated shard often satisfies the same dispatch entry in
-            # many full-region snapshots because its guarded code bytes are
-            # unchanged while unrelated data differs. Recheck fragments built
-            # earlier in this pass before invoking the recompiler again.
-            if any(current_variant_func_id_matches(
-                    (entry, variant['crc'], variant['ranges']),
-                    data, load_addr, size)
-                    for variant in fragment_variants_by_entry.get(entry, ())):
-                fragment_reused += 1
-                continue
             part, fragment_reason = generate_interior_fragment_static(
                 entry, data, load_addr, size, phys_addr, args)
             if part is None:
@@ -7093,22 +6754,14 @@ def main():
                     byte_incoherent += 1
                 continue
             static_parts.append(part)
-            # Synthesize and spool immediately so fragment source memory is
-            # bounded by one shard rather than the full unresolved demand set.
-            synthesize_all_resume_wrappers([part], spool=True)
-            for variant in part['variants']:
-                variant_entry = ((variant['addr'] & 0x1FFFFFFF) |
-                                 0x80000000)
-                fragment_variants_by_entry.setdefault(
-                    variant_entry, []).append(variant)
+            new_fragment_parts.append(part)
             fragment_built += 1
 
-        print('Static phase: isolated shard spool complete', flush=True)
+        synthesize_all_resume_wrappers(new_fragment_parts)
         unresolved = unresolved_static_variant_requests(
             static_variant_requests, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')
         print(f'Static isolated interior shards: {fragment_built}')
-        print(f'Static isolated fragment reuses: {fragment_reused}')
         print(f'Static byte-incoherent entries excluded: {byte_incoherent}')
         if unresolved:
             sample = ', '.join(
@@ -7124,27 +6777,15 @@ def main():
                     'compiled body/owner')
 
         all_variants = []
+        combined = '/* Auto-generated overlay dispatch — do not edit.\n'
+        combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
+        combined += ' */\n'
         for part in static_parts:
+            combined += part['src']
             all_variants.extend(part['variants'])
-        # Static bundles can be hundreds of MiB. Stream existing shard strings
-        # instead of allocating a second translation-unit-sized string; on
-        # memory-constrained Windows hosts that allocation otherwise turns the
-        # final write into minutes of page churn.
+        combined += generate_overlay_dispatch(all_variants)
         with open(static_out, 'w') as f:
-            f.write('/* Auto-generated overlay dispatch — do not edit.\n')
-            f.write(' * Rebuild: python3 psxrecomp/tools/compile_overlays.py '
-                    '--static ...\n')
-            f.write(' */\n')
-            for part in static_parts:
-                source_path = part.get('source_path')
-                if source_path:
-                    with open(source_path, 'r') as source_file:
-                        import shutil
-                        shutil.copyfileobj(source_file, f, length=1024 * 1024)
-                else:
-                    f.write(part['src'])
-            f.write(generate_overlay_dispatch(
-                all_variants, args.static_symbol_prefix))
+            f.write(combined)
         print(f'Static output: {static_out}  '
               f'({len(all_variants)} exact function identities total)')
 

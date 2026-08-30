@@ -23,12 +23,6 @@
 
 #include <stdint.h>
 
-#ifdef PSX_NO_DEBUG_TOOLS
-#define PARITY_TRACE_ENABLED 0
-#else
-#define PARITY_TRACE_ENABLED 1
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -125,25 +119,6 @@ const char* parity_kind_str(uint32_t kind);
  * writer of that word at read time. Backs the debug server's parity_dump reads=1. */
 uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows);
 uint64_t parity_trace_reads_total(void);
-
-/* Lean builds keep linkable zero-result stubs in parity_trace.c. At consumer
- * sites these macros also eliminate producer/control calls, argument
- * evaluation, and the hot armed/frozen query calls. Parenthesizing a function
- * name bypasses its macro when a caller explicitly needs the linkable stub. */
-#if !PARITY_TRACE_ENABLED && !defined(PSX_PARITY_TRACE_IMPLEMENTATION)
-#define parity_trace_config(watched_tcb, trigger_target, tcb_epc_off, tcb_state_off, watch_addrs, watch_count) ((void)0)
-#define parity_trace_arm(on)                  ((void)0)
-#define parity_trace_reset()                  ((void)0)
-#define parity_trace_is_armed()               (0)
-#define parity_trace_is_frozen()              (0)
-#define parity_trace_record(kind, pc, ra, sp, target, read_word, ctx) ((void)0)
-#define parity_trace_note_write(addr, width, writer_pc) ((void)0)
-#define parity_trace_note_read(addr, value, reader_pc)  ((void)0)
-#define parity_trace_get(out, max_rows)        (0u)
-#define parity_trace_total()                   (UINT64_C(0))
-#define parity_trace_reads_get(out, max_rows)  (0u)
-#define parity_trace_reads_total()             (UINT64_C(0))
-#endif
 
 #ifdef __cplusplus
 }

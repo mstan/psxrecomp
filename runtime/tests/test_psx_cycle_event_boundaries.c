@@ -17,7 +17,6 @@ int g_psx_call_bail = 0;
 uint32_t i_mask = 0;
 uint64_t g_guest_store_count = 0;
 uint64_t g_mmio_access_count = 0;
-uint32_t g_debug_last_store_pc = 0;
 
 static uint32_t s_cd_cycles_remaining = 5;
 static int s_cd_ready = 0;

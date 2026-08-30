@@ -3,15 +3,12 @@
 ## Running the tests
 
 ```sh
-cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_TESTING=ON
+cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build recompiler/build
 cd recompiler/build && ctest --output-on-failure
 ```
 
-`BUILD_TESTING` is intentionally off for ordinary standalone builds, so test
-lanes must opt in at configure time. That is the whole thing: the suite runs in
-seconds and needs **no BIOS dump,
+That is the whole thing. 38 tests, under 5 seconds, and it needs **no BIOS dump,
 no disc image, and no generated code** — a plain recompiler build is enough. This
 is the check to run before opening a PR.
 
@@ -85,8 +82,6 @@ requires a generated BIOS (see [`BUILDING.md`](BUILDING.md)). Those are wired
 into `runtime/CMakeLists.txt` and run from `runtime/build`:
 
 ```sh
-cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DPSX_RECOMP_UI=OFF -DBUILD_TESTING=ON
 cd runtime/build && ctest --output-on-failure
 ```
 

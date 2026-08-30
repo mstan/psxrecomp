@@ -10,22 +10,17 @@
 #include <stdlib.h>
 
 /* RAM reader adapter for the parity trace (cpu->read_word takes only addr). */
-#ifndef PSX_NO_DEBUG_TOOLS
 static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
     return ((CPUState*)ctx)->read_word(addr);
 }
-#endif
 
 /* Frame + guest-cycle accessors for parity_trace.c (decoupled per process). */
 uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
 uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
-/* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata.
- * Play builds have no trace consumer, so do not define the storage at all. */
-#ifndef PSX_NO_DEBUG_TOOLS
+/* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata. */
 PSX_BSS FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 uint64_t             g_fntrace_seq = 0;
-#endif
 
 /* Frame counter shared with debug_server.c / dirty_ram_interp.c. */
 extern uint64_t s_frame_count;
@@ -80,7 +75,6 @@ void fntrace_maybe_mark_game_started(CPUState* cpu, uint32_t addr) {
         fntrace_mark_game_started(cpu);
 }
 
-#ifndef PSX_NO_DEBUG_TOOLS
 static inline int armed_match(uint32_t target) {
     /* PSX_FNTRACE_ALL=1 records every dispatch from power-on — the ring
      * then holds the earliest boot execution (before any TCP client can
@@ -100,7 +94,6 @@ static inline int armed_match(uint32_t target) {
     }
     return 0;
 }
-#endif
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ─────────────────
  * Records every dispatch where the guest SP crossed a 64 KB domain since the
@@ -114,9 +107,7 @@ static inline int armed_match(uint32_t target) {
  * per dispatch; entries only on domain edges. Dumped via `sp_ring`. */
 SpDomainEntry g_spdom_ring[SPDOM_RING_CAP];
 uint64_t      g_spdom_seq = 0;
-#ifndef PSX_NO_DEBUG_TOOLS
 static uint32_t s_spdom_prev_sp = 0;
-#endif
 
 /* Always-on dispatch tail ring: the last DISP_TAIL_CAP dispatches with
  * target/ra/sp/cycle. Unlike the armed fntrace ring this is unconditional —
@@ -182,12 +173,10 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     /* General parity ring: one DISPATCH row per leader while current_tcb matches
      * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
      * a single branch on this hot path. pc==target (the leader being entered). */
-#ifndef PSX_NO_DEBUG_TOOLS
     if (parity_trace_is_armed()) {
         parity_trace_record(PARITY_KIND_DISPATCH, target, cpu->gpr[31],
                             cpu->gpr[29], target, parity_rw_cb, cpu);
     }
-#endif
 
     /* Dispatch-level bail-source capture (Tomba 2 wild-return spin, runtime-only,
      * no BIOS regen). The generated psx_dispatch_impl calls us at the top of each
@@ -248,7 +237,6 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
      * ring preserves the window that led here (this culprit entry, with its
      * ra, still records; the wedge storm after it does not). */
     if ((target & 0x1FFFFFFFu) < 0x40u) g_insn_log_frozen = 1;
-#ifndef PSX_NO_DEBUG_TOOLS
     if (!armed_match(target)) return;
     if (was_frozen) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
@@ -262,9 +250,6 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     e->a3     = cpu->gpr[7];
     e->s3     = cpu->gpr[19];
     e->sp     = cpu->gpr[29];
-#else
-    (void)was_frozen;
-#endif
 }
 
 void fntrace_arm(uint32_t target) {
@@ -327,28 +312,6 @@ void fntrace_arm_from_env(const char *env_name) {
 }
 
 void fntrace_clear(void) {
-#ifndef PSX_NO_DEBUG_TOOLS
     g_fntrace_seq = 0;
     /* Storage left in place; consumer dumps relative to seq. */
-#endif
-}
-
-uint64_t fntrace_total(void) {
-#ifndef PSX_NO_DEBUG_TOOLS
-    return g_fntrace_seq;
-#else
-    return 0;
-#endif
-}
-
-const FntraceEntry* fntrace_get(uint64_t seq) {
-#ifndef PSX_NO_DEBUG_TOOLS
-    uint64_t total = g_fntrace_seq;
-    uint64_t available = total < FNTRACE_RING_CAP ? total : FNTRACE_RING_CAP;
-    if (seq < total - available || seq >= total) return NULL;
-    return &g_fntrace_ring[seq & (FNTRACE_RING_CAP - 1u)];
-#else
-    (void)seq;
-    return NULL;
-#endif
 }

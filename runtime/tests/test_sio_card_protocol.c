@@ -30,95 +30,11 @@
 
 #include "sio.h"
 #include "memcard.h"
-#include <errno.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <direct.h>
-#include <process.h>
-#else
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
-#define TEST_PATH_CAP 1024
-
-static char g_test_root[TEST_PATH_CAP];
-static char g_test_card_dir[TEST_PATH_CAP];
-static char g_test_synth_path[TEST_PATH_CAP];
-
-static int test_mkdir(const char *path) {
-#ifdef _WIN32
-    return _mkdir(path);
-#else
-    return mkdir(path, 0700);
-#endif
-}
-
-static int test_rmdir(const char *path) {
-#ifdef _WIN32
-    return _rmdir(path);
-#else
-    return rmdir(path);
-#endif
-}
-
-static unsigned long test_pid(void) {
-#ifdef _WIN32
-    return (unsigned long)_getpid();
-#else
-    return (unsigned long)getpid();
-#endif
-}
-
-static void cleanup_test_files(void) {
-    char path[TEST_PATH_CAP];
-    if (!g_test_root[0]) return;
-    snprintf(path, sizeof(path), "%s/card1.mcd", g_test_card_dir);
-    (void)remove(path);
-    snprintf(path, sizeof(path), "%s/card2.mcd", g_test_card_dir);
-    (void)remove(path);
-    (void)remove(g_test_synth_path);
-    (void)test_rmdir(g_test_card_dir);
-    (void)test_rmdir(g_test_root);
-}
-
-static int setup_test_files(void) {
-    const char *base = getenv("TMPDIR");
-    if (!base || !base[0]) base = getenv("TEMP");
-    if (!base || !base[0]) base = getenv("TMP");
-#ifndef _WIN32
-    if (!base || !base[0]) base = "/tmp";
-#endif
-    if (!base || !base[0]) {
-        fprintf(stderr, "FAIL no temporary directory is configured\n");
-        return -1;
-    }
-
-    for (unsigned nonce = 0; nonce < 1000; nonce++) {
-        int n = snprintf(g_test_root, sizeof(g_test_root),
-                         "%s/psxrecomp-sio-card-%lu-%u",
-                         base, test_pid(), nonce);
-        if (n < 0 || (size_t)n >= sizeof(g_test_root)) return -1;
-        if (test_mkdir(g_test_root) == 0) break;
-        if (errno != EEXIST || nonce == 999) return -1;
-    }
-    if (snprintf(g_test_card_dir, sizeof(g_test_card_dir), "%s/cards",
-                 g_test_root) >= (int)sizeof(g_test_card_dir) ||
-        snprintf(g_test_synth_path, sizeof(g_test_synth_path), "%s/synth.mcd",
-                 g_test_root) >= (int)sizeof(g_test_synth_path) ||
-        test_mkdir(g_test_card_dir) != 0) {
-        cleanup_test_files();
-        return -1;
-    }
-    if (atexit(cleanup_test_files) != 0) {
-        cleanup_test_files();
-        return -1;
-    }
-    return 0;
-}
 
 /* ---- Stubs for sio.c's external dependencies ---- */
 uint32_t i_stat = 0;
@@ -167,9 +83,6 @@ void psx_irq_raise(uint32_t bit, uint32_t detail) {
     (void)detail;
     i_stat |= 1u << bit;
 }
-void psx_irq_refresh_cause_ip2(void) {}
-uint32_t gpu_vblank_period_cycles(void) { return 564480u; }
-uint32_t gpu_get_crtc_refresh_multiplier(void) { return 1u; }
 
 /* ---- Test harness ---- */
 
@@ -275,7 +188,7 @@ static int run_card_write(int slot, uint16_t sector, const uint8_t data[128],
 /* Pin idx 8/9 explicitly (MSB/LSB echo) for non-zero sectors. */
 static void test_msb_lsb_echo(void) {
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
     uint8_t rx[140];
     uint16_t sector = 0x1234;  /* MSB=0x12, LSB=0x34 */
     int n = run_card_read(0, sector, rx);
@@ -319,12 +232,8 @@ static void test_card_read_sector_0(void) {
     for (int i = 2; i < 128; i++) fake_card[i] = (uint8_t)i;  /* known pattern */
 
     /* Stuff into memcard — easiest path: write to .mcd and load it */
-    FILE* f = fopen(g_test_synth_path, "wb");
-    if (!f) {
-        fprintf(stderr, "FAIL could not create synthetic card\n");
-        g_failures++;
-        return;
-    }
+    FILE* f = fopen("test_card_synth.mcd", "wb");
+    assert(f);
     fwrite(fake_card, 1, MEMCARD_SIZE, f);
     /* Pad to full 128KB */
     uint8_t zero = 0;
@@ -335,18 +244,16 @@ static void test_card_read_sector_0(void) {
     /* memcard_init looks for cardN.mcd in dir — set up a temp dir */
     /* Simpler: direct write test using memcard API — but memcard_init is the
      * only public entry. Let's symlink/copy our file as card1.mcd. */
-    char card1_path[TEST_PATH_CAP];
-    snprintf(card1_path, sizeof(card1_path), "%s/card1.mcd", g_test_card_dir);
-    f = fopen(card1_path, "wb");
+    f = fopen("test_dir/card1.mcd", "wb");
     if (!f) {
-        fprintf(stderr, "FAIL could not create slot-one card\n");
-        g_failures++;
-        return;
+        system("mkdir test_dir 2>/dev/null || mkdir -p test_dir");
+        f = fopen("test_dir/card1.mcd", "wb");
     }
+    assert(f);
     fwrite(fake_card, 1, MEMCARD_SIZE, f);
     fclose(f);
 
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
 
     /* Run protocol on slot 0, sector 0 */
     uint8_t rx[140];
@@ -386,7 +293,7 @@ static void test_card_read_sector_0(void) {
 
 static void test_flag_clears_on_write(void) {
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
 
     uint8_t data[128];
     memset(data, 0x00, sizeof(data));
@@ -408,12 +315,10 @@ static void test_pad_poll_during_card_read(void) {
     /* Connect a pad in slot 0 so 0x01 returns valid pad data. */
     sio_connect_pad(0);
 
-    char card1_path[TEST_PATH_CAP];
-    snprintf(card1_path, sizeof(card1_path), "%s/card1.mcd", g_test_card_dir);
-    FILE* f = fopen(card1_path, "rb");
+    FILE* f = fopen("test_dir/card1.mcd", "rb");
     if (!f) { fprintf(stderr, "SKIP test_pad_poll: card file missing\n"); return; }
     fclose(f);
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
 
     /* Send first 4 card bytes (header phase) */
     EXPECT_EQ("pad_intr.0x81", 0xFF, card_xchg(0x81, 0));
@@ -439,7 +344,7 @@ static void test_pad_poll_during_card_read(void) {
 /* Test 4: per-slot state isolation — slot 0 mid-read, switch to slot 1 */
 static void test_per_slot_state(void) {
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
 
     /* Start protocol on slot 0 */
     EXPECT_EQ("perslot.s0_0x81", 0xFF, card_xchg(0x81, 0));
@@ -447,7 +352,7 @@ static void test_per_slot_state(void) {
     card_deselect(0);
     /* Switch to slot 1 mid-protocol — start fresh on slot 1 */
     EXPECT_EQ("perslot.s1_0x81", 0xFF, card_xchg(0x81, 1));
-    /* Slot 1 may have no card — accept either response. */
+    /* Slot 1 might have no card (test_dir/card2.mcd doesn't exist) — accept either */
 
     /* Switch back to slot 0 — should restart fresh (real card forgets state) */
     card_deselect(1);
@@ -458,13 +363,13 @@ static void test_per_slot_state(void) {
 /* Test 5: directory entry layout — sector 1 is the first directory frame */
 static void test_directory_frame_layout(void) {
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
 
     uint8_t buf[128];
     int rc = memcard_read_sector(0, 1, buf);
     EXPECT_EQ("dir.read_sector_rc", 0, rc);
     /* For a freshly-formatted card, frame 1 should have status=0xA0 (free)
-     * — but our slot-one card was raw-written, so layout depends on file.
+     * — but our test_dir/card1.mcd was raw-written, so layout depends on file.
      * Just check that read succeeded. */
 }
 
@@ -477,7 +382,7 @@ static void test_cycle_paced_exact_boundaries(void) {
     const uint16_t ctrl = CTRL_TX_EN | CTRL_SELECT | CTRL_ACK_IRQ_EN;
 
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
     i_stat = 0;
     sio_write(SIO_CTRL, ctrl);
     sio_write(SIO_TX_DATA, 0x81);
@@ -496,7 +401,7 @@ static void test_cycle_paced_exact_boundaries(void) {
 
     /* sio_tick() retains the same event walker for access-paced callers. */
     sio_init();
-    memcard_init(g_test_card_dir);
+    memcard_init("test_dir");
     i_stat = 0;
     sio_write(SIO_CTRL, ctrl);
     sio_write(SIO_TX_DATA, 0x81);
@@ -508,10 +413,6 @@ static void test_cycle_paced_exact_boundaries(void) {
 
 int main(int argc, char **argv) {
     fprintf(stderr, "=== sio card protocol tests ===\n");
-    if (setup_test_files() != 0) {
-        fprintf(stderr, "FAIL could not create isolated test directory\n");
-        return 1;
-    }
 
     if (argc == 2 && strcmp(argv[1], "exact-boundaries") == 0) {
         test_cycle_paced_exact_boundaries();
