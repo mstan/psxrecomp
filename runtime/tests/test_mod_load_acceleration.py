@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Guard mod-owned, bounded load acceleration and its launcher migration."""
 
+import re
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = (ROOT / "runtime/src/main.cpp").read_text(encoding="utf-8")
@@ -48,8 +48,14 @@ assert 'f << "turbo_loads       = "' not in CONFIG_CPP
 
 # The in-game Settings apply path reads a launcher snapshot taken BEFORE mod
 # activation, so it must not write either mod-owned global.
-assert "if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;" in MAIN
-assert "if (skip_fmv_offered)     g_auto_skip_fmv = ls.auto_skip_fmv ? 1 : 0;" in MAIN
+assert re.search(
+    r"if\s*\(turbo_loads_offered\)\s*g_turbo_loads_enabled\s*=\s*ls\.turbo_loads\s*\?\s*1\s*:\s*0\s*;",
+    MAIN,
+)
+assert re.search(
+    r"if\s*\(skip_fmv_offered\)\s*g_auto_skip_fmv\s*=\s*ls\.auto_skip_fmv\s*\?\s*1\s*:\s*0\s*;",
+    MAIN,
+)
 
 reset = """g_mod_load_wall_multiplier = -1;
     g_mod_load_release_frames = -1;"""
@@ -58,17 +64,20 @@ disc_reset = """g_mod_disc_speed_divisor = -1;
 disable_mod_owned_baseline = """if (!turbo_loads_offered)
         g_turbo_loads_enabled = 0;"""
 activate = "mod_runtime_activate_plugins();"
-apply = "if (g_mod_load_wall_multiplier >= 0) {"
+apply = "g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;"
 assert reset in MAIN
 assert disc_reset in MAIN
 assert disable_mod_owned_baseline in MAIN
 assert apply in MAIN
-assert (
-    MAIN.index(reset)
-    < MAIN.index(disable_mod_owned_baseline)
-    < MAIN.index(activate)
-    < MAIN.index(apply)
-)
+# The helper now returns early when no plugin claimed acceleration; assignment
+# after that negative-sentinel check is the semantic equivalent of the former
+# positive conditional.
+reset_at = MAIN.index(reset)
+disable_at = MAIN.index(disable_mod_owned_baseline, reset_at)
+activate_at = MAIN.index(activate, disable_at)
+reject_at = MAIN.index("if (g_mod_load_wall_multiplier < 0)", activate_at)
+apply_at = MAIN.index(apply, reject_at)
+assert reset_at < disable_at < activate_at < reject_at < apply_at
 
 assert "release_run = g_turbo_load_release_frames;" in MAIN
 assert "g_frame_period_ms / (double)g_turbo_load_wall_multiplier" in MAIN

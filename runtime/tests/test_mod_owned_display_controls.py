@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Guard PSX display enhancements as trusted-mod-only features."""
+"""Guard ownership of PSX display and FMV controls."""
 
+import re
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = (ROOT / "runtime" / "src" / "main.cpp").read_text(encoding="utf-8")
@@ -10,13 +10,20 @@ HEADER = (ROOT / "runtime" / "include" / "mod_plugins.h").read_text(
     encoding="utf-8"
 )
 
-for declaration in (
-    "constexpr bool ws_offered = false;",
-    "constexpr bool ws_ultrawide_offered = false;",
-    "constexpr bool frame_interpolation_offered = false;",
-    "constexpr bool skip_fmv_offered = false;",
-):
-    assert declaration in MAIN, f"PSX launcher capability must default off: {declaration}"
+def has_const_bool(name: str, value: bool) -> bool:
+    return re.search(
+        rf"\bconstexpr\s+bool\s+{name}\s*=\s*{'true' if value else 'false'}\s*;",
+        MAIN,
+    ) is not None
+
+
+# Display shape/interpolation remain mod-owned. WipEout explicitly exposes its
+# tested FMV-skip option through the launcher, so that capability is product-owned.
+for capability in ("ws_offered", "ws_ultrawide_offered", "frame_interpolation_offered"):
+    assert has_const_bool(capability, False), (
+        f"trusted-mod display capability must remain hidden: {capability}"
+    )
+assert has_const_bool("skip_fmv_offered", True), "FMV skip must remain launcher-visible"
 
 for legacy_route in (
     "ws_offered = gc.ws_offered;",
@@ -27,10 +34,10 @@ for legacy_route in (
     assert legacy_route not in MAIN, f"legacy offer flag still controls UI: {legacy_route}"
 
 for hidden_capability in (
-    "gi->widescreen_supported = 0;",
-    "gi->aspect_mask = 0;",
+    r"gi->widescreen_supported\s*=\s*0\s*;",
+    r"gi->aspect_mask\s*=\s*0\s*;",
 ):
-    assert hidden_capability in MAIN
+    assert re.search(hidden_capability, MAIN)
 
 for trusted_api in (
     "psx_mod_set_fixed_display_aspect",
@@ -40,6 +47,10 @@ for trusted_api in (
 ):
     assert trusted_api in HEADER, f"missing trusted mod API: {trusted_api}"
 
-assert MAIN.index("g_auto_skip_fmv = 0;") < MAIN.index("mod_runtime_activate_plugins();")
+# Session defaults (including the launcher-owned FMV choice) are restored before
+# plugins activate and are allowed to override them.
+restore = MAIN.index("g_auto_skip_fmv = defaults.auto_skip_fmv;")
+activate = MAIN.index("mod_runtime_activate_plugins();", restore)
+assert restore < activate
 
-print("mod-owned PSX display controls guard passed")
+print("PSX display/FMV ownership guard passed")
