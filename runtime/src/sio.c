@@ -392,14 +392,23 @@ static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
 static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
 
 /* ---- SIO byte-level trace ring buffer ---- */
+#ifndef PSX_NO_DEBUG_TOOLS
 static PSX_BSS SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
 static int sio_trace_idx = 0;       /* next write position */
+#endif
+/* Runtime progress guards also consume this counter; keep it in lean builds. */
 static uint32_t sio_trace_seq = 0;  /* monotonic sequence number */
 
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (buf_out) *buf_out = NULL;
+    if (write_idx_out) *write_idx_out = 0;
+    return 0;
+#else
     if (buf_out) *buf_out = sio_trace_buf;
     if (write_idx_out) *write_idx_out = sio_trace_idx;
     return sio_trace_seq;
+#endif
 }
 
 uint32_t sio_get_seq(void) {
@@ -1900,10 +1909,12 @@ static void mc_process_byte(uint8_t tx_byte) {
 static void sio_process_byte(uint8_t tx_byte) {
     /* ---- Trace: capture pre-state ---- */
     extern uint32_t g_debug_current_func_addr;
+#ifndef PSX_NO_DEBUG_TOOLS
     uint8_t trace_mc_pre = (uint8_t)mc_state;
     uint8_t trace_dev_pre = (uint8_t)active_device;
     uint8_t trace_irq_cd = (uint8_t)(sio_irq_countdown > 255 ? 255 : sio_irq_countdown);
     int trace_abort_before = sio_mc_abort_count;
+#endif
     int trace_ack_before   = sio_mc_ack_count;
 
     /* ---- Card transaction tracking ----
@@ -2046,6 +2057,7 @@ static void sio_process_byte(uint8_t tx_byte) {
     }
 
     /* ---- Trace: capture post-state and record entry ---- */
+#ifndef PSX_NO_DEBUG_TOOLS
     {
         SioTraceEntry *e = &sio_trace_buf[sio_trace_idx];
         e->seq           = sio_trace_seq;
@@ -2069,8 +2081,10 @@ static void sio_process_byte(uint8_t tx_byte) {
         e->slot0_state = (uint8_t)mc_slots[0].state;
         e->slot1_state = (uint8_t)mc_slots[1].state;
         sio_trace_idx = (sio_trace_idx + 1) % SIO_TRACE_CAP;
-        sio_trace_seq++;
     }
+#endif
+    /* Load-bearing for card progress/stale guards even without trace storage. */
+    sio_trace_seq++;
 }
 
 uint32_t sio_read(uint32_t addr) {

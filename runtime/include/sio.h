@@ -200,7 +200,9 @@ int sio_get_pad_analog(int slot);
 void sio_get_pad_sticks(int slot, uint8_t out[4]);
 
 /* ---- SIO byte-level trace ring buffer ----
- * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
+ * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history.
+ * PSX_NO_DEBUG_TOOLS builds retain the types and accessors for API stability,
+ * but omit the backing ring and report no captured entries. */
 #define SIO_TRACE_CAP (1 << 20)
 
 typedef struct {
@@ -226,10 +228,13 @@ typedef struct {
 } SioTraceEntry;
 
 /* Get pointer to ring buffer and current write index.
- * Returns number of entries ever written (seq of next write). */
+ * Returns number of entries ever written (seq of next write).  In
+ * PSX_NO_DEBUG_TOOLS builds this returns 0, sets *buf_out to NULL, and sets
+ * *write_idx_out to 0. */
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
 
-/* Current SIO byte sequence — used by SIO PC tracer for cross-referencing. */
+/* Current SIO byte sequence — used by SIO PC tracer for cross-referencing and
+ * by runtime progress guards.  This counter remains active in lean builds. */
 uint32_t sio_get_seq(void);
 
 /* Returns 1 if a memcard protocol exchange is in progress on either
