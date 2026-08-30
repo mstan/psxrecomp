@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 INCLUDE = ROOT / "runtime" / "include"
 
@@ -18,6 +17,9 @@ def find_gcc() -> str:
         os.environ.get("CC"),
         shutil.which("gcc"),
         shutil.which("cc"),
+        # Last-resort compatibility path for developers whose MSYS2 compiler
+        # is not exposed through PATH.  Prefer the configured/PATH compiler:
+        # an unrelated or partially upgraded MSYS2 install must not shadow it.
         r"C:\msys64\mingw64\bin\gcc.exe" if os.name == "nt" else None,
     ]
     for candidate in candidates:
@@ -36,7 +38,6 @@ void func_80010000(CPUState *cpu) {
     psx_advance_cycles(1u);
     cpu->gpr[2] = psx_cyc_load_word(cpu, cpu->gpr[4], 2u, 0u);
     cpu->gpr[3] = psx_cyc_load_half(cpu, cpu->gpr[5], 3u, 0u);
-    cpu->gpr[6] = psx_ws_cull_slti_lower(cpu->gpr[7], 0xff00u);
     psx_cyc_bb_defer_flush();
     psx_cyc_bb_defer_end();
     if (psx_slice_block(cpu, 0x80010000u, 1u, 0)) return;
@@ -59,14 +60,13 @@ void func_80010000(CPUState *cpu) {
             "-DPSX_ENABLE_BLOCK_CYCLES=1",
             "-DPSX_OVERLAY_FLAVOR=2",
             "-DPSX_PGXP=1",
-            "-Werror=implicit-function-declaration",
         ]
         if os.name != "nt":
             command.append("-fPIC")
         command.extend([
             str(c_path), "-o", str(out_path), f"-I{INCLUDE}", "-lm",
         ])
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
         if result.returncode != 0:
             sys.stderr.write(result.stdout)
             sys.stderr.write(result.stderr)

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Structural regression test for unmarked post-EXE code discovery."""
 
-from pathlib import Path
 import re
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "runtime" / "src" / "dirty_ram_interp.c"
@@ -60,12 +59,13 @@ def main() -> int:
 
     dirty_gate = body.find("!dirty_ram_is_dirty(phys) && !clean_game_text_miss")
     region_gate = body.find("phys_is_overlay_region(phys)", dirty_gate)
-    ram_gate = body.find("phys < (2u * 1024u * 1024u)", dirty_gate)
+    ram_gate = body.find("phys < (8u * 1024u * 1024u)", dirty_gate)
     decode_gate = body.find("dirty_ram_word_looks_decodable(fetch_word(phys))", dirty_gate)
     mark = body.find("dirty_ram_mark_executable_range(phys, 4u)", dirty_gate)
     if min(dirty_gate, region_gate, ram_gate, decode_gate, mark) < 0:
-        raise AssertionError("missing dirty/region/RAM/decode/mark fallback chain")
-    if not (dirty_gate < region_gate < decode_gate < mark and dirty_gate < ram_gate < mark):
+        raise AssertionError("missing dirty/overlay-region/RAM/decode/mark fallback chain")
+    if not (dirty_gate < region_gate < decode_gate < mark and
+            dirty_gate < ram_gate < mark):
         raise AssertionError("fallback checks or executable marking are out of order")
     if "phys >= g_overlay_region_floor" not in overlay_region:
         raise AssertionError("overlay-region helper lost the above-text floor check")
