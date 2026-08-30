@@ -409,6 +409,11 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} -m pytest -q -p no:cacheprovider --
                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_package_setup_host.py
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME overlay_compiler_safety_guards
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_compile_overlays_safety.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
         # These two invoke psxrecomp-game, whose BIOS-profile resolution
         # probes fixed working-directory-relative paths (bios/<name>.toml,
@@ -471,16 +476,8 @@ if(BUILD_TESTING)
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         endforeach()
 
-        # test_aot_overlay_discovery.py had no add_test() entry at all. It runs
-        # far enough to exercise real discovery, then fails in
-        # check_real_batched_fragment_publication: that check reaches
-        # MOD.compile_fragment_batch, which spawns psxrecomp-game with cwd set
-        # to its own TemporaryDirectory, so BIOS-profile resolution (which
-        # probes bios/SCPH1001.toml relative to the working directory) finds
-        # nothing and returns "recompiler-error: no BIOS profile found". Every
-        # other subprocess in the same file passes cwd=str(ROOT) explicitly, so
-        # this looks like a missed cwd rather than a product defect — but it
-        # needs an owner, and DISABLED keeps it counted until then.
+        # Full overlay discovery exercises real host-DLL publication, cache
+        # recovery, fixed-point behavior, and the runtime manifest contract.
         add_test(
             NAME aot_overlay_discovery
             COMMAND ${Python3_EXECUTABLE}
