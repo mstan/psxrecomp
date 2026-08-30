@@ -25,6 +25,12 @@
 
 #include <stdint.h>
 
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DEVICE_TRACE_ENABLED 0
+#else
+#define DEVICE_TRACE_ENABLED 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -65,6 +71,20 @@ void device_trace_note(uint32_t source, uint32_t detail);
 uint32_t device_trace_get(DevEvent* out, uint32_t max_rows);
 uint64_t device_trace_total(void);
 const char* device_source_str(uint32_t source);
+
+/* Lean builds retain linkable zero-result stubs in device_trace.c while these
+ * macros remove producer/control calls (and their argument evaluation) from
+ * consumers. The implementation opts out while defining those ABI symbols.
+ * Parenthesizing a function name bypasses its macro when a caller explicitly
+ * needs the linkable stub. */
+#if !DEVICE_TRACE_ENABLED && !defined(PSX_DEVICE_TRACE_IMPLEMENTATION)
+#define device_trace_arm(on)                 ((void)0)
+#define device_trace_reset()                 ((void)0)
+#define device_trace_is_armed()              (0)
+#define device_trace_note(source, detail)    ((void)0)
+#define device_trace_get(out, max_rows)      (0u)
+#define device_trace_total()                 (UINT64_C(0))
+#endif
 
 #ifdef __cplusplus
 }

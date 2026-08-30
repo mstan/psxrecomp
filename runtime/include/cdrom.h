@@ -261,6 +261,9 @@ typedef struct CDROMTraceEntry {
     int read_delay;
 } CDROMTraceEntry;
 
+/* Diagnostic ring capacities. PSX_NO_DEBUG_TOOLS retains the public layouts
+ * and accessors for source/ABI compatibility, but omits all three backing
+ * rings; getters then return 0 and set their output pointer to NULL. */
 #define CDROM_TRACE_CAP (1 << 16)
 #define CDROM_COMMAND_HISTORY_CAP (1 << 13)
 #define CDROM_SECTOR_HISTORY_CAP (1 << 13)

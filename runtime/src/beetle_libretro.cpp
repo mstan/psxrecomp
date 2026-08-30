@@ -31,6 +31,15 @@
 #include "device_trace.h"   /* general device-event cycle ring (oracle producer) */
 static void irq_event_callback(int which);  /* fwd: device-event ring producer */
 
+/* psx-beetle is also shipped as a lean/release target. Keep its diagnostic
+ * exports link-compatible there, but do not retain the oracle-only history
+ * rings or install their hot-path callbacks. */
+#ifdef PSX_NO_DEBUG_TOOLS
+#define BEETLE_DIAGNOSTICS_ENABLED 0
+#else
+#define BEETLE_DIAGNOSTICS_ENABLED 1
+#endif
+
 /* GPU global lives in PS_GPU's translation unit; psx.h doesn't extern it.
  * Declared here for the per-frame display-state snapshot. NOTE: GPU is
  * a struct VALUE in gpu.cpp (`PS_GPU GPU;`), not a pointer, despite the
@@ -48,6 +57,7 @@ uint16_t  s_joypad       = 0xFFFF;  /* all released (active-low) */
 bool      s_loaded       = false;
 uint32_t  s_frame_count  = 0;
 
+#if BEETLE_DIAGNOSTICS_ENABLED
 /* ---- SIO byte trace ---- */
 #define BEETLE_SIO_TRACE_CAP 65536
 struct BeetleSioTraceEntry {
@@ -350,6 +360,7 @@ static void fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
     }
     s_fntrace_idx = (s_fntrace_idx + 1) % BEETLE_FNTRACE_CAP;
 }
+#endif /* BEETLE_DIAGNOSTICS_ENABLED */
 
 /* ---- Disk control + system dir ---- */
 static char s_system_dir[4096] = ".";
@@ -385,8 +396,13 @@ void on_video_refresh(const void *data, unsigned width, unsigned height, size_t 
  * 4380's audio_wav can dump oracle PCM for offline A/B against the recomp's
  * tap on port 4370. The host still plays no audio from psx-beetle. */
 void on_audio_sample(int16_t l, int16_t r) {
+#if AUDIO_TRACE_ENABLED
     int16_t frame[2] = { l, r };
     audio_trace_pcm(AUDIO_TAP_SPU_OUT, frame, 1);
+#else
+    (void)l;
+    (void)r;
+#endif
 }
 size_t on_audio_sample_batch(const int16_t *data, size_t frames) {
     audio_trace_pcm(AUDIO_TAP_SPU_OUT, data, (int)frames);
@@ -563,6 +579,7 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
         }
     }
 
+#if BEETLE_DIAGNOSTICS_ENABLED
     if (PSX_FIO) {
         PSX_FIO->SetSIOTraceCallback(sio_trace_callback);
         std::fprintf(stderr, "[psx-beetle] SIO trace callback registered\n");
@@ -576,6 +593,7 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
     g_psxrecomp_cdcmd_cb = cdcmd_trace_callback;
     std::fprintf(stderr, "[psx-beetle] wtrace + fntrace + cdcmd callbacks registered\n");
     std::fflush(stderr);
+#endif
 
     return 0;
 }
@@ -684,13 +702,19 @@ extern "C" uint64_t parity_host_cycle(void) { return (uint64_t)beetle_core_get_g
  *   DMA -> DMAIntStatus per-channel bitmask (bit n = channel n completed)
  * so devtrace can compare native vs Beetle like-for-like (INT1-sector cadence,
  * per-channel DMA-completion cadence). */
+#if DEVICE_TRACE_ENABLED
 extern "C" unsigned psxrecomp_cdc_irq_type(void);   /* beetle-psx cdc.cpp */
 extern "C" unsigned psxrecomp_dma_int_status(void); /* beetle-psx dma.cpp */
+#endif
 static void irq_event_callback(int which) {
+#if DEVICE_TRACE_ENABLED
     uint32_t detail = 0u;
     if (which == 2)      detail = psxrecomp_cdc_irq_type();    /* IRQ_CD  */
     else if (which == 3) detail = psxrecomp_dma_int_status();  /* IRQ_DMA */
     device_trace_note((uint32_t)which, detail);
+#else
+    (void)which;
+#endif
 }
 
 extern "C" void beetle_get_ram(uint8_t *out_2mb) {
@@ -717,6 +741,7 @@ extern "C" void beetle_get_scratchpad(uint8_t *out_1kb) {
 }
 
 /* ---- SIO trace accessors ---- */
+#if BEETLE_DIAGNOSTICS_ENABLED
 extern "C" uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
                                           uint8_t *out_rx, uint16_t *out_ctrl,
                                           int max_count)
@@ -954,6 +979,60 @@ extern "C" void beetle_fntrace_reset(void) {
     memset(s_fntrace, 0, sizeof(s_fntrace));
 }
 extern "C" uint64_t beetle_fntrace_total(void) { return s_fntrace_seq; }
+#else
+extern "C" uint32_t beetle_get_sio_trace(uint32_t *, uint8_t *, uint8_t *,
+                                           uint16_t *, int) { return 0; }
+extern "C" uint32_t beetle_get_sio_trace_total(void) { return 0; }
+extern "C" void beetle_reset_sio_trace(void) {}
+
+extern "C" uint32_t beetle_get_cdcmd_trace(uint32_t *, uint8_t *, uint8_t *,
+                                             uint8_t *, uint8_t *, uint8_t *,
+                                             uint32_t *, int) { return 0; }
+extern "C" uint32_t beetle_get_cdcmd_trace_total(void) { return 0; }
+extern "C" void beetle_reset_cdcmd_trace(void) {}
+
+extern "C" int beetle_wtrace_arm(uint32_t, uint32_t) { return -1; }
+extern "C" void beetle_wtrace_disarm_all(void) {}
+extern "C" int beetle_wtrace_disarm(int) { return -1; }
+extern "C" int beetle_wtrace_range_count(void) { return 0; }
+extern "C" int beetle_wtrace_max_ranges(void) { return 0; }
+extern "C" int beetle_wtrace_capacity(void) { return 0; }
+extern "C" int beetle_wtrace_get_range(int, uint32_t *, uint32_t *) { return -1; }
+extern "C" void beetle_wtrace_reset(void) {}
+extern "C" uint64_t beetle_wtrace_total(void) { return 0; }
+extern "C" uint32_t beetle_wtrace_get_rich(
+    uint64_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
+    uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
+    uint32_t *, uint32_t *, uint32_t *, uint8_t *, uint8_t *, int) { return 0; }
+
+extern "C" int beetle_rtrace_arm(uint32_t, uint32_t) { return -1; }
+extern "C" void beetle_rtrace_disarm_all(void) {}
+extern "C" int beetle_rtrace_disarm(int) { return -1; }
+extern "C" int beetle_rtrace_range_count(void) { return 0; }
+extern "C" int beetle_rtrace_capacity(void) { return 0; }
+extern "C" int beetle_rtrace_max_ranges(void) { return 0; }
+extern "C" int beetle_rtrace_get_range(int, uint32_t *, uint32_t *) { return -1; }
+extern "C" void beetle_rtrace_reset(void) {}
+extern "C" uint64_t beetle_rtrace_total(void) { return 0; }
+extern "C" uint32_t beetle_rtrace_get(
+    uint64_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
+    uint8_t *, int) { return 0; }
+
+extern "C" uint64_t beetle_wtrace_all_total(void) { return 0; }
+extern "C" int beetle_wtrace_all_capacity(void) { return 0; }
+extern "C" void beetle_wtrace_all_reset(void) {}
+extern "C" uint32_t beetle_wtrace_all_get(
+    uint64_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
+    uint8_t *, int) { return 0; }
+
+extern "C" int beetle_fntrace_arm(uint32_t) { return -1; }
+extern "C" void beetle_fntrace_disarm_all(void) {}
+extern "C" int beetle_fntrace_arm_count(void) { return 0; }
+extern "C" uint32_t beetle_fntrace_get_arm(int) { return 0; }
+extern "C" void beetle_fntrace_set_unfiltered(int) {}
+extern "C" void beetle_fntrace_reset(void) {}
+extern "C" uint64_t beetle_fntrace_total(void) { return 0; }
+#endif
 
 /* ---- SPU event ring (always-on, mirrors recomp's spu_events).
  *
@@ -964,6 +1043,7 @@ extern "C" uint64_t beetle_fntrace_total(void) { return s_fntrace_seq; }
  * directly against recomp's port-4370 spu_events output. */
 /* 1M entries × ~32 B = 32 MB. Sized for full boot-chime capture plus
  * minutes of in-game timeline; mirrors recomp's SPU_EVENT_CAP exactly. */
+#if BEETLE_DIAGNOSTICS_ENABLED
 #define BEETLE_SPU_EVENT_CAP (1u << 20)
 struct BeetleSpuEvent {
     uint64_t seq;
@@ -1010,6 +1090,10 @@ extern "C" void psxrecomp_beetle_spu_event(unsigned kind, unsigned voice,
 }
 
 extern "C" uint64_t beetle_spu_event_total(void) { return s_spu_event_seq; }
+#else
+extern "C" void psxrecomp_beetle_spu_event(unsigned, unsigned, unsigned, unsigned) {}
+extern "C" uint64_t beetle_spu_event_total(void) { return 0; }
+#endif
 
 /* CD-audio volume matrix ground truth (PS_CDC::DecodeVolume; 0x80 = unity).
  * Returns 0 if the CDC isn't up. */
@@ -1034,6 +1118,7 @@ extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
                                          uint8_t *out_kind, uint8_t *out_voice,
                                          uint32_t max_count)
 {
+#if BEETLE_DIAGNOSTICS_ENABLED
     uint64_t avail = s_spu_event_seq < (uint64_t)BEETLE_SPU_EVENT_CAP
                      ? s_spu_event_seq : (uint64_t)BEETLE_SPU_EVENT_CAP;
     if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
@@ -1053,6 +1138,12 @@ extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
         out_voice[i]   = e->voice;
     }
     return max_count;
+#else
+    (void)out_seq; (void)out_frame; (void)out_addr; (void)out_env;
+    (void)out_pitch; (void)out_vol_l; (void)out_vol_r; (void)out_adsr_lo;
+    (void)out_adsr_hi; (void)out_kind; (void)out_voice; (void)max_count;
+    return 0;
+#endif
 }
 
 /* ---- SPU register peeks via PS_SPU::GetRegister ----
@@ -1117,6 +1208,7 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                        uint8_t *out_kind, uint32_t *out_sp,
                                        int max_count)
 {
+#if BEETLE_DIAGNOSTICS_ENABLED
     int avail = (int)(s_fntrace_seq < (uint64_t)BEETLE_FNTRACE_CAP
                       ? s_fntrace_seq : BEETLE_FNTRACE_CAP);
     int count = max_count < avail ? max_count : avail;
@@ -1137,6 +1229,12 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
         out_sp[i]     = e->sp;
     }
     return (uint32_t)count;
+#else
+    (void)out_seq; (void)out_caller; (void)out_target; (void)out_ra;
+    (void)out_a0; (void)out_a1; (void)out_a2; (void)out_a3;
+    (void)out_frame; (void)out_kind; (void)out_sp; (void)max_count;
+    return 0;
+#endif
 }
 
 /* ====================================================================== */
@@ -1151,12 +1249,15 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
  * and RAM via the MainRAM byte array. The runtime's recorder reads s_cpu
  * (recomp CPUState) and psx_read_byte. Different sources, same wire shape. */
 
+#if BEETLE_DIAGNOSTICS_ENABLED
 static BeetleFrameRecord *s_beetle_history = nullptr;
 static uint64_t           s_beetle_history_count = 0;
+#endif
 static uint32_t           s_beetle_snap_addrs[BEETLE_RAM_SNAPSHOT_REGIONS];
 static int                s_beetle_snap_active[BEETLE_RAM_SNAPSHOT_REGIONS];
 
 extern "C" void beetle_history_init(void) {
+#if BEETLE_DIAGNOSTICS_ENABLED
     if (s_beetle_history) return;
     s_beetle_history = (BeetleFrameRecord *)std::calloc(
         BEETLE_FRAME_HISTORY_CAP, sizeof(BeetleFrameRecord));
@@ -1168,9 +1269,14 @@ extern "C" void beetle_history_init(void) {
             "[psx-beetle] WARNING: failed to allocate %u-frame history ring\n",
             (unsigned)BEETLE_FRAME_HISTORY_CAP);
     }
+#else
+    std::memset(s_beetle_snap_addrs,  0, sizeof(s_beetle_snap_addrs));
+    std::memset(s_beetle_snap_active, 0, sizeof(s_beetle_snap_active));
+#endif
 }
 
 extern "C" void beetle_history_record_frame(void) {
+#if BEETLE_DIAGNOSTICS_ENABLED
     if (!s_beetle_history || !PSX_CPU) return;
 
     uint32_t idx = (uint32_t)(s_frame_count % BEETLE_FRAME_HISTORY_CAP);
@@ -1237,12 +1343,14 @@ extern "C" void beetle_history_record_frame(void) {
     }
 
     s_beetle_history_count = (uint64_t)s_frame_count + 1;
+#endif
 }
 
 extern "C" void beetle_history_get_bounds(uint64_t *out_count,
                                           uint64_t *out_oldest,
                                           uint64_t *out_newest)
 {
+#if BEETLE_DIAGNOSTICS_ENABLED
     uint64_t cnt = s_beetle_history_count;
     uint64_t oldest = (cnt > BEETLE_FRAME_HISTORY_CAP)
                      ? cnt - BEETLE_FRAME_HISTORY_CAP : 0;
@@ -1250,9 +1358,15 @@ extern "C" void beetle_history_get_bounds(uint64_t *out_count,
     if (out_count)  *out_count  = cnt;
     if (out_oldest) *out_oldest = oldest;
     if (out_newest) *out_newest = newest;
+#else
+    if (out_count)  *out_count  = 0;
+    if (out_oldest) *out_oldest = 0;
+    if (out_newest) *out_newest = 0;
+#endif
 }
 
 extern "C" const BeetleFrameRecord *beetle_history_get_frame(uint32_t frame) {
+#if BEETLE_DIAGNOSTICS_ENABLED
     if (!s_beetle_history) return nullptr;
     uint64_t cnt = s_beetle_history_count;
     uint64_t oldest = (cnt > BEETLE_FRAME_HISTORY_CAP)
@@ -1263,6 +1377,10 @@ extern "C" const BeetleFrameRecord *beetle_history_get_frame(uint32_t frame) {
     const BeetleFrameRecord *r = &s_beetle_history[idx];
     if (r->frame_number != frame) return nullptr;  /* slot reused since */
     return r;
+#else
+    (void)frame;
+    return nullptr;
+#endif
 }
 
 extern "C" int beetle_history_first_failure(uint32_t *out_frame, int *out_diff_count) {

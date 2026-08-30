@@ -106,9 +106,12 @@ static SweepEnv sweep_voice_env[SPU_VOICE_COUNT][2];  /* [voice][0=L 1=R] */
 static SweepEnv sweep_main_env[2];                    /* [0=L 1=R] */
 
 /* External vblank counter (debug_server.c) used as event timestamp. */
+#ifndef PSX_NO_DEBUG_TOOLS
 extern uint64_t s_frame_count;
+#endif
 
-/* ---- Always-on event ring -------------------------------------------- */
+/* ---- Diagnostic event ring ------------------------------------------- */
+#ifndef PSX_NO_DEBUG_TOOLS
 /* 1M entries × ~32B = 32 MB. Power of 2 so wrap is a mask. Beetle peaks at
  * a few hundred audible-voice events per chime second; recomp at <1k total
  * per chime. 1M gives ~minutes of headroom for game-scene capture too. */
@@ -116,6 +119,7 @@ extern uint64_t s_frame_count;
 static SpuEvent  s_events[SPU_EVENT_CAP];
 static uint32_t  s_event_idx = 0;
 static uint64_t  s_event_seq = 0;
+#endif
 
 /* CD input FIFO, fed by the CD-ROM XA decoder at 44.1 kHz stereo. */
 #define SPU_CD_RING_FRAMES (44100u * 8u)
@@ -153,6 +157,7 @@ typedef struct {
 
 static SpuVoice voices[SPU_VOICE_COUNT];
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
     e->seq      = s_event_seq++;
@@ -178,6 +183,9 @@ static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     }
     s_event_idx++;
 }
+#else
+#define spu_event_record(kind, voice, addr) ((void)0)
+#endif
 
 /* PS1 envelope rate decoder. Ported verbatim from Beetle's CalcVCDelta
  * (beetle-psx/mednafen/psx/spu.cpp). Each call emits the per-step
@@ -951,7 +959,9 @@ void spu_init(void) {
     memset(spu_ram, 0, sizeof(spu_ram));
     memset(spu_regs, 0, sizeof(spu_regs));
     memset(voices, 0, sizeof(voices));
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(s_events, 0, sizeof(s_events));
+#endif
     transfer_addr = 0;
     key_on_count = 0;
     render_frames = 0;
@@ -975,8 +985,10 @@ void spu_init(void) {
     capture_pos = 0;
     memset(sweep_voice_env, 0, sizeof(sweep_voice_env));
     memset(sweep_main_env, 0, sizeof(sweep_main_env));
+#ifndef PSX_NO_DEBUG_TOOLS
     s_event_idx = 0;
     s_event_seq = 0;
+#endif
     spu_cd_audio_reset();
     s_shadow_tap_on = 0;
     s_shadow_tap_frame = 0;
@@ -1019,6 +1031,7 @@ void spu_render(int16_t* out_stereo, int frames) {
      * 24-voice walk and per-voice sweep steps. Shadow tap stays on the
      * general path. */
     if (enabled && !any_voice && !s_shadow_tap_on) {
+#if AUDIO_TRACE_ENABLED
         static int16_t s_voice_silence[2048 * 2];
         int voice_tap_n = frames;
         if (voice_tap_n > 2048) voice_tap_n = 2048;
@@ -1029,6 +1042,7 @@ void spu_render(int16_t* out_stereo, int frames) {
             audio_trace_pcm(AUDIO_TAP_VOICES, s_voice_silence, n);
             off += n;
         }
+#endif
 
         int32_t block_peak = 0;
         for (int f = 0; f < frames; f++) {
@@ -1117,10 +1131,12 @@ void spu_render(int16_t* out_stereo, int frames) {
     }
 
     int32_t block_peak = 0;
+#if AUDIO_TRACE_ENABLED
     /* Voice-sum tap is filled once per block (not per sample) — same bytes. */
     static int16_t s_voice_sum[2048 * 2];
     int voice_sum_cap = frames < 2048 ? frames : 2048;
     int voice_sum_pos = 0;
+#endif
 
     for (int f = 0; f < frames; f++) {
         int32_t mix_l = 0;
@@ -1179,11 +1195,13 @@ void spu_render(int16_t* out_stereo, int frames) {
             }
             mix_l = voice_l;
             mix_r = voice_r;
+#if AUDIO_TRACE_ENABLED
             if (voice_sum_pos < voice_sum_cap) {
                 s_voice_sum[voice_sum_pos * 2 + 0] = clamp16(voice_l);
                 s_voice_sum[voice_sum_pos * 2 + 1] = clamp16(voice_r);
                 voice_sum_pos++;
             }
+#endif
 
             /* CD input bus. The bus runs continuously while the SPU is
              * enabled (the capture buffers record it regardless of SPUCNT
@@ -1283,6 +1301,7 @@ void spu_render(int16_t* out_stereo, int frames) {
             s_shadow_tap_frame = f + 1;
         }
     }
+#if AUDIO_TRACE_ENABLED
     if (enabled) {
         /* Flush voice-sum tap; if the block was longer than the staging buf,
          * emit the remainder as silence (MotK FMV blocks are ≤2048). */
@@ -1296,6 +1315,7 @@ void spu_render(int16_t* out_stereo, int frames) {
             left -= n;
         }
     }
+#endif
     render_frames += (uint64_t)frames;
     last_peak = block_peak;
     if (block_peak > peak) peak = block_peak;
@@ -1641,9 +1661,20 @@ void spu_get_global_state(SpuGlobalState* out) {
                     | (((spu_regs[reg_index(0x1F801D82u)] >> 15) & 1u) << 1);
 }
 
-uint64_t spu_event_total(void) { return s_event_seq; }
+uint64_t spu_event_total(void) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    return 0;
+#else
+    return s_event_seq;
+#endif
+}
 
 uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)out;
+    (void)max_count;
+    return 0;
+#else
     if (!out || max_count == 0) return 0;
     uint64_t avail = s_event_seq < (uint64_t)SPU_EVENT_CAP
                      ? s_event_seq : (uint64_t)SPU_EVENT_CAP;
@@ -1654,12 +1685,15 @@ uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
         out[i] = s_events[(start + i) & (SPU_EVENT_CAP - 1u)];
     }
     return max_count;
+#endif
 }
 
 void spu_event_reset(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     s_event_idx = 0;
     s_event_seq = 0;
     memset(s_events, 0, sizeof(s_events));
+#endif
 }
 
 /* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */
