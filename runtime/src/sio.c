@@ -715,27 +715,42 @@ static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
 
 
 /* ---- Card transaction ring buffer ---- */
+#ifndef PSX_NO_DEBUG_TOOLS
 static PSX_BSS SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
 static int       sio_txn_idx = 0;        /* next-write slot */
 static uint32_t  sio_txn_seq = 0;        /* monotonic id of next-to-close */
+#endif
 /* sio_txn_open declared above (defer guard). */
 static SioTxnEntry sio_txn_cur;          /* in-progress txn, flushed on close */
 
 uint32_t sio_get_card_txns(const SioTxnEntry **buf_out, int *write_idx_out, int *open_out) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (buf_out) *buf_out = NULL;
+    if (write_idx_out) *write_idx_out = 0;
+    if (open_out) *open_out = 0;
+    return 0;
+#else
     if (buf_out) *buf_out = sio_txn_buf;
     if (write_idx_out) *write_idx_out = sio_txn_idx;
     if (open_out) *open_out = sio_txn_open;
     return sio_txn_seq;
+#endif
 }
 
 const SioTxnEntry *sio_get_card_txn_live(void) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    return NULL;
+#else
     return sio_txn_open ? &sio_txn_cur : NULL;
+#endif
 }
 
 /* Open a new txn. Caller must have ensured none is currently open. */
 static void txn_open(uint8_t slot, uint32_t start_byte_seq, uint32_t func) {
     memset(&sio_txn_cur, 0, sizeof(sio_txn_cur));
+#ifndef PSX_NO_DEBUG_TOOLS
     sio_txn_cur.txn_seq         = sio_txn_seq;
+#endif
     sio_txn_cur.start_byte_seq  = start_byte_seq;
     sio_txn_cur.start_func      = func;
     sio_txn_cur.slot            = slot;
@@ -799,16 +814,21 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
     /* Any finished card txn can leave A6C10 nested; arm unstick check. */
     if (ape_unstick_enabled())
         s_ape_unstick_pending = 1;
-    sio_txn_buf[sio_txn_idx]   = sio_txn_cur;
+#ifndef PSX_NO_DEBUG_TOOLS
+    sio_txn_buf[sio_txn_idx] = sio_txn_cur;
     sio_txn_idx = (sio_txn_idx + 1) % SIO_TXN_CAP;
     sio_txn_seq++;
+#endif
     sio_txn_open = 0;
     ape_card_unstick_maybe(0);
 }
 
 /* ---- SIO IRQ #7 delivery ring ---- */
+#ifndef PSX_NO_DEBUG_TOOLS
 static PSX_BSS SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
 static int       sio_irq_idx = 0;
+#endif
+/* Also feeds load-bearing burst accounting; retain it in lean builds. */
 static uint32_t  sio_irq_seq = 0;
 
 /* Pending-IRQ context — captured when the countdown is armed, used when it fires. */
@@ -819,9 +839,39 @@ static uint8_t   sio_irq_pending_mc_state   = 0;
 static uint32_t  sio_irq_pending_byte_seq   = 0;
 
 uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (buf_out) *buf_out = NULL;
+    if (write_idx_out) *write_idx_out = 0;
+    return 0;
+#else
     if (buf_out) *buf_out = sio_irq_buf;
     if (write_idx_out) *write_idx_out = sio_irq_idx;
     return sio_irq_seq;
+#endif
+}
+
+static void sio_irq_ring_record(uint32_t i_stat_before) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    extern uint32_t g_debug_current_func_addr;
+    extern uint8_t psx_read_byte(uint32_t addr);
+    SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
+    e->seq            = sio_irq_seq;
+    e->byte_seq       = sio_irq_pending_byte_seq;
+    e->i_stat_before  = i_stat_before;
+    e->i_stat_after   = i_stat;
+    e->mc_state       = (uint32_t)sio_irq_pending_mc_state;
+    e->active_device  = (uint32_t)active_device;
+    e->ctrl           = (uint32_t)sio_ctrl;
+    e->func_addr      = g_debug_current_func_addr;
+    e->counter_7514   = (uint32_t)psx_read_byte(0x7514);
+    e->source         = sio_irq_pending_source;
+    e->slot           = sio_irq_pending_slot;
+    e->delay_applied  = sio_irq_pending_delay;
+    sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
+#else
+    (void)i_stat_before;
+#endif
+    sio_irq_seq++;
 }
 
 /* ---- Card IRQ-arm audit -----------------------------------------------
@@ -1018,9 +1068,8 @@ void sio_init(void) {
     g_sio_timing_active = 0;
 #endif
     sio_txn_open = 0;
-    /* Note: sio_txn_buf, sio_txn_idx, sio_txn_seq deliberately persist
-     * across sio_init so post-reset diagnostics can still inspect prior
-     * transactions. Boot path zero-inits them via BSS. */
+    /* The historical transaction ring, when debug tools are enabled,
+     * deliberately persists across sio_init for post-reset inspection. */
 }
 
 /* Cycle-budgeted precise event slicing: guest CPU cycles until SIO raises a
@@ -2712,23 +2761,7 @@ static void sio_fire_ack_irq(void) {
             card_handoff_push(5, 0);
     }
 
-    extern uint32_t g_debug_current_func_addr;
-    extern uint8_t psx_read_byte(uint32_t addr);
-    SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
-    e->seq            = sio_irq_seq;
-    e->byte_seq       = sio_irq_pending_byte_seq;
-    e->i_stat_before  = i_stat_before;
-    e->i_stat_after   = i_stat;
-    e->mc_state       = (uint32_t)sio_irq_pending_mc_state;
-    e->active_device  = (uint32_t)active_device;
-    e->ctrl           = (uint32_t)sio_ctrl;
-    e->func_addr      = g_debug_current_func_addr;
-    e->counter_7514   = (uint32_t)psx_read_byte(0x7514);
-    e->source         = sio_irq_pending_source;
-    e->slot           = sio_irq_pending_slot;
-    e->delay_applied  = sio_irq_pending_delay;
-    sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
-    sio_irq_seq++;
+    sio_irq_ring_record(i_stat_before);
     s_pace_ack_fires++;
     if (!sio_shift_active && !sio_tx_buffered && !sio_pending_ack) {
         g_sio_timing_active = 0;
@@ -2892,24 +2925,9 @@ void sio_tick(int cycles) {
             psx_irq_raise(IRQ_SIO0, 1); /* SIO shift IRQ */
             event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 1u); /* SIO shift IRQ fired */
 
-            /* SIO IRQ ring capture. */
-            extern uint32_t g_debug_current_func_addr;
-            extern uint8_t psx_read_byte(uint32_t addr);
-            SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
-            e->seq            = sio_irq_seq;
-            e->byte_seq       = sio_irq_pending_byte_seq;
-            e->i_stat_before  = i_stat_before;
-            e->i_stat_after   = i_stat;
-            e->mc_state       = (uint32_t)sio_irq_pending_mc_state;
-            e->active_device  = (uint32_t)active_device;
-            e->ctrl           = (uint32_t)sio_ctrl;
-            e->func_addr      = g_debug_current_func_addr;
-            e->counter_7514   = (uint32_t)psx_read_byte(0x7514);
-            e->source         = sio_irq_pending_source;
-            e->slot           = sio_irq_pending_slot;
-            e->delay_applied  = sio_irq_pending_delay;
-            sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
-            sio_irq_seq++;
+            /* Record the diagnostic payload when enabled and always advance
+             * the sequence used by burst accounting. */
+            sio_irq_ring_record(i_stat_before);
         }
     }
 

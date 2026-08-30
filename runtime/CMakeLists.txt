@@ -479,6 +479,38 @@ if(BUILD_TESTING)
     target_include_directories(mod_session_defaults_test PRIVATE include)
     add_test(NAME mod_session_defaults_test COMMAND mod_session_defaults_test)
 
+    foreach(_audio_trace_mode IN ITEMS debug release)
+        add_executable(audio_trace_${_audio_trace_mode}_config_test
+            tests/test_audio_trace_config.c
+            src/audio_trace.c)
+        target_include_directories(audio_trace_${_audio_trace_mode}_config_test
+            PRIVATE include)
+        target_compile_features(audio_trace_${_audio_trace_mode}_config_test
+            PRIVATE c_std_11)
+        if(_audio_trace_mode STREQUAL "release")
+            target_compile_definitions(audio_trace_${_audio_trace_mode}_config_test
+                PRIVATE PSX_NO_DEBUG_TOOLS=1)
+        endif()
+        add_test(NAME audio_trace_${_audio_trace_mode}_config_test
+                 COMMAND audio_trace_${_audio_trace_mode}_config_test)
+    endforeach()
+
+    foreach(_device_trace_mode IN ITEMS debug release)
+        add_executable(device_parity_trace_${_device_trace_mode}_config_test
+            tests/test_device_parity_trace_config.c
+            src/device_trace.c
+            src/parity_trace.c)
+        target_include_directories(
+            device_parity_trace_${_device_trace_mode}_config_test PRIVATE include)
+        if(_device_trace_mode STREQUAL "release")
+            target_compile_definitions(
+                device_parity_trace_${_device_trace_mode}_config_test
+                PRIVATE PSX_NO_DEBUG_TOOLS=1)
+        endif()
+        add_test(NAME device_parity_trace_${_device_trace_mode}_config_test
+                 COMMAND device_parity_trace_${_device_trace_mode}_config_test)
+    endforeach()
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         foreach(_gp0_diag_mode IN ITEMS debug release)
@@ -489,6 +521,21 @@ if(BUILD_TESTING)
                              --mode ${_gp0_diag_mode}
                              --runtime ${CMAKE_CURRENT_SOURCE_DIR})
         endforeach()
+        add_test(NAME cd_spu_trace_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cd_spu_trace_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME sio_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sio_diag_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME beetle_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_beetle_diag_config.py
+                         --compiler ${CMAKE_CXX_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME rewind_toggle_combo_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rewind_toggle_combo.py)

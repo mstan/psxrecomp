@@ -52,8 +52,10 @@ extern int iso_track_is_audio(void* handle, int track);
 extern uint32_t i_stat;
 /* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
 extern void psx_irq_raise(uint32_t bit, uint32_t detail);
+#ifndef PSX_NO_DEBUG_TOOLS
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
+#endif
 extern uint64_t s_frame_count;
 
 /* CD-ROM state */
@@ -162,10 +164,12 @@ static uint8_t last_sector_xa_file;
 static uint8_t last_sector_xa_channel;
 static uint8_t last_sector_xa_submode;
 static uint8_t last_sector_xa_coding;
+#ifndef PSX_NO_DEBUG_TOOLS
 static CDROMSectorHistoryEntry sector_history[CDROM_SECTOR_HISTORY_CAP];
 static uint64_t sector_history_seq;
 static CDROMCommandHistoryEntry command_history[CDROM_COMMAND_HISTORY_CAP];
 static uint64_t command_history_seq;
+#endif
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
@@ -707,6 +711,7 @@ static void update_last_valid_subq(uint32_t lba) {
     }
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static CDROMTraceEntry cdrom_trace[CDROM_TRACE_CAP];
 static uint64_t cdrom_trace_seq;
 
@@ -777,6 +782,10 @@ static void record_command_history(uint8_t kind, uint8_t cmd,
     e->queued_cmd = queued_cmd.cmd;
     e->queued_pending = (uint8_t)(queued_cmd.pending ? 1 : 0);
 }
+#else
+#define trace_cdrom(kind, addr, val, width) ((void)0)
+#define record_command_history(kind, cmd, params, count) ((void)0)
+#endif
 
 static int xa_is_audio_realtime(const CDROMSectorDelivery *d) {
     return d &&
@@ -800,6 +809,7 @@ static CDROMSectorDelivery classify_raw_sector(const uint8_t *raw_data, int have
     return d;
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static void record_sector_history(int lba, int size, uint8_t mode, int have_raw,
                                   const uint8_t *bytes,
                                   const CDROMSectorDelivery *delivery) {
@@ -829,6 +839,9 @@ static void record_sector_history(int lba, int size, uint8_t mode, int have_raw,
                CDROM_SECTOR_HISTORY_BYTES - e->bytes_len);
     }
 }
+#else
+#define record_sector_history(lba, size, mode, have_raw, bytes, delivery) ((void)0)
+#endif
 
 static int has_disc(void) {
     return iso_handle != NULL;
@@ -1260,7 +1273,8 @@ static int xa_resample_to_44100(const int16_t* in, int in_frames,
     return out_frames;
 }
 
-/* Always-on XA zero-run scanner (audio_trace event ring). Decoded XA music
+#if AUDIO_TRACE_ENABLED
+/* Debug XA zero-run scanner (audio_trace event ring). Decoded XA music
  * must not contain long exact-zero spans when the source sectors are dense;
  * a run here localizes corruption to a pipeline stage (stage 0 = straight
  * out of the ADPCM decoder at native rate, stage 1 = after resample +
@@ -1283,9 +1297,13 @@ static void xa_zero_scan(const int16_t *stereo, int frames, int lba,
         }
     }
 }
+#endif
 
 static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
                                   const CDROMSectorDelivery *delivery) {
+#if !AUDIO_TRACE_ENABLED
+    (void)lba;
+#endif
     if (!(mode_reg & 0x40u) || !raw_data || !delivery || cd_muted) return 0;
     if (!xa_is_audio_realtime(delivery)) return 0;
 
@@ -1324,13 +1342,17 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
     int native_frames = stereo
         ? xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native)
         : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
+#if AUDIO_TRACE_ENABLED
     xa_zero_scan(native, native_frames, lba, 0);
+#endif
     int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
     /* Volume is applied after resampling, per PS1 hardware tests (Beetle
      * cdc.cpp GetCDAudio comment). */
     cd_apply_decode_volume(pcm_44100, out_frames);
+#if AUDIO_TRACE_ENABLED
     xa_zero_scan(pcm_44100, out_frames, lba, 1);
+#endif
     spu_cd_audio_push(pcm_44100, out_frames);
     s_xa_audio_sector_total++;
     s_xa_audio_frame_total += (uint64_t)out_frames;
@@ -2725,7 +2747,9 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
     int got = 0;
+#endif
     if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
         sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
@@ -2733,12 +2757,15 @@ uint32_t cdrom_dma_read(void) {
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
         }
+#ifndef PSX_NO_DEBUG_TOOLS
         got = 1;
+#endif
     }
     /* Per-word DMA data reads flood the CD trace ring (hundreds per sector) and
      * evict the command/IRQ/seek/play history we actually need to read the
      * streaming/audio flow (Rule 15). Gate them OFF by default; opt in with
      * PSX_CD_DMA_TRACE=1 when specifically inspecting the data path. */
+#ifndef PSX_NO_DEBUG_TOOLS
     if (got) {
         static int s_dma_trace = -1;
         if (s_dma_trace < 0) {
@@ -2747,6 +2774,7 @@ uint32_t cdrom_dma_read(void) {
         }
         if (s_dma_trace) trace_cdrom('D', 0, val, 4);
     }
+#endif
     return val;
 }
 
@@ -2772,7 +2800,9 @@ uint32_t cdrom_dma_sector_word_count(void) {
 void cdrom_debug_snapshot(CDROMDebugState* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
+#ifndef PSX_NO_DEBUG_TOOLS
     out->seq = cdrom_trace_seq;
+#endif
     out->index_reg = index_reg;
     out->stat_reg = stat_reg;
     out->request_reg = request_reg;
@@ -2821,33 +2851,54 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
 }
 
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (out_entries) *out_entries = NULL;
+    return 0;
+#else
     if (out_entries) *out_entries = cdrom_trace;
     return cdrom_trace_seq;
+#endif
 }
 
 void cdrom_debug_clear_trace(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(cdrom_trace, 0, sizeof(cdrom_trace));
     cdrom_trace_seq = 0;
+#endif
 }
 
 uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (out_entries) *out_entries = NULL;
+    return 0;
+#else
     if (out_entries) *out_entries = command_history;
     return command_history_seq;
+#endif
 }
 
 void cdrom_debug_clear_command_history(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(command_history, 0, sizeof(command_history));
     command_history_seq = 0;
+#endif
 }
 
 uint64_t cdrom_debug_get_sector_history(const CDROMSectorHistoryEntry** out_entries) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    if (out_entries) *out_entries = NULL;
+    return 0;
+#else
     if (out_entries) *out_entries = sector_history;
     return sector_history_seq;
+#endif
 }
 
 void cdrom_debug_clear_sector_history(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
     memset(sector_history, 0, sizeof(sector_history));
     sector_history_seq = 0;
+#endif
 }
 
 uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,

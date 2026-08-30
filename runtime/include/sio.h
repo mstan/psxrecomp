@@ -269,8 +269,9 @@ void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
 /* ---- Card transaction ring buffer ----
  *
  * One entry per card protocol transaction (0x81 → terminal state / abort).
- * Always-on.  64K entries × ~544 B ≈ 35 MB — holds tens of minutes of card
- * activity at typical detection-cycle rates. */
+ * Debug builds retain 64K entries × ~544 B ≈ 35 MB. Builds with
+ * PSX_NO_DEBUG_TOOLS keep the public types/getters for ABI compatibility but
+ * do not allocate or record the historical ring. */
 #define SIO_TXN_CAP        (1 << 16)
 #define SIO_TXN_MAX_BYTES  256
 
@@ -313,8 +314,9 @@ const SioTxnEntry *sio_get_card_txn_live(void);
 
 /* ---- SIO IRQ #7 delivery ring ----
  *
- * Captures every time IRQ #7 (SIO0) is raised into I_STAT.  Always-on.
- * 1M entries × ~64 B ≈ 64 MB — holds tens of minutes of IRQ history. */
+ * Captures every time IRQ #7 (SIO0) is raised into I_STAT. Debug builds retain
+ * 1M entries. Builds with PSX_NO_DEBUG_TOOLS keep the public types/getter for
+ * ABI compatibility but do not allocate or record the historical ring. */
 #define SIO_IRQ_RING_CAP (1 << 20)
 
 typedef enum {
