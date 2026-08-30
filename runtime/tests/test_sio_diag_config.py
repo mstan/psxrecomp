@@ -30,10 +30,6 @@ def compile_harness(compiler: Path, runtime: Path, lean: bool,
 #include <stdint.h>
 #include <stdio.h>
 
-void psx_irq_refresh_cause_ip2(void) {}
-uint32_t gpu_vblank_period_cycles(void) { return 564480u; }
-uint32_t gpu_get_crtc_refresh_multiplier(void) { return 1u; }
-
 int main(void) {
     const SioTxnEntry *txns = (const SioTxnEntry *)(uintptr_t)1;
     const SioTxnEntry *live;
