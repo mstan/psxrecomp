@@ -523,9 +523,9 @@ static int s_tb_gate = 0;
  * could not be given one depth state. */
 static int s_tb_depth = 0;
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
-#ifndef PSX_NO_DEBUG_TOOLS
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
 static int s_bdg_applied = 0, s_bdg_prims = 0, s_bdg_clearx = -999999;
 /* per-prim draw-order trace (ws_backdrop_trace): x-extent + textured flag, in
  * draw order, for the last frame -- so we can SEE where the background sits. */
