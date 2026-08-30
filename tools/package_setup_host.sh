@@ -324,10 +324,31 @@ DIST="${ROOT}/dist"
 STAGE="${DIST}/stage-setup-${ARTIFACT}"
 
 EXE=""
-for cand in \
-  "${BUILD_DIR}/${EXE_NAME}" \
-  "${BUILD_DIR}/${EXE_NAME}.exe" \
-  "${BUILD_DIR}/Release/${EXE_NAME}.exe"
+if [[ "${EXE_NAME,,}" == *.exe ]]; then
+  EXE_CANDIDATES=(
+    "${BUILD_DIR}/${EXE_NAME}"
+    "${BUILD_DIR}/Release/${EXE_NAME}"
+  )
+else
+  EXE_CANDIDATES=()
+  for candidate_dir in "${BUILD_DIR}" "${BUILD_DIR}/Release"; do
+    extensionless="${candidate_dir}/${EXE_NAME}"
+    windows_exe="${extensionless}.exe"
+    if [[ -f "${extensionless}" ]]; then
+      # MSYS suffix aliases make `Host` appear present when only Host.exe
+      # exists. Identity distinguishes that alias from a real Linux Host that
+      # happens to live beside a distinct Windows build.
+      if [[ -f "${windows_exe}" && "${extensionless}" -ef "${windows_exe}" ]]; then
+        EXE_CANDIDATES+=("${windows_exe}")
+      else
+        EXE_CANDIDATES+=("${extensionless}")
+      fi
+    elif [[ -f "${windows_exe}" ]]; then
+      EXE_CANDIDATES+=("${windows_exe}")
+    fi
+  done
+fi
+for cand in "${EXE_CANDIDATES[@]}"
 do
   if [[ -f "${cand}" ]]; then
     EXE="${cand}"
@@ -791,20 +812,26 @@ fi
 
 find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {} +
 
-(
-  cd "${STAGE}"
-  if command -v zip >/dev/null 2>&1; then
-    zip -r -q "${DIST}/${ZIP_NAME}" .
-  elif command -v tar >/dev/null 2>&1; then
-    # Windows installations commonly have bsdtar but no zip.exe.  Its
-    # archive-format auto-detection keeps the published artifact a normal
-    # .zip without requiring an installer or an extra SDK package.
-    tar -a -c -f "${DIST}/${ZIP_NAME}" .
-  else
-    echo "error: neither zip nor tar is available" >&2
-    exit 1
+ZIP_HELPER="${SCRIPT_DIR}/create_release_zip.py"
+if [[ ! -f "${ZIP_HELPER}" ]]; then
+  echo "error: missing canonical release ZIP helper: ${ZIP_HELPER}" >&2
+  exit 1
+fi
+PYTHON_BIN=""
+for candidate in python3 python; do
+  if command -v "${candidate}" >/dev/null 2>&1 &&
+     "${candidate}" -c 'import zipfile' >/dev/null 2>&1; then
+    PYTHON_BIN="${candidate}"
+    break
   fi
-)
+done
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "error: Python 3 with zipfile is required to create a canonical setup ZIP" >&2
+  exit 1
+fi
+"${PYTHON_BIN}" "${ZIP_HELPER}" \
+  --source "${STAGE}" \
+  --output "${DIST}/${ZIP_NAME}"
 
 echo "Wrote ${DIST}/${ZIP_NAME}"
 du -h "${DIST}/${ZIP_NAME}"
