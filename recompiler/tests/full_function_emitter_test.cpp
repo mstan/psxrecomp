@@ -63,6 +63,7 @@ std::string read_file(const std::filesystem::path& path) {
 struct RunResult {
     EmitStats stats;
     std::string dispatch;
+    std::string full;
 };
 
 RunResult run_case(const char* name, const std::vector<uint32_t>& words,
@@ -87,6 +88,7 @@ RunResult run_case(const char* name, const std::vector<uint32_t>& words,
         rom, kBase, kBase + static_cast<uint32_t>(rom.size()) - 1u,
         discovery, "synthetic", out_dir.string(), stem);
     result.dispatch = read_file(out_dir / (stem + "_dispatch.c"));
+    result.full = read_file(out_dir / (stem + "_full.c"));
     std::filesystem::remove_all(out_dir);
     return result;
 }
@@ -231,6 +233,26 @@ void destructive_pgxp_writes_are_emitted() {
            "MFC0 invalidates destination provenance");
 }
 
+void delayed_pgxp_shadow_hooks_are_emitted() {
+    const auto result = run_case(
+        "pgxp-load-delay",
+        {
+            0x8D280000u,  // lw t0,0(t1)
+            0x01001021u,  // addu v0,t0,zero -- reads the old t0
+            0x03E00008u,  // jr ra
+            0x00000000u,  // nop
+        },
+        {function_at(kBase, kBase + 12u, {kBase})});
+    expect(result.stats.functions_emitted == 1,
+           "dependent load pair remains native in the full emitter");
+    expect(result.full.find("PGXP_LOAD_DELAYED(0x8D280000u") !=
+               std::string::npos,
+           "full emitter stages the load shadow before the dependent successor");
+    expect(result.full.find("PGXP_LOAD_COMMIT(8u, psx_ldd_BFC00000);") !=
+               std::string::npos,
+           "full emitter commits the shadow after delayed writeback");
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +278,7 @@ int main() {
     noncomplementary_lwl_falls_back();
     complementary_lwl_lwr_stays_native();
     destructive_pgxp_writes_are_emitted();
+    delayed_pgxp_shadow_hooks_are_emitted();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d full-function emitter test(s) failed\n", failures);

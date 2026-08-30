@@ -806,6 +806,9 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
             if (regimm_op == 0x00 && config_.ws_cull_nclip_keep_sites.count(addr))
                 return fmt::format("psx_ws_x_margin() > 0 ? 0 : ((int32_t){} < 0) /* ws nclip keep */",
                                    reg_name(rs));
+            if (regimm_op == 0x00 && config_.ws_cull_nclip_exact_sites.count(addr))
+                return fmt::format("psx_ws_x_margin() > 0 ? gte_nclip_precise_bltz((int32_t){}) : ((int32_t){} < 0) /* ws exact nclip */",
+                                   reg_name(rs), reg_name(rs));
             return keep_branch_if_wide(
                 fmt::format("(int32_t){} < 0", reg_name(rs)));
         } else {                            // bgez family (incl. bgezal + undefined mirrors)
@@ -1997,8 +2000,12 @@ std::string CodeGenerator::translate_basic_block(
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
                     /* Assign into a function-scope temp. PGXP wraps loads in
                      * `{{ ... }}`; declaring the temp inside that block left
-                     * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
+                    * the writeback `cpu->gpr[N] = psx_ldd_*` out of scope. */
                     emitted.replace(pos, lhs.size(), temp + " =");
+                    const size_t hook = emitted.find("PGXP_LOAD(");
+                    if (hook != std::string::npos)
+                        emitted.replace(hook, std::string("PGXP_LOAD").size(),
+                                       "PGXP_LOAD_DELAYED");
                     ss << config_.indent << "uint32_t " << temp << ";\n";
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
                     delayed_load_addr = addr;
@@ -2008,13 +2015,23 @@ std::string CodeGenerator::translate_basic_block(
             }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
-                if (writes_gpr(instr, delayed_load_dest)) {
+                const int successor_load_dest = simple_load_dest(instr);
+                const bool successor_replaces_pending =
+                    successor_load_dest == static_cast<int>(delayed_load_dest) &&
+                    ((instr >> 21) & 31u) == delayed_load_dest;
+                if (writes_gpr(instr, delayed_load_dest) && !successor_replaces_pending) {
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_CANCEL({}u);  /* successor write wins */\n",
+                        delayed_load_dest);
                     ss << config_.indent << fmt::format(
                         "(void)psx_ldd_{:08X};  /* successor write wins */\n",
                         delayed_load_addr);
                 } else {
                     ss << config_.indent << fmt::format(
                         "cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
+                        delayed_load_dest, delayed_load_addr);
+                    ss << config_.indent << fmt::format(
+                        "PGXP_LOAD_COMMIT({}u, psx_ldd_{:08X});\n",
                         delayed_load_dest, delayed_load_addr);
                 }
                 ss << config_.indent << "}\n";
@@ -3488,6 +3505,15 @@ std::string CodeGenerator::generate_file(
         // promotions and alias entries widened the function set.
         const int MAX_PASSES = 256;
         bool converged = false;
+        auto zero_filled_target = [&](uint32_t target) {
+            constexpr uint32_t kProbeWords = 8u;
+            if (target + kProbeWords * 4u > exe_end) return false;
+            for (uint32_t i = 0; i < kProbeWords; ++i) {
+                auto word = exe_.read_word(target + i * 4u);
+                if (!word.has_value() || *word != 0u) return false;
+            }
+            return true;
+        };
 
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
@@ -3501,6 +3527,11 @@ std::string CodeGenerator::generate_file(
                         if (known_addrs.count(target)) return;
                         if (target < exe_start || target >= exe_end) return;
                         if (target & 3) return;
+                        // Broad conservative host ranges may cover packed data
+                        // whose words decode as branches.  Never manufacture a
+                        // callable split at runtime-populated zero storage just
+                        // because a data word branches there syntactically.
+                        if (zero_filled_target(target)) return;
                         mid_targets.insert(target);
                     };
 

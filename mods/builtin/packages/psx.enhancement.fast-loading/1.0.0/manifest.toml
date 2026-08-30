@@ -15,9 +15,9 @@ game_id = "*"
 [[feature]]
 id = "fast-loading"
 name = "Fast Loading (host pacing)"
-description = "Disabled by default. Host pacing is the safe accelerator: it only changes how fast real time is fed to a load, so the guest cannot desync. It does speed the game up while a load is detected, which some speedrun routes rely on NOT happening -- if that is you, leave this off and use CD Speed instead."
+description = "Enabled by default. Host pacing changes only how quickly real time is fed to a load; guest frames, CD interrupts, and callbacks retain their normal schedule. Disable it for strictly authentic wall-clock loading."
 group = "Quality of Life"
-default_enabled = false
+default_enabled = true
 
 [[option]]
 feature = "fast-loading"

@@ -307,5 +307,17 @@ void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_
 void psx_pgxp_gpr_write(struct CPUState *cpu, uint32_t reg) {
     if (g_cbs.pgxp && g_cbs.pgxp->gpr_write) g_cbs.pgxp->gpr_write(cpu, reg);
 }
+void psx_pgxp_load_delayed(struct CPUState *cpu, uint32_t instr, uint32_t addr, uint32_t value) {
+    if (g_cbs.pgxp && g_cbs.pgxp->load_delayed)
+        g_cbs.pgxp->load_delayed(cpu, instr, addr, value);
+}
+void psx_pgxp_load_commit(struct CPUState *cpu, uint32_t reg, uint32_t value) {
+    if (g_cbs.pgxp && g_cbs.pgxp->load_commit)
+        g_cbs.pgxp->load_commit(cpu, reg, value);
+}
+void psx_pgxp_load_cancel(struct CPUState *cpu, uint32_t reg) {
+    if (g_cbs.pgxp && g_cbs.pgxp->load_cancel)
+        g_cbs.pgxp->load_cancel(cpu, reg);
+}
 #endif /* PSX_PGXP */
 /* ----------------------------------------------------------------------- */

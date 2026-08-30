@@ -1,5 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.20)
 project(psxrecomp-runtime C CXX)
+option(BUILD_TESTING "Build the PSXRecomp runtime tests" OFF)
 include(CTest)
 
 set(CMAKE_C_STANDARD 99)
@@ -9,6 +10,10 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
+
+option(PSXRECOMP_BUILD_ORACLE
+    "Build the standalone first-divergence oracle runtime"
+    OFF)
 
 psxrecomp_add_runtime_target(psx-runtime
     DEBUG_PORT 4370
@@ -23,6 +28,12 @@ psxrecomp_add_runtime_target(psx-runtime
 # (ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    add_executable(freeze_artifacts_test
+        tests/test_freeze_artifacts.c
+        src/freeze_artifacts.c)
+    target_include_directories(freeze_artifacts_test PRIVATE include)
+    add_test(NAME freeze_artifacts_test COMMAND freeze_artifacts_test)
+
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)
     target_include_directories(launcher_device_roundtrip_test PRIVATE include)
@@ -43,11 +54,25 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
 
+    foreach(_ram_bytes IN ITEMS 0x00200000u 0x00800000u)
+        string(REPLACE "0x00200000u" "default" _ram_profile "${_ram_bytes}")
+        string(REPLACE "0x00800000u" "8mb" _ram_profile "${_ram_profile}")
+        add_executable(psx_ram_profile_${_ram_profile}_test
+            tests/test_psx_ram_profile.c)
+        target_include_directories(psx_ram_profile_${_ram_profile}_test
+            PRIVATE include src)
+        target_compile_definitions(psx_ram_profile_${_ram_profile}_test PRIVATE
+            EXPECTED_MAIN_RAM_BYTES=${_ram_bytes}
+            $<$<STREQUAL:${_ram_profile},8mb>:PSX_MAIN_RAM_BYTES=${_ram_bytes}>)
+        add_test(NAME psx_ram_profile_${_ram_profile}_test
+                 COMMAND psx_ram_profile_${_ram_profile}_test)
+    endforeach()
+
     # Generated-code/runtime boundary benchmark. This is intentionally a
     # separate target (not a ctest): it runs a fixed generated-style guest
     # workload so IPO/native-code build options can be measured without
     # launching a game or changing guest code.
-    add_executable(psx_runtime_hotpath_bench
+    add_executable(psx_runtime_hotpath_bench EXCLUDE_FROM_ALL
         tests/bench_psx_runtime_hotpath.c
         src/psx_cyc_steps.c
         src/psx_icache.c)
@@ -433,6 +458,12 @@ if(BUILD_TESTING)
     add_test(NAME overlay_store_cycle_barrier_test
              COMMAND overlay_store_cycle_barrier_test)
 
+    add_executable(overlay_cycle_retirement_test
+        tests/test_overlay_cycle_retirement.c)
+    target_include_directories(overlay_cycle_retirement_test PRIVATE include)
+    add_test(NAME overlay_cycle_retirement_test
+             COMMAND overlay_cycle_retirement_test)
+
     add_executable(psx_cycle_event_boundaries_test
         tests/test_psx_cycle_event_boundaries.c
         src/psx_cycles.c)
@@ -450,8 +481,80 @@ if(BUILD_TESTING)
     target_include_directories(spu_gaussian_test PRIVATE include)
     add_test(NAME spu_gaussian_test COMMAND spu_gaussian_test)
 
+    add_executable(mod_session_defaults_test tests/test_mod_session_defaults.cpp)
+    target_include_directories(mod_session_defaults_test PRIVATE include)
+    add_test(NAME mod_session_defaults_test COMMAND mod_session_defaults_test)
+
+    foreach(_audio_trace_mode IN ITEMS debug release)
+        add_executable(audio_trace_${_audio_trace_mode}_config_test
+            tests/test_audio_trace_config.c
+            src/audio_trace.c)
+        target_include_directories(audio_trace_${_audio_trace_mode}_config_test
+            PRIVATE include)
+        target_compile_features(audio_trace_${_audio_trace_mode}_config_test
+            PRIVATE c_std_11)
+        if(_audio_trace_mode STREQUAL "release")
+            target_compile_definitions(audio_trace_${_audio_trace_mode}_config_test
+                PRIVATE PSX_NO_DEBUG_TOOLS=1)
+        endif()
+        add_test(NAME audio_trace_${_audio_trace_mode}_config_test
+                 COMMAND audio_trace_${_audio_trace_mode}_config_test)
+    endforeach()
+
+    foreach(_device_trace_mode IN ITEMS debug release)
+        add_executable(device_parity_trace_${_device_trace_mode}_config_test
+            tests/test_device_parity_trace_config.c
+            src/device_trace.c
+            src/parity_trace.c)
+        target_include_directories(
+            device_parity_trace_${_device_trace_mode}_config_test PRIVATE include)
+        if(_device_trace_mode STREQUAL "release")
+            target_compile_definitions(
+                device_parity_trace_${_device_trace_mode}_config_test
+                PRIVATE PSX_NO_DEBUG_TOOLS=1)
+        endif()
+        add_test(NAME device_parity_trace_${_device_trace_mode}_config_test
+                 COMMAND device_parity_trace_${_device_trace_mode}_config_test)
+    endforeach()
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        foreach(_gp0_diag_mode IN ITEMS debug release)
+            add_test(NAME gpu_gp0_diag_${_gp0_diag_mode}_config_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_gp0_diag_config.py
+                             --compiler ${CMAKE_C_COMPILER}
+                             --mode ${_gp0_diag_mode}
+                             --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        endforeach()
+        add_test(NAME cd_spu_trace_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cd_spu_trace_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME fntrace_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fntrace_diag_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME dma_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dma_diag_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME debug_server_storage_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_debug_server_storage_config.py)
+        add_test(NAME sio_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sio_diag_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME beetle_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_beetle_diag_config.py
+                         --compiler ${CMAKE_CXX_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME rewind_toggle_combo_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rewind_toggle_combo.py)
@@ -461,9 +564,26 @@ if(BUILD_TESTING)
         add_test(NAME perf_round3_guards_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perf_round3_guards.py)
+        add_test(NAME gl_release_diag_guards_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_release_diag_guards.py)
+        add_test(NAME hash_codegen_contract_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hash_codegen.py)
         add_test(NAME pgxp_destructive_write_coverage_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_destructive_write_coverage.py)
+        add_test(NAME mod_activation_lifecycle_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_activation_lifecycle.py)
+        add_test(NAME savestate_status_protocol_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_savestate_status_protocol.py)
+        add_test(NAME debug_tools_multiconfig_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_debug_tools_multiconfig.py
+                         --cmake ${CMAKE_COMMAND}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
     endif()
 
     # DISABLED, not de-registered. It links and runs, but 147 of its 309 checks
@@ -516,7 +636,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/check_test_registration.cmake)
 psxrecomp_check_all_tests_registered()
 
-if(NOT MSVC)
+if(PSXRECOMP_BUILD_ORACLE AND NOT MSVC)
     psxrecomp_add_runtime_target(psx-oracle
         ORACLE
         DEBUG_PORT 4371
@@ -582,9 +702,7 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         DEFAULT_DEBUG_PORT=4380
         $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>
     )
-    if(NOT PSX_DEBUG_TOOLS)
-        target_compile_definitions(psx-beetle PRIVATE PSX_NO_DEBUG_TOOLS=1)
-    endif()
+    psxrecomp_apply_debug_tools(psx-beetle)
 
     target_link_libraries(psx-beetle PRIVATE
         "${BEETLE_LIB}"

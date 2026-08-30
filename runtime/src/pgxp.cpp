@@ -35,6 +35,7 @@
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -76,6 +77,7 @@ static PGXPValue *s_ram = nullptr;            /* lazily allocated             */
 static uint32_t   s_ram_words = 0;            /* sized to live RAM at arm     */
 static PGXPValue  s_scratch[PGXP_SCRATCH_WORDS];
 static PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
+static PGXPValue  s_pending_gpr[32];          /* recompiler load-delay slots  */
 static PGXPValue  s_gte[32];                  /* GTE data registers           */
 
 static uint32_t s_gen = 1;
@@ -101,6 +103,7 @@ static int g_pgxp_full_hooks = 0;
 extern "C" { int g_pgxp_alu_armed = 0; }
 extern "C" { uint32_t g_pgxp_gpr_live_mask = 0; }
 extern "C" { int g_pgxp_memory_armed = 0; }
+extern "C" { uint32_t g_pgxp_pending_load_mask = 0; }
 extern "C" { uint32_t g_pgxp_memory_live_generation = 1; }
 extern "C" {
 uint32_t g_pgxp_memory_live_page_generation[PGXP_MEMORY_LIVE_PAGE_COUNT] = {};
@@ -130,7 +133,10 @@ extern "C" void pgxp_invalidate_all(void) {
      * performs its own generation bump.  Timeline restores are frequent in
      * rollback/rewind configurations, so do not charge even the stats write
      * and generation branch when no PGXP consumer is armed. */
-    if (!s_enabled) return;
+    if (!s_enabled) {
+        g_pgxp_pending_load_mask = 0;
+        return;
+    }
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
     s_stats.invalidations++;
     if (++s_gen == 0) {
@@ -138,6 +144,7 @@ extern "C" void pgxp_invalidate_all(void) {
         if (s_ram) std::memset(s_ram, 0, s_ram_words * sizeof(PGXPValue));
         std::memset(s_scratch, 0, sizeof(s_scratch));
         std::memset(s_gpr, 0, sizeof(s_gpr));
+        std::memset(s_pending_gpr, 0, sizeof(s_pending_gpr));
         std::memset(s_gte, 0, sizeof(s_gte));
         std::memset(g_pgxp_memory_live_page_generation, 0,
                     sizeof(g_pgxp_memory_live_page_generation));
@@ -147,6 +154,7 @@ extern "C" void pgxp_invalidate_all(void) {
     }
     g_pgxp_memory_live_generation = s_gen;
     g_pgxp_gpr_live_mask = 0;
+    g_pgxp_pending_load_mask = 0;
 }
 
 extern "C" void pgxp_set_enabled(int enabled) {
@@ -189,7 +197,10 @@ extern "C" void pgxp_set_enabled(int enabled) {
         return;
     s_enabled = enabled ? 1 : 0;
     pgxp_invalidate_all();
-    if (!s_enabled) g_pgxp_gpr_live_mask = 0;
+    if (!s_enabled) {
+        g_pgxp_gpr_live_mask = 0;
+        g_pgxp_pending_load_mask = 0;
+    }
     recompute_active();
 }
 
@@ -395,7 +406,9 @@ extern "C" void pgxp_memory_write(uint32_t addr, uint32_t size) {
 
 extern "C" void psx_pgxp_gpr_write(struct CPUState *cpu, uint32_t reg) {
     (void)cpu;
-    if (!g_pgxp_active || reg == 0 || reg >= 32) return;
+    if (reg == 0 || reg >= 32) return;
+    g_pgxp_pending_load_mask &= ~(1u << reg);
+    if (!g_pgxp_active) return;
     const uint32_t bit = 1u << reg;
     if ((g_pgxp_gpr_live_mask & bit) == 0) return;
     pv_kill(&s_gpr[reg]);
@@ -413,20 +426,39 @@ static inline uint32_t f_shamt(uint32_t i) { return (i >> 6) & 31u; }
 static inline uint32_t f_funct(uint32_t i) { return i & 63u; }
 static inline int32_t  f_simm(uint32_t i)  { return (int32_t)(int16_t)(i & 0xFFFFu); }
 
+static inline void pgxp_pending_cancel(uint32_t reg) {
+    if (reg != 0 && reg < 32)
+        g_pgxp_pending_load_mask &= ~(1u << reg);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Memory-mode hooks: loads / stores                                          */
 /* ------------------------------------------------------------------------- */
 
-extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
-                              uint32_t addr, uint32_t value) {
-    (void)cpu;
-    if (!g_pgxp_active) return;
+static void pgxp_load_shadow_into(PGXPValue *dst, uint32_t instr,
+                                  uint32_t addr, uint32_t value) {
     uint32_t rt = f_rt(instr);
     if (rt == 0) return;
-    PGXPValue *dst = &s_gpr[rt];
-    GprMaskCommit commit{dst};
 
     switch (f_op(instr)) {
+    case 0x10: {                               /* MFC0: known, non-position */
+        pv_reset(dst, value);
+        return;
+    }
+    case 0x12: {                               /* delayed MFC2/CFC2          */
+        if (f_rs(instr) == 0x00) {
+            PGXPValue *src = &s_gte[f_rd(instr)];
+            if (src->gen == s_gen) {
+                pv_validate(src, value);
+                *dst = *src;
+            } else {
+                pv_reset(dst, value);
+            }
+        } else {
+            pv_reset(dst, value);
+        }
+        return;
+    }
     case 0x23: {                               /* LW                          */
         PGXPValue *src = pgxp_ptr(addr);
         if (src && src->gen == s_gen) {
@@ -472,6 +504,53 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
         pv_reset(dst, value);
         return;
     }
+}
+
+extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+                              uint32_t addr, uint32_t value) {
+    (void)cpu;
+    const uint32_t rt = f_rt(instr);
+    pgxp_pending_cancel(rt);
+    if (!g_pgxp_active) return;
+    if (rt == 0) return;
+    PGXPValue *dst = &s_gpr[rt];
+    GprMaskCommit commit{dst};
+    pgxp_load_shadow_into(dst, instr, addr, value);
+}
+
+extern "C" void psx_pgxp_load_delayed(struct CPUState *cpu, uint32_t instr,
+                                       uint32_t addr, uint32_t value) {
+    (void)cpu;
+    if (!g_pgxp_active) return;
+    const uint32_t rt = f_rt(instr);
+    if (rt == 0) return;
+    pgxp_load_shadow_into(&s_pending_gpr[rt], instr, addr, value);
+    g_pgxp_pending_load_mask |= 1u << rt;
+}
+
+extern "C" void psx_pgxp_load_commit(struct CPUState *cpu, uint32_t reg,
+                                      uint32_t value) {
+    (void)cpu;
+    if (reg == 0 || reg >= 32) return;
+    const uint32_t bit = 1u << reg;
+    if (!g_pgxp_active) {
+        g_pgxp_pending_load_mask &= ~bit;
+        return;
+    }
+    PGXPValue *dst = &s_gpr[reg];
+    GprMaskCommit commit{dst};
+    if (g_pgxp_pending_load_mask & bit) {
+        *dst = s_pending_gpr[reg];
+        pv_validate(dst, value);
+    } else {
+        pv_reset(dst, value);
+    }
+    g_pgxp_pending_load_mask &= ~bit;
+}
+
+extern "C" void psx_pgxp_load_cancel(struct CPUState *cpu, uint32_t reg) {
+    (void)cpu;
+    pgxp_pending_cancel(reg);
 }
 
 extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
@@ -553,6 +632,9 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
 extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
                               uint32_t value, uint32_t addr) {
     (void)cpu;
+    if (f_op(instr) == 0x12 &&
+        (f_rs(instr) == 0x00 || f_rs(instr) == 0x02))
+        pgxp_pending_cancel(f_rt(instr));
     if (!g_pgxp_active) return;
 
     switch (f_op(instr)) {
@@ -689,10 +771,13 @@ static inline int halves_independent(uint32_t a, uint32_t b, uint32_t r, int sub
 extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
                              uint32_t result, uint32_t s1, uint32_t s2) {
     (void)cpu;
+    const uint32_t op = f_op(instr);
+    const uint32_t dst_for_cancel = (op == 0u) ? f_rd(instr) : f_rt(instr);
+    if (!(op == 0u && (f_funct(instr) == 0x11u || f_funct(instr) == 0x13u)))
+        pgxp_pending_cancel(dst_for_cancel);
     if (!g_pgxp_active) return;
     if (!g_pgxp_full_hooks && !s_cpu_mode) return;
 
-    uint32_t op = f_op(instr);
     uint32_t dst_reg;
     PGXPValue *a = nullptr, *b = nullptr;      /* source shadows (may be 0)   */
 
@@ -1106,8 +1191,10 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
                 (int32_t)((int64_t)int_x * 65536);
             const int32_t native_y16 =
                 (int32_t)((int64_t)int_y * 65536);
-            float dx = (float)(px - native_x16) * (1.0f / 65536.0f);
-            float dy = (float)(py - native_y16) * (1.0f / 65536.0f);
+            float dx = std::fabs((float)((int64_t)px - native_x16) *
+                                 (1.0f / 65536.0f));
+            float dy = std::fabs((float)((int64_t)py - native_y16) *
+                                 (1.0f / 65536.0f));
             if (dx > s_tolerance || dy > s_tolerance) {
                 s_stats.tolerance_reject++;
                 have = 0;

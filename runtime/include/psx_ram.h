@@ -20,13 +20,31 @@ extern "C" {
 #define PSX_RAM_8MB      0x00800000u
 #define PSX_RAM_CAPACITY PSX_RAM_8MB
 #define PSX_RAM_WINDOW   0x00800000u
+
+/* A title may require expanded RAM as part of its hardware contract instead
+ * of exposing it as an optional mod. Retail 2 MiB remains the framework
+ * default, and only capacities implemented by the mapper are accepted. */
+#ifndef PSX_MAIN_RAM_BYTES
+#define PSX_MAIN_RAM_BYTES PSX_RAM_2MB
+#endif
+#if PSX_MAIN_RAM_BYTES != PSX_RAM_2MB && PSX_MAIN_RAM_BYTES != PSX_RAM_8MB
+#error "PSX_MAIN_RAM_BYTES must be PSX_RAM_2MB or PSX_RAM_8MB"
+#endif
+
+static inline int psx_ram_title_requires_8mb(void) {
+    return PSX_MAIN_RAM_BYTES == PSX_RAM_8MB;
+}
+
+static inline int psx_ram_resolve_8mb_request(int mod_enabled) {
+    return psx_ram_title_requires_8mb() || mod_enabled;
+}
 /* Default unique range for psx_mod_set_main_ram_8mb: entire high window.
  * Narrowing the top bank for AOT fold corrupted Wipeout enhanced race
  * start (stores folded onto overlay RAM → jalr 0x80800000). */
 
-/* Live installed size / fold mask. 2 MB + 0x1FFFFF until a mod requests 8 MB
- * and memory_init applies it. DMA and CPU paths must use these, not a
- * compile-time 2 MB constant. */
+/* Live installed size / fold mask. The title default and any mod request are
+ * applied by memory_init. DMA and CPU paths must use these, not a fixed 2 MiB
+ * constant. */
 extern uint32_t g_psx_ram_size;
 extern uint32_t g_psx_ram_mask;
 

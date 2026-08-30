@@ -999,6 +999,9 @@ struct GameConfig {
     // not-taken only while widescreen reveals extra world. This is deliberately
     // separate from bltz_sites, whose helper adjusts screen-X edge thresholds.
     std::vector<uint32_t> ws_cull_nclip_keep_sites;
+    // Exact NCLIP/backface branch sites that use the validated tracked sign
+    // only while wide. Guest MAC0 remains native and 4:3 remains bit-exact.
+    std::vector<uint32_t> ws_cull_nclip_exact_sites;
     // Exact branch PCs whose reject path is forced not-taken only while
     // widescreen reveals extra world. Use only after screenshot-validated
     // evidence that the target is a visibility reject.

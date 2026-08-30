@@ -150,6 +150,10 @@ struct CodeGenConfig {
     // widescreen reveals extra world. 4:3 keeps the original branch predicate.
     std::set<uint32_t> ws_cull_nclip_keep_sites;
 
+    // Exact `bltz MAC0, reject`-style NCLIP/backface sites that consume the
+    // validated precise sign while wide, without changing guest-visible MAC0.
+    std::set<uint32_t> ws_cull_nclip_exact_sites;
+
     // Exact branch PCs whose reject target is suppressed while widescreen
     // reveals extra world. 4:3 keeps the original branch predicate.
     std::set<uint32_t> ws_cull_branch_keep_sites;

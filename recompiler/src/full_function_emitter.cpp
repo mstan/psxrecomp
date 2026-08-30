@@ -527,6 +527,11 @@ bool FullFunctionEmitter::emit_function(
     };
     /* load addr -> {dest reg, flush writeback (vs discard)} */
     std::map<uint32_t, std::pair<int, bool>> ldd_sites;
+    /* A dependent successor that is itself a load to the same register
+     * replaces the pending shadow in its own PGXP_LOAD call.  Do not flush the
+     * older load after it, or the old shadow would cancel/overwrite the new
+     * load's provenance. */
+    std::set<uint32_t> ldd_flush_replaced;
     std::string unmodeled_load_delay;
     for (const auto& [la, lw_raw] : addr_to_raw) {
         int dest = simple_load_dest(lw_raw);
@@ -607,7 +612,14 @@ bool FullFunctionEmitter::emit_function(
             }
             continue;
         }
-        ldd_sites[la] = {dest, true};
+        const bool successor_same_load =
+            simple_load_dest(nx->second) == dep_reg &&
+            ((nx->second >> 21) & 31u) == static_cast<uint32_t>(dep_reg);
+        ldd_sites[la] = {dest,
+                         !insn_writes_gpr(nx->second, static_cast<uint32_t>(dep_reg)) &&
+                         !successor_same_load};
+        if (successor_same_load)
+            ldd_flush_replaced.insert(la + 4u);
     }
     if (!unmodeled_load_delay.empty()) {
         // dirty_ram_dispatch interprets live main-RAM bytes only. Relocated
@@ -704,10 +716,14 @@ bool FullFunctionEmitter::emit_function(
     auto emit_ldd_flush = [&](uint32_t succ_addr) {
         auto it = ldd_sites.find(succ_addr - 4);
         if (it == ldd_sites.end()) return;
+        if (ldd_flush_replaced.count(succ_addr)) return;
         if (it->second.second) {
             out += fmt::format("    cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
                                it->second.first, it->first);
+            out += fmt::format("    PGXP_LOAD_COMMIT({}u, psx_ldd_{:08X});\n",
+                               it->second.first, it->first);
         } else {
+            out += fmt::format("    PGXP_LOAD_CANCEL({}u);\n", it->second.first);
             out += fmt::format("    (void)psx_ldd_{:08X};  /* load-delay: successor overwrites rt */\n",
                                it->first);
         }

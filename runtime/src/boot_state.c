@@ -80,6 +80,11 @@ extern int      sio_snapshot_read(const uint8_t* p, uint32_t len);
 extern uint32_t mdec_snapshot_bytes(void);
 extern void     mdec_snapshot_write(uint8_t* p);
 extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
+/* PGXP shadows are derived from guest RAM/GTE state and are deliberately not
+ * part of the portable machine-state wire format.  A restore must invalidate
+ * them before the next draw, including when importing a state made by the
+ * base (non-PGXP) flavor. */
+extern void     pgxp_invalidate_all(void);
 
 /* CPU regs wire: 32+3+32+32+32 LE u32 = 131 * 4 = 524 bytes (no padding). */
 #define CPU_REGS_WIRE_BYTES (524u)
@@ -868,9 +873,16 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
                  (unsigned)PSX_OVERLAY_CODEGEN_HASH);
         boot_state_append_reason(reason, reason_cap, part);
     }
-    if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
-        snprintf(part, sizeof(part), "abi_tag=%d(want %d)",
-                 (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
+    /* The high 16 bits identify the generated-runtime flavor (base, wide,
+     * PGXP).  They do not change the portable CPU/RAM/GPU wire layout; the
+     * low 16-bit ABI version is the actual serializer contract.  Accept a
+     * state across flavors when codegen_hash and codegen_ver already match,
+     * then discard/rederive PGXP provenance after RAM restore. */
+    if (((uint32_t)h.abi_tag & 0xFFFFu) !=
+        ((uint32_t)PSX_OVERLAY_ABI_TAG & 0xFFFFu)) {
+        snprintf(part, sizeof(part), "abi_version=%d(want %d)",
+                 (int)((uint32_t)h.abi_tag & 0xFFFFu),
+                 (int)((uint32_t)PSX_OVERLAY_ABI_TAG & 0xFFFFu));
         boot_state_append_reason(reason, reason_cap, part);
     }
     if (h.codegen_ver != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
@@ -992,6 +1004,13 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
+    pgxp_invalidate_all();
+    if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
+        fprintf(stderr,
+                "boot_state: accepted compatible flavor transition abi_tag=%d -> %d; "
+                "PGXP provenance invalidated\n",
+                (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
+    }
 
     {
         const double total_ms = boot_state_mono_ms() - t0;

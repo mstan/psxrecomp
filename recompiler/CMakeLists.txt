@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(PSXRecomp C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(BUILD_TESTING "Build the PSXRecomp recompiler tests" OFF)
 include(CTest)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../runtime/chd_dependency.cmake")
@@ -146,6 +147,7 @@ set(_baked_hash_hdr ${CMAKE_CURRENT_BINARY_DIR}/psxrecomp_baked_codegen_hash.h)
 add_custom_command(
     OUTPUT  ${_baked_hash_hdr}
     COMMAND ${CMAKE_COMMAND} -DOUT=${_baked_hash_hdr}
+            -DROOT=${PSXRECOMP_CODEGEN_HASH_ROOT}
             "-DSRCS=${PSXRECOMP_CODEGEN_HASH_SRCS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/hash_codegen.cmake
     DEPENDS ${PSXRECOMP_CODEGEN_HASH_SRCS}
@@ -223,58 +225,73 @@ if(PSXRECOMP_STATIC_CLI AND WIN32 AND (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "C
     endforeach()
 endif()
 
-# BIOS address-model equivalence test — sweeps every 4-byte address through
-# the profile-driven BiosAddressModel and compares against verbatim copies of
-# the pre-refactor hardcoded SCPH1001 helpers; also exercises the from_config
-# invariants. Run from the framework root: recompiler/build/bios_address_model_test
-add_executable(bios_address_model_test
-    tests/bios_address_model_test.cpp
-    src/bios_address_model.cpp
-    src/config_loader.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(bios_address_model_test PRIVATE
-    include
-    src
-    lib/fmt/include
-    lib/toml11
-)
-target_link_libraries(bios_address_model_test PRIVATE fmt)
-
-# L1 decoder conformance test — compares MipsDecoder against Rabbitizer
-# oracle for every instruction in SCPH1001.BIN code regions.
-add_executable(l1_decoder_test
-    tests/l1_decoder_test.cpp
-    src/mips_decoder.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(l1_decoder_test PRIVATE
-    include
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
-)
-target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
-
-# L2 structural codegen test — verifies StrictTranslator output patterns
-# for each MIPS instruction form.
-add_executable(l2_structural_test
-    tests/l2_structural_test.cpp
-    src/mips_decoder.cpp
-    src/ps1_exe_parser.cpp
-    src/strict_translator.cpp
-    src/pgxp_hook_emitter.cpp
-)
-target_include_directories(l2_structural_test PRIVATE
-    include
-    src
-    lib/rabbitizer/include
-    lib/rabbitizer/cplusplus/include
-    lib/fmt/include
-)
-target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
-
 if(BUILD_TESTING)
+    # BIOS address-model equivalence test — sweeps every 4-byte address through
+    # the profile-driven BiosAddressModel and compares against verbatim copies of
+    # the pre-refactor hardcoded SCPH1001 helpers; also exercises the from_config
+    # invariants. Run from the framework root: recompiler/build/bios_address_model_test
+    add_executable(bios_address_model_test
+        tests/bios_address_model_test.cpp
+        src/bios_address_model.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(bios_address_model_test PRIVATE
+        include
+        src
+        lib/fmt/include
+        lib/toml11
+    )
+    target_link_libraries(bios_address_model_test PRIVATE fmt)
+
+    # L1 decoder conformance requires a user-supplied SCPH1001.BIN, so keep it
+    # visible to test configurations without making either the default build or
+    # ordinary CTest runs depend on a copyrighted external asset. To run it,
+    # build l1_decoder_test explicitly and pass --rom PATH.
+    add_executable(l1_decoder_test EXCLUDE_FROM_ALL
+        tests/l1_decoder_test.cpp
+        src/mips_decoder.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(l1_decoder_test PRIVATE
+        include
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+    )
+    target_link_libraries(l1_decoder_test PRIVATE fmt rabbitizer)
+
+    # L2 structural codegen test — verifies StrictTranslator output patterns
+    # for each MIPS instruction form.
+    add_executable(l2_structural_test
+        tests/l2_structural_test.cpp
+        src/mips_decoder.cpp
+        src/ps1_exe_parser.cpp
+        src/strict_translator.cpp
+        src/pgxp_hook_emitter.cpp
+    )
+    target_include_directories(l2_structural_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+    )
+    target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
+
+    # Reachable main-EXE discovery test: parser-bound validation plus exact-entry
+    # analysis behavior for direct, indirect, seeded, and out-of-bound targets.
+    add_executable(reachable_discovery_test
+        tests/reachable_discovery_test.cpp
+        src/function_analysis.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(reachable_discovery_test PRIVATE
+        include
+        lib/fmt/include
+    )
+    target_link_libraries(reachable_discovery_test PRIVATE fmt)
+
     add_executable(debug_trace_ranges_test
         ../runtime/tests/test_debug_trace_ranges.c
         ../runtime/src/debug_trace_ranges.c
@@ -375,12 +392,42 @@ if(BUILD_TESTING)
     add_test(NAME l2_structural_test COMMAND l2_structural_test)
     add_test(NAME reachable_discovery_test COMMAND reachable_discovery_test)
 
+    add_test(NAME l1_decoder_test
+             COMMAND l1_decoder_test --rom
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../bios/SCPH1001.BIN)
+    set_tests_properties(l1_decoder_test PROPERTIES DISABLED TRUE)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(
             NAME cli_project_packaging
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_project_packaging.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME setup_host_packaging_guards
+            COMMAND ${Python3_EXECUTABLE} -m pytest -q -p no:cacheprovider --
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_package_setup_host.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME overlay_compiler_safety_guards
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_compile_overlays_safety.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME overlay_static_symbol_prefix
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_compile_overlays_static_prefix.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME coverage_vault
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_coverage_vault.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME aot_overlay_coverage_report
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/aot_overlay_spike/test_coverage_report.py
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
         # These two invoke psxrecomp-game, whose BIOS-profile resolution
@@ -444,16 +491,8 @@ if(BUILD_TESTING)
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         endforeach()
 
-        # test_aot_overlay_discovery.py had no add_test() entry at all. It runs
-        # far enough to exercise real discovery, then fails in
-        # check_real_batched_fragment_publication: that check reaches
-        # MOD.compile_fragment_batch, which spawns psxrecomp-game with cwd set
-        # to its own TemporaryDirectory, so BIOS-profile resolution (which
-        # probes bios/SCPH1001.toml relative to the working directory) finds
-        # nothing and returns "recompiler-error: no BIOS profile found". Every
-        # other subprocess in the same file passes cwd=str(ROOT) explicitly, so
-        # this looks like a missed cwd rather than a product defect — but it
-        # needs an owner, and DISABLED keeps it counted until then.
+        # Full overlay discovery exercises real host-DLL publication, cache
+        # recovery, fixed-point behavior, and the runtime manifest contract.
         add_test(
             NAME aot_overlay_discovery
             COMMAND ${Python3_EXECUTABLE}
@@ -485,6 +524,8 @@ if(BUILD_TESTING)
                 release_zip
                 overlay_decodable_fallback
                 overlay_init_guard
+                interpreter_perf_guards
+                runtime_perf_diag_guards
                 sdl3_main_single_include
                 vk_build_default
                 vk_color_self_barrier
@@ -502,8 +543,8 @@ if(BUILD_TESTING)
         endforeach()
 
         # ---- known-failing guards: DISABLED, not de-registered ---------------
-        # These three were previously left out of the list above with a comment
-        # explaining that they FAIL and that wiring a red check would recreate
+        # This test was previously left out of the list above with a comment
+        # explaining that it fails and that wiring a red check would recreate
         # the problem that took CI off PRs. That reasoning is right; the remedy
         # was not. De-registering is precisely how a test stops being counted,
         # and it is the mechanism that let 16 C/C++ tests rot in runtime/tests/.
@@ -513,18 +554,9 @@ if(BUILD_TESTING)
         # rather than silently absent — without turning the run red. Delete the
         # matching set_tests_properties line to re-enable one once it is fixed.
         #
-        #   interpreter_perf_guards    psx_devices_mmio_sync's recompute-deadline
-        #                              branch never clears g_psx_cycle_fast_limit,
-        #                              and the guard still names the pre-rename
-        #                              s_next_service_cycle
-        #   runtime_perf_diag_guards   asserts a substring no longer present in
-        #                              the runtime source
         #   overlay_pair_dedup_runtime needs its companion harness built; not a
         #                              source-only guard
-        foreach(_t IN ITEMS
-                interpreter_perf_guards
-                runtime_perf_diag_guards
-                overlay_pair_dedup_runtime)
+        foreach(_t IN ITEMS overlay_pair_dedup_runtime)
             add_test(
                 NAME ${_t}
                 COMMAND ${Python3_EXECUTABLE}
@@ -534,19 +566,6 @@ if(BUILD_TESTING)
         endforeach()
     endif()
 endif()
-
-# Reachable main-EXE discovery test: parser-bound validation plus exact-entry
-# analysis behavior for direct, indirect, seeded, and out-of-bound targets.
-add_executable(reachable_discovery_test
-    tests/reachable_discovery_test.cpp
-    src/function_analysis.cpp
-    src/ps1_exe_parser.cpp
-)
-target_include_directories(reachable_discovery_test PRIVATE
-    include
-    lib/fmt/include
-)
-target_link_libraries(reachable_discovery_test PRIVATE fmt)
 
 # ---- test-registration completeness guard -----------------------------------
 # Reads both CMakeLists.txt files as text, so it catches an orphan in either

@@ -1,13 +1,56 @@
 /* parity_trace.c — general two-process control-flow parity trace.
  * See parity_trace.h. Self-contained (no runtime internals) so the SAME TU
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
+#define PSX_PARITY_TRACE_IMPLEMENTATION 1
 #include "parity_trace.h"
 #include "psx_bss.h"
 #include <string.h>
 
+#ifdef PSX_NO_DEBUG_TOOLS
+
+void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
+                         uint32_t tcb_epc_off, uint32_t tcb_state_off,
+                         const uint32_t* watch_addrs, int watch_count)
+{
+    (void)watched_tcb; (void)trigger_target; (void)tcb_epc_off;
+    (void)tcb_state_off; (void)watch_addrs; (void)watch_count;
+}
+void parity_trace_arm(int on) { (void)on; }
+void parity_trace_reset(void) {}
+int parity_trace_is_armed(void) { return 0; }
+int parity_trace_is_frozen(void) { return 0; }
+void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
+                         uint32_t sp, uint32_t target,
+                         parity_read_word_fn read_word, void* ctx)
+{
+    (void)kind; (void)pc; (void)ra; (void)sp; (void)target;
+    (void)read_word; (void)ctx;
+}
+void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc)
+{
+    (void)addr; (void)width; (void)writer_pc;
+}
+void parity_trace_note_read(uint32_t addr, uint32_t value, uint32_t reader_pc)
+{
+    (void)addr; (void)value; (void)reader_pc;
+}
+uint32_t parity_trace_get(ParityEntry* out, uint32_t max_rows)
+{
+    (void)out; (void)max_rows; return 0;
+}
+uint64_t parity_trace_total(void) { return 0; }
+uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows)
+{
+    (void)out; (void)max_rows; return 0;
+}
+uint64_t parity_trace_reads_total(void) { return 0; }
+
+#else
+
 #define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
                                   * so the parked-thread1 divergence is in-window,
-                                  * not just the wedge tail (~7.5 MB ring). */
+                                  * not just the wedge tail (25 MiB per ring with
+                                  * the current provenance-rich entry ABI). */
 
 static PSX_BSS ParityEntry s_ring[PARITY_RING_CAP];
 static uint64_t    s_seq      = 0;
@@ -72,20 +115,6 @@ void parity_trace_reset(void)        {
 int  parity_trace_is_armed(void)     { return (int)s_armed; }
 int  parity_trace_is_frozen(void)    { return (int)s_frozen; }
 uint64_t parity_trace_total(void)    { return s_seq; }
-
-const char* parity_kind_str(uint32_t kind)
-{
-    switch (kind) {
-        case PARITY_KIND_DISPATCH:     return "dispatch";
-        case PARITY_KIND_CHANGETHREAD: return "changethread";
-        case PARITY_KIND_RFE:          return "rfe";
-        case PARITY_KIND_YIELD:        return "yield";
-        case PARITY_KIND_SAVE:         return "save";
-        case PARITY_KIND_RESTORE:      return "restore";
-        case PARITY_KIND_TRIGGER:      return "trigger";
-        default:                       return "?";
-    }
-}
 
 void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
                          uint32_t sp, uint32_t target,
@@ -205,4 +234,20 @@ uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows)
     for (uint32_t i = 0; i < n; i++)
         out[i] = s_rring[(start + i) & (PARITY_RING_CAP - 1u)];
     return n;
+}
+
+#endif /* PSX_NO_DEBUG_TOOLS */
+
+const char* parity_kind_str(uint32_t kind)
+{
+    switch (kind) {
+        case PARITY_KIND_DISPATCH:     return "dispatch";
+        case PARITY_KIND_CHANGETHREAD: return "changethread";
+        case PARITY_KIND_RFE:          return "rfe";
+        case PARITY_KIND_YIELD:        return "yield";
+        case PARITY_KIND_SAVE:         return "save";
+        case PARITY_KIND_RESTORE:      return "restore";
+        case PARITY_KIND_TRIGGER:      return "trigger";
+        default:                       return "?";
+    }
 }

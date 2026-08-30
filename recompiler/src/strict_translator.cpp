@@ -72,15 +72,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
     if (opcode != 0x32 && opcode != 0x3A && !r.c_code.empty())
         PSXRecomp::append_pgxp_hooks(d.raw, r.c_code);
     /* The deferred load-delay variant assigns into the function-scope
-     * psx_ldd_<addr> temp instead of the GPR; hook it with that temp as the
-     * loaded value (the shadow keys on the value, not on where it lands —
-     * the emitter's later writeback makes the GPR match). */
+     * psx_ldd_<addr> temp instead of the GPR. Stage its shadow separately;
+     * the dependent successor must continue seeing the old GPR provenance,
+     * and the emitter commits/cancels the pending shadow with writeback. */
     if (r.load_dest >= 0 && !r.c_code_deferred.empty()) {
         const uint32_t rs = (d.raw >> 21) & 0x1F;
         const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
         r.c_code_deferred = fmt::format(
             "{{ uint32_t _pgxa = cpu->gpr[{}] + {}; {} "
-            "PGXP_LOAD(0x{:08X}u, _pgxa, psx_ldd_{:08X}); }}",
+            "PGXP_LOAD_DELAYED(0x{:08X}u, _pgxa, psx_ldd_{:08X}); }}",
             static_cast<int>(rs), static_cast<int>(offset),
             r.c_code_deferred, d.raw, d.address);
     }

@@ -1538,6 +1538,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
 
     uint32_t exe_start = exe_.header.load_address;
     uint32_t exe_end   = exe_.end_address();
+    std::set<uint32_t> direct_call_starts;
 
     for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
         auto word_opt = exe_.read_word(addr);
@@ -1561,6 +1562,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                         target = setup_start;
                     }
                 }
+                direct_call_starts.insert(target);
                 function_starts.insert(target);
             }
         }
@@ -1862,7 +1864,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             targets.push_back(target_pair.second);
         return true;
     };
-    struct ExtentP3 { uint32_t terminus; bool clean_code; bool hit_invalid; bool resolved_jt; bool unresolved_indirect; };
+    struct ExtentP3 { uint32_t terminus; bool clean_code; bool hit_invalid; bool resolved_jt; bool unresolved_indirect; bool reached_exit; };
     auto compute_extent_p3 = [&](uint32_t entry, uint32_t hard_cap) -> ExtentP3 {
         std::set<uint32_t> visited;
         std::queue<uint32_t> work;
@@ -1899,7 +1901,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             case ExactCfKind::Jump:
                 if (in_fn(delay)) visited.insert(delay);
                 if (in_fn(cf.target)) work.push(cf.target);
-                else reached_exit = true;  // tail call / jump out of function
+                // A direct jump to another address in the loaded image is
+                // credible tail-transfer evidence.  An out-of-image target is
+                // not: arbitrary data frequently decodes as `j` and used to
+                // make an otherwise unverified data seed look like a tiny,
+                // clean function.  Let those candidates fall back to the
+                // whole-span code/data density classifier instead.
+                else if (in_exe_p3(cf.target)) reached_exit = true;
                 break;
             case ExactCfKind::Jal:
             case ExactCfKind::Jalr:
@@ -1951,6 +1959,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         info.hit_invalid = hit_invalid;
         info.resolved_jt = resolved_jt;
         info.unresolved_indirect = unresolved_indirect;
+        info.reached_exit = reached_exit;
         return info;
     };
 
@@ -1996,7 +2005,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                     func.end_addr = return_end;
                 }
             }
-            if (!ext.unresolved_indirect && ext.terminus > func.start_addr &&
+            if (ext.reached_exit && !ext.unresolved_indirect &&
+                ext.terminus > func.start_addr &&
                 ext.terminus < func.end_addr) {
                 func.end_addr = ext.terminus;
             }
@@ -2028,6 +2038,19 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
+        // A return-shaped word in arbitrary data can manufacture a start via
+        // the whole-image backward scan.  Once the candidate is positively
+        // classified as data, retain it only when execution evidence asked for
+        // that exact address: a configured/initial forced entry or a direct
+        // call target.  Those evidence-backed data entries remain fail-closed
+        // diagnostic stubs; scan-only data islands must not become functions,
+        // declarations, or native-validity ranges.
+        if (func.is_data_section &&
+            std::find(forced_entry_points_.begin(), forced_entry_points_.end(),
+                      func.start_addr) == forced_entry_points_.end() &&
+            !direct_call_starts.count(func.start_addr)) {
+            continue;
+        }
         result.functions.push_back(func);
     }
 

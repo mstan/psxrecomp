@@ -1,11 +1,12 @@
 /*
- * audio_trace.h - always-on audio observability rings (PCM taps + event ring).
+ * audio_trace.h - debug-build audio observability rings (PCM taps + event ring).
  *
  * Port of the snesrecomp audio-campaign measurement harness (audio_trace.{c,h},
  * commit 67ead27 lineage) to the PSX pipeline, following the cross-system tap
  * model in F:/Projects/_audio_round2/ROUND2_PLAN.md: always-on ring buffers
  * recording every sample/event from process start, dumped AFTER the fact via
- * TCP debug commands — never arm-then-reproduce.
+ * TCP debug commands — never arm-then-reproduce. PSX_NO_DEBUG_TOOLS builds
+ * retain the query ABI as zero-result stubs but compile producer calls out.
  *
  * Taps (PSX pipeline):
  *   AUDIO_TAP_SPU_OUT  "T1" — canonical spu_render() output @44100, recorded
@@ -29,6 +30,12 @@
 #define PSX_AUDIO_TRACE_H
 
 #include <stdint.h>
+
+#ifdef PSX_NO_DEBUG_TOOLS
+#define AUDIO_TRACE_ENABLED 0
+#else
+#define AUDIO_TRACE_ENABLED 1
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,6 +128,16 @@ uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max);
  * error (unwritable path / empty ring / slice already evicted). */
 int64_t audio_trace_dump_wav(int tap, const char *path,
                              int64_t start, uint64_t count);
+
+/* Producer macros remove both the call and argument evaluation from lean
+ * builds. audio_trace.c opts out while defining the ABI-compatible stubs.
+ * A parenthesized function name, e.g. (audio_trace_pcm)(...), bypasses the
+ * macro when tooling explicitly needs the linkable stub. */
+#if !AUDIO_TRACE_ENABLED && !defined(PSX_AUDIO_TRACE_IMPLEMENTATION)
+#define audio_trace_pcm(tap, stereo, frames)   ((void)0)
+#define audio_trace_event(kind, a, b)          ((void)0)
+#define audio_trace_note_frame(frame)          ((void)0)
+#endif
 
 #ifdef __cplusplus
 }

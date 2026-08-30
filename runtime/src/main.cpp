@@ -52,6 +52,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "frame_pacing.h"
 #include "guest_clock.h"
 #include "latency_ring.h"
+#include "mod_session_defaults.h"
 #include "sio.h"
 #ifndef PSX_MAX_PLAYERS
 #define PSX_MAX_PLAYERS 2
@@ -980,6 +981,15 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
     mod_runtime_on_savestate_loaded();
+    /* The live host pad word is deliberately not part of the guest snapshot.
+     * A load can therefore leave the pre-load Start+Select chord latched until
+     * the next normal input sample, which reopens Hueponik's in-race menu even
+     * when the saved frame was captured with that menu hidden.  Drop every
+     * live pad word at the restore boundary; the normal sampler repopulates it
+     * after savestate_input_guard releases, so guest RAM/VRAM and timing remain
+     * exactly those of the saved state. */
+    for (int slot = 0; slot < PSX_MAX_PLAYERS; ++slot)
+        sio_set_pad_state_slot(slot, 0xFFFFu);
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -1134,6 +1144,7 @@ static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
 /* recomp-ui stores this 1-based so a zero-initialized (older) host reads as
  * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
  * the boundary, and treat anything out of range as the default. */
+#if defined(RECOMP_LAUNCHER)
 static inline int launcher_fmv_filter_to_cfg(int ls_value) {
     if (ls_value < 1 || ls_value > RECOMP_LAUNCHER_FMV_FILTER_COUNT)
         return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
@@ -1144,6 +1155,7 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
     return cfg_value + 1;
 }
+#endif
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
@@ -1316,6 +1328,39 @@ static int g_netplay_local_viewport = 0; /* 0 off, 1 vertical split */
  * activation, but remains game.toml opt-in so normal netplay stays vanilla. */
 static int g_netplay_local_viewport_aspect = 0; /* 0 off, 1 16:9, 2 21:9, 3 adaptive */
 
+static ModSessionDefaults g_mod_session_defaults;
+static bool g_mod_session_defaults_captured = false;
+
+static ModSessionDefaults capture_mod_session_defaults(void) {
+    ModSessionDefaults state;
+    state.video_renderer = g_video_renderer;
+    state.video_vsync = g_video_vsync;
+    state.aspect_num = g_video_aspect_num;
+    state.aspect_den = g_video_aspect_den;
+    state.adaptive_aspect = g_ws_adaptive_view;
+    state.adaptive_max_num = g_ws_adaptive_max_num;
+    state.adaptive_max_den = g_ws_adaptive_max_den;
+    state.auto_skip_fmv = g_auto_skip_fmv;
+    state.bezel = g_bezel_path;
+    state.frame_interpolation = g_frame_interpolation;
+    state.frame_interpolation_fps = g_frame_interpolation_fps;
+    state.frame_interpolation_blend = g_frame_interpolation_blend_default;
+    state.crtc_multiplier = gpu_get_crtc_refresh_multiplier();
+    state.crtc_period_override = gpu_get_crtc_vblank_period_override();
+    return state;
+}
+
+static void refresh_launcher_owned_mod_defaults(bool auto_skip_offered) {
+    /* These values are written by the rematch launcher before the new plan is
+     * committed. Cadence, vsync, bezel and adaptive mode are not launcher
+     * fields, so retain their original config values: their current globals
+     * may still contain the previous plugin overlay. Auto-skip is refreshed
+     * only for titles that actually offer that launcher control. */
+    const ModSessionDefaults launcher = capture_mod_session_defaults();
+    mod_session_refresh_launcher_defaults(g_mod_session_defaults, launcher,
+                                          auto_skip_offered);
+}
+
 extern "C" int psx_mod_set_fixed_display_aspect(
     uint32_t numerator, uint32_t denominator) {
     if (numerator == 0 || denominator == 0 ||
@@ -1356,6 +1401,16 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
         "(initial %d:%d, range 4:3 through %u:%u)\n",
         g_video_aspect_num, g_video_aspect_den,
         (unsigned)max_numerator, (unsigned)max_denominator);
+    return 1;
+}
+
+extern "C" int psx_mod_set_bezel(const char* selection) {
+    if (!selection || !selection[0]) {
+        std::fprintf(stderr, "psxrecomp: mod rejected empty bezel selection\n");
+        return 0;
+    }
+    g_bezel_path = selection;
+    std::fprintf(stdout, "psxrecomp: mod selected bezel %s\n", selection);
     return 1;
 }
 
@@ -2760,6 +2815,67 @@ static std::filesystem::path default_memcard_dir(const char* argv0) {
     return exe_dir_from_argv(argv0);
 }
 
+static void apply_bezel_selection(const std::filesystem::path &disc,
+                                  const char *argv0) {
+    if (!g_gl_active)
+        return;
+    (void)gl_renderer_set_bezel(nullptr, 0, 0);
+    if (g_bezel_path.empty() || g_bezel_path == "off")
+        return;
+
+    std::filesystem::path bp;
+    const std::filesystem::path bez_dir =
+        exe_dir_from_argv(argv0) / "bezels";
+    if (g_bezel_path == "random") {
+        std::vector<std::filesystem::path> pool;
+        std::error_code bec;
+        for (const auto &entry :
+             std::filesystem::directory_iterator(bez_dir, bec)) {
+            if (bec) break;
+            if (entry.is_regular_file(bec) && entry.path().extension() == ".png")
+                pool.push_back(entry.path());
+        }
+        std::sort(pool.begin(), pool.end());
+        if (!pool.empty()) {
+            std::random_device rd;
+            bp = pool[rd() % pool.size()];
+        }
+    } else {
+        bp = std::filesystem::path(g_bezel_path);
+        if (!bp.has_extension()) {
+            const std::filesystem::path named = bez_dir / (g_bezel_path + ".png");
+            std::error_code nec;
+            if (std::filesystem::exists(named, nec)) bp = named;
+        }
+        if (bp.is_relative()) bp = disc.parent_path() / bp;
+    }
+
+    std::vector<unsigned char> file;
+    if (FILE *bf = std::fopen(bp.string().c_str(), "rb")) {
+        std::fseek(bf, 0, SEEK_END);
+        const long len = std::ftell(bf);
+        std::fseek(bf, 0, SEEK_SET);
+        if (len > 0) {
+            file.resize((size_t)len);
+            if (std::fread(file.data(), 1, file.size(), bf) != file.size())
+                file.clear();
+        }
+        std::fclose(bf);
+    }
+    int bw = 0, bh = 0, bc = 0;
+    unsigned char *px = file.empty() ? nullptr
+        : stbi_load_from_memory(file.data(), (int)file.size(), &bw, &bh, &bc, 4);
+    if (px) {
+        gl_renderer_set_bezel(px, bw, bh);
+        stbi_image_free(px);
+        std::fprintf(stdout, "psxrecomp: bezel artwork %dx%d from %s\n",
+                     bw, bh, bp.string().c_str());
+    } else {
+        std::fprintf(stdout, "psxrecomp: bezel artwork not loaded: %s\n",
+                     bp.string().c_str());
+    }
+}
+
 static void close_controller(void);
 static void shutdown_runtime(void);
 
@@ -2800,6 +2916,99 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
             break;
         default:
             break;
+    }
+}
+
+/* Apply the plan that mod_runtime_commit* just resolved. This must run after
+ * both the initial launcher and a lobby rematch: committing a new plan does
+ * not invoke activation callbacks, and stale per-session overrides otherwise
+ * survive the jump back to session_reboot. */
+static void activate_committed_mod_plan(int *player_mode,
+                                        bool netplay_enabled,
+                                        bool turbo_loads_offered,
+                                        bool auto_skip_offered,
+                                        bool refresh_launcher_defaults) {
+    if (!g_mod_session_defaults_captured) {
+        g_mod_session_defaults = capture_mod_session_defaults();
+        g_mod_session_defaults_captured = true;
+    } else if (refresh_launcher_defaults) {
+        refresh_launcher_owned_mod_defaults(auto_skip_offered);
+    }
+
+    const ModSessionDefaults defaults =
+        mod_session_restore_defaults(g_mod_session_defaults);
+    g_mod_native_vblank_rate = false;
+    g_mod_native_vblank_active = false;
+    g_mod_native_vblank_fps = 0;
+    g_mod_pending_crtc_multiplier = defaults.crtc_multiplier;
+    gpu_set_crtc_refresh_multiplier(defaults.crtc_multiplier);
+    gpu_set_crtc_vblank_period_override(defaults.crtc_period_override);
+    g_video_renderer = defaults.video_renderer;
+    g_video_vsync = defaults.video_vsync;
+    g_video_aspect_num = defaults.aspect_num;
+    g_video_aspect_den = defaults.aspect_den;
+    g_ws_adaptive_view = defaults.adaptive_aspect;
+    g_ws_adaptive_max_num = defaults.adaptive_max_num;
+    g_ws_adaptive_max_den = defaults.adaptive_max_den;
+    g_auto_skip_fmv = defaults.auto_skip_fmv;
+    g_bezel_path = defaults.bezel;
+    g_frame_interpolation = defaults.frame_interpolation;
+    g_frame_interpolation_fps = defaults.frame_interpolation_fps;
+    g_frame_interpolation_blend = defaults.frame_interpolation_blend;
+    s_fmv_skip_present_skip = 0;
+    s_fmv_skip_last_mdec = 0;
+    s_fmv_skip_hold = 0;
+    refresh_frame_pacer_period();
+    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+
+    g_mod_controller_mode_override[0] = -1;
+    g_mod_controller_mode_override[1] = -1;
+    g_mod_load_wall_multiplier = -1;
+    g_mod_load_release_frames = -1;
+    g_mod_disc_speed_divisor = -1;
+    g_mod_disc_instant_rate = -1;
+    g_turbo_audio_sink_enabled = 0;
+    psx_ram_reset_size_request();
+    g_turbo_load_wall_multiplier = 0;
+    g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
+    if (!turbo_loads_offered)
+        g_turbo_loads_enabled = 0;
+    mod_runtime_activate_plugins();
+    apply_netplay_local_viewport_aspect(netplay_enabled);
+    if (g_gl_active) {
+        gl_renderer_set_interpolation(g_frame_interpolation,
+                                      g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps,
+                                      g_frame_interpolation_blend);
+    }
+    if (g_gl_active || g_vk_active)
+        apply_present_cadence();
+
+    if (g_mod_controller_mode_override[0] >= 0)
+        player_mode[0] = g_mod_controller_mode_override[0];
+    if (g_mod_controller_mode_override[1] >= 0)
+        player_mode[1] = g_mod_controller_mode_override[1];
+    if (g_mod_load_wall_multiplier < 0)
+        return;
+
+    g_turbo_loads_enabled = 1;
+    g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
+    g_turbo_load_release_frames = g_mod_load_release_frames;
+    /* Fast Loading advances the guest at a host rate greater than real time.
+     * Keep canonical SPU/CD state running, but discard accelerated
+     * presentation audio until pacing resumes. */
+    g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
+    if (g_turbo_load_wall_multiplier) {
+        std::fprintf(stdout,
+            "psxrecomp: mod selected %dx load acceleration "
+            "(%d release frames)\n",
+            g_turbo_load_wall_multiplier, g_turbo_load_release_frames);
+    } else {
+        std::fprintf(stdout,
+            "psxrecomp: mod selected uncapped load acceleration "
+            "(%d release frames)\n",
+            g_turbo_load_release_frames);
     }
 }
 
@@ -6031,8 +6240,13 @@ static int savestate_submit_slot(int slot, int save) {
         host_osd_push(msg, 1200);
         return 0;
     }
-    if (!save)
-        savestate_input_guard_arm();
+    /* The save-state menu is a host overlay, but its commit key is also a
+     * perfectly valid guest chord: Right Shift is Select and Enter is Start.
+     * Arm the same release guard for BOTH directions.  Without it, submitting
+     * a save with Shift+Enter closes the overlay and the very next pad sample
+     * presents Select+Start to the game, reopening Hueponik's menu (or allowing
+     * any other guest action bound to the host save gesture). */
+    savestate_input_guard_arm();
     if (psx_netplay_active()) {
         if (!psx_netplay_is_host()) {
             host_osd_push("Save states are host-only in netplay", 1500);
@@ -13273,49 +13487,9 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    /* Activation callbacks are re-run after every launcher session. Clear
-     * game-owned controller overrides first so disabling a package cannot
-     * leave its prior mode latched across a soft return to the launcher. */
-    g_mod_controller_mode_override[0] = -1;
-    g_mod_controller_mode_override[1] = -1;
-    g_mod_load_wall_multiplier = -1;
-    g_mod_load_release_frames = -1;
-    g_mod_disc_speed_divisor = -1;
-    g_mod_disc_instant_rate = -1;
-    g_turbo_audio_sink_enabled = 0;
-    psx_ram_reset_size_request();
-    g_turbo_load_wall_multiplier = 0;
-    g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
-    if (!turbo_loads_offered)
-        g_turbo_loads_enabled = 0;
-    g_frame_interpolation_blend = g_frame_interpolation_blend_default;
-    mod_runtime_activate_plugins();
-    apply_netplay_local_viewport_aspect(net_cfg.enabled);
-    if (g_mod_controller_mode_override[0] >= 0)
-        player_mode[0] = g_mod_controller_mode_override[0];
-    if (g_mod_controller_mode_override[1] >= 0)
-        player_mode[1] = g_mod_controller_mode_override[1];
-    if (g_mod_load_wall_multiplier >= 0) {
-        g_turbo_loads_enabled = 1;
-        g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
-        g_turbo_load_release_frames = g_mod_load_release_frames;
-        /* Fast Loading advances the guest at a host rate greater than real
-         * time. Keep the canonical SPU/CD stream running, but discard the
-         * accelerated presentation-side audio until pacing resumes; otherwise
-         * the SDL bridge overflows and the load becomes observably unstable. */
-        g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
-        if (g_turbo_load_wall_multiplier) {
-            std::fprintf(stdout,
-                "psxrecomp: mod selected %dx load acceleration "
-                "(%d release frames)\n",
-                g_turbo_load_wall_multiplier, g_turbo_load_release_frames);
-        } else {
-            std::fprintf(stdout,
-                "psxrecomp: mod selected uncapped load acceleration "
-                "(%d release frames)\n",
-                g_turbo_load_release_frames);
-        }
-    }
+    activate_committed_mod_plan(player_mode, net_cfg.enabled,
+                                turbo_loads_offered, skip_fmv_offered,
+                                /*refresh_launcher_defaults=*/false);
 
     /* Re-apply the resolved language to the translation layer. text_xlate_init
      * (at config load) only saw the game.toml default; this folds in the
@@ -13992,67 +14166,7 @@ session_reboot:
      * exists and stb_image is already linked for the HD texture pack. A
      * relative path resolves against the disc directory, so a pack of team
      * wallpapers can sit beside the disc like the texture pack does. */
-    if (!g_bezel_path.empty() && g_bezel_path != "off" && g_gl_active) {
-        /* Resolve the setting to a file.
-         *
-         *   "random"      one of the bundled team logos, chosen ONCE per
-         *                 launch and kept for the whole session -- a mark that
-         *                 changed mid-run would read as a glitch;
-         *   "qirex" etc.  that team;
-         *   anything else a path, relative to the disc directory.
-         *
-         * Bundled art lives next to the executable so a stock install has it
-         * without touching the disc folder. */
-        std::filesystem::path bp;
-        const std::filesystem::path bez_dir =
-            exe_dir_from_argv(argv[0]) / "bezels";
-        if (g_bezel_path == "random") {
-            std::vector<std::filesystem::path> pool;
-            std::error_code bec;
-            for (const auto &e : std::filesystem::directory_iterator(bez_dir, bec)) {
-                if (bec) break;
-                if (e.is_regular_file(bec) && e.path().extension() == ".png")
-                    pool.push_back(e.path());
-            }
-            std::sort(pool.begin(), pool.end());   /* directory order is not defined */
-            if (!pool.empty()) {
-                std::random_device rd;
-                bp = pool[rd() % pool.size()];
-            }
-        } else {
-            bp = std::filesystem::path(g_bezel_path);
-            if (!bp.has_extension()) {             /* a team name */
-                std::filesystem::path named = bez_dir / (g_bezel_path + ".png");
-                std::error_code nec;
-                if (std::filesystem::exists(named, nec)) bp = named;
-            }
-            if (bp.is_relative()) bp = resolved_disc.parent_path() / bp;
-        }
-        std::vector<unsigned char> file;
-        if (FILE *bf = std::fopen(bp.string().c_str(), "rb")) {
-            std::fseek(bf, 0, SEEK_END);
-            const long len = std::ftell(bf);
-            std::fseek(bf, 0, SEEK_SET);
-            if (len > 0) {
-                file.resize((size_t)len);
-                if (std::fread(file.data(), 1, file.size(), bf) != file.size())
-                    file.clear();
-            }
-            std::fclose(bf);
-        }
-        int bw = 0, bh = 0, bc = 0;
-        unsigned char *px = file.empty() ? nullptr
-            : stbi_load_from_memory(file.data(), (int)file.size(), &bw, &bh, &bc, 4);
-        if (px) {
-            gl_renderer_set_bezel(px, bw, bh);
-            stbi_image_free(px);
-            std::fprintf(stdout, "psxrecomp: bezel artwork %dx%d from %s\n",
-                         bw, bh, bp.string().c_str());
-        } else {
-            std::fprintf(stdout, "psxrecomp: bezel artwork not loaded: %s\n",
-                         bp.string().c_str());
-        }
-    }
+    apply_bezel_selection(resolved_disc, argv[0]);
         if (!g_gl_active) {
             gr_set_backend(GR_BACKEND_SOFTWARE);
             gl_renderer_set_cpu_auth_dual(0);
@@ -14643,12 +14757,13 @@ session_reboot:
             std::fprintf(tf, "{\n  \"final_pc\": \"0x%08X\",\n  \"final_ra\": \"0x%08X\",\n"
                             "  \"final_sp\": \"0x%08X\",\n  \"fntrace_seq\": %llu,\n  \"tail\": [\n",
                          cpu.pc, cpu.gpr[31], cpu.gpr[29],
-                         (unsigned long long)g_fntrace_seq);
-            uint64_t seq = g_fntrace_seq;
+                         (unsigned long long)fntrace_total());
+            uint64_t seq = fntrace_total();
             uint32_t n = seq < 128u ? (uint32_t)seq : 128u;
             for (uint32_t i = 0; i < n; i++) {
                 uint64_t idx = seq - n + i;
-                const FntraceEntry* e = &g_fntrace_ring[idx % FNTRACE_RING_CAP];
+                const FntraceEntry* e = fntrace_get(idx);
+                if (!e) continue;
                 std::fprintf(tf,
                     "    {\"seq\":%llu,\"frame\":%u,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
                     "\"sp\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\"}%s\n",
@@ -15196,7 +15311,9 @@ soft_return_lobby:
                     return 1;
                 }
             }
-            apply_netplay_local_viewport_aspect(net_cfg.enabled);
+            activate_committed_mod_plan(player_mode, net_cfg.enabled,
+                                        turbo_loads_offered, skip_fmv_offered,
+                                        /*refresh_launcher_defaults=*/true);
             std::printf("psxrecomp: rematch from lobby (netplay=%d)\n",
                         net_cfg.enabled ? 1 : 0);
             std::fflush(stdout);

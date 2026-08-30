@@ -9,6 +9,7 @@ if(NOT DEFINED PSXRECOMP_ROOT)
 endif()
 
 include("${PSXRECOMP_ROOT}/runtime/chd_dependency.cmake")
+include("${PSXRECOMP_ROOT}/runtime/debug_tools.cmake")
 
 # Default to an optimized build. The recompiled game is a huge (~270 MB) block of
 # generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
@@ -68,17 +69,6 @@ if(NOT DEFINED CMAKE_C_COMPILER_LAUNCHER)
                        "branch ops will be slow. Install ccache on PATH (or update "
                        "cmake-clang-v1) to fix.")
     endif()
-endif()
-
-# PSX_DEBUG_TOOLS: TCP debug server + heartbeat + per-block recording.
-# Defaults ON for Debug/RelWithDebInfo, OFF for Release/MinSizeRel so
-# a plain cmake -DCMAKE_BUILD_TYPE=Release gives a lean production binary
-# with no TCP server and no debug console. Override explicitly with
-# -DPSX_DEBUG_TOOLS=ON/OFF to force either way regardless of build type.
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" OFF)
-else()
-    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
 # PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
@@ -319,6 +309,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/cosim.c
     ${PSXRECOMP_ROOT}/runtime/src/traps.c
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
+    ${PSXRECOMP_ROOT}/runtime/src/freeze_artifacts.c
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
@@ -801,6 +792,7 @@ function(psxrecomp_add_runtime_target target)
     set(oneValueArgs
         GAME_GENERATED_DISPATCH_C
         GAME_OVERLAY_STATIC_C
+        GAME_OVERLAY_EXTRA_STATIC_C
         BIOS_GENERATED_FULL_C
         BIOS_GENERATED_DISPATCH_C
         DEBUG_PORT
@@ -914,6 +906,12 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_OVERLAY_STATIC_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_STATIC_C}")
         set(has_overlay_dispatch TRUE)
+    endif()
+    if(PSXRT_GAME_OVERLAY_EXTRA_STATIC_C AND EXISTS "${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}")
+        set_source_files_properties("${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}" PROPERTIES GENERATED TRUE)
+        list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_EXTRA_STATIC_C}")
+        set(has_overlay_dispatch TRUE)
+        set(has_overlay_extra_dispatch TRUE)
     endif()
 
     if(PSXRT_ORACLE)
@@ -1050,7 +1048,8 @@ function(psxrecomp_add_runtime_target target)
         set(_codegen_srcs ${PSXRECOMP_CODEGEN_HASH_SRCS})
         add_custom_command(
             OUTPUT  ${_codegen_hash_hdr}
-            COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} "-DSRCS=${_codegen_srcs}"
+            COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} -DROOT=${PSXRECOMP_ROOT}
+                    "-DSRCS=${_codegen_srcs}"
                     -P ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
             DEPENDS ${_codegen_srcs} ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
             COMMENT "Hashing recompiler codegen -> overlay_codegen_hash.h"
@@ -1100,7 +1099,13 @@ function(psxrecomp_add_runtime_target target)
         foreach(_g IN LISTS _game_generated_check)
             file(APPEND "${_psxrt_gen_list}" "${_g}\n")
         endforeach()
-        add_custom_target(${target}_require_generated
+        # Give the verification a real output stamp.  A target-only custom
+        # command has no up-to-date state, so Ninja reruns it forever and can
+        # starve the actual compile/link step on Windows.
+        set(_psxrt_gen_stamp
+            "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated_sources.stamp")
+        add_custom_command(
+            OUTPUT "${_psxrt_gen_stamp}"
             COMMAND ${CMAKE_COMMAND}
                     "-DSOURCES_FILE=${_psxrt_gen_list}"
                     "-DTARGET=${target}"
@@ -1108,8 +1113,12 @@ function(psxrecomp_add_runtime_target target)
                     "-DRECOMPILER=${_psxrt_recompiler_hint}"
                     "-DDOC=psxrecomp/docs/BUILDING.md  (\"Build and run a game\")"
                     -P "${PSXRECOMP_ROOT}/runtime/check_generated_sources.cmake"
+            COMMAND ${CMAKE_COMMAND} -E touch "${_psxrt_gen_stamp}"
+            DEPENDS "${_psxrt_gen_list}"
             COMMENT "Verifying recompiled game C exists for ${target}"
             VERBATIM)
+        add_custom_target(${target}_require_generated
+            DEPENDS "${_psxrt_gen_stamp}")
         # Target-level dependency: this check runs to completion before ANY of
         # ${target}'s objects compile, so a missing generated source aborts with
         # our message rather than the compiler's.
@@ -1302,25 +1311,37 @@ function(psxrecomp_add_runtime_target target)
     # own POST_BUILD copy so a title may still override an id if it ever needs
     # to; copy_directory merges rather than replacing the tree.
     if(EXISTS "${PSXRECOMP_ROOT}/mods/builtin/packages")
+        # Clear first: copy_directory MERGES, so a mod deleted from source
+        # would otherwise survive in the build output forever and keep
+        # appearing on the Mods page (and inflate release catalog assertions).
+        # Scoped to mods/packages, not mods/: state.toml is launcher-owned user
+        # state and must survive a rebuild.
+        set(_psx_builtin_mod_copy_commands "")
+        if(DEFINED PSX_BUILTIN_MOD_ALLOWLIST AND NOT
+           "${PSX_BUILTIN_MOD_ALLOWLIST}" STREQUAL "")
+            foreach(_psx_builtin_mod IN LISTS PSX_BUILTIN_MOD_ALLOWLIST)
+                if(NOT EXISTS "${PSXRECOMP_ROOT}/mods/builtin/packages/${_psx_builtin_mod}")
+                    message(FATAL_ERROR
+                        "PSX_BUILTIN_MOD_ALLOWLIST names missing package: ${_psx_builtin_mod}")
+                endif()
+                list(APPEND _psx_builtin_mod_copy_commands
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${PSXRECOMP_ROOT}/mods/builtin/packages/${_psx_builtin_mod}"
+                        "$<TARGET_FILE_DIR:${target}>/mods/packages/${_psx_builtin_mod}")
+            endforeach()
+        else()
+            list(APPEND _psx_builtin_mod_copy_commands
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${PSXRECOMP_ROOT}/mods/builtin"
+                    "$<TARGET_FILE_DIR:${target}>/mods")
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD
-            # Clear first: copy_directory MERGES, so a mod deleted from source
-            # would otherwise survive in the build output forever and keep
-            # appearing on the Mods page (and inflate the release packagers'
-            # catalog assertions). This runs before the game's own staging, so
-            # both catalogs land on a clean slate.
-            #
-            # Scoped to mods/packages, NOT mods/: both catalogs own only a
-            # packages/ subtree, while mods/state.toml is USER STATE written at
-            # runtime (which mods are enabled, with which options). Wiping the
-            # whole tree silently disabled every enabled mod on every rebuild,
-            # repeatedly misread as the mods themselves regressing.
             COMMAND ${CMAKE_COMMAND} -E rm -rf
                 "$<TARGET_FILE_DIR:${target}>/mods/packages"
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${PSXRECOMP_ROOT}/mods/builtin"
-                "$<TARGET_FILE_DIR:${target}>/mods"
+            ${_psx_builtin_mod_copy_commands}
             COMMENT "Staging framework-owned mod catalog"
             VERBATIM)
+        unset(_psx_builtin_mod_copy_commands)
     endif()
     endif()
 
@@ -1351,12 +1372,13 @@ function(psxrecomp_add_runtime_target target)
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
     endif()
-
-    # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's
-    # also visible to psx-beetle / non-runtime-helper targets.
-    if(NOT PSX_DEBUG_TOOLS)
-        target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    if(has_overlay_extra_dispatch)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_EXTRA_DISPATCH=1)
     endif()
+
+    # AUTO is configuration-aware in Visual Studio/Xcode/Ninja Multi-Config;
+    # explicit ON/OFF remains a tree-wide override.
+    psxrecomp_apply_debug_tools(${target})
 
     if(PSXRECOMP_HAS_RECOMP_NET)
         target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_NET=1)
@@ -1719,6 +1741,8 @@ function(psxrecomp_add_game_runtime target)
         VERSION_FILE
         CODEGEN_SETUP_INCLUDE_DIR
         NETPLAY_LOBBY_URL
+        GAME_OVERLAY_STATIC_C
+        GAME_OVERLAY_EXTRA_STATIC_C
     )
     set(multiValueArgs GEN_FULL_GLOB CODEGEN_SETUP_SOURCES)
     cmake_parse_arguments(PSXG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -1869,6 +1893,14 @@ function(psxrecomp_add_game_runtime target)
         EXTRAS_SOURCES ${_psxg_extras}
         ${PSXG_UNPARSED_ARGUMENTS}
     )
+    if(PSXG_GAME_OVERLAY_STATIC_C)
+        list(APPEND _psxg_rt_args
+            GAME_OVERLAY_STATIC_C "${PSXG_GAME_OVERLAY_STATIC_C}")
+    endif()
+    if(PSXG_GAME_OVERLAY_EXTRA_STATIC_C)
+        list(APPEND _psxg_rt_args
+            GAME_OVERLAY_EXTRA_STATIC_C "${PSXG_GAME_OVERLAY_EXTRA_STATIC_C}")
+    endif()
 
     if(_psxg_has_game_c)
         message(STATUS

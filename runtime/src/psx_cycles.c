@@ -436,6 +436,114 @@ static int32_t  s_idle_progress_delta = 0;
 static uint64_t s_idle_last_cycle = 0;
 static uint64_t s_idle_last_stores = 0;
 static uint64_t s_idle_last_mmio = 0;
+static uint32_t s_idle_last_oc_accum = 0;
+static uint32_t s_idle_last_store_pc = 0;
+static uint32_t s_idle_stack_value = 0;
+static int      s_idle_stack_countdown = 0;
+
+/* Calls inside a poll loop put several other interrupt boundaries between two
+ * observations of the repeated branch PC.  The original single candidate is
+ * intentionally cheap, but can never recognize that shape.  Keep a bounded
+ * direct-mapped table for the stricter stack-countdown case; collisions only
+ * discard training and can never create a match because the full PC is tagged. */
+typedef struct IdleStackPollSite {
+    uint32_t pc;
+    uint32_t gpr[32];
+    uint32_t hi, lo;
+    uint32_t stack_value;
+    uint32_t store_pc;
+    uint32_t oc_accum;
+    uint32_t quantum;
+    uint32_t streak;
+    uint64_t cycle;
+    uint64_t stores;
+    uint64_t mmio;
+} IdleStackPollSite;
+
+static IdleStackPollSite s_idle_stack_sites[256];
+
+static int idle_stack_poll_note(CPUState *cpu, uint32_t check_pc,
+                                uint64_t stores, uint64_t mmio,
+                                uint32_t store_pc) {
+    IdleStackPollSite *s = &s_idle_stack_sites[(check_pc >> 2) & 255u];
+    uint64_t now = psx_cycle_count;
+    if (s->pc != check_pc) {
+        memset(s, 0, sizeof(*s));
+        s->pc = check_pc;
+        goto snapshot;
+    }
+
+    if (stores - s->stores != 1u || mmio != s->mmio ||
+        store_pc != s->store_pc || cpu->gpr[29] != s->gpr[29]) {
+        s->streak = 0;
+        goto snapshot;
+    }
+    {
+        uint32_t stack_value = cpu->read_word(cpu->gpr[29] + 16u);
+        if (stack_value != s->stack_value - 1u || cpu->hi != s->hi ||
+            cpu->lo != s->lo) {
+            s->streak = 0;
+            goto snapshot_with_stack;
+        }
+        for (int i = 1; i < 32; i++) {
+            if (cpu->gpr[i] != s->gpr[i]) {
+                s->streak = 0;
+                goto snapshot_with_stack;
+            }
+        }
+
+        uint64_t device_delta = now - s->cycle;
+        int64_t raw_num = (int64_t)(device_delta << 16)
+                        + (int64_t)g_psx_oc_accum - (int64_t)s->oc_accum;
+        uint32_t quantum = 0;
+        if (raw_num > 0 && g_psx_oc_scale_q16 != 0u &&
+            (uint64_t)raw_num % g_psx_oc_scale_q16 == 0u)
+            quantum = (uint32_t)((uint64_t)raw_num / g_psx_oc_scale_q16);
+        if (quantum == 0u || quantum > IDLE_QUANTUM_MAX) {
+            s->streak = 0;
+            goto snapshot_with_stack;
+        }
+        if (quantum == s->quantum) s->streak++;
+        else { s->quantum = quantum; s->streak = 1u; }
+
+        if (s->streak >= IDLE_STREAK_MIN) {
+            uint32_t dist = devices_cycles_to_next_idle_event();
+            uint64_t need_q16 = (uint64_t)dist << 16;
+            uint64_t need_raw = need_q16 > g_psx_oc_accum
+                ? (need_q16 - g_psx_oc_accum + g_psx_oc_scale_q16 - 1u) /
+                      g_psx_oc_scale_q16
+                : 0u;
+            uint32_t k = (uint32_t)((need_raw + quantum - 1u) / quantum);
+            uint32_t max_k = stack_value > 1u ? stack_value - 1u : 0u;
+            if (k > max_k) k = max_k;
+            uint64_t raw_skip = (uint64_t)k * quantum;
+            if (k > 1u && raw_skip <= IDLE_SKIP_MAX_CYCLES) {
+                cpu->write_word(cpu->gpr[29] + 16u, stack_value - k);
+                g_idle_skip_count++;
+                g_idle_skip_cycles += raw_skip;
+                g_idle_skip_last_pc = check_pc;
+                g_idle_skip_last_quantum = quantum;
+                psx_advance_cycles((uint32_t)raw_skip);
+                s->streak = 0;
+                goto snapshot;
+            }
+        }
+        s->stack_value = stack_value;
+    }
+
+snapshot:
+snapshot_with_stack:
+    s->stack_value = cpu->read_word(cpu->gpr[29] + 16u);
+    for (int i = 1; i < 32; i++) s->gpr[i] = cpu->gpr[i];
+    s->hi = cpu->hi;
+    s->lo = cpu->lo;
+    s->store_pc = store_pc;
+    s->oc_accum = g_psx_oc_accum;
+    s->cycle = psx_cycle_count;
+    s->stores = stores;
+    s->mmio = mmio;
+    return 0;
+}
 
 static void idle_snapshot_regs(const CPUState *cpu) {
     for (int i = 1; i < 32; i++) s_idle_gpr[i] = cpu->gpr[i];
@@ -471,6 +579,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
     extern int psx_get_in_exception(void);
     extern uint64_t g_guest_store_count, g_mmio_access_count;
+    extern uint32_t g_debug_last_store_pc;
 
     /* A speculative replay must not clear or train the authoritative live idle
      * detector. Its clock/device view is transactional and cannot be skipped. */
@@ -485,8 +594,25 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     }
 
     uint64_t cyc = psx_cycle_count;
+    (void)idle_stack_poll_note(cpu, check_pc, g_guest_store_count,
+                               g_mmio_access_count, g_debug_last_store_pc);
+    cyc = psx_cycle_count; /* a proven stack poll may have fast-forwarded */
+    uint64_t store_delta = g_guest_store_count - s_idle_last_stores;
+    uint32_t stack_value = s_idle_stack_value;
+    if (store_delta == 1u || s_idle_stack_countdown)
+        stack_value = cpu->read_word(cpu->gpr[29] + 16u);
+    int no_store = store_delta == 0u;
+    /* A common BIOS-era timed wait keeps its otherwise unobservable timeout
+     * counter in one stack slot.  Admit that loop only when one repeated SW
+     * at one instruction, with a stable SP, decrements [sp+16] by exactly one.
+     * The final skipped value is written below before device catch-up. */
+    int stack_countdown =
+        store_delta == 1u &&
+        g_debug_last_store_pc == s_idle_last_store_pc &&
+        cpu->gpr[29] == s_idle_gpr[29] &&
+        stack_value == s_idle_stack_value - 1u;
     if (check_pc == s_idle_pc && s_idle_have_snap &&
-        g_guest_store_count == s_idle_last_stores &&
+        (no_store || stack_countdown) &&
         g_mmio_access_count == s_idle_last_mmio) {
         int changed = -1, changed_count = 0;
         for (int i = 1; i < 32; i++) {
@@ -505,7 +631,20 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
          * executes. No stores/MMIO are allowed, so there is no hidden work. */
         int progress_reg = changed_count == 0 ? -1
                          : (changed_count == 1 && progress_delta == -1 ? changed : -2);
-        uint32_t quantum = (uint32_t)(cyc - s_idle_last_cycle);
+        if (stack_countdown && changed_count != 0)
+            progress_reg = -2;
+        /* psx_cycle_count is the DEVICE-clock delta after CPU-overclock
+         * scaling. Recover the exact raw retired-cycle quantum from the Q16
+         * carry as well; otherwise a 900% loop both looks unstable (fractional
+         * deltas) and gets scaled a second time when fast-forwarded. */
+        uint64_t device_delta = cyc - s_idle_last_cycle;
+        int64_t raw_num = (int64_t)(device_delta << 16)
+                        + (int64_t)g_psx_oc_accum
+                        - (int64_t)s_idle_last_oc_accum;
+        uint32_t quantum = 0;
+        if (raw_num > 0 && g_psx_oc_scale_q16 != 0u &&
+            (uint64_t)raw_num % g_psx_oc_scale_q16 == 0u)
+            quantum = (uint32_t)((uint64_t)raw_num / g_psx_oc_scale_q16);
         if (progress_reg != -2 && quantum > 0 && quantum <= IDLE_QUANTUM_MAX) {
             if (quantum == s_idle_quantum &&
                 progress_reg == s_idle_progress_reg &&
@@ -517,6 +656,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
                 s_idle_progress_delta = progress_delta;
                 s_idle_streak = 1;
             }
+            s_idle_stack_countdown = stack_countdown;
         } else {
             s_idle_streak = 0;
             s_idle_quantum = 0;
@@ -525,7 +665,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         }
         idle_snapshot_regs(cpu);
     } else if (check_pc == s_idle_pc &&
-               g_guest_store_count == s_idle_last_stores &&
+               (no_store || stack_countdown) &&
                g_mmio_access_count == s_idle_last_mmio) {
         /* Second consecutive observation of this PC with no stores/MMIO —
          * take the baseline snapshot; the next hit can compare. Defers the
@@ -548,14 +688,28 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_last_cycle  = cyc;
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
+    s_idle_last_oc_accum = g_psx_oc_accum;
+    s_idle_last_store_pc = g_debug_last_store_pc;
+    s_idle_stack_value = stack_value;
 
     if (s_idle_streak < IDLE_STREAK_MIN) return;
-    uint32_t q = s_idle_quantum;
+    uint32_t q = s_idle_quantum;          /* raw CPU cycles / iteration */
     uint32_t dist = devices_cycles_to_next_idle_event();
-    if (dist <= q) return;               /* one real iteration reaches it */
-    uint32_t k = (dist + q - 1u) / q;    /* first check boundary >= event */
+    uint64_t need_q16 = (uint64_t)dist << 16;
+    uint64_t need_raw = need_q16 > g_psx_oc_accum
+        ? (need_q16 - g_psx_oc_accum + g_psx_oc_scale_q16 - 1u) /
+              g_psx_oc_scale_q16
+        : 0u;
+    uint32_t k = (uint32_t)((need_raw + q - 1u) / q);
+    if (k <= 1u) return;                 /* one real iteration reaches it */
     if (s_idle_progress_reg > 0) {
         uint32_t value = cpu->gpr[s_idle_progress_reg];
+        uint32_t max_k = value > 1u ? value - 1u : 0u;
+        if (k > max_k) k = max_k;
+        if (k == 0) return;
+    }
+    if (s_idle_stack_countdown) {
+        uint32_t value = stack_value;
         uint32_t max_k = value > 1u ? value - 1u : 0u;
         if (k > max_k) k = max_k;
         if (k == 0) return;
@@ -565,6 +719,8 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 
     if (s_idle_progress_reg > 0)
         cpu->gpr[s_idle_progress_reg] -= k;
+    if (s_idle_stack_countdown)
+        cpu->write_word(cpu->gpr[29] + 16u, stack_value - k);
 
     g_idle_skip_count++;
     g_idle_skip_cycles += skip;
@@ -581,6 +737,9 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_last_cycle  = psx_cycle_count;
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
+    s_idle_last_oc_accum = g_psx_oc_accum;
+    s_idle_last_store_pc = g_debug_last_store_pc;
+    s_idle_stack_value = cpu->read_word(cpu->gpr[29] + 16u);
 #endif
 }
 

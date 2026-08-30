@@ -149,7 +149,14 @@ static inline void set_reg(CPUState* cpu, uint32_t r, uint32_t v) {
 
 static inline void apply_load_delay(CPUState* cpu) {
     if (s_load_reg != 0) {
-        cpu->gpr[s_load_reg] = s_load_val;
+        uint32_t reg = s_load_reg;
+        uint32_t value = s_load_val;
+        cpu->gpr[reg] = value;
+        /* Keep PGXP's GPR shadow on the same one-instruction timeline as the
+         * architectural register.  The issue-side hook stages provenance;
+         * commit happens only after the dependent instruction has read the
+         * old register.  A missing pending slot conservatively resets it. */
+        psx_pgxp_load_commit(cpu, reg, value);
         s_load_reg = 0;
     }
 }
@@ -389,10 +396,11 @@ static void exec_one(CPUState* cpu) {
         switch (cop_op) {
         case 0x00: /* MFC0 */
             set_load_delay(RT(insn), cpu->cop0[RD(insn)]);
-            /* Conservative at issue time: the pending COP0 value has no
-             * projection provenance, even if its integer bits equal the
-             * register's old tracked value. */
-            PGXP_GPR_WRITE(RT(insn));
+            /* MFC0 is a delayed, non-position load.  Its issue-side PGXP
+             * staging is conservative; apply_load_delay() resets the
+             * destination after the dependent instruction reads the old
+             * shadow. */
+            psx_pgxp_load_delayed(cpu, insn, 0, cpu->cop0[RD(insn)]);
             break;
         case 0x04: /* MTC0 */
             cpu->cop0[RD(insn)] = rt_val;
@@ -417,13 +425,13 @@ static void exec_one(CPUState* cpu) {
         case 0x00: { /* MFC2 */
             uint32_t v = gte_read_data(cpu, RD(insn));
             set_load_delay(RT(insn), v);
-            psx_pgxp_cop2(cpu, insn, v, 0);
+            psx_pgxp_load_delayed(cpu, insn, 0, v);
             break;
         }
         case 0x02: { /* CFC2 */
             uint32_t v = gte_read_ctrl(cpu, RD(insn));
             set_load_delay(RT(insn), v);
-            psx_pgxp_cop2(cpu, insn, v, 0);
+            psx_pgxp_load_delayed(cpu, insn, 0, v);
             break;
         }
         case 0x04: /* MTC2 */
@@ -450,14 +458,14 @@ static void exec_one(CPUState* cpu) {
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         uint32_t v = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
         set_load_delay(RT(insn), v);
-        psx_pgxp_load(cpu, insn, addr, v);
+        psx_pgxp_load_delayed(cpu, insn, addr, v);
         break;
     }
     case 0x21: { /* LH */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         uint32_t v = (uint32_t)(int32_t)(int16_t)cpu->read_half(addr);
         set_load_delay(RT(insn), v);
-        psx_pgxp_load(cpu, insn, addr, v);
+        psx_pgxp_load_delayed(cpu, insn, addr, v);
         break;
     }
     case 0x22: { /* LWL */
@@ -471,29 +479,29 @@ static void exec_one(CPUState* cpu) {
             case 2: cur = (cur & 0x000000FFu) | (word <<  8); break;
             case 3: cur = word; break;
         }
-        set_reg(cpu, RT(insn), cur);
-        psx_pgxp_load(cpu, insn, addr, cur);
+        set_load_delay(RT(insn), cur);
+        psx_pgxp_load_delayed(cpu, insn, addr, cur);
         break;
     }
     case 0x23: { /* LW */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         uint32_t v = cpu->read_word(addr);
         set_load_delay(RT(insn), v);
-        psx_pgxp_load(cpu, insn, addr, v);
+        psx_pgxp_load_delayed(cpu, insn, addr, v);
         break;
     }
     case 0x24: { /* LBU */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         uint32_t v = (uint32_t)cpu->read_byte(addr);
         set_load_delay(RT(insn), v);
-        psx_pgxp_load(cpu, insn, addr, v);
+        psx_pgxp_load_delayed(cpu, insn, addr, v);
         break;
     }
     case 0x25: { /* LHU */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         uint32_t v = (uint32_t)cpu->read_half(addr);
         set_load_delay(RT(insn), v);
-        psx_pgxp_load(cpu, insn, addr, v);
+        psx_pgxp_load_delayed(cpu, insn, addr, v);
         break;
     }
     case 0x26: { /* LWR */
@@ -507,8 +515,8 @@ static void exec_one(CPUState* cpu) {
             case 2: cur = (cur & 0xFFFF0000u) | (word >> 16); break;
             case 3: cur = (cur & 0xFFFFFF00u) | (word >> 24); break;
         }
-        set_reg(cpu, RT(insn), cur);
-        psx_pgxp_load(cpu, insn, addr, cur);
+        set_load_delay(RT(insn), cur);
+        psx_pgxp_load_delayed(cpu, insn, addr, cur);
         break;
     }
 
