@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Regression guard for portable release ZIP entry names."""
 
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import zipfile
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "tools" / "create_release_zip.py"
@@ -16,9 +15,7 @@ with tempfile.TemporaryDirectory() as temporary:
     stage = base / "stage"
     (stage / "mods" / "package").mkdir(parents=True)
     (stage / "Tomba Recompiled.exe").write_bytes(b"exe")
-    (stage / "mods" / "package" / "manifest.toml").write_text(
-        'id = "test"\n', encoding="utf-8"
-    )
+    (stage / "mods" / "package" / "manifest.toml").write_bytes(b'id = "test"\n')
     output = base / "release.zip"
     subprocess.run(
         [
