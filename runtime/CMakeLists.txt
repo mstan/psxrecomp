@@ -537,6 +537,11 @@ if(BUILD_TESTING)
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fntrace_diag_config.py
                          --compiler ${CMAKE_C_COMPILER}
                          --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME dma_diag_config_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dma_diag_config.py
+                         --compiler ${CMAKE_C_COMPILER}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME debug_server_storage_config_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_debug_server_storage_config.py)
