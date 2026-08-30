@@ -3130,6 +3130,7 @@ uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
 #ifndef PSX_NO_DEBUG_TOOLS
     int got = 0;
+#endif
     if ((request_reg & CDROM_REQUEST_BFRD) && rb_available() &&
         RB_.pos + 4 <= RB_.size) {
         memcpy(&val, RB_.data + RB_.pos, 4);
