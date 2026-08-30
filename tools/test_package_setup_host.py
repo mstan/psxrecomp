@@ -1,6 +1,9 @@
 import os
+import shlex
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).with_name("package_setup_host.sh").resolve()
 
@@ -12,6 +15,13 @@ def _bash_path(path: Path) -> str:
     drive = resolved.drive.rstrip(":").lower()
     tail = resolved.as_posix().split(":", 1)[1]
     return f"/mnt/{drive}{tail}"
+
+
+def _bash_is_symlink(path: Path) -> bool:
+    return subprocess.run(
+        ["bash", "-c", 'test -L "$1"', "test", _bash_path(path)],
+        check=False,
+    ).returncode == 0
 
 
 def _git(root: Path, *args: str) -> None:
@@ -154,6 +164,7 @@ def test_only_tracked_title_directory_files_are_staged(tmp_path: Path) -> None:
     stage = tmp_path / "dist/stage-setup-linux-x64/src"
     assert (stage / "tracked.c").read_text(encoding="utf-8") == "tracked\n"
     assert not (stage / "ignored.secret").exists()
+    assert (tmp_path / "dist/stage-setup-linux-x64/Host").read_bytes() == b"host"
 
 
 def test_packaging_does_not_rewrite_source_version(tmp_path: Path) -> None:
@@ -201,6 +212,113 @@ def test_windows_host_is_stripped_only_after_copy(
     assert "psxrecomp missing" in result.stderr
     assert source.read_bytes() == source_payload
     staged = tmp_path / "dist/stage-setup-linux-x64/Host.exe"
+    assert staged.read_bytes() == b"stripped-host"
+
+
+def test_distinct_extensionless_host_wins_over_windows_candidate(
+    tmp_path: Path,
+) -> None:
+    _write_host_fixture(tmp_path)
+    (tmp_path / "VERSION").write_text("1.2.3\n", encoding="utf-8")
+    extensionless = tmp_path / "build/Host"
+    windows_host = tmp_path / "build/Host.exe"
+    extensionless_payload = extensionless.read_bytes()
+    windows_payload = b"unstripped-windows-host"
+    windows_host.write_bytes(windows_payload)
+    strip_tool = _write_strip_fixture(tmp_path, "exit 7\n")
+
+    result = _run(
+        tmp_path,
+        "--strip-tool",
+        _bash_path(strip_tool),
+        "--project-file",
+        "VERSION",
+    )
+
+    assert result.returncode == 1
+    assert "stripped staged release host" not in result.stdout
+    assert "psxrecomp missing" in result.stderr
+    assert extensionless.read_bytes() == extensionless_payload
+    assert windows_host.read_bytes() == windows_payload
+    stage = tmp_path / "dist/stage-setup-linux-x64"
+    assert (stage / "Host").read_bytes() == extensionless_payload
+    assert not (stage / "Host.exe").exists()
+
+
+def test_same_file_extensionless_alias_selects_and_strips_windows_host(
+    tmp_path: Path,
+) -> None:
+    source = _write_windows_host_fixture(tmp_path)
+    source_payload = source.read_bytes()
+    alias = tmp_path / "build/Host"
+    os.link(source, alias)
+    strip_tool = _write_strip_fixture(
+        tmp_path,
+        '[ "$1" = "--strip-all" ] || exit 9\nprintf "stripped-host" >"$2"\n',
+    )
+
+    result = _run(
+        tmp_path,
+        "--strip-tool",
+        _bash_path(strip_tool),
+        "--project-file",
+        "VERSION",
+    )
+
+    assert result.returncode == 1
+    assert "stripped staged release host" in result.stdout
+    assert "psxrecomp missing" in result.stderr
+    assert source.read_bytes() == source_payload
+    assert alias.read_bytes() == source_payload
+    stage = tmp_path / "dist/stage-setup-linux-x64"
+    assert not (stage / "Host").exists()
+    assert (stage / "Host.exe").read_bytes() == b"stripped-host"
+
+
+def test_symlinked_windows_host_is_copied_before_stripping(tmp_path: Path) -> None:
+    _write_host_fixture(tmp_path)
+    (tmp_path / "VERSION").write_text("1.2.3\n", encoding="utf-8")
+    (tmp_path / "build/Host").unlink()
+    target = tmp_path / "build/Host.real.exe"
+    target_payload = b"canonical-symlink-target"
+    target.write_bytes(target_payload)
+    source = tmp_path / "build/Host.exe"
+    try:
+        source.symlink_to(target.name)
+    except OSError as exc:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"ln -s {shlex.quote(target.name)} {shlex.quote(_bash_path(source))}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"symlink creation is unavailable: {exc}; {result.stderr}")
+    if not _bash_is_symlink(source):
+        pytest.skip("the active Bash filesystem does not expose symlink identity")
+    strip_tool = _write_strip_fixture(
+        tmp_path,
+        '[ "$1" = "--strip-all" ] || exit 9\nprintf "stripped-host" >"$2"\n',
+    )
+
+    result = _run(
+        tmp_path,
+        "--strip-tool",
+        _bash_path(strip_tool),
+        "--project-file",
+        "VERSION",
+    )
+
+    assert result.returncode == 1
+    assert "stripped staged release host" in result.stdout
+    assert target.read_bytes() == target_payload
+    assert _bash_is_symlink(source)
+    staged = tmp_path / "dist/stage-setup-linux-x64/Host.exe"
+    assert not _bash_is_symlink(staged)
     assert staged.read_bytes() == b"stripped-host"
 
 
