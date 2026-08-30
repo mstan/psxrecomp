@@ -43,6 +43,20 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
 
+    foreach(_ram_bytes IN ITEMS 0x00200000u 0x00800000u)
+        string(REPLACE "0x00200000u" "default" _ram_profile "${_ram_bytes}")
+        string(REPLACE "0x00800000u" "8mb" _ram_profile "${_ram_profile}")
+        add_executable(psx_ram_profile_${_ram_profile}_test
+            tests/test_psx_ram_profile.c)
+        target_include_directories(psx_ram_profile_${_ram_profile}_test
+            PRIVATE include src)
+        target_compile_definitions(psx_ram_profile_${_ram_profile}_test PRIVATE
+            EXPECTED_MAIN_RAM_BYTES=${_ram_bytes}
+            $<$<STREQUAL:${_ram_profile},8mb>:PSX_MAIN_RAM_BYTES=${_ram_bytes}>)
+        add_test(NAME psx_ram_profile_${_ram_profile}_test
+                 COMMAND psx_ram_profile_${_ram_profile}_test)
+    endforeach()
+
     # Generated-code/runtime boundary benchmark. This is intentionally a
     # separate target (not a ctest): it runs a fixed generated-style guest
     # workload so IPO/native-code build options can be measured without
