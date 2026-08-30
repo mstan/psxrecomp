@@ -414,6 +414,21 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_compile_overlays_safety.py
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME overlay_static_symbol_prefix
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_compile_overlays_static_prefix.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME coverage_vault
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_coverage_vault.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME aot_overlay_coverage_report
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/aot_overlay_spike/test_coverage_report.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
         # These two invoke psxrecomp-game, whose BIOS-profile resolution
         # probes fixed working-directory-relative paths (bios/<name>.toml,
@@ -509,6 +524,8 @@ if(BUILD_TESTING)
                 release_zip
                 overlay_decodable_fallback
                 overlay_init_guard
+                interpreter_perf_guards
+                runtime_perf_diag_guards
                 sdl3_main_single_include
                 vk_build_default
                 vk_color_self_barrier
@@ -526,8 +543,8 @@ if(BUILD_TESTING)
         endforeach()
 
         # ---- known-failing guards: DISABLED, not de-registered ---------------
-        # These three were previously left out of the list above with a comment
-        # explaining that they FAIL and that wiring a red check would recreate
+        # This test was previously left out of the list above with a comment
+        # explaining that it fails and that wiring a red check would recreate
         # the problem that took CI off PRs. That reasoning is right; the remedy
         # was not. De-registering is precisely how a test stops being counted,
         # and it is the mechanism that let 16 C/C++ tests rot in runtime/tests/.
@@ -537,18 +554,9 @@ if(BUILD_TESTING)
         # rather than silently absent — without turning the run red. Delete the
         # matching set_tests_properties line to re-enable one once it is fixed.
         #
-        #   interpreter_perf_guards    psx_devices_mmio_sync's recompute-deadline
-        #                              branch never clears g_psx_cycle_fast_limit,
-        #                              and the guard still names the pre-rename
-        #                              s_next_service_cycle
-        #   runtime_perf_diag_guards   asserts a substring no longer present in
-        #                              the runtime source
         #   overlay_pair_dedup_runtime needs its companion harness built; not a
         #                              source-only guard
-        foreach(_t IN ITEMS
-                interpreter_perf_guards
-                runtime_perf_diag_guards
-                overlay_pair_dedup_runtime)
+        foreach(_t IN ITEMS overlay_pair_dedup_runtime)
             add_test(
                 NAME ${_t}
                 COMMAND ${Python3_EXECUTABLE}
