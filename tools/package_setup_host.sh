@@ -17,6 +17,7 @@
 #     [--project-file REL]... [--project-dir REL]... \
 #     [--disc-hint "your legally owned disc"] \
 #     [--version-env BPE_RELEASE_VERSION] \
+#     [--strip-tool /path/to/x86_64-w64-mingw32-strip] \
 #     [--embed-toolchain]   # optional: copy PSXRECOMP_TOOLCHAIN_DIR into zip
 #
 # Env:
@@ -24,6 +25,7 @@
 #   PSXRECOMP_TOOLCHAIN_DIR | TOOLCHAIN_DIR | BPE_TOOLCHAIN_DIR  (only with --embed-toolchain)
 #   PSXRECOMP_EMBED_TOOLCHAIN=1  same as --embed-toolchain
 #   PSXRECOMP_RUNTIME_BIN_DIR | BPE_RUNTIME_BIN_DIR  (Windows MinGW DLL search)
+#   PSXRECOMP_STRIP  strip executable to use for staged Windows hosts
 #
 # Lobby pin: the host exe must have been built with current runtime.cmake so
 # $<TARGET_FILE_DIR>/psx_game_version.txt exists. This script refuses to ship a
@@ -45,6 +47,7 @@ PROJECT_FILES=()
 PROJECT_DIRS=()
 RUNTIME_BIN_DIR="${PSXRECOMP_RUNTIME_BIN_DIR:-${BPE_RUNTIME_BIN_DIR:-/usr/x86_64-w64-mingw32/bin}}"
 EMBED_TOOLCHAIN=0
+STRIP_TOOL="${PSXRECOMP_STRIP:-}"
 if [[ "${PSXRECOMP_EMBED_TOOLCHAIN:-0}" == "1" ]]; then
   EMBED_TOOLCHAIN=1
 fi
@@ -68,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --project-file) PROJECT_FILES+=("${2:?}"); shift 2 ;;
     --project-dir) PROJECT_DIRS+=("${2:?}"); shift 2 ;;
     --runtime-bin) RUNTIME_BIN_DIR="${2:?}"; shift 2 ;;
+    --strip-tool) STRIP_TOOL="${2:?}"; shift 2 ;;
     --root) ROOT="${2:?}"; shift 2 ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
     --no-embed-toolchain) EMBED_TOOLCHAIN=0; shift ;;
@@ -314,15 +318,57 @@ rm -rf "${STAGE}"
 mkdir -p "${STAGE}" "${DIST}"
 rm -f "${DIST}/${ZIP_NAME}"
 
-cp -a "${EXE}" "${STAGE}/"
+EXE_BASENAME="$(basename "${EXE}")"
+EXE_DIR="$(dirname "${EXE}")"
+# Dereference a symlinked build output so release-only transforms below can
+# never follow the staged path back into the canonical build tree.
+cp -L "${EXE}" "${STAGE}/${EXE_BASENAME}"
 # Ship the stamp beside the exe so installers / RetComM can prefer it over VERSION.
 if [[ -f "$(dirname "${EXE}")/psx_game_version.txt" ]]; then
   cp -a "$(dirname "${EXE}")/psx_game_version.txt" "${STAGE}/psx_game_version.txt"
 else
   printf '%s\n' "${VERSION}" >"${STAGE}/psx_game_version.txt"
 fi
-EXE_BASENAME="$(basename "${EXE}")"
-EXE_DIR="$(dirname "${EXE}")"
+strip_staged_windows_host() {
+  local staged_exe="$1"
+  local strip_tool="${STRIP_TOOL}"
+
+  if [[ -n "${strip_tool}" ]]; then
+    if [[ "${strip_tool}" == */* ]]; then
+      if [[ ! -x "${strip_tool}" ]]; then
+        echo "error: configured strip tool is not executable: ${strip_tool}" >&2
+        exit 1
+      fi
+    elif ! command -v "${strip_tool}" >/dev/null 2>&1; then
+      echo "error: configured strip tool was not found on PATH: ${strip_tool}" >&2
+      exit 1
+    fi
+  else
+    local candidate
+    for candidate in x86_64-w64-mingw32-strip llvm-strip strip; do
+      if command -v "${candidate}" >/dev/null 2>&1; then
+        strip_tool="${candidate}"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${strip_tool}" ]]; then
+    echo "error: no PE-capable strip tool found for release host ${EXE_BASENAME}" >&2
+    echo "  Install x86_64-w64-mingw32-strip/llvm-strip, set PSXRECOMP_STRIP," >&2
+    echo "  or pass --strip-tool explicitly." >&2
+    exit 1
+  fi
+  if ! "${strip_tool}" --strip-all "${staged_exe}"; then
+    echo "error: failed to strip staged release host with ${strip_tool}: ${staged_exe}" >&2
+    exit 1
+  fi
+  echo "stripped staged release host with ${strip_tool}: ${EXE_BASENAME}"
+}
+
+if [[ "${EXE_BASENAME,,}" == *.exe ]]; then
+  strip_staged_windows_host "${STAGE}/${EXE_BASENAME}"
+fi
 
 # Windows: CMake may already have placed imported runtime DLLs (zlib1.dll)
 # next to the host. Copy siblings into the stage before MinGW bundling —
