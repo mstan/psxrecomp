@@ -2,6 +2,7 @@
 
 #include "freeze_heartbeat.h"
 #include "freeze_dump_policy.h"
+#include "freeze_artifacts.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -314,7 +315,6 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
  * main thread mid-dump (2026-06-10 chest-freeze postmortem). First dump
  * in wins; the loser skips (same rings either way). */
 static volatile long s_dump_in_progress = 0;
-static uint32_t s_dump_sequence = 0;  /* protected by s_dump_in_progress */
 
 static void freeze_dump_unlock(void) {
 #ifdef _WIN32
@@ -481,9 +481,12 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         return 0;
 #endif
 
-    char path[128];
-    uint32_t sequence = s_dump_sequence++;
-    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
+    char artifact_dir[1024];
+    char path[1200];
+    unsigned artifact_keep;
+    freeze_artifacts_config(artifact_dir, sizeof(artifact_dir), &artifact_keep);
+    if (!freeze_artifacts_dump_path(path, sizeof(path), artifact_dir,
+                                    s_backend, wall)) {
         freeze_dump_unlock();
         return 0;
     }
@@ -663,7 +666,12 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     fputs("}\n", f);
     int written = !ferror(f);
     if (fclose(f) != 0) written = 0;
-    if (!written) (void)remove(path);
+    if (!written) {
+        (void)remove(path);
+    } else {
+        /* The just-closed dump participates, preserving newest evidence. */
+        (void)freeze_artifacts_prune(artifact_dir, artifact_keep);
+    }
     freeze_dump_unlock();
     return written;
 }
