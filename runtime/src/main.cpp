@@ -2155,7 +2155,7 @@ int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
 extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
-int      g_turbo_audio_sink_enabled = 0;
+int      g_turbo_audio_sink_enabled = g_turbo_audio_sink_config_enabled;
 int      g_turbo_audio_sink_active = 0;
 uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued */
 }
@@ -2977,6 +2977,58 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
             break;
         default:
             break;
+    }
+}
+
+/* Apply the plan that mod_runtime_commit* just resolved. This must run after
+ * both the initial launcher and a lobby rematch: committing a new plan does
+ * not invoke activation callbacks, and stale per-session overrides otherwise
+ * survive the jump back to session_reboot. */
+static void activate_committed_mod_plan(int *player_mode,
+                                        bool netplay_enabled,
+                                        bool turbo_loads_offered) {
+    g_mod_controller_mode_override.fill(-1);
+    for (auto& policy : g_mod_controller_policy)
+        policy = ModControllerPresentationPolicy{};
+    g_mod_load_wall_multiplier = -1;
+    g_mod_load_release_frames = -1;
+    g_mod_disc_speed_divisor = -1;
+    g_mod_disc_instant_rate = -1;
+    g_turbo_audio_sink_enabled = g_turbo_audio_sink_config_enabled;
+    psx_ram_reset_size_request();
+    g_turbo_load_wall_multiplier = 0;
+    g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
+    if (!turbo_loads_offered)
+        g_turbo_loads_enabled = 0;
+    g_frame_interpolation_blend = g_frame_interpolation_blend_default;
+
+    mod_runtime_activate_plugins();
+    apply_netplay_local_viewport_aspect(netplay_enabled);
+
+    for (int i = 0; i < PSX_MAX_PLAYERS; ++i) {
+        if (g_mod_controller_mode_override[i] >= 0)
+            player_mode[i] = g_mod_controller_mode_override[i];
+    }
+    if (g_mod_load_wall_multiplier < 0)
+        return;
+
+    g_turbo_loads_enabled = 1;
+    g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
+    g_turbo_load_release_frames = g_mod_load_release_frames;
+    /* Fast Loading advances the guest at a host rate greater than real time.
+     * Keep canonical SPU/CD state running, but discard accelerated
+     * presentation audio until pacing resumes. */
+    g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
+    if (g_turbo_load_wall_multiplier) {
+        std::fprintf(stdout,
+            "psxrecomp: mod selected %dx load acceleration "
+            "(%d release frames)\n",
+            g_turbo_load_wall_multiplier, g_turbo_load_release_frames);
+    } else {
+        std::fprintf(stdout,
+            "psxrecomp: mod selected uncapped load acceleration "
+            "(%d release frames)\n",
+            g_turbo_load_release_frames);
     }
 }
 
@@ -13385,50 +13437,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    /* Activation callbacks are re-run after every launcher session. Clear
-     * game-owned controller overrides/policies first so disabling a package
-     * cannot leave its prior state latched across a soft return. */
-    g_mod_controller_mode_override.fill(-1);
-    for (auto& policy : g_mod_controller_policy)
-        policy = ModControllerPresentationPolicy{};
-    g_mod_load_wall_multiplier = -1;
-    g_mod_load_release_frames = -1;
-    g_mod_disc_speed_divisor = -1;
-    g_mod_disc_instant_rate = -1;
-    g_turbo_audio_sink_enabled = g_turbo_audio_sink_config_enabled;
-    psx_ram_reset_size_request();
-    g_turbo_load_wall_multiplier = 0;
-    g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
-    if (!turbo_loads_offered)
-        g_turbo_loads_enabled = 0;
-    g_frame_interpolation_blend = g_frame_interpolation_blend_default;
-    mod_runtime_activate_plugins();
-    apply_netplay_local_viewport_aspect(net_cfg.enabled);
-    for (int i = 0; i < PSX_MAX_PLAYERS; ++i) {
-        if (g_mod_controller_mode_override[i] >= 0)
-            player_mode[i] = g_mod_controller_mode_override[i];
-    }
-    if (g_mod_load_wall_multiplier >= 0) {
-        g_turbo_loads_enabled = 1;
-        g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
-        g_turbo_load_release_frames = g_mod_load_release_frames;
-        /* Fast Loading advances the guest at a host rate greater than real
-         * time. Keep the canonical SPU/CD stream running, but discard the
-         * accelerated presentation-side audio until pacing resumes; otherwise
-         * the SDL bridge overflows and the load becomes observably unstable. */
-        g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
-        if (g_turbo_load_wall_multiplier) {
-            std::fprintf(stdout,
-                "psxrecomp: mod selected %dx load acceleration "
-                "(%d release frames)\n",
-                g_turbo_load_wall_multiplier, g_turbo_load_release_frames);
-        } else {
-            std::fprintf(stdout,
-                "psxrecomp: mod selected uncapped load acceleration "
-                "(%d release frames)\n",
-                g_turbo_load_release_frames);
-        }
-    }
+    activate_committed_mod_plan(player_mode, net_cfg.enabled,
+                                turbo_loads_offered);
 
     /* Re-apply the resolved language to the translation layer. text_xlate_init
      * (at config load) only saw the game.toml default; this folds in the
@@ -15350,7 +15360,8 @@ soft_return_lobby:
                     return 1;
                 }
             }
-            apply_netplay_local_viewport_aspect(net_cfg.enabled);
+            activate_committed_mod_plan(player_mode, net_cfg.enabled,
+                                        turbo_loads_offered);
             std::printf("psxrecomp: rematch from lobby (netplay=%d)\n",
                         net_cfg.enabled ? 1 : 0);
             std::fflush(stdout);

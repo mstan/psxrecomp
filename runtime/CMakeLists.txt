@@ -604,6 +604,9 @@ if(BUILD_TESTING)
         add_test(NAME pgxp_destructive_write_coverage_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_destructive_write_coverage.py)
+        add_test(NAME mod_activation_lifecycle_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_activation_lifecycle.py)
         add_test(NAME savestate_status_protocol_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_savestate_status_protocol.py)
