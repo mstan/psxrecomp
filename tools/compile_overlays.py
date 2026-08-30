@@ -5372,6 +5372,29 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
     return True
 
 
+@contextmanager
+def _quiet_windows_loader_errors():
+    """Prevent invalid cache shards from opening interactive system dialogs."""
+    if os.name != 'nt':
+        yield
+        return
+
+    import ctypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    set_thread_error_mode = kernel32.SetThreadErrorMode
+    set_thread_error_mode.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+    set_thread_error_mode.restype = ctypes.c_bool
+    previous = ctypes.c_uint()
+    # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX. Thread scope avoids
+    # changing loader behavior for other work running in this Python process.
+    changed = set_thread_error_mode(0x0001 | 0x8000, ctypes.byref(previous))
+    try:
+        yield
+    finally:
+        if changed:
+            set_thread_error_mode(previous.value, None)
+
+
 def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
     """Read overlay_abi from one loaded image, then release it immediately."""
     import _ctypes
@@ -5381,7 +5404,8 @@ def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
         # Shards are generated as ordinary C (cdecl). ctypes.WinDLL selects
         # stdcall and can corrupt a 32-bit Windows caller's stack; CDLL is the
         # correct loader on every supported host (x64 merely masks the error).
-        library = ctypes.CDLL(dll_path)
+        with _quiet_windows_loader_errors():
+            library = ctypes.CDLL(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -5404,7 +5428,8 @@ def _dll_pair_id_matches(dll_path: str, expected_pair_id: int) -> bool:
     import ctypes
     library = None
     try:
-        library = ctypes.CDLL(dll_path)
+        with _quiet_windows_loader_errors():
+            library = ctypes.CDLL(dll_path)
         pair_fn = library.overlay_pair_id
         pair_fn.argtypes = []
         pair_fn.restype = ctypes.c_uint64
@@ -5429,7 +5454,8 @@ def _dll_runtime_exports_match(dll_path: str, expected_abi: int | None,
     import ctypes
     library = None
     try:
-        library = ctypes.CDLL(dll_path)
+        with _quiet_windows_loader_errors():
+            library = ctypes.CDLL(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
