@@ -55,7 +55,9 @@ typedef enum {
 
 static Gp0State gp0_state;
 static uint64_t gp0_write_count;
+#ifndef PSX_NO_DEBUG_TOOLS
 static uint64_t gp0_nop_count, gp0_fill_count, gp0_draw_count, gp0_env_count, gp0_copy_count;
+#endif
 static uint32_t gp0_cmd_buf[16];   /* max fixed-length command is 12 words */
 static int      gp0_words_collected;
 static int      gp0_words_needed;
@@ -5259,25 +5261,31 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
     }
 }
 
-/* Per-opcode execution counters (exposed via gpu_get_opcode_stats) */
+/* Per-opcode execution counters (exposed via gpu_get_opcode_stats). Play
+ * builds have no consumer for these counters, so do not pay their per-command
+ * write or retain their storage there. */
+#ifndef PSX_NO_DEBUG_TOOLS
 static uint32_t gp0_opcode_count[256];
 
 uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
+#else
+uint32_t gpu_get_opcode_count(uint8_t op) { (void)op; return 0; }
+#endif
 
-/* ---- Per-frame GP0 command ring (always-on, queried via debug server) ---- */
-/* We record every GP0 command (header + up to 6 payload words) with the
+/* ---- Per-frame GP0 command ring (debug-tools builds only) --------------- */
+/* We record every GP0 command (header + up to 11 payload words) with the
  * frame number it was issued in. Per CLAUDE.md ring-buffer rule: capture
  * is continuous and observers query a window of interest later, not arm-
- * then-record. ~34 MB at 1M entries. Polyline / long commands get the
- * first 6 payload words; that's enough for the header + first vertex pair
+ * then-record. ~104 MiB at 1,048,576 entries. Polyline / long commands get the
+ * first 11 payload words; that's enough for every fixed-length GP0 command
  * + first uv/color word for diagnosing per-primitive state. */
 
-extern uint64_t s_frame_count;  /* defined in debug_server.c */
+#ifndef PSX_NO_DEBUG_TOOLS
 extern uint32_t g_debug_last_store_pc;  /* defined in debug_server.c */
 extern uint32_t g_debug_current_func_addr;  /* defined in debug_server.c */
 uint32_t debug_guest_ra(void);  /* accessor in debug_server.c (guest $ra) */
 uint32_t debug_guest_sp(void);  /* accessor in debug_server.c (guest $sp) */
-extern uint8_t *memory_get_ram_ptr(void); /* raw 2MB main-RAM base (no lockstep) */
+extern uint8_t *memory_get_ram_ptr(void); /* raw main-RAM backing (no lockstep) */
 
 /* Bounded guest-stack unwind for VRAM-copy builder attribution. Scans the live
  * stack for words that are valid return addresses (main-RAM code range, and the
@@ -5348,11 +5356,6 @@ static void gp0_ring_record(const uint32_t *words, int n) {
 /* Public accessors for debug_server.c */
 uint64_t gpu_gp0_ring_total(void)    { return gp0_ring_seq; }
 uint32_t gpu_gp0_ring_capacity(void) { return GP0_RING_CAP; }
-uint32_t gpu_gp0_ring_max_words(void){ return GPU_GP0_RING_MAX_WORDS; }
-
-void gpu_set_gp0_source(uint32_t addr) {
-    gp0_next_source_addr = addr;
-}
 
 /* Fill `out[0..max_out-1]` with entries from the requested frame; returns
  * count. Walks from oldest in-buffer to newest so iteration order matches
@@ -5383,6 +5386,31 @@ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
     uint32_t newest_idx = (start + avail - 1) % GP0_RING_CAP;
     if (out_oldest) *out_oldest = gp0_ring[start].frame;
     if (out_newest) *out_newest = gp0_ring[newest_idx].frame;
+}
+#else
+uint64_t gpu_gp0_ring_total(void) { return 0; }
+uint32_t gpu_gp0_ring_capacity(void) { return 0; }
+
+int gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out) {
+    (void)frame;
+    (void)out;
+    (void)max_out;
+    return 0;
+}
+
+void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
+    if (out_oldest) *out_oldest = 0;
+    if (out_newest) *out_newest = 0;
+}
+#endif
+
+/* This is a wire-protocol/type constant, not retained diagnostic state. */
+uint32_t gpu_gp0_ring_max_words(void) { return GPU_GP0_RING_MAX_WORDS; }
+
+/* Source provenance remains functional in play builds: widescreen and PGXP
+ * decisions consume gp0_cmd_source_addr independently of the debug ring. */
+void gpu_set_gp0_source(uint32_t addr) {
+    gp0_next_source_addr = addr;
 }
 
 /* ---- Draw census ring (ALWAYS-ON) -----------------------------------------
@@ -5515,8 +5543,10 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
 /* Execute a fully-collected GP0 command */
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
+#ifndef PSX_NO_DEBUG_TOOLS
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
+#endif
     extern void ws_bg_phase_note(uint32_t op);
     ws_bg_phase_note(opcode);   /* native-wide 2D-backdrop stretch: background-phase latch */
 
@@ -5529,11 +5559,13 @@ static void gp0_execute_command(void) {
     }
 
     /* Categorize for diagnostics */
+#ifndef PSX_NO_DEBUG_TOOLS
     if (opcode <= 0x01) gp0_nop_count++;
     else if (opcode == 0x02) gp0_fill_count++;
     else if (opcode >= 0x20 && opcode <= 0x7F) gp0_draw_count++;
     else if (opcode >= 0x80 && opcode <= 0xDF) gp0_copy_count++;
     else if (opcode >= 0xE1 && opcode <= 0xE6) gp0_env_count++;
+#endif
 
     switch (opcode) {
         case 0x00:
@@ -5728,8 +5760,16 @@ static void gp0_execute_command(void) {
 uint64_t gpu_get_gp0_count(void) { return gp0_write_count; }
 
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy) {
+#ifndef PSX_NO_DEBUG_TOOLS
     *nop = gp0_nop_count; *fill = gp0_fill_count;
     *draw = gp0_draw_count; *env = gp0_env_count; *copy = gp0_copy_count;
+#else
+    if (nop) *nop = 0;
+    if (fill) *fill = 0;
+    if (draw) *draw = 0;
+    if (env) *env = 0;
+    if (copy) *copy = 0;
+#endif
 }
 
 void gpu_get_draw_area(GpuDrawArea* out) {
@@ -5904,12 +5944,16 @@ static void gpu_write_gp0_body(uint32_t val) {
         polyline_has_prev = 0;
         gr_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
         gp0_state = shaded ? GP0_POLYLINE_SHADED : GP0_POLYLINE_MONO;
+#ifndef PSX_NO_DEBUG_TOOLS
         gp0_draw_count++;
+#endif
         /* Record polyline header (variable-length body not captured;
          * just enough so per-frame stream shows the polyline existed). */
+#ifndef PSX_NO_DEBUG_TOOLS
         gp0_opcode_count[opcode]++;
         uint32_t hdr_only[1] = { val };
         gp0_ring_record(hdr_only, 1);
+#endif
         return;
     }
 
