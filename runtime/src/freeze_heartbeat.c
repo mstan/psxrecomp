@@ -1,6 +1,7 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "freeze_heartbeat.h"
+#include "freeze_artifacts.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -480,9 +481,15 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         return;
 #endif
 
-    char path[128];
-    snprintf(path, sizeof(path),
-             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
+    char artifact_dir[1024];
+    char path[1200];
+    unsigned artifact_keep;
+    freeze_artifacts_config(artifact_dir, sizeof(artifact_dir), &artifact_keep);
+    if (!freeze_artifacts_dump_path(path, sizeof(path), artifact_dir,
+                                    s_backend, wall)) {
+        freeze_dump_unlock();
+        return;
+    }
 
     FILE *f = fopen(path, "wb");
     if (!f) { freeze_dump_unlock(); return; }
@@ -658,6 +665,9 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
     fputs("}\n", f);
     fclose(f);
+    /* Best-effort bounded retention. The just-closed dump participates in the
+     * ordering, so the newest evidence is preserved even after long soaks. */
+    (void)freeze_artifacts_prune(artifact_dir, artifact_keep);
     freeze_dump_unlock();
 }
 
