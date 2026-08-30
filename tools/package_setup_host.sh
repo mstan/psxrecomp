@@ -87,14 +87,6 @@ if [[ -z "${DISPLAY_NAME}" ]]; then
 fi
 
 ROOT="$(cd "${ROOT}" && pwd)"
-if [[ -d "${ROOT}/${BUILD_DIR}" ]]; then
-  BUILD_DIR="$(cd "${ROOT}/${BUILD_DIR}" && pwd)"
-elif [[ -d "${BUILD_DIR}" ]]; then
-  BUILD_DIR="$(cd "${BUILD_DIR}" && pwd)"
-else
-  echo "error: build dir not found: ${BUILD_DIR}" >&2
-  exit 1
-fi
 
 # Defaults for a typical title if caller passed none.
 # Codegen host sources live in psxrecomp/host/ (copied with the framework tree).
@@ -110,6 +102,130 @@ if [[ ${#PROJECT_FILES[@]} -eq 0 && ${#PROJECT_DIRS[@]} -eq 0 ]]; then
       PROJECT_FILES+=("${f}")
     fi
   done
+fi
+
+validate_slug() {
+  local label="$1" value="$2"
+  if [[ -z "${value}" || "${value}" == "." || "${value}" == ".." ||
+        "${value}" == *'.' || ! "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "error: ${label} must be a path-free slug: '${value}'" >&2
+    exit 2
+  fi
+  local stem="${value%%.*}"
+  stem="${stem,,}"
+  case "${stem}" in
+    aux|con|nul|prn|com[1-9]|lpt[1-9])
+      echo "error: ${label} must not use a Windows device name: '${value}'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_project_relpath() {
+  local rel="$1" label="$2"
+  if [[ -z "${rel}" || "${rel}" == /* || "${rel}" == \\* ||
+        "${rel}" == *:* || "${rel}" == *\\* ]]; then
+    echo "error: ${label} must be a project-relative path: '${rel}'" >&2
+    exit 2
+  fi
+  local component component_stem
+  local -a components
+  IFS='/' read -r -a components <<<"${rel}"
+  for component in "${components[@]}"; do
+    if [[ -z "${component}" || "${component}" == "." || "${component}" == ".." ||
+          "${component}" =~ [[:cntrl:]] || "${component}" == *[[:space:]] ||
+          "${component}" == *'.' ]]; then
+      echo "error: ${label} has an unsafe path component: '${rel}'" >&2
+      exit 2
+    fi
+    component_stem="${component%%.*}"
+    component_stem="${component_stem,,}"
+    case "${component_stem}" in
+      aux|con|nul|prn|com[1-9]|lpt[1-9])
+        echo "error: ${label} has a Windows device path component: '${rel}'" >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+validate_slug "--artifact" "${ARTIFACT}"
+validate_slug "--zip-prefix" "${ZIP_PREFIX}"
+for f in "${PROJECT_FILES[@]}"; do
+  validate_project_relpath "${f}" "--project-file"
+done
+for d in "${PROJECT_DIRS[@]}"; do
+  validate_project_relpath "${d}" "--project-dir"
+done
+
+ROOT_IS_GIT=0
+if git -C "${ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ROOT_TOP="$(git -C "${ROOT}" rev-parse --show-toplevel)"
+  ROOT_TOP="$(cd "${ROOT_TOP}" && pwd)"
+  if [[ "${ROOT_TOP}" != "${ROOT}" ]]; then
+    echo "error: --root must be the Git worktree root: ${ROOT}" >&2
+    exit 1
+  fi
+  ROOT_IS_GIT=1
+elif [[ -e "${ROOT}/.git" || -L "${ROOT}/.git" ]]; then
+  echo "error: cannot inspect Git metadata for project root ${ROOT}" >&2
+  exit 1
+fi
+
+if [[ "${ROOT_IS_GIT}" -eq 1 ]]; then
+  PROJECT_PATHS=("${PROJECT_FILES[@]}" "${PROJECT_DIRS[@]}")
+  CLEAN_PROJECT_PATHS=("${PROJECT_DIRS[@]}")
+  for f in "${PROJECT_FILES[@]}"; do
+    # Release jobs intentionally stamp VERSION before the build. Its content is
+    # checked against the baked binary stamp below; every other input is clean.
+    if [[ "${f}" != "VERSION" ]]; then
+      CLEAN_PROJECT_PATHS+=("${f}")
+    fi
+  done
+  if [[ ${#CLEAN_PROJECT_PATHS[@]} -gt 0 ]]; then
+    if ! git -C "${ROOT}" diff --quiet -- "${CLEAN_PROJECT_PATHS[@]}" ||
+       ! git -C "${ROOT}" diff --cached --quiet -- "${CLEAN_PROJECT_PATHS[@]}"; then
+      echo "error: refusing to package dirty or untracked title rebuild inputs" >&2
+      exit 1
+    fi
+  fi
+  if [[ ${#PROJECT_PATHS[@]} -gt 0 ]]; then
+    PROJECT_UNTRACKED="$(git -C "${ROOT}" ls-files --others --exclude-standard -- "${PROJECT_PATHS[@]}")"
+    if [[ -n "${PROJECT_UNTRACKED}" ]]; then
+      echo "error: refusing to package dirty or untracked title rebuild inputs" >&2
+      printf '%s\n' "${PROJECT_UNTRACKED}" >&2
+      exit 1
+    fi
+  fi
+  for f in "${PROJECT_FILES[@]}"; do
+    if [[ ! -f "${ROOT}/${f}" && ! -L "${ROOT}/${f}" ]]; then
+      echo "error: title rebuild file is missing or is not a file: ${f}" >&2
+      exit 1
+    elif ! git -C "${ROOT}" ls-files --error-unmatch -- "${f}" >/dev/null 2>&1; then
+      echo "error: title rebuild file is not tracked: ${f}" >&2
+      exit 1
+    fi
+  done
+  for d in "${PROJECT_DIRS[@]}"; do
+    if [[ ! -d "${ROOT}/${d}" ]]; then
+      echo "error: title rebuild directory is missing or is not a directory: ${d}" >&2
+      exit 1
+    fi
+    TRACKED_IN_DIR="$(git -C "${ROOT}" ls-files -- "${d}")"
+    if [[ -z "${TRACKED_IN_DIR}" ]]; then
+      echo "error: title rebuild directory has no tracked files: ${d}" >&2
+      exit 1
+    fi
+  done
+fi
+
+if [[ -d "${ROOT}/${BUILD_DIR}" ]]; then
+  BUILD_DIR="$(cd "${ROOT}/${BUILD_DIR}" && pwd)"
+elif [[ -d "${BUILD_DIR}" ]]; then
+  BUILD_DIR="$(cd "${BUILD_DIR}" && pwd)"
+else
+  echo "error: build dir not found: ${BUILD_DIR}" >&2
+  exit 1
 fi
 
 # Resolve *requested* version from env / VERSION file (may be empty until stamp).
@@ -131,9 +247,6 @@ REQUESTED="${REQUESTED#v}"
 
 DIST="${ROOT}/dist"
 STAGE="${DIST}/stage-setup-${ARTIFACT}"
-
-rm -rf "${STAGE}"
-mkdir -p "${STAGE}" "${DIST}"
 
 EXE=""
 for cand in \
@@ -186,8 +299,19 @@ if [[ -n "${REQUESTED}" && "${REQUESTED}" != "${BUILT}" ]]; then
   exit 1
 fi
 VERSION="${BUILT}"
-printf '%s\n' "${VERSION}" >"${ROOT}/VERSION"
+validate_slug "release version" "${VERSION}"
+for f in "${PROJECT_FILES[@]}"; do
+  if [[ "${f}" == "VERSION" ]]; then
+    SOURCE_VERSION="$(normalize_ver "$(cat "${ROOT}/VERSION")")"
+    if [[ "${SOURCE_VERSION}" != "${VERSION}" ]]; then
+      echo "error: source VERSION=${SOURCE_VERSION} but binary stamp=${VERSION}" >&2
+      exit 1
+    fi
+  fi
+done
 ZIP_NAME="${ZIP_PREFIX}-${VERSION}-${ARTIFACT}.zip"
+rm -rf "${STAGE}"
+mkdir -p "${STAGE}" "${DIST}"
 rm -f "${DIST}/${ZIP_NAME}"
 
 cp -a "${EXE}" "${STAGE}/"
@@ -267,12 +391,28 @@ copy_proj() {
   fi
 }
 
-for f in "${PROJECT_FILES[@]}"; do
-  copy_proj "${f}"
-done
-for d in "${PROJECT_DIRS[@]}"; do
-  copy_proj "${d}"
-done
+if [[ "${ROOT_IS_GIT}" -eq 1 ]]; then
+  TRACKED_PROJECT_INPUTS="$(mktemp)"
+  git -C "${ROOT}" ls-files -z -- "${PROJECT_FILES[@]}" "${PROJECT_DIRS[@]}" \
+    >"${TRACKED_PROJECT_INPUTS}"
+  while IFS= read -r -d '' rel; do
+    if [[ ! -e "${ROOT}/${rel}" && ! -L "${ROOT}/${rel}" ]]; then
+      echo "error: tracked title rebuild input disappeared: ${rel}" >&2
+      rm -f "${TRACKED_PROJECT_INPUTS}"
+      exit 1
+    fi
+    mkdir -p "$(dirname "${STAGE}/${rel}")"
+    cp -a "${ROOT}/${rel}" "${STAGE}/${rel}"
+  done <"${TRACKED_PROJECT_INPUTS}"
+  rm -f "${TRACKED_PROJECT_INPUTS}"
+else
+  for f in "${PROJECT_FILES[@]}"; do
+    copy_proj "${f}"
+  done
+  for d in "${PROJECT_DIRS[@]}"; do
+    copy_proj "${d}"
+  done
+fi
 
 copy_tree_filtered() {
   local src="$1" dest="$2"
@@ -303,6 +443,10 @@ copy_tree_filtered() {
     fi
     rm -f "${tracked}"
     return
+  fi
+  if [[ -e "${src}/.git" || -L "${src}/.git" ]]; then
+    echo "error: cannot inspect Git metadata for framework tree ${src}" >&2
+    exit 1
   fi
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "$@" "${src}/" "${dest}/"
