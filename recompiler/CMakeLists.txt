@@ -146,6 +146,7 @@ set(_baked_hash_hdr ${CMAKE_CURRENT_BINARY_DIR}/psxrecomp_baked_codegen_hash.h)
 add_custom_command(
     OUTPUT  ${_baked_hash_hdr}
     COMMAND ${CMAKE_COMMAND} -DOUT=${_baked_hash_hdr}
+            -DROOT=${PSXRECOMP_CODEGEN_HASH_ROOT}
             "-DSRCS=${PSXRECOMP_CODEGEN_HASH_SRCS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/hash_codegen.cmake
     DEPENDS ${PSXRECOMP_CODEGEN_HASH_SRCS}

@@ -1058,7 +1058,8 @@ function(psxrecomp_add_runtime_target target)
         set(_codegen_srcs ${PSXRECOMP_CODEGEN_HASH_SRCS})
         add_custom_command(
             OUTPUT  ${_codegen_hash_hdr}
-            COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} "-DSRCS=${_codegen_srcs}"
+            COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} -DROOT=${PSXRECOMP_ROOT}
+                    "-DSRCS=${_codegen_srcs}"
                     -P ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
             DEPENDS ${_codegen_srcs} ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
             COMMENT "Hashing recompiler codegen -> overlay_codegen_hash.h"
