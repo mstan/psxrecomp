@@ -576,6 +576,14 @@ if(BUILD_TESTING)
         add_test(NAME mod_bezel_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_bezel.py)
+        foreach(_gp0_diag_mode IN ITEMS debug release)
+            add_test(NAME gpu_gp0_diag_${_gp0_diag_mode}_config_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_gp0_diag_config.py
+                             --compiler ${CMAKE_C_COMPILER}
+                             --mode ${_gp0_diag_mode}
+                             --runtime ${CMAKE_CURRENT_SOURCE_DIR})
+        endforeach()
         add_test(NAME rewind_toggle_combo_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rewind_toggle_combo.py)
