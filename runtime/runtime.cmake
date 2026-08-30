@@ -10,6 +10,7 @@ endif()
 
 include("${PSXRECOMP_ROOT}/cmake/psx_dependency_archive.cmake")
 include("${PSXRECOMP_ROOT}/runtime/chd_dependency.cmake")
+include("${PSXRECOMP_ROOT}/runtime/debug_tools.cmake")
 
 # Default to an optimized build. The recompiled game is a huge (~270 MB) block of
 # generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
@@ -69,17 +70,6 @@ if(NOT DEFINED CMAKE_C_COMPILER_LAUNCHER)
                        "branch ops will be slow. Install ccache on PATH (or update "
                        "cmake-clang-v1) to fix.")
     endif()
-endif()
-
-# PSX_DEBUG_TOOLS: TCP debug server + heartbeat + per-block recording.
-# Defaults ON for Debug/RelWithDebInfo, OFF for Release/MinSizeRel so
-# a plain cmake -DCMAKE_BUILD_TYPE=Release gives a lean production binary
-# with no TCP server and no debug console. Override explicitly with
-# -DPSX_DEBUG_TOOLS=ON/OFF to force either way regardless of build type.
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" OFF)
-else()
-    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
 # PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
@@ -1483,11 +1473,9 @@ function(psxrecomp_add_runtime_target target)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_EXTRA_DISPATCH=1)
     endif()
 
-    # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's
-    # also visible to psx-beetle / non-runtime-helper targets.
-    if(NOT PSX_DEBUG_TOOLS)
-        target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
-    endif()
+    # AUTO is configuration-aware in Visual Studio/Xcode/Ninja Multi-Config;
+    # explicit ON/OFF remains a tree-wide override.
+    psxrecomp_apply_debug_tools(${target})
 
     if(PSXRECOMP_HAS_RECOMP_NET)
         target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_NET=1)
