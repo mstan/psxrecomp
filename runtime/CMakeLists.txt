@@ -615,6 +615,12 @@ if(BUILD_TESTING)
         add_test(NAME perf_round3_guards_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perf_round3_guards.py)
+        add_test(NAME gl_release_diag_guards_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_release_diag_guards.py)
+        add_test(NAME hash_codegen_contract_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hash_codegen.py)
         add_test(NAME pgxp_destructive_write_coverage_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_destructive_write_coverage.py)

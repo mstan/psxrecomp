@@ -178,6 +178,7 @@ typedef void   (APIENTRY *PFN_glDeleteRenderbuffers)(GLsizei, const GLuint *);
 typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
 typedef void   (APIENTRY *PFN_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+#ifndef PSX_NO_DEBUG_TOOLS
 /* GPU timer queries (ARB_timer_query / core GL 3.3) — frame_perf instrumentation. */
 typedef void   (APIENTRY *PFN_glGenQueries)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glDeleteQueries)(GLsizei, const GLuint *);
@@ -197,6 +198,7 @@ typedef void   (APIENTRY *PFN_glQueryCounter)(GLuint, GLenum);
 #endif
 #ifndef GL_QUERY_RESULT_AVAILABLE
 #define GL_QUERY_RESULT_AVAILABLE  0x8867
+#endif
 #endif
 
 static PFN_glCreateShader      p_glCreateShader;
@@ -237,6 +239,7 @@ static PFN_glBindFramebuffer   p_glBindFramebuffer;
 static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
 static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
 static PFN_glBlitFramebuffer   p_glBlitFramebuffer;
+#ifndef PSX_NO_DEBUG_TOOLS
 static PFN_glGenQueries          p_glGenQueries;
 static PFN_glDeleteQueries       p_glDeleteQueries;
 static PFN_glBeginQuery          p_glBeginQuery;
@@ -244,6 +247,7 @@ static PFN_glEndQuery            p_glEndQuery;
 static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
 static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
 static PFN_glQueryCounter        p_glQueryCounter;
+#endif
 static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
 static void gl_perf_mirror_begin(void); /* frame_perf: GPU-time bracket around ONE native-wide */
 static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits scene canonical/mirror) */
@@ -294,6 +298,12 @@ static int load_modern_gl(void) {
     LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
     LOAD(p_glRenderbufferStorage, "glRenderbufferStorage");
     LOAD(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer");
+    /* Optional: PBO map for the async rewind VRAM readback. Absent ⇒
+     * gl_renderer_vram_readback_begin() returns 0 and rewind keeps the
+     * synchronous ensure_cpu path. */
+    p_glMapBufferRange = (void *)SDL_GL_GetProcAddress("glMapBufferRange");
+    p_glUnmapBuffer    = (void *)SDL_GL_GetProcAddress("glUnmapBuffer");
+#ifndef PSX_NO_DEBUG_TOOLS
     /* GPU timer queries — optional (frame_perf). Don't fail the renderer if
      * absent; gl_perf just stays disabled. */
     p_glGenQueries          = (void *)SDL_GL_GetProcAddress("glGenQueries");
@@ -303,6 +313,7 @@ static int load_modern_gl(void) {
     p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
     p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
     p_glQueryCounter        = (void *)SDL_GL_GetProcAddress("glQueryCounter");
+#endif
 #undef LOAD
     return ok;
 }
@@ -493,6 +504,7 @@ static int s_tb_gate = 0;
  * could not be given one depth state. */
 static int s_tb_depth = 0;
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
+#ifndef PSX_NO_DEBUG_TOOLS
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
 static int s_bdg_applied = 0, s_bdg_prims = 0, s_bdg_clearx = -999999;
@@ -502,6 +514,7 @@ typedef struct { short x0, x1, y0, y1; unsigned char tex; } PrimRec;
 #define PTRACE_CAP 200
 static PrimRec s_ptrace[PTRACE_CAP]; static int s_ptrace_n = 0;
 PrimRec g_ptrace[PTRACE_CAP]; int g_ptrace_n = 0;   /* snapshot (extern) */
+#endif
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
 static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
@@ -689,7 +702,7 @@ static void up_add_transfer(int x, int y, int w, int h) {
     if (w2 && h2) up_add(0, 0, w2 - 1, h2 - 1);
 }
 
-/* ---- coherency event ring (always-on, debug server "gl_coh_ring") -------- */
+/* ---- coherency event ring (diagnostics builds, debug server "gl_coh_ring") */
 /* Every coherency-relevant operation — upload flushes, fills, copies, draw
  * bboxes, packs, full readbacks, presents, and probe perturbations — is
  * recorded with its rect and frame number. Per CLAUDE.md ring-buffer rule:
@@ -697,11 +710,12 @@ static void up_add_transfer(int x, int y, int w, int h) {
  * attribution convention: an op that flushes internally (fill/copy/draw/
  * present/peek) records its own event AFTER the FLUSH event it caused, so
  * the event following a FLUSH names the trigger. 16 B * 64 Ki = 1 MB. */
-extern uint64_t s_frame_count;  /* defined in debug_server.c */
-
 #define GL_COH_RING_CAP (1u << 16)
+extern uint64_t s_frame_count;  /* defined in debug_server.c */
+#ifndef PSX_NO_DEBUG_TOOLS
 static GlCohEvent s_coh_ring[GL_COH_RING_CAP];
 static uint64_t   s_coh_seq = 0;
+#endif
 
 /* 16x16 native-pixel tiles changed since their last on-screen present. This
  * lets a double-buffered 30 Hz game avoid swapping the unchanged front buffer
@@ -864,23 +878,37 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int lx, int ly, int lw, int lh, int v_flip);
 
 static void coh_record(int kind, int x0, int y0, int x1, int y1) {
+#ifndef PSX_NO_DEBUG_TOOLS
     GlCohEvent *e = &s_coh_ring[s_coh_seq % GL_COH_RING_CAP];
     e->frame = (uint32_t)s_frame_count;
     e->kind  = (uint8_t)kind;
     e->x0 = (int16_t)x0; e->y0 = (int16_t)y0;
     e->x1 = (int16_t)x1; e->y1 = (int16_t)y1;
     s_coh_seq++;
+#endif
     if (kind == GL_COH_FLUSH || kind == GL_COH_FILL ||
         kind == GL_COH_COPY || kind == GL_COH_DRAW)
         present_dirty_rect(x0, y0, x1, y1, 1);
 }
 
-uint64_t gl_renderer_coh_total(void) { return s_coh_seq; }
+uint64_t gl_renderer_coh_total(void) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    return 0;
+#else
+    return s_coh_seq;
+#endif
+}
 int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)seq;
+    (void)out;
+    return 0;
+#else
     if (seq >= s_coh_seq) return 0;
     if (s_coh_seq - seq > GL_COH_RING_CAP) return 0;  /* evicted */
     *out = s_coh_ring[seq % GL_COH_RING_CAP];
     return 1;
+#endif
 }
 
 /* ---- present ring (always-on, debug server "present_ring") --------------- */
@@ -1803,11 +1831,15 @@ static void ensure_cpu(void) {
 
 /* ---- GPU primitives ------------------------------------------------------ */
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static uint64_t s_scene_prims = 0;     /* frame_perf: scene primitives submitted (pre double-draw) */
 static uint64_t s_scene_prims_tex = 0; /* frame_perf: of which textured (vs flat geometry)         */
+#endif
 static void flush_tex_batch(void);     /* fwd: drained at the backdrop-phase boundary below */
 static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
+#ifndef PSX_NO_DEBUG_TOOLS
     s_scene_prims++;
+#endif
     int x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
     for (int i = 1; i < n; i++) {
         if (xs[i] < x0) x0 = xs[i]; if (xs[i] > x1) x1 = xs[i];
@@ -1818,12 +1850,16 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
      * each max edge than the integer bbox covers. Widen before clipping so the
      * pack/readback dirty rect never trails the drawn area. */
     if (s_pc_valid) { x1 += 1; y1 += 1; }
+#ifndef PSX_NO_DEBUG_TOOLS
     s_bdg_prims++;   /* dbg: prims seen this frame (gate is now per-prim, see bd_prim_gate) */
     if (s_ptrace_n < PTRACE_CAP) {
         PrimRec *p = &s_ptrace[s_ptrace_n++];
         p->x0 = (short)x0; p->x1 = (short)x1; p->y0 = (short)y0; p->y1 = (short)y1;
         p->tex = (unsigned char)textured;
     }
+#else
+    (void)textured;
+#endif
     if (x0 < s_area_x1) x0 = s_area_x1;
     if (y0 < s_area_y1) y0 = s_area_y1;
     if (x1 > s_area_x2) x1 = s_area_x2;
@@ -1968,7 +2004,9 @@ static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
             center = (float)g_wide_cur_base + (float)native_w / 2.0f;
         }
     }
+#ifndef PSX_NO_DEBUG_TOOLS
     if (scale != 1.0f) s_bdg_applied++;
+#endif
     p_glUniform1f(uScale, scale);
     p_glUniform1f(uCenter, center);
 }
@@ -1993,11 +2031,17 @@ static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
+#ifndef PSX_NO_DEBUG_TOOLS
 static uint64_t s_batch_total = 0, s_batch_reason[7];
+#endif
 
 void gl_renderer_batch_diag(uint64_t out[8]) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    for (int i = 0; i < 8; i++) out[i] = 0;
+#else
     out[0] = s_batch_total;
     for (int i = 0; i < 7; i++) out[i + 1] = s_batch_reason[i];
+#endif
 }
 
 /* Draw the queued textured batch with correct PSX mask-bit handling AND correct
@@ -2096,6 +2140,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
  * cost surfaces INSIDE our gl* calls) + counters for the wide plumbing, so a
  * CPU-bound wide frame (emu_cpu >> scene_gpu) can be attributed without a
  * sampling profiler. Reset at present enter; reported by frame_perf. */
+#ifndef PSX_NO_DEBUG_TOOLS
 static double cw_ms(void) {
     static double freq = 0.0;
     if (freq == 0.0) {
@@ -2108,6 +2153,7 @@ static double s_cw_flush_ms = 0.0;   /* CPU wall inside flush_tex_batch        *
 static double s_cw_wide_ms  = 0.0;   /* CPU wall inside glb_wide_* entry points */
 static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
               s_cw_wide_clears = 0, s_cw_fbo_creates = 0, s_cw_flush_depth = 0;
+#endif
 
 /* Textured-batch variant of mirror_x_center_only: scan the queued verts' x
  * (attr 0, stride TEXV). Defined here so s_tb / TEXV are in scope. */
@@ -2129,8 +2175,13 @@ static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
+#ifndef PSX_NO_DEBUG_TOOLS
     double cw_t0 = cw_ms();
-    s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
+    s_cw_batches++; s_cw_flush_depth++;
+#endif
+#ifndef PSX_NO_DEBUG_TOOLS
+    s_batch_total++;
+#endif
 
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
@@ -2167,7 +2218,9 @@ static void flush_tex_batch(void) {
         gl_perf_mirror_end();
     }
     hr_end();
+#ifndef PSX_NO_DEBUG_TOOLS
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
+#endif
 }
 
 /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
@@ -2409,7 +2462,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         us = mu; vs = mv;
         lim = lim_buf;
     }
+#ifndef PSX_NO_DEBUG_TOOLS
     s_scene_prims_tex++;
+#endif
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
@@ -2469,10 +2524,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (depth_ok != s_tb_depth) reason = 4;   /* depth is a key too */
         }
         if (reason >= 0) {
+#ifndef PSX_NO_DEBUG_TOOLS
             s_batch_reason[reason]++;
+#endif
             flush_tex_batch();
         }
-        if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
+        if (s_tb_n + 3 > TEXBATCH_MAXV) {
+#ifndef PSX_NO_DEBUG_TOOLS
+            s_batch_reason[6]++;
+#endif
+            flush_tex_batch();
+        }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
@@ -4028,7 +4090,9 @@ static GLuint wide_fbo_for(int base_x) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         if (!s_wide_fbo[i]) {
             int w = g_wide_w * s_scale, h = VRAM_H * s_scale;
+#ifndef PSX_NO_DEBUG_TOOLS
             s_cw_fbo_creates++;
+#endif
             s_wide_tex[i] = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
             /* Depth-stencil RB, same as the hr FBO: the stencil carries the
              * PSX mask-bit mirror for the wide surface, and (the hard lesson)
@@ -4068,23 +4132,37 @@ static GLuint wide_fbo_for(int base_x) {
  * sw_wide_configure. */
 static void glb_wide_configure(int wide_w, int offset) {
     if (!s_raster_ok) return;
+#ifndef PSX_NO_DEBUG_TOOLS
     double t0 = cw_ms(); s_cw_wide_cfgs++;
+#endif
     flush_tex_batch();   /* a queued batch's wide mirror targets the CURRENT surfaces */
-    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; s_cw_wide_ms += cw_ms() - t0; return; }
+    if (wide_w <= 0) {
+        wide_free_all(); g_wide_w = 0; g_wide_off = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+        s_cw_wide_ms += cw_ms() - t0;
+#endif
+        return;
+    }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
     g_wide_off = offset;
+#ifndef PSX_NO_DEBUG_TOOLS
     s_cw_wide_ms += cw_ms() - t0;
+#endif
 }
 
 /* Select the wide surface to mirror into for the back buffer at base_x. */
 static void glb_wide_set_target(int base_x) {
     if (!s_raster_ok) { g_wide_cur = 0; return; }
+#ifndef PSX_NO_DEBUG_TOOLS
     double t0 = cw_ms(); s_cw_wide_sets++;
+#endif
     flush_tex_batch();   /* drain into the OLD target before switching */
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
+#ifndef PSX_NO_DEBUG_TOOLS
     s_cw_wide_ms += cw_ms() - t0;
+#endif
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
@@ -4095,10 +4173,17 @@ static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; }
  * a scissored glClear with the 1555 color converted to RGBA8 (alpha = bit15). */
 static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     if (!s_raster_ok || s_ws_ablate == 1) return;
+#ifndef PSX_NO_DEBUG_TOOLS
     double t0 = cw_ms(); s_cw_wide_clears++;
+#endif
     flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
-    if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
+    if (!fbo) {
+#ifndef PSX_NO_DEBUG_TOOLS
+        s_cw_wide_ms += cw_ms() - t0;
+#endif
+        return;
+    }
     gl_perf_mirror_begin();
     int H = VRAM_H * s_scale;
     int y0 = y * s_scale, y1 = (y + h) * s_scale;
@@ -4120,17 +4205,26 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     gl_perf_mirror_end();
+#ifndef PSX_NO_DEBUG_TOOLS
     s_cw_wide_ms += cw_ms() - t0;
+#endif
 }
 
 /* Clear only the two synthetic reveal strips, preserving the centred canonical
  * framebuffer. This is an opt-in transition cleanup driven by gpu.c. */
 static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
     if (!s_raster_ok || s_ws_ablate == 1 || g_wide_off <= 0) return;
+#ifndef PSX_NO_DEBUG_TOOLS
     double t0 = cw_ms(); s_cw_wide_clears++;
+#endif
     flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
-    if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
+    if (!fbo) {
+#ifndef PSX_NO_DEBUG_TOOLS
+        s_cw_wide_ms += cw_ms() - t0;
+#endif
+        return;
+    }
     gl_perf_mirror_begin();
     int H = VRAM_H * s_scale;
     int W = g_wide_w * s_scale;
@@ -4140,7 +4234,9 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     if (y1 > H) y1 = H;
     if (y1 <= y0 || margin * 2 >= W) {
         gl_perf_mirror_end();
+#ifndef PSX_NO_DEBUG_TOOLS
         s_cw_wide_ms += cw_ms() - t0;
+#endif
         return;
     }
     float r = (color & 0x1F) / 31.0f;
@@ -4164,7 +4260,9 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     gl_perf_mirror_end();
+#ifndef PSX_NO_DEBUG_TOOLS
     s_cw_wide_ms += cw_ms() - t0;
+#endif
 }
 
 /* Present source: read the wide FBO for the displayed buffer (base_x) into the
@@ -4280,6 +4378,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
  * wide frame can otherwise issue hundreds of unused mirror timestamp queries.
  * One question this answers in a diagnostics build:
  * where does a 16:9 frame go vs 4:3 — scene fill, wide composite, or CPU. */
+#ifndef PSX_NO_DEBUG_TOOLS
 #define GLPERF_NBUF 4
 #define GLPERF_RING 256
 typedef struct {
@@ -4334,9 +4433,6 @@ static GlPerfSample s_pf_ring[GLPERF_RING];
 static uint64_t     s_pf_ring_seq = 0;
 
 static void gl_perf_init(void) {
-#ifdef PSX_NO_DEBUG_TOOLS
-    return;
-#else
     /* Timer queries are intentionally available in diagnostics builds, but a
      * driver may serialize command submission while collecting them.  Keep an
      * escape hatch so frame cadence can be A/B tested without rebuilding or
@@ -4360,7 +4456,6 @@ static void gl_perf_init(void) {
     s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
     s_pf_last_enter = 0;
     s_pf_on = 1;
-#endif
 }
 
 /* Bracket ONE native-wide mirror pass (called from the wide-mirror draw sites).
@@ -4501,6 +4596,24 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
     out[0] = (double)n;
     return n;
 }
+#else
+static void gl_perf_init(void) {}
+static void gl_perf_mirror_begin(void) {}
+static void gl_perf_mirror_end(void) {}
+static void gl_perf_present_enter(void) {}
+static void gl_perf_present_exit(int wide) { (void)wide; }
+
+uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
+    if (out_tex_frac) *out_tex_frac = 0.0;
+    return 0;
+}
+
+int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
+    (void)wide_filter;
+    for (int i = 0; i < 18; i++) out[i] = 0.0;
+    return 0;
+}
+#endif
 
 /* Native-wide mirror ablation (perf attribution): see s_ws_ablate. */
 void gl_renderer_set_ws_ablate(int mode) { s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
