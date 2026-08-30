@@ -136,12 +136,13 @@ Correctness is demonstrated, not asserted:
 ### Automated tests — run these first
 
 ```sh
-cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TESTING=ON
 cmake --build recompiler/build
 cd recompiler/build && ctest --output-on-failure
 ```
 
-38 tests, under five seconds, no BIOS dump or disc image required. See
+The suite runs in seconds with no BIOS dump or disc image required. See
 [`docs/TESTING.md`](docs/TESTING.md) for running individual tests, what the
 suite covers, and the three known-failing tests that are deliberately not
 registered.

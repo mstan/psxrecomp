@@ -1,5 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.20)
 project(psxrecomp-runtime C CXX)
+option(BUILD_TESTING "Build the PSXRecomp runtime tests" OFF)
 include(CTest)
 
 set(CMAKE_C_STANDARD 99)
@@ -474,6 +475,10 @@ if(BUILD_TESTING)
     target_include_directories(spu_gaussian_test PRIVATE include)
     add_test(NAME spu_gaussian_test COMMAND spu_gaussian_test)
 
+    add_executable(mod_session_defaults_test tests/test_mod_session_defaults.cpp)
+    target_include_directories(mod_session_defaults_test PRIVATE include)
+    add_test(NAME mod_session_defaults_test COMMAND mod_session_defaults_test)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         foreach(_gp0_diag_mode IN ITEMS debug release)
@@ -508,6 +513,11 @@ if(BUILD_TESTING)
         add_test(NAME savestate_status_protocol_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_savestate_status_protocol.py)
+        add_test(NAME debug_tools_multiconfig_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_debug_tools_multiconfig.py
+                         --cmake ${CMAKE_COMMAND}
+                         --runtime ${CMAKE_CURRENT_SOURCE_DIR})
     endif()
 
     # DISABLED, not de-registered. It links and runs, but 147 of its 309 checks
@@ -626,9 +636,7 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         DEFAULT_DEBUG_PORT=4380
         $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>
     )
-    if(NOT PSX_DEBUG_TOOLS)
-        target_compile_definitions(psx-beetle PRIVATE PSX_NO_DEBUG_TOOLS=1)
-    endif()
+    psxrecomp_apply_debug_tools(psx-beetle)
 
     target_link_libraries(psx-beetle PRIVATE
         "${BEETLE_LIB}"

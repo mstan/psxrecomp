@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOLS = ("psxrecomp", "psxrecomp-toml", "psxrecomp-game", "psxrecomp-bios")
 
@@ -77,6 +76,8 @@ def main() -> int:
             "cmake", "-S", source_arg, "-B", build_arg,
             f"-DCMAKE_BUILD_TYPE={config}",
             "-DPSXRECOMP_STATIC_CLI=ON",
+            # The release workflow runs cli_boot_path_test from this graph.
+            "-DBUILD_TESTING=ON",
         ]
         if not (build_dir / "CMakeCache.txt").exists() and shutil.which("ninja"):
             configure += ["-G", "Ninja"]
