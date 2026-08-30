@@ -1,6 +1,7 @@
 #include "mod_runtime.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "psx_lobby_client.h"
 #include "psx_sha256.h"
 
 #include "gpu.h"
@@ -60,6 +61,10 @@ extern "C" uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t, uint32_t) {
     return 0;
 }
 extern "C" int psx_ws_x_margin(void) { return 0; }
+extern "C" int psx_lobby_in_lobby(void) { return 0; }
+extern "C" const PsxLobbyMatchCaps* psx_lobby_match_caps(void) {
+    return nullptr;
+}
 
 /* Stand-in for the GPU's display geometry. psx_mod_display_width/height must
  * report exactly what the presenter reports -- a plugin drawing an overlay
