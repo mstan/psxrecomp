@@ -109,6 +109,8 @@ uint32_t psx_compiled_irq_resume_pc(void);
  * matching its resume PC. Dirty-RAM synthetic pump sites may expose a committed
  * resume PC for IRQ timing before the live CPUState is safe to serialize. */
 int psx_irq_resume_context_snapshot_safe(void);
+int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc);
+int psx_irq_resume_context_snapshot_site(void);
 /* Soft-return / netplay BYE: drop sticky resume latches so rematch dig0 snaps
  * cannot inherit a prior-match game PC (see pick_snap_resume_pc). */
 void psx_irq_clear_resume_latches(void);

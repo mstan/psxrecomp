@@ -487,7 +487,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
     if (!cpu || !s_ring)
         return 0;
     pc = rewind_resolve_resume_pc(cpu, resume_pc);
-    if (!psx_irq_resume_context_snapshot_safe() || !resume_pc_ok(pc))
+    if (!psx_irq_resume_context_snapshot_safe_at(pc) || !resume_pc_ok(pc))
         return 0;
     snap = *cpu;
     snap.pc = pc;

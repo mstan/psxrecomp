@@ -626,12 +626,45 @@ uint32_t psx_compiled_irq_resume_pc(void) { return s_compiled_interrupt_resume_p
 uint64_t psx_last_irq_check_cycle(void) { return s_last_interrupt_check_cycle; }
 uint64_t psx_interrupt_total_checks(void) { return total_checks; }
 uint32_t psx_interrupt_fast_maintenance(void) { return s_fast_maintenance; }
+int psx_irq_resume_context_snapshot_site(void)
+{
+    return g_cosim_dirty_pump_site;
+}
+
+int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc)
+{
+    if (g_cosim_dirty_pump_site == 0)
+        return 1;
+
+    /* Dirty interpreter pump sites are IRQ-precise, but only a subset are
+     * whole-machine snapshot-safe: the interpreted instruction stream has fully
+     * retired into CPUState, no host call unit is active, and the published
+     * dirty resume PC is the same PC the caller intends to serialize. Keep
+     * call-return and precise-IRQ pump sites rejected; those are the contexts
+     * that can pair a plausible resume PC with stale nested-call registers. */
+    extern int g_call_unit_depth;
+    if (in_exception || g_call_unit_depth != 0 || g_psx_dispatch_depth > 1)
+        return 0;
+    if (resume_pc == 0u || (resume_pc & 3u) != 0u)
+        return 0;
+    if (g_dirty_safe_resume_pc == 0u ||
+        ((g_dirty_safe_resume_pc ^ resume_pc) & 0x1FFFFFFFu) != 0u)
+        return 0;
+    switch (g_cosim_dirty_pump_site) {
+    case 1: /* transfer surface: target PC is materialized in CPUState */
+    case 2: /* stop_addr reached: straight-line dirty flow fully retired */
+    case 3: /* left dirty page: next dispatch PC is materialized */
+    case 4: /* interpreter guard-yield: CPUState PC was flushed */
+    case 6: /* public dirty dispatch pump after handled block */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int psx_irq_resume_context_snapshot_safe(void)
 {
-    /* Dirty interpreter pump sites are IRQ-precise but not save-state safe:
-     * they can publish a valid committed PC while CPUState still describes a
-     * helper/device or previous local context. Snapshot only at normal polls. */
-    return g_cosim_dirty_pump_site == 0;
+    return psx_irq_resume_context_snapshot_safe_at(g_dirty_safe_resume_pc);
 }
 
 void psx_irq_clear_resume_latches(void)

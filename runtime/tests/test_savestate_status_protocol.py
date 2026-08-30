@@ -16,9 +16,13 @@ assert "s_status_generation++" in STATE
 assert '"savestate_status"' in SERVER
 assert "savestate_status_json(status, sizeof status)" in SERVER
 assert "int psx_irq_resume_context_snapshot_safe(void);" in INTERRUPTS_H
+assert "int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc);" in INTERRUPTS_H
 assert "psx_irq_resume_context_snapshot_safe(void)" in INTERRUPTS
+assert "psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc)" in INTERRUPTS
 assert "g_cosim_dirty_pump_site == 0" in INTERRUPTS
-assert "!snapshot_safe || !savestate_resume_pc_ok(pc)" in STATE
-assert "!psx_irq_resume_context_snapshot_safe() || !resume_pc_ok(pc)" in REWIND
+assert "case 1: /* transfer surface: target PC is materialized in CPUState */" in INTERRUPTS
+assert "int pc_ok = savestate_resume_pc_ok(pc);" in STATE
+assert "(resume_pc == 0u && !pc_matches_cpu) || !snapshot_safe || !pc_ok" in STATE
+assert "!psx_irq_resume_context_snapshot_safe_at(pc) || !resume_pc_ok(pc)" in REWIND
 assert "psx_check_interrupts_at(cpu, pc)" in DIRTY
 print("savestate status protocol guard passed")
