@@ -223,15 +223,21 @@ static inline void psx_cyc_generated_base(CPUState* cpu) {
         cpu->read_absorb[w]--;
         return;
     }
-#if !defined(PSX_COSIM)
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    /* Overlay defer/local helpers are intentionally no-ops: publish through
+     * the callback shim instead of importing the host's batching globals. */
+    psx_cyc_charge(1u);
+#elif !defined(PSX_COSIM)
     if (g_psx_cyc_bb_defer > 0 && g_psx_cyc_local_acc == NULL &&
         !g_ls_replay_active && !g_event_step_conservative &&
         !psx_in_device_service && g_psx_cyc_batch != UINT32_MAX) {
         g_psx_cyc_batch++;
         return;
     }
-#endif
     psx_cyc_charge(1u);
+#else
+    psx_cyc_charge(1u);
+#endif
 }
 
 static inline void psx_cyc_step_0(CPUState* cpu) {
