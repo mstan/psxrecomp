@@ -1183,6 +1183,7 @@ static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
 /* recomp-ui stores this 1-based so a zero-initialized (older) host reads as
  * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
  * the boundary, and treat anything out of range as the default. */
+#if defined(RECOMP_LAUNCHER)
 static inline int launcher_fmv_filter_to_cfg(int ls_value) {
     if (ls_value < 1 || ls_value > PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
         return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
@@ -1193,6 +1194,7 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
     return cfg_value + 1;
 }
+#endif
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
