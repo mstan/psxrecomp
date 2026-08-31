@@ -34,6 +34,10 @@ std::map<std::string, ModBuiltinResolver>& builtin_resolvers() {
 struct RegisteredPlugin {
     PSXModActivationCallback activation = nullptr;
     PSXModVBlankCallback vblank = nullptr;
+    /* Set when a function override is queued under this id (the callback
+     * itself lives in mod_runtime's pending list) — participates in
+     * availability so a manifest can gate an override-only plugin. */
+    bool function_override = false;
 };
 
 std::map<std::string, RegisteredPlugin>& registered_plugins() {
@@ -1449,10 +1453,19 @@ bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void)) {
     return true;
 }
 
+bool mod_register_function_override_marker(const std::string& id) {
+    if (!valid_id(id)) return false;
+    RegisteredPlugin& plugin = registered_plugins()[id];
+    if (plugin.function_override) return false;
+    plugin.function_override = true;
+    return true;
+}
+
 bool mod_plugin_registered(const std::string& id) {
     const auto found = registered_plugins().find(id);
     return found != registered_plugins().end() &&
-        (found->second.activation || found->second.vblank);
+        (found->second.activation || found->second.vblank ||
+         found->second.function_override);
 }
 
 void mod_invoke_activation_plugin(const std::string& id) {

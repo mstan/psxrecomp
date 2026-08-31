@@ -1472,6 +1472,16 @@ uint32_t psx_read_word(uint32_t addr) {
     if (!psx_get_in_exception()) ls_read_hook(addr, 4, v);
     return v;
 }
+/* Untraced word peek for HOST-SIDE inspection: same address decode as a guest
+ * read, but no lockstep record, no lockstep-replay substitution, and no
+ * data-shard/DuckStation capture. Use this for anything the guest did not
+ * actually execute — residency guards, host-side checks, diagnostics — so a
+ * host inspection can never appear in a guest read stream (which would both
+ * dirty every divergence comparison and, under replay, return replayed data
+ * instead of resident bytes). Never use it to service a guest load. */
+uint32_t psx_peek_word_untraced(uint32_t addr) {
+    return psx_read_word_raw(addr);
+}
 /* Physical address of a CPU/DMA main-RAM access. Fold KUSEG/KSEG0/KSEG1 first
  * (0x1FFFFFFF), then fold the 2nd-4th main-RAM mirrors: real hardware mirrors the
  * 2 MB DRAM across the WHOLE 0..0x7FFFFF physical window (Beetle libretro.cpp:874

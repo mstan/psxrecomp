@@ -75,6 +75,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "launcher_device.h"
 #include "game_options.h"
 #include "mod_plugins.h"
+#include "func_override.h"
 #include "mod_runtime.h"
 #include "crc32.h"
 #include "disc_identity.h"
@@ -12932,6 +12933,11 @@ int main(int argc, char** argv) {
         g_turbo_loads_enabled = 0;
     g_frame_interpolation_blend = g_frame_interpolation_blend_default;
     mod_runtime_activate_plugins();
+    /* Arm directly-registered function overrides (EXTRAS_SOURCES game code
+     * calling func_override_add from constructors, the adrecomp idiom) even
+     * when no package plan exists; package-gated overrides were armed by
+     * mod_runtime_activate_plugins above. Idempotent. */
+    func_override_install();
     apply_netplay_local_viewport_aspect(net_cfg.enabled);
     for (int i = 0; i < PSX_MAX_PLAYERS; ++i) {
         if (g_mod_controller_mode_override[i] >= 0)

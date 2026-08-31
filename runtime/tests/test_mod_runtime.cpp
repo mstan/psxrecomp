@@ -73,6 +73,23 @@ extern "C" void gpu_get_display_info(GpuDisplayInfo* out) {
 extern "C" void dirty_ram_mark_executable_range(uint32_t, uint32_t) {}
 extern "C" int fntrace_is_game_started(void) { return 1; }
 
+/* func_override.c doubles: linked in so mod_runtime's package arming/reset
+ * paths run for real. The tier's own behavior is pinned by
+ * test_func_override.c; here the doubles only need to satisfy the link. */
+extern "C" uint32_t psx_peek_word_untraced(uint32_t) { return 0; }
+extern "C" void psx_dispatch_call(struct CPUState*, uint32_t, uint32_t) {}
+extern "C" {
+uint64_t psx_cycle_count = 0;
+uint64_t psx_next_service_cycle = 0;
+int      psx_in_device_service = 0;
+int      g_event_step_conservative = 0;
+int      g_ls_replay_active = 0;
+uint32_t g_psx_cyc_batch = 0;
+uint32_t g_psx_cyc_batch_limit = 0;
+void psx_devices_service_to_now(void) {}
+void psx_advance_cycles_slow(uint32_t cycles) { psx_cycle_count += cycles; }
+}
+
 static void test_vblank_plugin(void) {
     plugin_calls++;
 }

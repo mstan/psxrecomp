@@ -320,6 +320,23 @@ frames. Trusted callbacks receive only the narrow C services exposed by
 `runtime/include/mod_plugins.h`. Games should continue to use declarative
 patches and overlays when those operations are sufficient.
 
+An implementation may also register **function overrides** under a plugin id
+(`psx_mod_register_function_override`): hand-written C that replaces or wraps
+a guest function at a given address, with an optional prologue-word residency
+guard. Registration only queues the override; it is ARMED into the dispatcher
+tier when the resolved plan selects that plugin — the same gating as the other
+callback kinds, so an override-only plugin id counts as available to the
+resolver. Every registration states a required guest-cycle `credit` (a fixed
+per-handled-call charge, `0` for a mod with no hardware analog, or
+`FO_CREDIT_SELF` when the body — or a wrapped original — accounts for its own
+time). The full execution contract (guest ABI, decline semantics,
+`func_override_call_original` wrap primitive, `func_override_guest_call`,
+determinism and cycle-accounting policy) is documented in
+`runtime/include/func_override.h`. Overrides registered directly through
+`func_override_add` (game `EXTRAS_SOURCES` constructors, the progressive-
+decompilation idiom) bypass package gating and are always active; packages
+are the right home for anything a player should be able to toggle.
+
 `psx_mod_set_load_acceleration(multiplier, release_frames)` is the narrow
 pre-boot service for a game-owned fast-loading feature. It changes host
 wall-clock pacing only: guest VBlanks, CD deadlines, interrupts, callbacks, and

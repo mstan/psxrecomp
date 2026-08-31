@@ -378,6 +378,7 @@ void mod_clear_builtin_resolvers_for_tests();
 bool mod_register_activation_plugin(const std::string& id, void (*callback)(void));
 bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void));
 bool mod_plugin_registered(const std::string& id);
+bool mod_register_function_override_marker(const std::string& id);
 void mod_invoke_activation_plugin(const std::string& id);
 void mod_invoke_vblank_plugin(const std::string& id);
 void mod_clear_plugins_for_tests();

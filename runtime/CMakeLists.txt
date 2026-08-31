@@ -220,6 +220,16 @@ if(BUILD_TESTING)
     target_include_directories(bios_hle_plan_test PRIVATE include)
     add_test(NAME bios_hle_plan_test COMMAND bios_hle_plan_test)
 
+    # Every func_override failure mode is silent at runtime: a registration
+    # that is never consulted, a package override that survives clear-mods
+    # (a netplay divergence), a residency guard that corrupts instead of
+    # declining. Drives the real g_psx_func_override_hook pointer.
+    add_executable(func_override_test
+        tests/test_func_override.c
+        src/func_override.c)
+    target_include_directories(func_override_test PRIVATE include)
+    add_test(NAME func_override_test COMMAND func_override_test)
+
     # A cue, conventional raw image, or Steam .car image is a valid pick; each
     # must mount the same disc and identify off the same data track.
     add_executable(disc_path_resolve_test
@@ -276,6 +286,7 @@ if(BUILD_TESTING)
     add_executable(mod_runtime_test
         tests/test_mod_runtime.cpp
         src/mod_runtime.cpp
+        src/func_override.c
         src/mod_packages.cpp
         src/disc_path.cpp
         src/cue_sheet.cpp

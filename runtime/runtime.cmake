@@ -389,6 +389,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
     ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
+    ${PSXRECOMP_ROOT}/runtime/src/func_override.c
     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_speed.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_pgxp.c
