@@ -5870,7 +5870,7 @@ static void handle_dma_state(int id, const char *json)
     DMADebugState s;
     dma_debug_get_state(&s);
 
-    char buf[4096];
+    char buf[2048];
     size_t pos = 0;
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "{\"id\":%d,\"ok\":true,\"dpcr\":\"0x%08X\","
@@ -5888,49 +5888,7 @@ static void handle_dma_state(int id, const char *json)
                         s.channels[i].remaining_words,
                         s.channels[i].cycles_accum);
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
-
-    /* CH2 ordering-table walk: dropped starts are silent geometry loss. */
-    {
-        DMAGpuOtStats ot;
-        dma_debug_get_gpu_ot_stats(&ot);
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        ",\"gpu_ot\":{\"starts\":%llu,\"starts_dropped\":%llu,"
-                        "\"completes\":%llu,\"cancels\":%llu,\"nodes_last\":%u,"
-                        "\"words_last\":%u,\"cycles_last\":%llu,"
-                        "\"cycles_max\":%llu,\"active\":%u,\"sync_drain\":%u}",
-                        (unsigned long long)ot.starts,
-                        (unsigned long long)ot.starts_dropped,
-                        (unsigned long long)ot.completes,
-                        (unsigned long long)ot.cancels,
-                        ot.nodes_last, ot.words_last,
-                        (unsigned long long)ot.cycles_last,
-                        (unsigned long long)ot.cycles_max,
-                        ot.active, ot.sync_drain);
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        ",\"gpu_ot_chcr\":{\"reads_total\":%llu,"
-                        "\"reads_in_walk\":%llu,\"cancel_ring_count\":%u,"
-                        "\"initiator_pc\":\"0x%08X\"},"
-                        "\"gpu_ot_cancels\":[",
-                        (unsigned long long)ot.chcr_reads_total,
-                        (unsigned long long)ot.chcr_reads_in_walk,
-                        ot.cancel_ring_count,
-                        ot.initiator_pc);
-        unsigned n = ot.cancel_ring_count < DMA_GPU_OT_CANCEL_RING
-                   ? ot.cancel_ring_count : DMA_GPU_OT_CANCEL_RING;
-        for (unsigned k = 0; k < n && pos < sizeof(buf) - 160; k++) {
-            const DMAGpuOtCancel *c = &ot.cancel_ring[k];
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "%s{\"pc\":\"0x%08X\",\"chcr\":\"0x%08X\","
-                            "\"nodes\":%u,\"words\":%u,\"cycles\":%u,"
-                            "\"polls\":%u}",
-                            k ? "," : "", c->pc, c->chcr,
-                            c->nodes, c->words, c->cycles, c->polls);
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
-    }
-
-    snprintf(buf + pos, sizeof(buf) - pos, "}");
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
     debug_server_send_line(buf);
 }
 
