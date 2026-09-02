@@ -47,6 +47,21 @@ could not be moved is left exactly where it is and reported.
 A manifest that fails to parse is never skipped silently: it is reported by
 `scan_errors()` and logged, naming the path and the reason.
 
+## Tools
+
+| Command | What it does |
+|---|---|
+| `psxmod validate <path>...` | Parses manifests with the runtime's own parser and reports what the runtime would see: every rejection with its reason, the features and their channels, and warnings for things that load but bite later. `--strict` makes warnings a non-zero exit; `--quiet` prints only defects. Takes a `manifest.toml`, a package source directory, or a catalog directory. |
+| `python tools/psxmod_pack.py <src> <out.psxmod>` | Packs a package source directory into a deterministic archive (fixed timestamps, sorted entries), so the same input always produces the same bytes. |
+| `python tools/mod_channel_filter.py <catalog>...` | Release-side. Drops developer-channel features from a staged catalog. Packagers call it; authors do not. |
+
+`psxmod` is built alongside the runtime — `-DPSXRECOMP_BUILD_MODTOOLS=OFF` opts
+out. It links `mod_packages.cpp`, so `validate` calls the same `read_manifest()`
+the runtime calls. That matters more than it looks: a validator with its own
+copy of the rules drifts from the parser at the first format bump and starts
+blessing manifests the runtime rejects, which is worse than having no validator
+because it would be believed.
+
 ## Feature manifest
 
 Write new manifests at the current format version, which is **6**. Older

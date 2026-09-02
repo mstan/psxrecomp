@@ -500,6 +500,19 @@ if(BUILD_TESTING)
         add_test(NAME mod_bezel_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_bezel.py)
+        add_test(NAME mod_catalog_diagnostics_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_catalog_diagnostics.py)
+        # Drives the built binary, not the source: a validator that compiles
+        # but returns the wrong verdict is the exact failure it exists to
+        # prevent. psxmod is defined by psxrecomp_add_runtime_target unless
+        # -DPSXRECOMP_BUILD_MODTOOLS=OFF.
+        if(TARGET psxmod)
+            add_test(NAME psxmod_validate_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psxmod_validate.py
+                             $<TARGET_FILE:psxmod>)
+        endif()
         add_test(NAME rewind_toggle_combo_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rewind_toggle_combo.py)

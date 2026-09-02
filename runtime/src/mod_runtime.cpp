@@ -919,6 +919,33 @@ int provider_feature_resource_set_path(void*, const char* package_id,
     });
 }
 
+/* Catalog-level problems: a manifest that would not parse, a legacy tree that
+ * could not be migrated. These belong to no (package, feature) -- the package
+ * never loaded -- so they cannot ride the per-feature channel, which is why
+ * they used to be discarded silently. */
+int provider_catalog_diagnostic_count(void*) {
+    return (int)state().manager.scan_errors().size();
+}
+
+int provider_catalog_diagnostic_get(void*, int index,
+                                    RecompLauncherCModDiagnostic* out) {
+    const std::vector<std::string>& errors = state().manager.scan_errors();
+    if (!out || index < 0 || (size_t)index >= errors.size()) return 0;
+    std::memset(out, 0, sizeof(*out));
+    out->severity = RECOMP_MOD_DIAGNOSTIC_ERROR;
+    /* scan_errors() entries are "<path>: <reason>". Split them so the path
+     * lands in `resource`, which is where the UI already looks for one. */
+    const std::string& entry = errors[(size_t)index];
+    const size_t split = entry.find(": ");
+    if (split == std::string::npos) {
+        copy_text(out->message, sizeof(out->message), entry);
+    } else {
+        copy_text(out->resource, sizeof(out->resource), entry.substr(0, split));
+        copy_text(out->message, sizeof(out->message), entry.substr(split + 2));
+    }
+    return 1;
+}
+
 int provider_diagnostic_count(void*, const char* package_id,
                               const char* feature_id) {
     if (!package_id || !feature_id) return 0;
@@ -1088,6 +1115,8 @@ RecompLauncherCModProvider provider = {
     provider_feature_resource_count,
     provider_feature_resource_get,
     provider_feature_resource_set_path,
+    provider_catalog_diagnostic_count,
+    provider_catalog_diagnostic_get,
 };
 #endif
 
@@ -1124,11 +1153,16 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         if (error) *error = s.error;
         return false;
     }
-    /* A manifest that fails to parse used to be skipped in silence, so a mod
-     * author's typo produced a mod that simply did not exist. Name every one. */
-    for (const std::string& scan_error : s.manager.scan_errors())
-        std::fprintf(stderr, "psxrecomp: mod manifest ignored: %s\n",
-                     scan_error.c_str());
+    /* A manifest that fails to parse is collected rather than skipped in
+     * silence (see ModPackageManager::scan_errors), so a mod author's typo no
+     * longer produces a mod that simply does not exist.
+     *
+     * It is deliberately NOT printed here: CLAUDE.md rule 3 forbids
+     * fprintf/logging in runtime source. The author-facing surface is
+     * `psxmod validate`, which runs this same parser from a shell and reports
+     * every rejection with its reason. The player-facing surface is still
+     * owed: it needs a catalog-level diagnostic channel on the launcher ABI,
+     * since a scan error has no (package, feature) to hang off. */
     if (!sha256_file(exe_path, s.exe_sha256, &s.error)) {
         /* Release installs commonly do not carry a loose PS-X EXE; game-id and
          * expected-byte guards remain available in that case. */

@@ -249,7 +249,7 @@ my-mod/
 A minimal guarded executable patch looks like this:
 
 ```toml
-format_version = 1
+format_version = 6
 id = "example.quick-start"
 version = "1.0.0"
 name = "Quick-start example"
@@ -284,17 +284,34 @@ made, so a package fails closed on the wrong revision. For disc changes use
 `disc_raw` or `disc_user`; for a larger asset use a file-backed `[[overlay]]`
 with payload and expected-range SHA-256 hashes.
 
-From a PSXRecomp checkout, pack the directory into a deterministic archive:
+Check it before you pack it. `psxmod` runs the same parser the runtime runs, so
+its verdict is the runtime's verdict:
+
+```sh
+psxmod validate my-mod
+```
+
+It reports every rejection with the parser's own reason, lists the features the
+runtime would see and the channel each is on, and warns about the things that
+load but bite later. `--strict` turns warnings into a non-zero exit for CI.
+`psxmod` is built beside the runtime (turn it off with
+`-DPSXRECOMP_BUILD_MODTOOLS=OFF`).
+
+Then pack the directory into a deterministic archive:
 
 ```sh
 python tools/psxmod_pack.py my-mod my-mod-1.0.0.psxmod
 ```
 
-Install the resulting `.psxmod` through the launcher's Mods manager. A game can
-also ship reviewed, default-disabled packages by placing unpacked sources at
-`mods/preloaded/packages/<package-id>/<version>/` and copying
-`mods/preloaded` beside the game executable as `mods`; see Tomba's build wiring
-below.
+Install the resulting `.psxmod` through the launcher's Mods manager. It lands in
+`<exe>/mods/installed/`, which belongs to the launcher and which no build ever
+touches.
+
+A game can also ship reviewed, default-disabled packages by placing unpacked
+sources at `mods/preloaded/packages/<package-id>/<version>/`. Build wiring
+stages those to `<exe>/mods/bundled/` — build output, wiped and re-staged on
+every build. See `docs/MOD_PACKAGES.md` for the two catalog roots and for
+channels (`stable` / `experimental` / `developer`).
 
 Choose the narrowest mechanism that describes the change:
 

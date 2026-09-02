@@ -1426,6 +1426,10 @@ function(psxrecomp_add_runtime_target target)
         target_compile_definitions(${target} PRIVATE PSX_SHELLWIN_INTERP_DEFAULT=1)
     endif()
 
+    option(PSXRECOMP_BUILD_MODTOOLS
+        "Build the psxmod mod-author CLI alongside the runtime" ON)
+    psxrecomp_add_modtools()
+
     # Developer-channel mod features do not ship. A contributor reaches them by
     # cloning the repo and building locally; a release build must not carry
     # them at all -- not hidden behind a toggle, absent. Keying the default off
@@ -1811,6 +1815,42 @@ endfunction()
 # Compatibility for early v4 game projects that used the longer helper name.
 function(psxrecomp_v4_add_runtime_target target)
     psxrecomp_add_runtime_target(${target} ${ARGN})
+endfunction()
+
+# ---------------------------------------------------------------------------
+# psxmod — the mod author's command line.
+#
+# Links the runtime's own mod_packages.cpp, so `psxmod validate` runs THE
+# parser the runtime runs. A separate validator would drift from it on the
+# first format bump and start blessing manifests the runtime rejects, which is
+# worse than no validator because it would be believed.
+#
+# Built once per build tree, not once per runtime target: a repo with
+# psx-runtime, psx-runtime-pgxp and an oracle needs one psxmod, and defining it
+# per target would collide (see check_target_name_collisions.cmake). Cheap
+# enough -- three translation units -- to be on by default, because a validator
+# nobody has built is a validator nobody runs.
+# ---------------------------------------------------------------------------
+function(psxrecomp_add_modtools)
+    if(TARGET psxmod)
+        return()
+    endif()
+    if(NOT PSXRECOMP_BUILD_MODTOOLS)
+        return()
+    endif()
+    add_executable(psxmod
+        ${PSXRECOMP_ROOT}/tools/psxmod/psxmod_cli.cpp
+        ${PSXRECOMP_ROOT}/runtime/src/mod_packages.cpp
+        ${PSXRECOMP_ROOT}/runtime/src/crc32.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_sha256.c)
+    target_include_directories(psxmod PRIVATE
+        ${PSXRECOMP_ROOT}/runtime/include
+        ${PSXRECOMP_ROOT}/recompiler/lib/toml11)
+    set_target_properties(psxmod PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    # The validator must judge a manifest the way a RELEASE build would, so it
+    # never inherits PSX_MOD_DEVELOPER_CHANNEL. It reports developer-channel
+    # features as a note instead of hiding them, which is what an author needs
+    # to see.
 endfunction()
 
 # ---------------------------------------------------------------------------
