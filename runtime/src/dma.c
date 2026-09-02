@@ -21,6 +21,8 @@
 #include "mdec.h"
 #include "mod_memory.h"
 #include "overlay_capture.h"
+#include "debug_server.h"
+#include "psx_cycles.h"
 #include "spu.h"
 #include "audio_trace.h"
 #include "event_ring.h"
@@ -63,6 +65,10 @@ typedef struct {
 static DMAAsyncChannel mdec_async[2];
 static DMAAsyncChannel cdrom_async;
 static DMAGPULinkedList gpu_linked_list;
+static DMAGpuOtStats gpu_ot_stats;
+static uint64_t gpu_ot_start_cycle;
+static uint32_t gpu_ot_polls_this_walk;
+
 
 /* ---- CD DMA transfer log ---- */
 /* Every forward CH3 DMA that lands below 0x1C0000 (game data region) records
@@ -392,8 +398,21 @@ static void cancel_async_transfer(int ch) {
         cdrom_async.cycles_accum = 0;
     }
     if (ch == 2 && gpu_linked_list.active) {
+        /* An OT walk abandoned mid-flight also loses geometry. Only the guest
+         * CHCR bit-24 clear in dma_write_masked can reach here for ch2, so
+         * g_debug_last_store_pc names the guest store that did it. */
+        DMAGpuOtCancel *c = &gpu_ot_stats.cancel_ring[
+            gpu_ot_stats.cancel_ring_count % DMA_GPU_OT_CANCEL_RING];
+        c->pc     = g_debug_last_store_pc;
+        c->chcr   = channels[2].chcr;
+        c->nodes  = gpu_linked_list.nodes_processed;
+        c->words  = gpu_linked_list.total_words;
+        c->cycles = (uint32_t)(psx_cycle_count - gpu_ot_start_cycle);
+        c->polls  = gpu_ot_polls_this_walk;
+        gpu_ot_stats.cancel_ring_count++;
+        gpu_ot_stats.cancels++;
         gpu_ws_end_linked_list();
-        dma_gpu_ll_cancel(&gpu_linked_list);
+            dma_gpu_ll_cancel(&gpu_linked_list);
     }
     if (ch >= 0 && ch < 7) {
         delayed_complete[ch].active = 0;
@@ -716,6 +735,12 @@ static void gpu_ll_emit_word(void *opaque, uint32_t address, uint32_t word) {
 
 static void gpu_ll_complete(void *opaque, int hit_limit) {
     (void)opaque;
+    gpu_ot_stats.completes++;
+    gpu_ot_stats.nodes_last = gpu_linked_list.nodes_processed;
+    gpu_ot_stats.words_last = gpu_linked_list.total_words;
+    gpu_ot_stats.cycles_last = psx_cycle_count - gpu_ot_start_cycle;
+    if (gpu_ot_stats.cycles_last > gpu_ot_stats.cycles_max)
+        gpu_ot_stats.cycles_max = gpu_ot_stats.cycles_last;
     channels[2].madr = hit_limit ? gpu_linked_list.current_addr
                                  : 0x00FFFFFFu;
     gpu_ws_end_linked_list();
@@ -730,8 +755,32 @@ static const DMAGPULinkedListOps gpu_ll_ops = {
     gpu_ll_complete
 };
 
+/* PSX_GPU_LL_SYNC=1 drains the ordering-table walk in one go at start, the way
+ * this channel behaved before it was sliced across guest cycles. Diagnostic
+ * A/B lever only: completion fires immediately rather than after the transfer's
+ * word count, so it is not a faithful restoration of the old timing — it exists
+ * to answer "is spreading this walk over guest time what breaks the geometry?"
+ */
+static int gpu_ll_sync_drain(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_GPU_LL_SYNC");
+        enabled = (e && *e && *e != '0') ? 1 : 0;
+        if (enabled)
+            fprintf(stdout, "psxrecomp: PSX_GPU_LL_SYNC enabled "
+                            "(ordering-table DMA drained synchronously)\n");
+    }
+    return enabled;
+}
+
 static void start_async_gpu_linked_list(void) {
-    if (gpu_linked_list.active) return;
+    if (gpu_linked_list.active) {
+        /* The guest asked for a new ordering table while the previous walk was
+         * still running. Dropping it silently costs a whole frame of geometry;
+         * count it so a miss is a number rather than a screenshot. */
+        gpu_ot_stats.starts_dropped++;
+        return;
+    }
     uint32_t start_addr = psx_mod_gpu_dma_resolve_address(channels[2].madr);
     gpu_ws_begin_linked_list();
     /* This scan only prepares optional widescreen grouping. It does not send
@@ -740,6 +789,18 @@ static void start_async_gpu_linked_list(void) {
     gpu_ws_prepass_linked_list(start_addr);
     dma_gpu_ll_start(&gpu_linked_list, start_addr, 0x40000u);
     event_ring_record_aux(EV_DMA_SCHED, 2u, channels[2].chcr);
+
+    gpu_ot_stats.starts++;
+    gpu_ot_start_cycle = psx_cycle_count;
+    gpu_ot_polls_this_walk = 0;
+
+    if (gpu_ll_sync_drain()) {
+        while (gpu_linked_list.active) {
+            dma_gpu_ll_advance(&gpu_linked_list,
+                               dma_gpu_ll_cycles_to_event(&gpu_linked_list),
+                               &gpu_ll_ops, NULL);
+        }
+    }
 }
 
 static uint32_t execute_ch2_gpu(void) {
@@ -1205,7 +1266,15 @@ uint32_t dma_read(uint32_t addr) {
         switch (reg) {
             case 0x00: return channels[ch].madr;
             case 0x04: return channels[ch].bcr;
-            case 0x08: return channels[ch].chcr;
+            case 0x08:
+                if (ch == 2) {
+                    gpu_ot_stats.chcr_reads_total++;
+                    if (gpu_linked_list.active) {
+                        gpu_ot_stats.chcr_reads_in_walk++;
+                        gpu_ot_polls_this_walk++;
+                    }
+                }
+                return channels[ch].chcr;
             case 0x0C: return 0;
             default: goto bad;
         }
@@ -1290,6 +1359,14 @@ bad:
 
 void dma_write(uint32_t addr, uint32_t val) {
     dma_write_masked(addr, val, 0xFFFFFFFFu);
+}
+
+void dma_debug_get_gpu_ot_stats(DMAGpuOtStats* out) {
+    if (!out) return;
+    *out = gpu_ot_stats;
+    out->initiator_pc   = s_dma_ch_initiator_pc[2];
+    out->active = gpu_linked_list.active;
+    out->sync_drain = (uint8_t)gpu_ll_sync_drain();
 }
 
 uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries) {
