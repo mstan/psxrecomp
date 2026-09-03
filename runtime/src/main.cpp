@@ -1217,6 +1217,7 @@ static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/1
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
 static int           g_hotkey_pad_rewind = 1272;       /* select + r3 */
 static int           g_hotkey_pad_save_state_menu = 2040;/* select + r1 */
+static int           g_hotkey_pad_fast_forward = 1528;   /* select + l1 (hold) */
 static uint32_t      g_savestate_input_guard_min_until = 0;
 static uint32_t      g_savestate_input_guard_max_until = 0;
 static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
@@ -5968,6 +5969,7 @@ static void depth24_stage_scanout(const GpuDisplayInfo *di, uint32_t *buf,
 enum {
     PSX_ASSIST_BIND_REWIND = 0,
     PSX_ASSIST_BIND_SAVE_STATE_MENU,
+    PSX_ASSIST_BIND_FAST_FORWARD,   /* hold-to-fast-forward; pad twin of [KeyMap] Turbo */
     PSX_ASSIST_BIND_COUNT
 };
 
@@ -5986,6 +5988,9 @@ enum {
 #define PSX_HOTKEY_PAD_SELECT_R1 \
     PSX_HOTKEY_PAD_BUTTON_COMBO(((uint32_t)1u << SDL_CONTROLLER_BUTTON_BACK) | \
                                 ((uint32_t)1u << SDL_CONTROLLER_BUTTON_RIGHTSHOULDER))
+#define PSX_HOTKEY_PAD_SELECT_L1 \
+    PSX_HOTKEY_PAD_BUTTON_COMBO(((uint32_t)1u << SDL_CONTROLLER_BUTTON_BACK) | \
+                                ((uint32_t)1u << SDL_CONTROLLER_BUTTON_LEFTSHOULDER))
 
 static int normalize_hotkey_pad_binding(int binding, int fallback) {
     if (PSX_HOTKEY_PAD_IS_BUTTON(binding)) {
@@ -6859,8 +6864,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         static int turbo_skip = 0;
         static int turbo_was_down = 0;
-        if (host_hotkey_input_focused() &&
-            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
+        /* Keyboard ([KeyMap] Turbo, default Tab) or the controller host
+         * shortcut ([hotkeys] fast_forward_pad, default select+L1). Both are
+         * hold-to-run; the pad chord goes through the same combo matcher as
+         * Rewind / Save states so the launcher's binding editor covers it. */
+        const bool kb_turbo = host_hotkey_input_focused() &&
+            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState());
+        if (kb_turbo || hotkey_pad_binding_down(g_hotkey_pad_fast_forward)) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
@@ -10850,6 +10860,7 @@ namespace {
     static const char* const kPsxHostShortcutLabels[] = {
         "Rewind",
         "Save states",
+        "Fast-forward",
     };
 
     void ae_rui_set_sidecar_paths(const char* argv0) {
@@ -11784,6 +11795,10 @@ int main(int argc, char** argv) {
             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
                 us.hotkey_pad_save_state_menu,
                 PSX_HOTKEY_PAD_SELECT_R1);
+        if (us.has_hotkey_pad_fast_forward)
+            g_hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
+                us.hotkey_pad_fast_forward,
+                PSX_HOTKEY_PAD_SELECT_L1);
         if (us.has_bios_path && !bios_from_cli && !us.bios_path.empty()) {
             settings_bios_storage = us.bios_path.string();
             bios_path = settings_bios_storage.c_str();
@@ -12272,6 +12287,8 @@ int main(int argc, char** argv) {
             seed.has_hotkey_pad_rewind = true;
             seed.hotkey_pad_save_state_menu = g_hotkey_pad_save_state_menu;
             seed.has_hotkey_pad_save_state_menu = true;
+            seed.hotkey_pad_fast_forward = g_hotkey_pad_fast_forward;
+            seed.has_hotkey_pad_fast_forward = true;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (has_netplay_player_name) {
                 seed.netplay_player_name = netplay_player_name;
@@ -12452,6 +12469,9 @@ int main(int argc, char** argv) {
             ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU] =
                 normalize_hotkey_pad_binding(seed.hotkey_pad_save_state_menu,
                     PSX_HOTKEY_PAD_SELECT_R1);
+            ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD] =
+                normalize_hotkey_pad_binding(seed.hotkey_pad_fast_forward,
+                    PSX_HOTKEY_PAD_SELECT_L1);
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
@@ -12741,6 +12761,10 @@ int main(int argc, char** argv) {
                     ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
                     PSX_HOTKEY_PAD_SELECT_R1);
                 seed.has_hotkey_pad_save_state_menu = true;
+                seed.hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
+                    ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
+                    PSX_HOTKEY_PAD_SELECT_L1);
+                seed.has_hotkey_pad_fast_forward = true;
                 seed.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 seed.has_auto_skip_fmv = skip_fmv_offered;
                 seed.turbo_loads = ls.turbo_loads != 0;
@@ -12958,6 +12982,9 @@ int main(int argc, char** argv) {
                 g_hotkey_pad_save_state_menu = seed.has_hotkey_pad_save_state_menu
                     ? seed.hotkey_pad_save_state_menu
                     : PSX_HOTKEY_PAD_SELECT_R1;
+                g_hotkey_pad_fast_forward = seed.has_hotkey_pad_fast_forward
+                    ? seed.hotkey_pad_fast_forward
+                    : PSX_HOTKEY_PAD_SELECT_L1;
                 skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
                     settings_bios_storage = seed.bios_path.string();
@@ -14444,6 +14471,10 @@ soft_return_lobby:
             normalize_hotkey_pad_binding(
                 g_hotkey_pad_save_state_menu,
                 PSX_HOTKEY_PAD_SELECT_R1);
+        ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD] =
+            normalize_hotkey_pad_binding(
+                g_hotkey_pad_fast_forward,
+                PSX_HOTKEY_PAD_SELECT_L1);
         ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
             : (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
         ls.language_index = 0;
@@ -14737,6 +14768,10 @@ soft_return_lobby:
                     ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
                     PSX_HOTKEY_PAD_SELECT_R1);
                 us.has_hotkey_pad_save_state_menu = true;
+                us.hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
+                    ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
+                    PSX_HOTKEY_PAD_SELECT_L1);
+                us.has_hotkey_pad_fast_forward = true;
                 us.auto_skip_fmv = ls.auto_skip_fmv != 0;
                 us.has_auto_skip_fmv = skip_fmv_offered;
                 us.turbo_loads = ls.turbo_loads != 0;
@@ -14817,6 +14852,9 @@ soft_return_lobby:
             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
                 ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
                 PSX_HOTKEY_PAD_SELECT_R1);
+            g_hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
+                ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
+                PSX_HOTKEY_PAD_SELECT_L1);
             switch (ls.aspect_index) {
                 case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
                 case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;

@@ -755,7 +755,10 @@ The runtime models **authentic 1× CD-ROM timing by default** — the same read 
 seek delays as real hardware. On top of that faithful baseline, load-time
 acceleration is **opt-in**, per game, so the accurate path is never compromised:
 
-- **Turbo** — a hold-to-fast-forward key that compresses loads on demand.
+- **Turbo** — a hold-to-fast-forward key that compresses loads on demand
+  (keyboard `[KeyMap] Turbo`, default Tab; controller `[hotkeys]
+  fast_forward_pad`, default Select+L1, rebindable under the launcher's
+  Controller → Host Shortcuts alongside Rewind and Save states).
 - **The "Fast Loading (host pacing)" and "CD Speed" mods** — automatic
   acceleration during load waits, shipped with every title and **off by
   default**, with `turbo_audio_sink` keeping the SPU timeline coherent through

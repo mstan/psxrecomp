@@ -40,4 +40,19 @@ assert "bool manual_turbo_active = false;" in MAIN
 assert "Fast forward: %dx" in MAIN
 assert "g_frame_period_ms / (double)mult" in MAIN
 
+# Fast-forward has a controller host shortcut alongside the keyboard Turbo key:
+# a select+L1 chord by default, routed through the same combo matcher, offered
+# to the launcher as the third host-shortcut row, and persisted as
+# [hotkeys] fast_forward_pad.
+assert "static int           g_hotkey_pad_fast_forward = 1528;" in MAIN
+assert "PSX_HOTKEY_PAD_SELECT_L1" in MAIN
+assert "PSX_ASSIST_BIND_FAST_FORWARD" in MAIN
+assert "if (kb_turbo || hotkey_pad_binding_down(g_hotkey_pad_fast_forward)) {" in MAIN
+assert MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD]") == \
+    MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU]")
+assert '"Fast-forward",' in MAIN
+CFG = (ROOT / "recompiler" / "src" / "config_loader.cpp").read_text(encoding="utf-8")
+assert 'h.contains("fast_forward_pad")' in CFG          # settings.toml read
+assert 'f << "fast_forward_pad = "' in CFG               # settings.toml write
+
 print("host shortcut guard passed")
