@@ -644,7 +644,7 @@ def stage_toolchain(stage, recomp_dir, recomp_tools, recomp_include, dl_cache,
     shutil.copy2(os.path.join(recomp_tools, 'compile_overlays.py'), toolchain)
     tool_inc = _mkdirs(os.path.join(toolchain, 'include'))
     for h in os.listdir(recomp_include):
-        if h.endswith('.h'):
+        if h.endswith(('.h', '.c.inc')):
             shutil.copy2(os.path.join(recomp_include, h), tool_inc)
 
     # The runtime gates autocompile on this exact file. If the layout ever

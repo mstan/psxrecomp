@@ -34,6 +34,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TOOLS = os.path.abspath(os.path.join(_HERE, '..', '..', 'tools'))
@@ -310,6 +311,59 @@ class CodegenHashGuardTest(unittest.TestCase):
         touch(os.path.join(self.tmp, 'overlay_codegen_hash.h'),
               '#define PSX_OVERLAY_CODEGEN_HASH 0xecd487f7\n')
         rs._require_built_codegen_hash(self.tmp)     # must not raise
+
+
+class ToolchainStagingTest(unittest.TestCase):
+    """The staged overlay toolchain must include every file compile_overlays.py
+    needs to produce a shard, not only public C headers."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='psx_reltool_')
+        self.stage = os.path.join(self.tmp, 'stage')
+        self.tools = os.path.join(self.tmp, 'tools')
+        self.include = os.path.join(self.tmp, 'include')
+        self.recomp = os.path.join(self.tmp, 'recompiler')
+        self.mingw = os.path.join(self.tmp, 'mingw')
+        self.cache = os.path.join(self.tmp, 'dl')
+        for d in (self.tools, self.include, self.recomp, self.mingw):
+            os.makedirs(d, exist_ok=True)
+        touch(os.path.join(self.tools, 'compile_overlays.py'))
+        touch(os.path.join(self.include, 'overlay_api.h'))
+        touch(os.path.join(self.include, 'overlay_dispatch_preamble.c.inc'))
+        touch(os.path.join(self.recomp, 'psxrecomp-game.exe'))
+        for d in ('libgcc_s_seh-1.dll', 'libstdc++-6.dll',
+                  'libwinpthread-1.dll'):
+            touch(os.path.join(self.mingw, d))
+
+        self.py_zip = os.path.join(self.tmp, 'python.zip')
+        with zipfile.ZipFile(self.py_zip, 'w') as z:
+            z.writestr('python.exe', 'fake')
+        self.tcc_zip = os.path.join(self.tmp, 'tcc.zip')
+        with zipfile.ZipFile(self.tcc_zip, 'w') as z:
+            z.writestr('tcc/tcc.exe', 'fake')
+
+        self.orig_pins = rs.TOOLCHAIN_PINS['win']
+        self.orig_fetch = rs.get_pinned_archive
+        rs.TOOLCHAIN_PINS['win'] = {
+            'python_url': self.py_zip,
+            'python_sha256': 'unused',
+            'tcc_url': self.tcc_zip,
+            'tcc_sha256': 'unused',
+        }
+        rs.get_pinned_archive = lambda url, _sha, _dest, log=print: url
+
+    def tearDown(self):
+        rs.TOOLCHAIN_PINS['win'] = self.orig_pins
+        rs.get_pinned_archive = self.orig_fetch
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stages_overlay_dispatch_preamble(self):
+        rs.stage_toolchain(self.stage, self.recomp, self.tools, self.include,
+                           self.cache, platform_tag='win',
+                           mingw_bin=self.mingw, log=lambda *_a: None)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.stage, 'overlay_toolchain', 'include',
+            'overlay_dispatch_preamble.c.inc')))
 
 
 if __name__ == '__main__':
