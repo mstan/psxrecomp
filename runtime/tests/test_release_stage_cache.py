@@ -321,15 +321,18 @@ class ToolchainStagingTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix='psx_reltool_')
         self.stage = os.path.join(self.tmp, 'stage')
         self.tools = os.path.join(self.tmp, 'tools')
-        self.include = os.path.join(self.tmp, 'include')
+        self.framework = os.path.join(self.tmp, 'framework')
+        self.include = os.path.join(self.framework, 'runtime', 'include')
+        self.bios = os.path.join(self.framework, 'bios')
         self.recomp = os.path.join(self.tmp, 'recompiler')
         self.mingw = os.path.join(self.tmp, 'mingw')
         self.cache = os.path.join(self.tmp, 'dl')
-        for d in (self.tools, self.include, self.recomp, self.mingw):
+        for d in (self.tools, self.include, self.bios, self.recomp, self.mingw):
             os.makedirs(d, exist_ok=True)
         touch(os.path.join(self.tools, 'compile_overlays.py'))
         touch(os.path.join(self.include, 'overlay_api.h'))
         touch(os.path.join(self.include, 'overlay_dispatch_preamble.c.inc'))
+        touch(os.path.join(self.bios, 'SCPH1001.toml'))
         touch(os.path.join(self.recomp, 'psxrecomp-game.exe'))
         for d in ('libgcc_s_seh-1.dll', 'libstdc++-6.dll',
                   'libwinpthread-1.dll'):
@@ -364,6 +367,8 @@ class ToolchainStagingTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.stage, 'overlay_toolchain', 'include',
             'overlay_dispatch_preamble.c.inc')))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.stage, 'overlay_toolchain', 'bios', 'SCPH1001.toml')))
 
 
 if __name__ == '__main__':

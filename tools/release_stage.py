@@ -646,6 +646,13 @@ def stage_toolchain(stage, recomp_dir, recomp_tools, recomp_include, dl_cache,
     for h in os.listdir(recomp_include):
         if h.endswith(('.h', '.c.inc')):
             shutil.copy2(os.path.join(recomp_include, h), tool_inc)
+    recomp_root = os.path.abspath(os.path.join(recomp_include, '..', '..'))
+    bios_src = os.path.join(recomp_root, 'bios')
+    bios_dest = _mkdirs(os.path.join(toolchain, 'bios'))
+    for profile in ('SCPH1001.toml', 'OpenBIOS.toml'):
+        src = os.path.join(bios_src, profile)
+        if os.path.isfile(src):
+            shutil.copy2(src, bios_dest)
 
     # The runtime gates autocompile on this exact file. If the layout ever
     # changes, fail here rather than shipping a toolchain the runtime ignores.
@@ -656,6 +663,12 @@ def stage_toolchain(stage, recomp_dir, recomp_tools, recomp_include, dl_cache,
              'stay interpreted forever'
              % os.path.relpath(probe, toolchain))
     os.chmod(probe, 0o755)
+    for required in (os.path.join('include', 'overlay_dispatch_preamble.c.inc'),
+                     os.path.join('bios', 'SCPH1001.toml')):
+        path = os.path.join(toolchain, required)
+        if not os.path.isfile(path):
+            _die('staged overlay_toolchain is missing %s; bundled shard '
+                 'autocompile would fail at runtime' % required)
 
     # lstat, and skip symlinks. os.path.getsize() follows them, and a
     # relocatable CPython is dense with them -- the staged Linux toolchain has
