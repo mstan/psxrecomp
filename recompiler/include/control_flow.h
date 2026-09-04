@@ -89,6 +89,14 @@ public:
 private:
     const PS1Executable& exe_;
 
+    // One past the last address that DISCOVERY and BLOCK CONSTRUCTION may
+    // reach for `func`: the function's own end, clamped to the image's
+    // analysis bound (PS1Executable::analysis_end_address). The clamp keeps a
+    // trailing delay-slot guard word — readable on purpose, but with no word
+    // after it — from ever becoming a block leader or a block's exit
+    // instruction. See the exe_tag comment in ps1_exe_parser.h.
+    uint32_t analysis_walk_hi(const Function& func) const;
+
     // Find all basic block boundaries in a function
     std::set<uint32_t> find_block_boundaries(const Function& func);
 

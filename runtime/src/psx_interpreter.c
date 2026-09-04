@@ -25,6 +25,7 @@
 extern uint32_t i_stat;
 /* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
 extern void psx_irq_raise(uint32_t bit, uint32_t detail);
+extern void psx_irq_refresh_cause_ip2(void);  /* interrupts.c — CAUSE.IP2 mirror */
 extern uint32_t i_mask;
 
 #define COP0_SR    12
@@ -71,6 +72,7 @@ static uint32_t s_load_val;
 /* ---- Init ---- */
 
 void interp_init(CPUState* cpu) {
+    (void)cpu;
     s_hit_bp = 0;
     s_trace_on = 0;
     s_halted = 0;
@@ -81,6 +83,11 @@ void interp_init(CPUState* cpu) {
     s_load_val = 0;
     s_vblank_count = 0;
     memset(s_trace_ring, 0, sizeof(s_trace_ring));
+}
+
+void interp_ld_delay_discard(void) {
+    s_load_reg = 0;
+    s_load_val = 0;
 }
 
 /* ---- Breakpoints ---- */
@@ -204,12 +211,18 @@ static void exec_one(CPUState* cpu) {
         uint32_t rd = RD(insn);
         uint32_t sa = SA(insn);
         switch (func) {
-        case 0x00: set_reg(cpu, rd, rt_val << sa); break;           /* SLL */
-        case 0x02: set_reg(cpu, rd, rt_val >> sa); break;           /* SRL */
-        case 0x03: set_reg(cpu, rd, (uint32_t)((int32_t)rt_val >> sa)); break; /* SRA */
-        case 0x04: set_reg(cpu, rd, rt_val << (rs_val & 31)); break; /* SLLV */
-        case 0x06: set_reg(cpu, rd, rt_val >> (rs_val & 31)); break; /* SRLV */
-        case 0x07: set_reg(cpu, rd, (uint32_t)((int32_t)rt_val >> (rs_val & 31))); break; /* SRAV */
+        case 0x00: set_reg(cpu, rd, rt_val << sa);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, sa); break;   /* SLL */
+        case 0x02: set_reg(cpu, rd, rt_val >> sa);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, sa); break;   /* SRL */
+        case 0x03: set_reg(cpu, rd, (uint32_t)((int32_t)rt_val >> sa));
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, sa); break;   /* SRA */
+        case 0x04: set_reg(cpu, rd, rt_val << (rs_val & 31));
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, rs_val); break; /* SLLV */
+        case 0x06: set_reg(cpu, rd, rt_val >> (rs_val & 31));
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, rs_val); break; /* SRLV */
+        case 0x07: set_reg(cpu, rd, (uint32_t)((int32_t)rt_val >> (rs_val & 31)));
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rt_val, rs_val); break; /* SRAV */
         case 0x08: { /* JR */
             uint32_t target = rs_val;
             exec_one(cpu); /* delay slot */
@@ -225,41 +238,54 @@ static void exec_one(CPUState* cpu) {
         }
         case 0x0C: raise_exception(cpu, 8, 0); return;              /* SYSCALL */
         case 0x0D: raise_exception(cpu, 9, 0); return;              /* BREAK */
-        case 0x10: set_reg(cpu, rd, cpu->hi); break;                /* MFHI */
-        case 0x11: cpu->hi = rs_val; break;                         /* MTHI */
-        case 0x12: set_reg(cpu, rd, cpu->lo); break;                /* MFLO */
-        case 0x13: cpu->lo = rs_val; break;                         /* MTLO */
+        case 0x10: set_reg(cpu, rd, cpu->hi);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->hi, 0); break;   /* MFHI */
+        case 0x11: cpu->hi = rs_val;
+                   psx_pgxp_alu(cpu, insn, cpu->hi, rs_val, 0); break;         /* MTHI */
+        case 0x12: set_reg(cpu, rd, cpu->lo);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->lo, 0); break;   /* MFLO */
+        case 0x13: cpu->lo = rs_val;
+                   psx_pgxp_alu(cpu, insn, cpu->lo, rs_val, 0); break;         /* MTLO */
         case 0x18: { /* MULT */
             int64_t r = (int64_t)(int32_t)rs_val * (int64_t)(int32_t)rt_val;
-            cpu->lo = (uint32_t)r; cpu->hi = (uint32_t)(r >> 32); break;
+            cpu->lo = (uint32_t)r; cpu->hi = (uint32_t)(r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, rs_val, rt_val); break;
         }
         case 0x19: { /* MULTU */
             uint64_t r = (uint64_t)rs_val * (uint64_t)rt_val;
-            cpu->lo = (uint32_t)r; cpu->hi = (uint32_t)(r >> 32); break;
+            cpu->lo = (uint32_t)r; cpu->hi = (uint32_t)(r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, rs_val, rt_val); break;
         }
         case 0x1A: /* DIV */
             if (rt_val == 0) { cpu->lo = (rs_val & 0x80000000u) ? 1 : 0xFFFFFFFFu; cpu->hi = rs_val; }
             else if (rs_val == 0x80000000u && rt_val == 0xFFFFFFFFu) { cpu->lo = 0x80000000u; cpu->hi = 0; }
             else { cpu->lo = (uint32_t)((int32_t)rs_val / (int32_t)rt_val); cpu->hi = (uint32_t)((int32_t)rs_val % (int32_t)rt_val); }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, rs_val, rt_val);
             break;
         case 0x1B: /* DIVU */
             if (rt_val == 0) { cpu->lo = 0xFFFFFFFFu; cpu->hi = rs_val; }
             else { cpu->lo = rs_val / rt_val; cpu->hi = rs_val % rt_val; }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, rs_val, rt_val);
             break;
         case 0x20: { /* ADD (overflow trap) */
             int64_t r = (int64_t)(int32_t)rs_val + (int64_t)(int32_t)rt_val;
             if (r < (int64_t)INT32_MIN || r > (int64_t)INT32_MAX) { raise_exception(cpu, 12, 0); return; }
-            set_reg(cpu, rd, (uint32_t)(int32_t)r); break;
+            set_reg(cpu, rd, (uint32_t)(int32_t)r);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break;
         }
-        case 0x21: set_reg(cpu, rd, rs_val + rt_val); break;       /* ADDU */
+        case 0x21: set_reg(cpu, rd, rs_val + rt_val);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break; /* ADDU */
         case 0x22: { /* SUB (overflow trap) */
             int64_t r = (int64_t)(int32_t)rs_val - (int64_t)(int32_t)rt_val;
             if (r < (int64_t)INT32_MIN || r > (int64_t)INT32_MAX) { raise_exception(cpu, 12, 0); return; }
-            set_reg(cpu, rd, (uint32_t)(int32_t)r); break;
+            set_reg(cpu, rd, (uint32_t)(int32_t)r);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break;
         }
-        case 0x23: set_reg(cpu, rd, rs_val - rt_val); break;       /* SUBU */
+        case 0x23: set_reg(cpu, rd, rs_val - rt_val);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break; /* SUBU */
         case 0x24: set_reg(cpu, rd, rs_val & rt_val); break;       /* AND */
-        case 0x25: set_reg(cpu, rd, rs_val | rt_val); break;       /* OR */
+        case 0x25: set_reg(cpu, rd, rs_val | rt_val);
+                   psx_pgxp_alu(cpu, insn, cpu->gpr[rd], rs_val, rt_val); break; /* OR */
         case 0x26: set_reg(cpu, rd, rs_val ^ rt_val); break;       /* XOR */
         case 0x27: set_reg(cpu, rd, ~(rs_val | rt_val)); break;    /* NOR */
         case 0x2A: set_reg(cpu, rd, (int32_t)rs_val < (int32_t)rt_val ? 1 : 0); break; /* SLT */
@@ -332,15 +358,19 @@ static void exec_one(CPUState* cpu) {
     case 0x08: { /* ADDI (overflow trap) */
         int64_t r = (int64_t)(int32_t)rs_val + (int64_t)SIMM(insn);
         if (r < (int64_t)INT32_MIN || r > (int64_t)INT32_MAX) { raise_exception(cpu, 12, 0); return; }
-        set_reg(cpu, RT(insn), (uint32_t)(int32_t)r); break;
+        set_reg(cpu, RT(insn), (uint32_t)(int32_t)r);
+        psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], rs_val, (uint32_t)SIMM(insn)); break;
     }
-    case 0x09: set_reg(cpu, RT(insn), rs_val + (uint32_t)SIMM(insn)); break; /* ADDIU */
+    case 0x09: set_reg(cpu, RT(insn), rs_val + (uint32_t)SIMM(insn));
+               psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], rs_val, (uint32_t)SIMM(insn)); break; /* ADDIU */
     case 0x0A: set_reg(cpu, RT(insn), (int32_t)rs_val < SIMM(insn) ? 1 : 0); break; /* SLTI */
     case 0x0B: set_reg(cpu, RT(insn), rs_val < (uint32_t)SIMM(insn) ? 1 : 0); break; /* SLTIU */
     case 0x0C: set_reg(cpu, RT(insn), rs_val & IMM16(insn)); break; /* ANDI */
-    case 0x0D: set_reg(cpu, RT(insn), rs_val | IMM16(insn)); break; /* ORI */
+    case 0x0D: set_reg(cpu, RT(insn), rs_val | IMM16(insn));
+               psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], rs_val, IMM16(insn)); break; /* ORI */
     case 0x0E: set_reg(cpu, RT(insn), rs_val ^ IMM16(insn)); break; /* XORI */
-    case 0x0F: set_reg(cpu, RT(insn), (uint32_t)IMM16(insn) << 16); break; /* LUI */
+    case 0x0F: set_reg(cpu, RT(insn), (uint32_t)IMM16(insn) << 16);
+               psx_pgxp_alu(cpu, insn, cpu->gpr[RT(insn)], 0, 0); break; /* LUI */
 
     /* --- COP0 --- */
     case 0x10: {
@@ -369,14 +399,21 @@ static void exec_one(CPUState* cpu) {
     case 0x12: {
         uint32_t cop_op = RS(insn);
         switch (cop_op) {
-        case 0x00: /* MFC2 */
-            set_load_delay(RT(insn), gte_read_data(cpu, RD(insn)));
+        case 0x00: { /* MFC2 */
+            uint32_t v = gte_read_data(cpu, RD(insn));
+            set_load_delay(RT(insn), v);
+            psx_pgxp_cop2(cpu, insn, v, 0);
             break;
-        case 0x02: /* CFC2 */
-            set_load_delay(RT(insn), gte_read_ctrl(cpu, RD(insn)));
+        }
+        case 0x02: { /* CFC2 */
+            uint32_t v = gte_read_ctrl(cpu, RD(insn));
+            set_load_delay(RT(insn), v);
+            psx_pgxp_cop2(cpu, insn, v, 0);
             break;
+        }
         case 0x04: /* MTC2 */
             gte_write_data(cpu, RD(insn), rt_val);
+            psx_pgxp_cop2(cpu, insn, rt_val, 0);
             break;
         case 0x06: /* CTC2 */
             gte_write_ctrl(cpu, RD(insn), rt_val);
@@ -396,12 +433,16 @@ static void exec_one(CPUState* cpu) {
     /* --- Loads --- */
     case 0x20: { /* LB */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        set_load_delay(RT(insn), (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr));
+        uint32_t v = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
+        set_load_delay(RT(insn), v);
+        psx_pgxp_load(cpu, insn, addr, v);
         break;
     }
     case 0x21: { /* LH */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        set_load_delay(RT(insn), (uint32_t)(int32_t)(int16_t)cpu->read_half(addr));
+        uint32_t v = (uint32_t)(int32_t)(int16_t)cpu->read_half(addr);
+        set_load_delay(RT(insn), v);
+        psx_pgxp_load(cpu, insn, addr, v);
         break;
     }
     case 0x22: { /* LWL */
@@ -416,21 +457,28 @@ static void exec_one(CPUState* cpu) {
             case 3: cur = word; break;
         }
         set_reg(cpu, RT(insn), cur);
+        psx_pgxp_load(cpu, insn, addr, cur);
         break;
     }
     case 0x23: { /* LW */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        set_load_delay(RT(insn), cpu->read_word(addr));
+        uint32_t v = cpu->read_word(addr);
+        set_load_delay(RT(insn), v);
+        psx_pgxp_load(cpu, insn, addr, v);
         break;
     }
     case 0x24: { /* LBU */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        set_load_delay(RT(insn), (uint32_t)cpu->read_byte(addr));
+        uint32_t v = (uint32_t)cpu->read_byte(addr);
+        set_load_delay(RT(insn), v);
+        psx_pgxp_load(cpu, insn, addr, v);
         break;
     }
     case 0x25: { /* LHU */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        set_load_delay(RT(insn), (uint32_t)cpu->read_half(addr));
+        uint32_t v = (uint32_t)cpu->read_half(addr);
+        set_load_delay(RT(insn), v);
+        psx_pgxp_load(cpu, insn, addr, v);
         break;
     }
     case 0x26: { /* LWR */
@@ -445,6 +493,7 @@ static void exec_one(CPUState* cpu) {
             case 3: cur = (cur & 0xFFFFFF00u) | (word >> 24); break;
         }
         set_reg(cpu, RT(insn), cur);
+        psx_pgxp_load(cpu, insn, addr, cur);
         break;
     }
 
@@ -452,11 +501,13 @@ static void exec_one(CPUState* cpu) {
     case 0x28: { /* SB */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         cpu->write_byte(addr, (uint8_t)(rt_val & 0xFF));
+        psx_pgxp_store(cpu, insn, addr, rt_val & 0xFFu);
         break;
     }
     case 0x29: { /* SH */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         cpu->write_half(addr, (uint16_t)(rt_val & 0xFFFF));
+        psx_pgxp_store(cpu, insn, addr, rt_val & 0xFFFFu);
         break;
     }
     case 0x2A: { /* SWL */
@@ -470,11 +521,13 @@ static void exec_one(CPUState* cpu) {
             case 3: cur = rt_val; break;
         }
         cpu->write_word(aligned, cur);
+        psx_pgxp_store(cpu, insn, addr, rt_val);
         break;
     }
     case 0x2B: { /* SW */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
         cpu->write_word(addr, rt_val);
+        psx_pgxp_store(cpu, insn, addr, rt_val);
         break;
     }
     case 0x2E: { /* SWR */
@@ -488,19 +541,24 @@ static void exec_one(CPUState* cpu) {
             case 3: cur = (cur & 0x00FFFFFFu) | (rt_val << 24); break;
         }
         cpu->write_word(aligned, cur);
+        psx_pgxp_store(cpu, insn, addr, rt_val);
         break;
     }
 
     /* --- COP2 load/store (LWC2/SWC2) --- */
     case 0x32: { /* LWC2 */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        gte_write_data(cpu, RT(insn), cpu->read_word(addr));
+        uint32_t v = cpu->read_word(addr);
+        gte_write_data(cpu, RT(insn), v);
+        psx_pgxp_cop2(cpu, insn, v, addr);
         break;
     }
     case 0x3A: { /* SWC2 */
         uint32_t addr = rs_val + (uint32_t)SIMM(insn);
-        cpu->write_word(addr, gte_read_data(cpu, RT(insn)));
+        uint32_t v = gte_read_data(cpu, RT(insn));
+        cpu->write_word(addr, v);
         gte_precision_store_word(addr, RT(insn));
+        psx_pgxp_cop2(cpu, insn, v, addr);
         break;
     }
 
@@ -540,7 +598,13 @@ static void interp_check_interrupts(CPUState* cpu) {
     /* Fire interrupt exception.
      * Push SR stack, set Cause, set EPC, jump to vector. */
     cpu->cop0[COP0_CAUSE] = (cpu->cop0[COP0_CAUSE] & ~0x7Cu) | (0u << 2); /* ExcCode=0 (interrupt) */
-    cpu->cop0[COP0_CAUSE] |= (1u << 10); /* IP2 */
+    /* IP2 is combinational — it mirrors the INTC line and is owned solely by
+     * psx_irq_refresh_cause_ip2() (interrupts.c). Latching it here with |= was
+     * the same defect as the compiled delivery path had: the bit was set at
+     * delivery and never cleared, so it survived the guest's I_STAT ack as a
+     * phantom pending interrupt. We reach this point only when
+     * (i_stat & i_mask) != 0, so the mirror necessarily asserts it. */
+    psx_irq_refresh_cause_ip2();
     cpu->cop0[COP0_SR] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2);
     cpu->cop0[COP0_EPC] = cpu->pc;
 

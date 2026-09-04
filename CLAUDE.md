@@ -36,7 +36,7 @@ core — and forbids per-game patches / symptom-workarounds / `game.toml` hacks
 *as a way to fake faithfulness*. It does NOT forbid them forever: once the
 faithful core is proven, per-game shims/hacks are the legitimate tool of the
 *enhancement* phase — accelerated load times (toward 0), widescreen, etc. (see
-`ENHANCEMENTS.md`). Likewise **LLE is the BASELINE, not an absolute**: a
+`docs/ENHANCEMENTS.md`). Likewise **LLE is the BASELINE, not an absolute**: a
 faithful, Beetle-validated HLE *subsystem replacement* is permitted at a genuine
 LLE landmine (non-determinism with no hardware analog, or profound performance
 loss), never as the starting point — see §0's amendment below and
@@ -104,7 +104,7 @@ forbidden; "we diverge loudly from Beetle / fall back to the faithful path" ⇒
 permitted. **Faithfulness is the FOUNDATION, not the destination:** once the
 faithful core is proven, the goals are accelerated load times (toward 0) and
 enhancements (widescreen), where per-game shims/hacks become legitimate
-(`ENHANCEMENTS.md`). Per-game hacks remain forbidden during foundation work.
+(`docs/ENHANCEMENTS.md`). Per-game hacks remain forbidden during foundation work.
 
 **AMENDMENT 2026-07-02 — HLE is a standing, swappable TIER (the gbarecomp
 model), not just a per-landmine carve-out.** This goes further than the

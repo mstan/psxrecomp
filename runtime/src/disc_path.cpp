@@ -15,9 +15,10 @@ namespace {
 
 // Raw image extensions we are willing to mount on their own, in preference
 // order for the cue-fallback search.
-const char* const kImageExtensions[] = { ".bin", ".img", ".iso" };
+const char* const kImageExtensions[] = { ".bin", ".img", ".iso", ".car" };
 
 bool is_cue(const fs::path& p) { return path_has_extension_ci(p, ".cue"); }
+bool is_chd(const fs::path& p) { return path_has_extension_ci(p, ".chd"); }
 
 bool is_raw_image(const fs::path& p) {
     for (const char* ext : kImageExtensions) {
@@ -55,7 +56,7 @@ fs::path first_existing_binary(const CueSheet& sheet) {
     return {};
 }
 
-// <stem>.bin / .img / .iso next to a cue we could not use.
+// <stem>.bin / .img / .iso / .car next to a cue we could not use.
 fs::path find_sibling_image(const fs::path& cue) {
     std::error_code ec;
     for (const char* ext : kImageExtensions) {
@@ -120,6 +121,10 @@ DiscPathResolution resolve_disc_path(const fs::path& picked) {
     r.data   = r.picked;
 
     if (r.picked.empty()) return r;
+
+    // CHD is already a complete image + table of contents. It must not be
+    // upgraded to a same-stem cue or treated as that cue's raw payload.
+    if (is_chd(r.picked)) return r;
 
     if (is_cue(r.picked)) {
         const CueSheet sheet = parse_cue_sheet(r.picked);

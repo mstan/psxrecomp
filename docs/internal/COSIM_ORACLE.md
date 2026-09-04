@@ -116,7 +116,7 @@ transfer transient state that a cycle-exact lockstep needs.
   precise-slice / dirty-interp resume state if it affects delivery.
 
 **Exclude from the hash (host-only, would cause false divergences):** CPUState function
-pointers + `sljit_helpers`, jmpbufs, fiber handles, malloc addresses, file handles,
+pointers, jmpbufs, fiber handles, malloc addresses, file handles,
 struct padding, uninitialized bytes. Serialize little-endian explicitly; serialize
 arrays in fixed order; serialize any event/deadline queue **sorted** by a deterministic
 key (guest_cycle, priority, type, seq).

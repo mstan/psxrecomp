@@ -702,6 +702,35 @@ int main() {
     CHECK(rounded.code_size() == 0x1800,
           "page reservation does not widen static analysis payload");
 
+    // Retail PS-X EXEs may declare BSS inside a sector-rounded payload. The
+    // overlap is safe only when every overlapped file byte is padding zero.
+    auto zero_padded_bss = make_exe_buffer(0x1000);
+    put32(zero_padded_bss, 0x28, kLoad + 0xDBC); // 0x244-byte overlap
+    put32(zero_padded_bss, 0x2C, 0x400);
+    std::string zero_bss_error;
+    const auto zero_bss_exe = PSXRecomp::PS1ExeParser::parse_buffer(
+        zero_padded_bss, zero_bss_error);
+    CHECK(zero_bss_exe.has_value(),
+          "zero-only BSS/payload overlap is accepted");
+
+    auto nonzero_bss = zero_padded_bss;
+    nonzero_bss[text + 0xE00] = 1;
+    std::string nonzero_bss_error;
+    const auto nonzero_bss_exe = PSXRecomp::PS1ExeParser::parse_buffer(
+        nonzero_bss, nonzero_bss_error);
+    CHECK(!nonzero_bss_exe.has_value(),
+          "non-zero BSS/code overlap remains rejected");
+    CHECK(nonzero_bss_error.find("overlaps non-zero code/data") !=
+              std::string::npos,
+          "non-zero overlap reports the unsafe bytes");
+
+    auto before_code_bss = zero_padded_bss;
+    put32(before_code_bss, 0x28, kLoad - 4);
+    std::string before_code_error;
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(
+               before_code_bss, before_code_error).has_value(),
+          "BSS beginning before the payload remains rejected");
+
     if (failures) {
         std::fprintf(stderr, "FAILED (%d)\n", failures);
         return 1;

@@ -21,6 +21,25 @@ int psx_game_text_native_ok(uint32_t addr)
     return psx_game_address_in_text(addr) && dirty_ram_text_native_ok(phys);
 }
 
+int psx_game_text_native_ok_full(uint32_t addr)
+{
+    (void)addr;
+    return 0;
+}
+
+#elif defined(PSX_HAS_GAME_DISPATCH) && \
+      !defined(PSX_GAME_DISPATCH_HAS_NATIVE_OK_FULL)
+
+/* A suffix-aware dispatcher cannot prove that a later direct host fallthrough
+ * in the same compiled entry still matches guest RAM. Decline straight-line
+ * handoff until regeneration provides exact whole-entry validation. */
+
+int psx_game_text_native_ok_full(uint32_t addr)
+{
+    (void)addr;
+    return 0;
+}
+
 #elif !defined(PSX_HAS_GAME_DISPATCH)
 
 /* The BIOS-only runtime still links shared dispatch observability. There is no
@@ -32,6 +51,12 @@ int psx_game_address_in_text(uint32_t addr)
 }
 
 int psx_game_text_native_ok(uint32_t addr)
+{
+    (void)addr;
+    return 0;
+}
+
+int psx_game_text_native_ok_full(uint32_t addr)
 {
     (void)addr;
     return 0;

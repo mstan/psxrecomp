@@ -99,8 +99,16 @@ void psx_clear_return_to_lobby(void);
 
 /* Save-state restore: unwind to psx_scheduler_run and re-dispatch resume_pc
  * (the restored CPUState's PC). Call on the scheduler fiber at a block-leader
- * boundary, in_exception == 0. Never returns (longjmp). */
+ * boundary, in_exception == 0. Never returns (longjmp). Arms top-level
+ * resume (see below) for the first post-resume frame. */
 void psx_scheduler_resume_at(uint32_t resume_pc);
+
+/* After resume_at, dispatch is top-level — there is no abandoned mid-block
+ * native chain under the resume PC. Sentinel same-thread RFE must not publish
+ * pc=0 / "continue live chain" (that is GUEST_EXIT). Active until the first
+ * finish_frame / explicit clear. Shared by savestate, selfcheck, and RB. */
+int  psx_scheduler_top_level_resume_active(void);
+void psx_scheduler_top_level_resume_clear(void);
 
 /* HLE-tier standing subsystem replacement (CLAUDE.md §0 amendments
  * 2026-06-29 + 2026-07-02). 1 = deterministic TCB scheduler (default, both

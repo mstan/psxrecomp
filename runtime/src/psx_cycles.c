@@ -3,6 +3,7 @@
 #include "psx_cycles.h"
 #include "cpu_state.h"
 #include <stdlib.h>
+#include <string.h>
 #if defined(_MSC_VER)
 #include <intrin.h>       /* MSVC intrinsics: _BitScanReverse (no __builtin_clz) */
 #endif
@@ -12,6 +13,9 @@
 #include "sio.h"
 #include "starvation_ring.h"
 #include "timers.h"
+#if defined(PSX_HAS_RECOMP_NET)
+#include "psx_netplay.h"
+#endif
 #ifdef PSX_COSIM
 #include "cosim_state.h"
 #endif
@@ -20,6 +24,7 @@ uint64_t psx_cycle_count = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
+uint32_t *g_psx_cyc_local_acc = NULL;
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
 
@@ -75,6 +80,7 @@ static void advance_devices(uint32_t c) {
     dma_advance(c);
     timers_advance(c);
     interrupts_advance_cycles(c);
+    psx_spu_sample_event_service();
 }
 
 /* ===== Event-deadline device servicing (production fast path) =================
@@ -107,6 +113,11 @@ static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here 
 /* Exported for the inlined psx_advance_cycles / psx_cyc_charge hot path. */
 uint64_t psx_next_service_cycle = 0;         /* absolute; 0 = dirty, recompute  */
 int      psx_in_device_service  = 0;         /* re-entrancy guard               */
+int      g_plp_cycle_diag       = 0;
+uint64_t g_plp_adv_calls        = 0;
+uint32_t g_plp_adv_max_chunk    = 0;
+uint64_t g_plp_adv_sum          = 0;
+uint64_t g_plp_svc_calls        = 0;
 #define s_next_service_cycle psx_next_service_cycle
 #define s_in_device_service  psx_in_device_service
 static uint64_t s_next_watchdog        = 0;
@@ -129,6 +140,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
+    uint32_t a = psx_spu_sample_event_cycles_to_next(); if (a < best) best = a;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
 }
@@ -146,8 +158,20 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
     uint32_t c = cdrom_cycles_to_irq(i_mask);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_deliverable_irq(i_mask); if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);     if (s < best) best = s;
+    /* SPU IRQ9 is raised by the guest-clock sample scheduler, not by a device
+     * *_advance(); a poll loop waiting on it must not be skipped across several
+     * 768-cycle sample boundaries before it can acknowledge and re-arm. Only an
+     * unmasked IRQ9 is observable, like the other sources above. */
+    if (i_mask & (1u << IRQ_SPU)) {
+        uint32_t a = psx_spu_sample_event_cycles_to_next(); if (a < best) best = a;
+    }
     if (best == 0) best = 1;
     return best;
+}
+
+/* Test/diagnostic accessor for the idle-skip observation boundary above. */
+uint32_t psx_idle_cycles_to_next_observable_event(void) {
+    return devices_cycles_to_next_idle_event();
 }
 
 static void psx_devices_recompute_deadline(void) {
@@ -158,6 +182,7 @@ static void psx_devices_recompute_deadline(void) {
 
 void psx_devices_service_to_now(void) {
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    if (g_plp_cycle_diag) g_plp_svc_calls++;
     g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
     uint64_t target = psx_cycle_count;
@@ -198,6 +223,11 @@ void psx_devices_service_to_now(void) {
     if (target >= s_next_watchdog) {
         s_next_watchdog = target + 65536ull;
         psx_cycles_watchdog_fire();
+#if defined(PSX_HAS_RECOMP_NET)
+        /* INPUT/CONFIRM retransmit during BIOS free-run (before vblank admit). */
+        if (psx_netplay_active())
+            psx_netplay_pump();
+#endif
     }
     if (target >= s_next_pc_sample) {
         s_next_pc_sample = target + 1048576ull;
@@ -300,10 +330,25 @@ void psx_advance_cycles_slow(uint32_t cycles) {
         psx_cycles_pc_sample_fire();
     }
 #endif
+#if defined(PSX_HAS_RECOMP_NET)
+    /* Independent of starvation ring (off in PSX_NO_DEBUG_TOOLS release).
+     * Retransmit INPUT/CONFIRM during BIOS free-run before first vblank. */
+    {
+        static uint32_t s_net_pump_throttle;
+        s_net_pump_throttle += cycles;
+        if (s_net_pump_throttle >= 65536u) {
+            s_net_pump_throttle = 0;
+            if (psx_netplay_active())
+                psx_netplay_pump();
+        }
+    }
+#endif
 }
 
 uint64_t psx_get_cycle_count(void) {
-    return psx_cycle_count + (uint64_t)g_psx_cyc_batch;
+    uint64_t n = psx_cycle_count + (uint64_t)g_psx_cyc_batch;
+    if (g_psx_cyc_local_acc) n += (uint64_t)(*g_psx_cyc_local_acc);
+    return n;
 }
 
 /* ===== Idle-loop cycle skip (wait-loop elision, 2026-07-06) ==================
@@ -381,6 +426,13 @@ static void idle_snapshot_regs(const CPUState *cpu) {
 }
 
 static int idle_skip_on(void) {
+    /* Cycle-skip is a host enhancement; under netplay it forks peers (detector
+     * streak / skip quanta are not part of the shared snap). Same for the
+     * solo resim self-check — keep the window on the faithful cycle path. */
+    extern int psx_netplay_active(void);
+    extern int psx_selfcheck_enabled(void);
+    if (psx_netplay_active() || psx_selfcheck_enabled())
+        return 0;
     if (g_idle_skip_enabled < 0) {
         /* No game config reached this process (for example a BIOS-only
          * runtime). Keep the enhancement inert unless the environment opts in;
@@ -518,16 +570,56 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
  * the deadline-model bookkeeping (synced position + next deadline) is stale and
  * would try to replay a bogus gap. Re-anchor devices at the restored cycle and
  * force a fresh deadline on the next charge. */
-void psx_cycles_resync_after_restore(void) {
+void psx_cycles_resync_after_restore(CPUState *cpu) {
+    if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
+    g_psx_cyc_local_acc    = NULL;
     g_psx_cyc_batch        = 0;
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
     s_devices_synced_cycle = psx_cycle_count;
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
+    /* Idle-skip detector latches absolute cycle/store counters from the
+     * pre-load timeline; drop them so a rewound clock cannot false-train. */
+    s_idle_pc = 0;
+    s_idle_streak = 0;
+    s_idle_have_snap = 0;
+    s_idle_progress_reg = -2;
+    s_idle_last_cycle = psx_cycle_count;
+    /* GTE/muldiv completion deadlines and load-absorb give-back are host-only
+     * absolute cycle stamps (not in BS_SEC_CPU). After a warm load they still
+     * hold the pre-load live timeline; the next psx_gte_stall / muldiv_stall
+     * would then advance (live_ts - restored_cycle) in one shot — tens of
+     * millions of cycles / N nested presents with zero IRQ checks (MotK
+     * transform CTC2 path). Anchor them at the restored clock. */
+    if (cpu) {
+        cpu->gte_ts_done = psx_cycle_count;
+        cpu->muldiv_ts_done = psx_cycle_count;
+        memset(cpu->read_absorb, 0, sizeof(cpu->read_absorb));
+        cpu->read_absorb_which = 0;
+        cpu->read_fudge = 0x20u; /* no committed predecessor load */
+        cpu->ld_which_t = 0x20u; /* no pending load dest */
+        cpu->ld_absorb = 0;
+    }
+    /* Dirty-RAM interpreter load-delay writebacks live in host statics, not
+     * BS_SEC_CPU. Discard (do not flush): snap GPRs are already architectural.
+     * A stale pending v0 write from the pre-load timeline was forking MotK
+     * resim peers (countdown vs BIOS v0=1) at matched guest clocks. */
+    {
+        extern void dirty_ram_ld_delay_discard(void);
+        dirty_ram_ld_delay_discard();
+    }
+    /* Entry-poll %%64 stride + 4096-insn pump gap are host-only; reset so
+     * both peers take the first post-load dirty wait IRQ on the same phase. */
+    {
+        extern void dirty_ram_irq_ambient_resync_after_restore(void);
+        dirty_ram_irq_ambient_resync_after_restore();
+    }
 }
 
 void psx_cycles_reset_for_boot(void) {
+    if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
+    g_psx_cyc_local_acc    = NULL;
     g_psx_cyc_batch        = 0;
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;

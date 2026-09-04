@@ -75,7 +75,9 @@ static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
                                  uint32_t pc) {
     /* Symmetric self-stop trap (mirror of the runtime's PSX_CD_TRAP_CMD):
      * SIGSTOP on the Nth matching CD command so a debugger can freeze the
-     * oracle at the exact boot point and diff its state against ours. */
+     * oracle at the exact boot point and diff its state against ours.
+     * POSIX-only, same guard as debug_server.c — Windows has no SIGSTOP. */
+#ifndef _WIN32
     {
         static long trap_cmd = -2, trap_nth = 1, hits = 0;
         if (trap_cmd == -2) {
@@ -86,6 +88,7 @@ static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
         }
         if ((long)cmd == trap_cmd && ++hits == trap_nth) raise(SIGSTOP);
     }
+#endif
     BeetleCdcmdEntry *e = &s_cdcmd_trace[s_cdcmd_idx];
     e->seq = s_cdcmd_seq++; e->pc = pc; e->cmd = cmd; e->nargs = nargs;
     e->a0 = a0; e->a1 = a1; e->a2 = a2;
@@ -544,7 +547,10 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
             FILE *f = fopen(card_files[sl], "rb");
             if (!f) {
                 std::fprintf(stderr,
-                    "[psx-beetle] WARNING: %s missing — slot %d will be blank\n",
+                    "[psx-beetle] WARNING: %s missing — slot %d will be blank "
+                    "(populated fixtures live in "
+                    "runtime/tests/fixtures/memcards/; copy dummy.*.mcr into "
+                    "this process's working directory)\n",
                     card_files[sl], sl + 1);
                 continue;
             }
@@ -616,7 +622,7 @@ extern "C" int beetle_is_loaded(void) { return s_loaded ? 1 : 0; }
  * Fills out[0..37]: [0..31]=GPR, [32]=PC, [33]=LO, [34]=HI, [35]=SR(cop0.12),
  * [36]=CAUSE(cop0.13), [37]=EPC(cop0.14). Returns 0 if the CPU isn't up yet.
  * This closes the get_registers gap so the oracle can serve full CPU state
- * for order+state+caller first-divergence (PRINCIPLES.md), matching the
+ * for order+state+caller first-divergence (docs/internal/PRINCIPLES.md), matching the
  * recomp's get_registers. */
 extern "C" int beetle_get_registers(uint32_t *out /* >= 38 words */) {
     if (!PSX_CPU || !out) return 0;
@@ -1281,4 +1287,47 @@ extern "C" int beetle_history_get_snapshot(int slot, uint32_t *out_addr, int *ou
     if (out_addr)   *out_addr   = s_beetle_snap_addrs[slot];
     if (out_active) *out_active = s_beetle_snap_active[slot];
     return 1;
+}
+
+/* ---- cyc_watch / exc_ring stubs ----
+ * Full per-instruction sampling lives in a beetle-psx DebugMode CPUHook that
+ * was never checked into docs/*.patch. GPU/OT oracle work only needs these
+ * symbols to link; wire returns empty/unarmed until the hook patch lands. */
+static uint32_t s_cw_anchor_raw = 0, s_cw_anchor_phys = 0;
+static uint32_t s_cw_end_raw = 0, s_cw_end_phys = 0;
+static uint32_t s_cw_max_hits = 0, s_cw_hits = 0;
+static int s_cw_armed = 0;
+
+extern "C" void beetle_cyc_watch_arm(uint32_t anchor_raw, uint32_t end_raw, int n) {
+    s_cw_anchor_raw = anchor_raw;
+    s_cw_anchor_phys = anchor_raw & 0x1FFFFFFFu;
+    s_cw_end_raw = end_raw;
+    s_cw_end_phys = end_raw & 0x1FFFFFFFu;
+    s_cw_max_hits = (n > 0) ? (uint32_t)n : 16u;
+    s_cw_hits = 0;
+    s_cw_armed = 1;
+}
+extern "C" void beetle_cyc_watch_clear(void) {
+    s_cw_armed = 0; s_cw_hits = 0;
+}
+extern "C" void beetle_cyc_watch_get_state(uint32_t *anchor_raw, uint32_t *anchor_phys,
+                                          uint32_t *end_raw, uint32_t *end_phys,
+                                          uint32_t *max_hits, uint32_t *hits, int *armed) {
+    if (anchor_raw)  *anchor_raw  = s_cw_anchor_raw;
+    if (anchor_phys) *anchor_phys = s_cw_anchor_phys;
+    if (end_raw)     *end_raw     = s_cw_end_raw;
+    if (end_phys)    *end_phys    = s_cw_end_phys;
+    if (max_hits)    *max_hits    = s_cw_max_hits;
+    if (hits)        *hits        = s_cw_hits;
+    if (armed)       *armed       = s_cw_armed;
+}
+extern "C" int beetle_cyc_watch_get(uint32_t i, uint32_t *hit_index, uint32_t *pc,
+                                   unsigned long long *cyc) {
+    (void)i; (void)hit_index; (void)pc; (void)cyc;
+    return 0;
+}
+
+extern "C" int retro_psxref_exc_ring_dump(char *out, int cap) {
+    if (!out || cap < 32) return -1;
+    return std::snprintf(out, (size_t)cap, "{\"ok\":true,\"entries\":[]}");
 }

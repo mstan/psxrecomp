@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the mod API's zero sentinel: follow the display, never busy-loop."""
+"""Guard the mod API's zero sentinel: follow the measured display rate."""
 
 from pathlib import Path
 
@@ -17,9 +17,7 @@ assert EXPECTED_ASSIGNMENT in MAIN, (
     "psx_mod_set_frame_interpolation(0) must preserve the 0 sentinel so "
     "gl_renderer_set_interpolation resolves it to the measured host refresh"
 )
-assert "frames_per_second ? (int)frames_per_second : -1" not in MAIN, (
-    "the -1 sentinel selects the uncapped interpolation busy loop"
-)
+assert "frames_per_second ? (int)frames_per_second : -1" not in MAIN
 assert "zero follows the measured host-display refresh rate" in HEADER, (
     "the public plugin contract must document the display-rate sentinel"
 )

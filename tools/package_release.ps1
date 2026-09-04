@@ -1,6 +1,9 @@
 param(
-    [string]$Version = "v0.1.0-alpha",
-    [string]$BuildDir = "runtime/build-release"
+    [string]$Version = "v0.3.2-alpha",
+    [string]$BuildDir = "runtime/build-release",
+    # Drop channel = "developer" packages. Off by default so a local package
+    # still carries in-progress work; CI sets EXCLUDE_DEV_MODS=1 instead.
+    [switch]$ExcludeDevMods
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +24,12 @@ cmake -S (Join-Path $Root "runtime") -B $BuildPath -G Ninja `
 cmake --build $BuildPath --target psx-runtime -j $env:NUMBER_OF_PROCESSORS
 
 if (Test-Path $StageRoot) {
-    Remove-Item -Recurse -Force $StageRoot
+    $resolvedRoot = (Resolve-Path $Root).Path.TrimEnd('\')
+    $resolvedStage = (Resolve-Path $StageRoot).Path.TrimEnd('\')
+    if (-not $resolvedStage.StartsWith($resolvedRoot + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to delete stage path outside repo root: $resolvedStage"
+    }
+    Remove-Item -LiteralPath $StageRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force $Stage | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $Stage "saves") | Out-Null
@@ -53,7 +61,7 @@ $imports = & $objdump -p (Join-Path $Stage "PSXRecomp.exe") |
 $systemDlls = @("kernel32.dll","user32.dll","gdi32.dll","shell32.dll","msvcrt.dll",
                 "advapi32.dll","ws2_32.dll","comdlg32.dll","dbghelp.dll","ole32.dll",
                 "oleaut32.dll","winmm.dll","imm32.dll","version.dll","setupapi.dll",
-                "dinput8.dll","rpcrt4.dll","hid.dll","cfgmgr32.dll")
+                "dinput8.dll","rpcrt4.dll","hid.dll","cfgmgr32.dll","opengl32.dll")
 $nonSystem = $imports | Where-Object { $systemDlls -notcontains $_.ToLower() }
 if ($nonSystem) {
     throw "Release exe is NOT self-contained; imports non-system DLL(s): $($nonSystem -join ', ')"
@@ -71,11 +79,67 @@ if ($bakedBios) {
 }
 Write-Host "Verified no baked absolute BIOS path in the exe"
 
+# Mod catalog. runtime.cmake stages <exe>/mods for every non-oracle target, so
+# a build that lacks it has broken wiring -- fail rather than ship a package
+# whose Mods page is silently empty.
+#
+# Staged BEFORE the stray-file scan below on purpose: mods/state.toml is the
+# BUILD MACHINE's per-user enable/disable state and must never ship (preloaded
+# catalogs are default-disabled, so a dev's selections would become everyone's
+# defaults). Strip it here -- a dev machine legitimately has one, so that is a
+# strip, not a failure -- and let the stray scan confirm none survived.
+$ModsSrc = Join-Path $BuildPath "mods"
+$ModsDst = Join-Path $Stage "mods"
+if (!(Test-Path $ModsSrc)) {
+    throw "Build has no mods/ next to the exe: $ModsSrc (rebuild the runtime target)"
+}
+Copy-Item -Recurse -Force $ModsSrc $ModsDst
+Get-ChildItem $ModsDst -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq "state.toml" -or $_.Name -eq "state.toml.tmp" } |
+    Remove-Item -Force
+$manifestCount = (Get-ChildItem $ModsDst -Recurse -File -Filter "manifest.toml" `
+    -ErrorAction SilentlyContinue | Measure-Object).Count
+if ($manifestCount -lt 1) {
+    throw "Staged mods/ contains no manifest.toml; the catalog would ship empty"
+}
+# Developer-channel packages (channel = "developer") are unfinished work that
+# ships with local builds but must never be published. Prune by PACKAGE
+# directory; never rewrite a manifest during packaging.
+$ExcludeDev = $ExcludeDevMods -or ($env:EXCLUDE_DEV_MODS -eq "1")
+if ($ExcludeDev) {
+    Write-Host "Excluding developer-channel mods"
+    Get-ChildItem (Join-Path $ModsDst "packages") -Recurse -File -Filter "manifest.toml" `
+        -ErrorAction SilentlyContinue | ForEach-Object {
+        if ((Get-Content $_.FullName) -match '^\s*channel\s*=\s*"developer"\s*$') {
+            $verDir = $_.Directory
+            $pkgDir = $verDir.Parent
+            Remove-Item -Recurse -Force $verDir.FullName
+            if (-not (Get-ChildItem $pkgDir.FullName -ErrorAction SilentlyContinue)) {
+                Remove-Item -Force $pkgDir.FullName
+            }
+            Write-Host "  excluded developer package: $($pkgDir.Name)/$($verDir.Name)"
+        }
+    }
+    $devLeft = Get-ChildItem $Stage -Recurse -File -Filter "manifest.toml" `
+        -ErrorAction SilentlyContinue |
+        Where-Object { (Get-Content $_.FullName) -match '^\s*channel\s*=\s*"developer"\s*$' }
+    if ($devLeft) {
+        throw "developer manifest(s) survived pruning: $(($devLeft | ForEach-Object FullName) -join '; ')"
+    }
+    $manifestCount = (Get-ChildItem $ModsDst -Recurse -File -Filter "manifest.toml" `
+        -ErrorAction SilentlyContinue | Measure-Object).Count
+    if ($manifestCount -lt 1) {
+        throw "every staged package was developer-channel; the catalog would ship empty"
+    }
+}
+Write-Host "Staged mod catalog: $manifestCount manifest(s)"
+
 # No user-machine or copyrighted files may ride along in the stage. OpenBIOS
 # is intentionally present and redistributable; retail SCPH images remain
 # forbidden.
 $strayPatterns = @("SCPH*.BIN","*.cue","*.iso","*.mcd","bios.cfg","disc.cfg",
-                   "settings.toml","keybinds.ini","overlay_captures.json")
+                   "settings.toml","keybinds.ini","overlay_captures.json",
+                   "state.toml")
 $stray = foreach ($pat in $strayPatterns) { Get-ChildItem $Stage -Recurse -File -Filter $pat -ErrorAction SilentlyContinue }
 if ($stray) {
     throw "Stage contains files that must never ship: $(($stray | ForEach-Object FullName) -join '; ')"

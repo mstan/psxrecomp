@@ -53,10 +53,42 @@ How the two configs relate:
 ```toml
 [program]    # in bios.toml; describes the BIOS
 [game]       # in game.toml; describes the game
+[prepare_disc]  # optional; data-track digests for prepare/verify
+[netplay]       # optional; TOC / cue policy for online
 [recompiler]
 [runtime]
 [audit]
 ```
+
+## Netplay disc mount (`[netplay]`)
+
+Optional. Online play needs the same CD geometry on every peer — data-track
+CRC/SHA alone cannot distinguish a Track-01-only dump from a full Redump
+multi-track cue. The runtime mounts the resolved path, fingerprints the TOC
+(`disc_fp`), and gates Host/Join on `netplay_ok`. Peers also exchange
+`disc_fp` through the lobby (`disc_mismatch` on join).
+
+| Field | Default | Description |
+|---|---|---|
+| `require_cue` | `false` | Require a `.cue` mount (reject bare `.bin` / cue→bin fallback) |
+| `required_tracks` | `0` | Exact `iso_track_count` when > 0 (e.g. MotK Redump = `17`) |
+| `required_leadout_lba` | unset | Exact lead-out LBA when set |
+| `required_disc_fp` | `""` | Exact lowercase hex SHA-256 TOC fingerprint when non-empty |
+| `required_disc_fps` | unset | Multi-disc: array parallel to `[game] discs`, the TOC fingerprint of each disc. Each disc of a set has its own TOC, so a set gated only on `required_disc_fp` (the boot disc's) refuses online play on every other disc the launcher lets the player select. A disc with no entry falls back to `required_disc_fp`. |
+
+The whole `[netplay]` policy is resolved **per mounted disc**, not once per
+build — `required_tracks` and `required_leadout_lba` are per-disc facts too (a
+set may mix a CD-DA disc with a data-only one, and the lead-out LBA is the
+disc's size). Only `required_disc_fps` carries per-disc data today; the
+resolution point is `netplay_expect_for_disc()` in `runtime/src/main.cpp`, and
+that is where the others go when a title needs them.
+
+Offline Play may still launch with a TOC warning; first-run setup Finish and
+online Create/Join require `netplay_ok` (and online also a clean verify +
+non-empty `disc_fp`). Mirror `required_tracks` in the RetComM catalog as
+`rom_identity.track_counts` so the hub library scan rejects Track-01-only dumps.
+Wizard / RetComM / catalog submission accept Redump `.cue` + sibling `.bin`
+tracks only — not `.iso`/`.chd` (cannot reliably expand to multi-track).
 
 ## Program / game block
 
@@ -83,6 +115,25 @@ respective files.
 | `stack_base` | game | hex string, initial `$sp` value for the game |
 | `disc` | game (single-disc) | path to .cue, relative to project root |
 | `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]` |
+| `disc_serials` | game (multi-disc, optional) | array parallel to `discs`: the serial each disc carries (`["SCUS-94163", "SCUS-94164", "SCUS-94165"]`). Without it every disc is checked against `[game] id` — the BOOT disc's serial — so selecting disc 2 reports "wrong disc". A disc with no entry here is not serial-gated; the ISO-header check still applies. |
+
+### Multi-disc selection
+
+A build whose `discs` array has more than one entry grows a **Disc Selection**
+dropdown in the launcher, above the Serial/Region/ISO-header checklist. The
+choice is persisted in `settings.toml`:
+
+```toml
+[disc]
+path     = "/abs/path/Game (Disc 2).bin"   # the image actually mounted
+selected = 2                               # 1-based index into [game] discs
+```
+
+`selected` names the disc and `path` only survives when it *is* that disc
+(same file-name stem), so writing `selected` alone — from an external launcher
+or by hand — switches discs even though `path` still points at the previous
+one. That is what makes disc choice manageable like any other setting. Both
+keys are written only for multi-disc titles.
 
 ## Recompiler block
 
@@ -304,12 +355,41 @@ The other load-time accelerators are likewise opt-in:
 
 ```toml
 [runtime]
-turbo_loads = true
 idle_skip = true
 turbo_audio_sink = true
+overlay_region_floor = "0x10000"   # optional: lowest RAM address treated as overlay region.
+                                    # Default = boot EXE text end. Lower it for titles whose gameplay
+                                    # code loads at/inside the boot text range (GT1 secondary EXEs at
+                                    # 0x80010000, Driver 2 mission pages) so it is overlay-cache
+                                    # eligible. Clamped >= 0x10000; PSX_OVERLAY_REGION_FLOOR overrides.
 ```
 
-`turbo_audio_sink` is meaningful only while `turbo_loads` is active. It keeps
+### `turbo_loads` / `offer_turbo_loads` — deprecated and ignored
+
+**Do not use these keys.** Load acceleration is owned by the Mods catalog:
+`psx.enhancement.fast-loading` ("Fast Loading (host pacing)") and
+`psx.enhancement.cd-speed`. Both target `game_id = "*"`, so they ship with every
+title, both default to off, and both expose the multiplier and instant-scheduler
+detail that a single opaque boolean never could. recomp-ui correspondingly draws
+no generic Turbo loads row.
+
+Both keys are still parsed so existing configs load without error, but neither is
+honoured — the runtime logs a deprecation line naming the Fast Loading mod and
+leaves acceleration off. Remove them from `game.toml`.
+
+The same applies to `[video] turbo_loads` in a user's `settings.toml`: it is no
+longer restored at startup, and it is no longer written back out, so the stale
+row disappears on the first save after updating. This is deliberate. Because the
+launcher stopped drawing a control for it, a persisted `true` was simultaneously
+authoritative and unreachable: one run of a build whose `game.toml` said `true`
+latched turbo on permanently, and no later config change could undo it. That
+shipped to players in MegaManX6Recomp v1.0.4/v1.0.5 (MegaManX6Recomp#14). Never
+restore this row without also restoring a UI control for it.
+
+For development, the `turbo_loads` TCP debug command still toggles acceleration
+at runtime.
+
+`turbo_audio_sink` is meaningful only while load acceleration is active. It keeps
 the guest SPU timeline advancing but discards accelerated samples before host
 playback, then fades normal output back in.
 
@@ -351,13 +431,47 @@ Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets
 it to false. The runtime then hides the Settings row, ignores stale persisted
 values, and leaves activation to the selected trusted plugin.
 
+### Local rewind (`settings.toml`)
+
+Rewind is a player setting, not a game one: it lives in the user's
+`settings.toml` beside the runtime executable, under `[video]`.
+
+```toml
+[video]
+rewind          = false   # off by default — see below
+rewind_depth    = 50      # snapshots kept: 50 / 100 / 150 / 200
+rewind_interval = 15      # frames between snapshots: 1 / 4 / 8 / 12 / 15
+```
+
+**`rewind` defaults to `false`.** The ring holds whole *machine* snapshots —
+2 MB main RAM + 1 MB VRAM + 512 KB SPU RAM, stored uncompressed — and captures
+one every `rewind_interval` frames (denser, toward 4, while an FMV runs). At
+the default depth that is a few hundred MB of resident memory plus a periodic
+multi-megabyte copy, which is not a cost to charge every host for a feature a
+session may never open. Turning it on is one click in the launcher's Display
+card; nothing is allocated until it is.
+
+`PSX_REWIND=1` / `PSX_REWIND=0` override the setting either way, and
+`PSX_REWIND_DEPTH` / `PSX_REWIND_INTERVAL` / `PSX_REWIND_FMV_INTERVAL` override
+the tuning. A build configured with `-DPSX_REWIND=OFF` has no rewind at all and
+ignores all of these.
+
+Netplay rollback is a separate subsystem with its own ring and is unaffected by
+this setting; rewind is in fact suppressed while a netplay session is active.
+
+Bezel artwork is intentionally not a `[video]` key. It is exposed as the
+disabled-by-default `psx.presentation.bezel` mod package, which draws a
+user-selected image resource behind the game image in OpenGL letterbox or
+pillarbox margins. With the mod disabled, or with no bezel image selected,
+margins remain the historical black clear.
+
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
 - `default_game_root` — for sibling-junction setups
 
 ## Audit block
 
-See `docs/audit_inventory.md` for the audit pipeline. The schema here is
+See `docs/internal/audit_inventory.md` for the audit pipeline. The schema here is
 the input side: regions to walk, address-normalisation rules.
 
 ```toml

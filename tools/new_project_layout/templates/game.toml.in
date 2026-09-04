@@ -1,0 +1,35 @@
+# Minimal game.toml stub for the New Project Layout.
+# With setup_project --disc <cue>, probe_disc.py overwrites this with
+# serial / EXE header / Track 01 digests / TOC fp / [netplay] gates, and writes
+# seeds/ghidra_funcs.txt (boot-EXE JAL scan).
+# Without --disc, fill by hand (or re-run probe_disc.py later).
+# See psxrecomp/docs/GAME_PROJECT_SETUP.md and docs/config_schema.md.
+
+[game]
+name = "@GAME_NAME@"
+# id = "SLUS-XXXXX"
+players = @PLAYERS@
+# exe = "disc/@BOOT_EXE@"
+# disc = "disc/game.cue"
+# load_address = "0x80010000"
+# entry_pc = "0x800XXXXX"
+# text_size = "0x00000000"
+# stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+
+# Optional identity hashes for Generate / netplay dump checks:
+# [prepare_disc]
+# out_dir = "disc"
+# boot_exe = "@BOOT_EXE@"
+# known_sizes = [...]
+# known_md5 = [...]
+# known_sha1 = [...]
+
+# [netplay]
+# require_cue = true
+# required_tracks = 0
+# required_disc_fp = "…"

@@ -105,6 +105,12 @@ BiosAddressModel BiosAddressModel::from_config(const BiosConfig& cfg) {
 
 uint32_t BiosAddressModel::normalize(uint32_t addr) const {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    // The 2 MiB main RAM is mirrored four times across the first 8 MiB of
+    // physical address space. Dispatch keys must use the same hardware alias
+    // as ordinary memory reads, or a valid call through 0x80200000+
+    // incorrectly becomes an unmapped-PC failure.
+    if (phys < 0x00800000u)
+        phys &= 0x001FFFFFu;
     // Sequential per-copy folds, same shape as the emitted normalize() —
     // equivalence to first-match-wins is enforced by from_config.
     for (const BiosAddrCopy& c : copies_) {
@@ -217,6 +223,8 @@ std::string BiosAddressModel::emit_normalize_c() const {
     std::string out;
     out += "static uint32_t normalize(uint32_t addr) {\n";
     out += "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
+    out += "    /* PSX main RAM: 2 MiB mirrored through physical 0x007FFFFF. */\n";
+    out += "    if (phys < 0x00800000u) phys &= 0x001FFFFFu;\n";
     for (const BiosAddrCopy& c : copies_) {
         if (c.key_is_ram) {
             out += fmt::format("    /* {}: ROM 0x{:X}+ -> RAM 0x{:X}+ */\n",

@@ -1269,6 +1269,10 @@ it decelerates and is unrelated to the (now-fixed) host-stack leak. Run gameplay
 
 ### 25.5 Stage 3 — overlay (sljit + gcc-DLL) CPS parity (2026-06-18)
 
+> Historical session log. The sljit tier was removed in `5b7e69b4` (2026-07-15);
+> the gcc-DLL findings below remain current, and the toolchain-free role sljit
+> filled is now the bundled tcc tier. A gcc miss falls to tcc, then interp.
+
 **sljit JIT (overlay_sljit.c), scoped:** `jr $ra` publishes `cpu->pc`; call-containing
 fragments **decline to the interp** (CPS-safe, depth-1); `jr rX` already tail-transferred.
 So only leaf shards JIT — `jr` covered, calls interp. Validated: boots, leak flat, shards

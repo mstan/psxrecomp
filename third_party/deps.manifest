@@ -1,0 +1,23 @@
+# psxrecomp vendored-dependency pins.
+#
+# THE single record of every source archive the build may fetch. Both
+# cmake/psx_dependency_archive.cmake and tools/ci/vendor_deps.sh read this
+# file, so a vendored archive under third_party/ can never drift from the
+# URL/hash the build would otherwise download.
+#
+# Columns, whitespace-separated:
+#   name    FetchContent name used in the CMake files
+#   file    archive name under third_party/ (vendored form)
+#   sha256  digest of that archive; also the URL_HASH of the upstream pin
+#   url     upstream download location
+#
+# Only psx_libchdr is committed: it is the one dependency with no local
+# fallback (no find_package path, no toolchain-pack copy), so a build with no
+# network dies at it. SDL3 and zlib resolve from a system package or a
+# cmake-clang-v1 toolchain pack first; run tools/ci/vendor_deps.sh to stage
+# them here as well for a fully air-gapped tree.
+#
+# name          file                                                     sha256                                                            url
+psx_libchdr     libchdr-6cde5348eb118da3baf94f75a69577a005a484fd.tar.gz   a222b1f1c842f988c2aad51e5f56ba94a423ed87ccab71f1abdb757caa7444f5  https://github.com/rtissera/libchdr/archive/6cde5348eb118da3baf94f75a69577a005a484fd.tar.gz
+SDL3            SDL3-3.4.10.tar.gz                                       12b34280415ec8418c864408b93d008a20a6530687ee613d60bfbd20411f2785  https://github.com/libsdl-org/SDL/releases/download/release-3.4.10/SDL3-3.4.10.tar.gz
+psx_zlib        zlib-1.3.1.tar.gz                                        9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23  https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz

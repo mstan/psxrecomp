@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="PSXRecomp">
+  <rect width="512" height="512" rx="96" fill="#121820"/>
+
+  <g fill="#2dd4bf">
+    <!-- Grips first (behind body) — flush with side edges at the corners -->
+    <rect x="46" y="255" width="72" height="120" rx="36"
+          transform="rotate(26 82 315)"/>
+    <rect x="394" y="255" width="72" height="120" rx="36"
+          transform="rotate(-26 430 315)"/>
+    <!-- Main body on top so grip tops are hidden -->
+    <rect x="70" y="130" width="372" height="210" rx="80"/>
+  </g>
+
+  <!-- Select / Start -->
+  <rect x="222" y="182" width="26" height="12" rx="6" fill="#121820"/>
+  <rect x="264" y="182" width="26" height="12" rx="6" fill="#121820"/>
+
+  <!-- Joysticks under Start / Select -->
+  <circle cx="235" cy="262" r="20" fill="#121820"/>
+  <circle cx="277" cy="262" r="20" fill="#121820"/>
+
+  <!-- D-pad -->
+  <path fill="#121820"
+        d="M146 152 H174 V180 H202 V208 H174 V236 H146 V208 H118 V180 H146 Z"/>
+
+  <!-- Face buttons -->
+  <circle cx="342" cy="158" r="15" fill="#121820"/>
+  <circle cx="372" cy="188" r="15" fill="#121820"/>
+  <circle cx="342" cy="218" r="15" fill="#121820"/>
+  <circle cx="312" cy="188" r="15" fill="#121820"/>
+</svg>

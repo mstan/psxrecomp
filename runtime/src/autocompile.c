@@ -4,6 +4,7 @@
 #include "autocompile.h"
 #include "overlay_loader.h"
 
+#include <stdarg.h>   /* autocompile_set_degraded takes a format + varargs */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv — declared here; glibc/windows.h leak it, macOS SDK does not */
@@ -12,6 +13,10 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#endif
+
+#ifndef PSX_OVERLAY_FLAVOR
+#define PSX_OVERLAY_FLAVOR 0
 #endif
 
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
@@ -107,6 +112,37 @@ static uint32_t     s_shard_skipped    = 0;   /* last run */
 static uint32_t     s_shard_fail_total = 0;   /* accumulated across all runs */
 static int          s_shard_result_seen = 0;  /* did we parse a result line? */
 
+/* ---- Degraded-state channel (portable; read by autocompile_status_json) ----
+ *
+ * Every warning in this file goes to stdout, and the shipped runtime links
+ * `-mwindows` — a GUI-subsystem binary with NO console attached. So the careful
+ * diagnostics below are emitted into nothing on exactly the builds people run,
+ * and a broken autocompile presents only as "the game feels slow".
+ *
+ * That is not hypothetical. A fresh worktree ran 100% interpreted for an entire
+ * session — `runs=8 fails=8 shard_ok=0`, `dispatch_native=0` — because
+ * `overlay_autocompile_cmd` named a recompiler path the documented build recipe
+ * does not produce. Nothing surfaced it, and it invalidated a whole performance
+ * comparison before the counters were queried by hand.
+ *
+ * Rule 3 forbids log files and printf debugging, so the fix is not more
+ * printing: record WHY we are degraded in one string that leaves over the TCP
+ * debug server in `autocompile_status`. One queryable field, carrying the
+ * reason, instead of a state that has to be reconstructed from counters. */
+static char s_degraded[600];
+
+static void autocompile_set_degraded(const char *fmt, ...) {
+    if (s_degraded[0]) return;          /* keep the FIRST cause, not the last */
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_degraded, sizeof(s_degraded), fmt, ap);
+    va_end(ap);
+}
+
+const char *autocompile_degraded_reason(void) {
+    return s_degraded[0] ? s_degraded : NULL;
+}
+
 /* Child-output tail ring. Watcher thread writes, TCP reads — guarded by a
  * critical section on Windows. Holds the TAIL (newest bytes win). */
 #define AC_OUT_CAP 8192
@@ -157,6 +193,13 @@ static int  s_child_line_overflow = 0;
 static void autocompile_report_broken_once(void) {
     if (s_reported_broken || s_consecutive_fails < AC_LOUD_AFTER_FAILS) return;
     s_reported_broken = 1;
+    autocompile_set_degraded(
+        "overlay autocompile failed %u consecutive runs (last exit %d); "
+        "nothing is being compiled to native code, so overlay execution stays "
+        "in the interpreter. Check [runtime] overlay_autocompile_cmd in "
+        "game.toml: every path in it must resolve from the process working "
+        "directory.",
+        s_consecutive_fails, (int)s_exit_code);
     char tail[AC_OUT_CAP];
     int n = 0;
     if (s_out_lock_init) {
@@ -560,6 +603,156 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
 }
 #endif /* _WIN32 */
 
+#ifdef _WIN32
+/* Name the interpreter the spawn will actually run, once, at configure time.
+ * The command line's first token resolves through PATH exactly as cmd.exe /C
+ * will resolve it, and on machines where an MSYS2/Cygwin usr/bin precedes the
+ * Windows Python install, a bare `python` silently binds to the Cygwin build.
+ * That interpreter dies with SIGSEGV (exit 0x0B00) under this file's
+ * job-object spawn BEFORE writing a single byte, so the failure report shows
+ * "(no output captured)" and nothing points at the cause. Resolving and
+ * printing the binding up front turns that class of breakage into a one-line
+ * diagnosis; the msys-2.0.dll/cygwin1.dll sibling check calls it out loudly
+ * before the first compile ever runs. */
+static void autocompile_report_interpreter(void) {
+    char tok[MAX_PATH];
+    size_t n = 0;
+    const char *p = s_cmd;
+    if (*p == '"') {                     /* quoted interpreter path */
+        p++;
+        while (*p && *p != '"' && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    } else {
+        while (*p && *p != ' ' && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    if (!tok[0]) return;
+    char resolved[MAX_PATH];
+    /* SearchPathA with .exe mirrors cmd.exe's lookup for extension-less
+     * tokens; a token that already has a path or extension resolves as-is. */
+    DWORD r = SearchPathA(NULL, tok, ".exe", sizeof(resolved), resolved, NULL);
+    if (r == 0 || r >= sizeof(resolved)) {
+        autocompile_set_degraded(
+            "overlay autocompile interpreter \"%s\" does not resolve on PATH; "
+            "every compile run will fail and overlay execution will stay in "
+            "the interpreter.", tok);
+        fprintf(stdout,
+            "psxrecomp: overlay autocompile interpreter '%s' does not resolve "
+            "on PATH — every compile run will fail.\n", tok);
+        fflush(stdout);
+        return;
+    }
+    fprintf(stdout, "psxrecomp: overlay autocompile interpreter: %s\n", resolved);
+    char *slash = strrchr(resolved, '\\');
+    if (!slash) slash = strrchr(resolved, '/');
+    if (slash) {
+        static const char *posix_dlls[] = { "msys-2.0.dll", "cygwin1.dll" };
+        for (size_t k = 0; k < sizeof(posix_dlls) / sizeof(posix_dlls[0]); k++) {
+            char cand[MAX_PATH + 16];
+            snprintf(cand, sizeof(cand), "%.*s\\%s",
+                     (int)(slash - resolved), resolved, posix_dlls[k]);
+            FILE *f = fopen(cand, "rb");
+            if (f) {
+                fclose(f);
+                autocompile_set_degraded(
+                    "overlay autocompile interpreter \"%s\" is an MSYS2/Cygwin "
+                    "build (%s beside it); it crashes under the job spawn "
+                    "before producing output, so every compile fails with no "
+                    "diagnostics. Use \"py -3 ...\" in "
+                    "[runtime] overlay_autocompile_cmd.",
+                    resolved, posix_dlls[k]);
+                fprintf(stdout,
+                    "psxrecomp: WARNING: that interpreter is an MSYS2/Cygwin "
+                    "build (%s beside it).\n"
+                    "  Cygwin-runtime processes crash under the autocompile "
+                    "job spawn before producing output,\n"
+                    "  so every overlay compile will fail with no diagnostics. "
+                    "Use the Windows Python launcher\n"
+                    "  instead: overlay_autocompile_cmd = \"py -3 ...\" in "
+                    "game.toml.\n", posix_dlls[k]);
+                fflush(stdout);
+                break;
+            }
+        }
+    }
+}
+#endif
+
+/* Validate the file arguments the command names, at configure time.
+ *
+ * autocompile_report_interpreter() above resolves the FIRST token (the Python
+ * interpreter). It does not look at the rest of the command line, and the
+ * argument that actually breaks in practice is `--recompiler <path>`: the path
+ * is per-title, hardcoded in game.toml, and does not agree with where the
+ * documented build recipe puts the recompiler.
+ *
+ *   Tomba 2 names psxrecomp-v4/recompiler/build-t2/psxrecomp-game.exe, while
+ *   the recipe builds build-recompiler/ at the worktree root — never matches.
+ *   MMX6 hardcodes an ABSOLUTE path into one checkout, so it works only by
+ *   luck of local layout.
+ *
+ * When the path is wrong every compile fails identically, and because the
+ * failure is only reachable through counters nobody queries, the run silently
+ * degrades to the interpreter. Checking here turns a session-long mystery into
+ * a fact known before the first compile is ever attempted.
+ *
+ * Deliberately advisory: a missing path is recorded and reported, not fatal.
+ * The runtime still runs (interpreted) exactly as before — this only removes
+ * the silence. */
+#ifdef _WIN32
+static void autocompile_check_path_args(void) {
+    static const char *flags[] = { "--recompiler", "--runtime-include" };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        const char *at = strstr(s_cmd, flags[i]);
+        if (!at) continue;
+        const char *p = at + strlen(flags[i]);
+        while (*p == ' ' || *p == '=') p++;
+        char path[MAX_PATH];
+        size_t n = 0;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"' && n + 1 < sizeof(path)) path[n++] = *p++;
+        } else {
+            while (*p && *p != ' ' && n + 1 < sizeof(path)) path[n++] = *p++;
+        }
+        path[n] = '\0';
+        if (!path[0]) continue;
+
+        /* Relative paths resolve against the child's working directory, which
+         * is s_cwd — not ours. Mirror that, or a correct relative path would
+         * look broken from here. */
+        /* Sized to hold s_cwd + separator + a full MAX_PATH argument, so a long
+         * working directory cannot silently truncate the path we then test. */
+        char full[sizeof(s_cwd) + MAX_PATH + 2];
+        int absolute = (path[0] == '/' || path[0] == '\\' ||
+                        (path[1] == ':' && (path[2] == '\\' || path[2] == '/')));
+        if (absolute || !s_cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s\\%s", s_cwd, path);
+
+        DWORD attr = GetFileAttributesA(full);
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            autocompile_set_degraded(
+                "overlay autocompile cannot start: %s \"%s\" does not exist "
+                "(resolved to \"%s\"). Every compile will fail and overlay "
+                "execution will stay in the interpreter. Fix the path in "
+                "[runtime] overlay_autocompile_cmd, or build the recompiler "
+                "where it points.",
+                flags[i], path, full);
+            fprintf(stdout,
+                "psxrecomp: WARNING: overlay autocompile %s \"%s\" does not "
+                "exist (resolved to \"%s\").\n"
+                "  Every overlay compile will fail and execution will stay in "
+                "the interpreter.\n"
+                "  Query the debug server's autocompile_status "
+                "(\"degraded_reason\") to see this without a console.\n",
+                flags[i], path, full);
+            fflush(stdout);
+        }
+    }
+}
+#endif /* _WIN32 */
+
 void autocompile_configure(const char *cmd, const char *cwd) {
     snprintf(s_cmd, sizeof(s_cmd), "%s", cmd ? cmd : "");
     snprintf(s_cwd, sizeof(s_cwd), "%s", cwd ? cwd : "");
@@ -568,6 +761,10 @@ void autocompile_configure(const char *cmd, const char *cwd) {
         InitializeCriticalSection(&s_out_lock);
         InitializeConditionVariable(&s_publish_cv);
         s_out_lock_init = 1;
+    }
+    if (s_cmd[0]) {
+        autocompile_report_interpreter();
+        autocompile_check_path_args();
     }
 #endif
 }
@@ -662,6 +859,16 @@ int autocompile_request(void) {
     if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
     if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
     SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
+    /* Pin the FLAVOR the same way: the tool's --flavor defaults to 0 (play),
+     * so an instrumented (flavor 2) runtime spawned a compile whose shards it
+     * could never load — the loader's flavor guard rejected them and EVERY
+     * overlay ran interpreted, forever, on debug builds. The child must
+     * always write the flavor this runtime reads. */
+    {
+        char flavor_buf[16];
+        snprintf(flavor_buf, sizeof flavor_buf, "%d", (int)PSX_OVERLAY_FLAVOR);
+        SetEnvironmentVariableA("PSX_OVERLAY_FLAVOR", flavor_buf);
+    }
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). The WHOLE command is
@@ -988,8 +1195,18 @@ int autocompile_status_json(char *out, int cap) {
     const uint64_t now_ms = autocompile_now_ms();
     if (s_retry_not_before_ms > now_ms)
         retry_ms = s_retry_not_before_ms - now_ms;
+    /* Degraded reason first, so it is the first thing a reader sees. This is
+     * the ONLY channel that works on the shipped build: the stdout warnings
+     * elsewhere in this file go nowhere under -mwindows. */
+    char degr[720];
+    degr[0] = '\0';
+    if (s_degraded[0])
+        json_escape_into(degr, (int)sizeof(degr), s_degraded,
+                         (int)strlen(s_degraded));
+
     return snprintf(out, cap,
-        "{\"configured\":%d,\"state\":\"%s\",\"runs\":%u,\"fails\":%u,"
+        "{\"degraded\":%d,\"degraded_reason\":\"%s\","
+        "\"configured\":%d,\"state\":\"%s\",\"runs\":%u,\"fails\":%u,"
         "\"rescans\":%u,\"last_exit\":%d,"
         "\"consecutive_fails\":%u,\"retry_ms\":%llu,"
         "\"shard_ok\":%u,\"shard_fail\":%u,\"shard_skipped\":%u,"
@@ -1002,8 +1219,9 @@ int autocompile_status_json(char *out, int cap) {
         "\"publish_prepare_max_us\":%llu,"
         "\"publish_prepare_last_us\":%llu,"
         "\"output_tail\":\"%s\"}",
+        s_degraded[0] ? 1 : 0, degr,
         autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
-        s_rescans, s_exit_code, s_consecutive_fails,
+        s_rescans, (int)s_exit_code, s_consecutive_fails,
         (unsigned long long)retry_ms,
         s_shard_ok, s_shard_fail, s_shard_skipped,
         s_shard_fail_total, s_shard_result_seen,

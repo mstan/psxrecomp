@@ -220,6 +220,11 @@ def build_cmd(args):
         return {"cmd": "read_scratch", "addr": addr, "len": length}, pretty_json
     elif cmd == "gpu":
         return {"cmd": "gpu_state"}, pretty_json
+    elif cmd in ("geom", "geom_correction"):
+        # Are the [video] geometry_correction / perspective_texturing
+        # enhancements actually engaging on this title? Free-running totals;
+        # sample twice and diff for a per-window rate.
+        return {"cmd": "geom_correction"}, pretty_json
     elif cmd == "overlay":
         return {"cmd": "overlay_state"}, pretty_json
     elif cmd == "watch":
@@ -323,6 +328,38 @@ def build_cmd(args):
         if len(args) > 1:
             d["path"] = args[1]
         return d, pretty_json
+    elif cmd in ("screenshot_hires", "shot_hires"):
+        # Captures the SUPERSAMPLED surface the player actually sees. Use this
+        # (not `screenshot`) to verify anything that only exists in the hi-res
+        # mirror -- geometry correction, SSAA edges, perspective UVs -- because
+        # the native capture resolves those away and looks clean regardless.
+        d = {"cmd": "screenshot_hires"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd in ("screenshot_file", "shot_file"):
+        # Canonical native 15-bit VRAM frame (pre-compositor, pre-stretch).
+        # Takes a positional path like its two sibling capture commands.
+        d = {"cmd": "screenshot_file"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd in ("present_shot", "shot_present"):
+        # The composed renderer output -- what the window actually shows,
+        # including the logical-size aspect fit the buffer captures miss.
+        # Use this to verify anything aspect-shaped (widescreen, letterbox).
+        d = {"cmd": "present_shot"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "present_shot_seq":
+        return {"cmd": "present_shot_seq"}, pretty_json
+    elif cmd == "turbo":
+        if len(args) < 2:
+            return None, lambda _: "Usage: turbo <0|1>"
+        return {"cmd": "turbo", "enabled": int(args[1])}, pretty_json
+    elif cmd == "turbo_state":
+        return {"cmd": "turbo_state"}, pretty_json
     elif cmd == "bios_trace":
         d = {"cmd": "bios_trace"}
         if len(args) > 1:
@@ -423,6 +460,29 @@ def build_cmd(args):
         if len(args) > 2:
             d["nth"] = int(args[2])
         return d, pretty_json
+    elif cmd == "pc_probe_arm":
+        # pc_probe_arm [nd_intro=1|2|3|nd|nd_ot|nd_wood] [pcs=0xA,0xB] [n=32]
+        d = {"cmd": "pc_probe_arm"}
+        for a in args[1:]:
+            if "=" in a:
+                k, v = a.split("=", 1)
+                if k in ("n", "nd_intro") and v.lstrip("-").isdigit():
+                    d[k] = int(v)
+                else:
+                    d[k] = v
+            elif a in ("nd", "nd_intro"):
+                d["nd_intro"] = 1
+            elif a in ("nd_ot", "ot"):
+                d["nd_intro"] = 2
+            elif a in ("nd_wood", "wood"):
+                d["nd_intro"] = 3
+            elif a in ("nd_depth", "depth"):
+                d["nd_intro"] = 4
+        return d, pretty_json
+    elif cmd == "pc_probe_dump":
+        return {"cmd": "pc_probe_dump"}, pretty_json
+    elif cmd == "pc_probe_clear":
+        return {"cmd": "pc_probe_clear"}, pretty_json
     elif cmd == "fntrace_arm":
         # <target_hex|0xFFFFFFFF=all|0=clear>
         return {"cmd": "fntrace_arm", "target": args[1]}, pretty_json

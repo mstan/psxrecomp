@@ -1,0 +1,39 @@
+name: Build psxrecomp emitters
+description: Configure and build psxrecomp-game + psxrecomp-bios via tools/ci/build_emitters.sh
+
+inputs:
+  framework:
+    description: Path to the psxrecomp checkout
+    required: false
+    default: psxrecomp
+  build-dir:
+    description: Out-of-tree build directory for the emitters
+    required: false
+    default: build-recompiler
+  toolchain-dir:
+    description: >
+      Portable cmake-clang-v1 root (llvm-mingw on Windows). Empty uses
+      PSXRECOMP_TOOLCHAIN_DIR / TOOLCHAIN_DIR from the environment.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        SCRIPT="${{ inputs.framework }}/tools/ci/build_emitters.sh"
+        if [[ ! -f "${SCRIPT}" ]]; then
+          echo "::error::missing ${SCRIPT}"
+          exit 1
+        fi
+        chmod +x "${SCRIPT}"
+        args=(
+          --framework "${{ inputs.framework }}"
+          --build-dir "${{ inputs.build-dir }}"
+        )
+        if [[ -n "${{ inputs.toolchain-dir }}" ]]; then
+          args+=(--toolchain-dir "${{ inputs.toolchain-dir }}")
+        fi
+        bash "${SCRIPT}" "${args[@]}"

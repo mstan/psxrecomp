@@ -8,6 +8,10 @@
  *   - trap_crash
  *   - TCP "post_mortem_dump" command (future)
  *
+ * Soft-exit (SIGINT / SIGTERM / SIGUSR1, plus Windows console Ctrl handlers)
+ * calls exit(0) so atexit / __gcov_exit / LLVM profile writers flush — required
+ * for PGO train scripts that stop the process with kill.
+ *
  * Mirrors the sibling SuperMarioWorldRecomp project's src/post_mortem.c. The file
  * is OVERWRITTEN on each dump (last-write-wins, single file per run);
  * this is not a log per CLAUDE.md §3 — it's a one-shot final state
@@ -19,7 +23,9 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <intrin.h>     /* __readgsqword — fiber TEB stack bounds for native_stack walk */
 #endif
@@ -32,7 +38,10 @@
 #include <time.h>
 
 #include "cpu_state.h"
+#include "psx_bss.h"
 #include "crash_trace.h"
+#include "autocompile.h"   /* autocompile_degraded_reason — stamp a degraded
+                            * (interpreter-only) run into its own report */
 
 /* Output path — overwritten per dump. */
 static const char *kReportPath = "psx_last_run_report.json";
@@ -48,6 +57,32 @@ static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ")";
 
 /* CPU state pointer (set by debug server at init). */
 extern CPUState *debug_cpu_ptr;
+
+/* Main RAM (2 MiB) and scratchpad — peeks in the crash report, no MMIO. */
+extern uint8_t *g_psx_ram;
+extern uint8_t *memory_get_scratchpad_ptr(void);
+
+/* Overlay loader snapshot (post-FMV splash miss vs resim load freeze). */
+extern uint32_t overlay_loader_get_inprogress(void);
+extern int      overlay_loader_load_frozen(void);
+extern int      overlay_loader_registered_count(void);
+extern void     overlay_loader_get_status(int *active, int *registered,
+                                          int *regions_checked,
+                                          char *cache_dir_out, int cache_dir_len,
+                                          char *game_id_out, int game_id_len,
+                                          uint32_t *checked_out, int checked_max,
+                                          int *checked_written,
+                                          uint32_t *last_crc_out,
+                                          int *last_file_found_out);
+extern void     overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
+                                            uint32_t *unregistered,
+                                            uint64_t *disp_native, uint64_t *disp_interp,
+                                            uint64_t *stale_blocked,
+                                            uint32_t *last_write_pc,
+                                            uint32_t *last_write_addr,
+                                            uint32_t *last_write_size,
+                                            int *regions, uint32_t *revalidations);
+extern int      psx_netplay_is_resimulating(void);
 
 /* Frame counter from debug_server.c (non-static). */
 extern uint64_t s_frame_count;
@@ -114,6 +149,65 @@ static void json_escape(const char *in, char *out, size_t outcap) {
         else if (ch >= 0x20)         { out[o++] = (char)ch; }
     }
     out[o] = 0;
+}
+
+/* Copy `len` guest bytes at `vaddr` into `dst`. DRAM (2 MiB, mirrored across
+ * the first 8 MiB of each KSEG) or scratchpad only — never MMIO. Returns
+ * bytes copied (0 if the address is not in those regions). */
+static int crash_peek_guest(uint32_t vaddr, uint8_t *dst, int len) {
+    uint32_t phys = vaddr & 0x1FFFFFFFu;
+    if (len <= 0) return 0;
+    if (phys >= 0x1F800000u && phys < 0x1F800400u) {
+        uint8_t *sp = memory_get_scratchpad_ptr();
+        if (!sp) return 0;
+        uint32_t off = phys - 0x1F800000u;
+        if (off + (uint32_t)len > 0x400u) len = (int)(0x400u - off);
+        memcpy(dst, sp + off, (size_t)len);
+        return len;
+    }
+    if (phys < 0x00800000u && g_psx_ram) {
+        uint32_t folded = phys & 0x1FFFFFu;
+        if (folded + (uint32_t)len > 0x200000u) len = (int)(0x200000u - folded);
+        if (len <= 0) return 0;
+        memcpy(dst, g_psx_ram + folded, (size_t)len);
+        return len;
+    }
+    return 0;
+}
+
+static void append_hex_bytes(char *buf, size_t cap, size_t *pos,
+                             const uint8_t *p, int n) {
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < n && *pos + 2 < cap; i++) {
+        buf[(*pos)++] = hexd[(p[i] >> 4) & 0xF];
+        buf[(*pos)++] = hexd[p[i] & 0xF];
+    }
+    if (*pos < cap) buf[*pos] = 0;
+}
+
+static void append_ram_peek(char *buf, size_t cap, size_t *pos,
+                            const char *key, uint32_t vaddr, int want, int comma) {
+    uint8_t tmp[64];
+    int n = crash_peek_guest(vaddr, tmp, want);
+    append_fmt(buf, cap, pos,
+               "%s\"%s\":{\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
+               comma ? "," : "", key, vaddr, n);
+    if (n > 0) append_hex_bytes(buf, cap, pos, tmp, n);
+    append_str(buf, cap, pos, "\"}");
+}
+
+/* If the insn at $ra-8 is j/jal, return its target (live RAM, not AOT). */
+static uint32_t crash_jal_target_from_ra(uint32_t ra) {
+    uint8_t b[4];
+    uint32_t pc, insn, op;
+    if (ra < 8u) return 0;
+    pc = (ra - 8u) & ~3u;
+    if (crash_peek_guest(pc, b, 4) != 4) return 0;
+    insn = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    op = (insn >> 26) & 0x3Fu;
+    if (op != 2u && op != 3u) return 0; /* j / jal */
+    return (pc & 0xF0000000u) | ((insn & 0x03FFFFFFu) << 2);
 }
 
 /* Serialize a single uint32_t hex value as a JSON string. */
@@ -265,10 +359,34 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         if (tm) strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm);
     }
 
+    /* Overlay autocompile health. A run whose autocompile never worked executed
+     * entirely in the interpreter, so ANY timing taken from it is meaningless —
+     * and that state is otherwise invisible (the warnings go to stdout, which
+     * does not exist under -mwindows). Stamping it into the run report makes a
+     * degraded session self-documenting rather than something the next reader
+     * has to suspect and re-derive. */
+    const char *ac_degraded = autocompile_degraded_reason();
+    char ac_escaped[640];
+    ac_escaped[0] = '\0';
+    if (ac_degraded) {
+        size_t w = 0;
+        for (const char *p = ac_degraded; *p && w + 2 < sizeof(ac_escaped); p++) {
+            if (*p == '"' || *p == '\\') ac_escaped[w++] = '\\';
+            else if ((unsigned char)*p < 0x20) { ac_escaped[w++] = ' '; continue; }
+            ac_escaped[w++] = *p;
+        }
+        ac_escaped[w] = '\0';
+    }
+
+    char reason_esc[384];
+    json_escape(reason, reason_esc, sizeof(reason_esc));
+
     append_fmt(buf, sizeof(buf), &pos,
         "{\n"
         "  \"reason\": \"%s\",\n"
         "  \"exit_origin\": \"%s\",\n"
+        "  \"autocompile_degraded\": %d,\n"
+        "  \"autocompile_degraded_reason\": \"%s\",\n"
         "  \"build\": \"%s\",\n"
         "  \"timestamp\": \"%s\",\n"
         "  \"frame\": %llu,\n"
@@ -289,8 +407,10 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "    \"entry_sp\": \"0x%08X\",\n"
         "    \"insns_into_block\": %u\n"
         "  },\n",
-        reason ? reason : "(unknown)",
+        reason_esc[0] ? reason_esc : "(unknown)",
         s_exit_origin,
+        ac_degraded ? 1 : 0,
+        ac_degraded ? ac_escaped : "",
         kBuildId,
         ts,
         (unsigned long long)s_frame_count,
@@ -414,9 +534,13 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
             "    \"sr\": \"0x%08X\",\n"
             "    \"cause\": \"0x%08X\",\n"
             "    \"epc\": \"0x%08X\",\n"
+            "    \"iec\": %u,\n"
+            "    \"im2\": %u,\n"
             "    \"gpr\": [",
             cpu->pc, cpu->hi, cpu->lo,
-            cpu->cop0[12], cpu->cop0[13], cpu->cop0[14]);
+            cpu->cop0[12], cpu->cop0[13], cpu->cop0[14],
+            (cpu->cop0[12] & 1u) ? 1u : 0u,
+            (cpu->cop0[12] & (1u << 10)) ? 1u : 0u);
         for (int i = 0; i < 32; i++) {
             append_fmt(buf, sizeof(buf), &pos,
                 "%s\"0x%08X\"", i == 0 ? "" : ",", cpu->gpr[i]);
@@ -424,6 +548,85 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
     } else {
         append_str(buf, sizeof(buf), &pos, "  \"cpu\": null,\n");
+    }
+
+    /* DRAM around $ra-32 (catches jalr at ra-8) and $s0-16, plus the overlay
+     * page that held the TM4 splash caller (0x80165000), the j/jal target at
+     * ra-8 (boot-text hole vs overwrite), and full scratchpad. */
+    {
+        uint32_t ra = 0, s0 = 0;
+        if (debug_cpu_ptr) {
+            ra = debug_cpu_ptr->gpr[31] & ~3u;
+            s0 = debug_cpu_ptr->gpr[16] & ~3u;
+        }
+        uint32_t ra_peek = (ra >= 32u) ? (ra - 32u) : ra;
+        uint32_t s0_peek = (s0 >= 16u) ? (s0 - 16u) : s0;
+        uint32_t jal_tgt = crash_jal_target_from_ra(ra);
+        append_str(buf, sizeof(buf), &pos, "  \"ram_peeks\": {");
+        append_ram_peek(buf, sizeof(buf), &pos, "ra", ra_peek, 64, 0);
+        append_ram_peek(buf, sizeof(buf), &pos, "s0", s0_peek, 48, 1);
+        if (jal_tgt)
+            append_ram_peek(buf, sizeof(buf), &pos, "jal_target", jal_tgt, 64, 1);
+        else
+            append_str(buf, sizeof(buf), &pos,
+                       ",\"jal_target\":{\"addr\":\"0x00000000\",\"len\":0,\"hex\":\"\"}");
+        append_ram_peek(buf, sizeof(buf), &pos, "overlay_80165000",
+                        0x80165000u, 64, 1);
+        {
+            uint8_t spad[1024];
+            int nsp = crash_peek_guest(0x1F800000u, spad, 1024);
+            append_fmt(buf, sizeof(buf), &pos,
+                       ",\"scratchpad\":{\"addr\":\"0x1F800000\",\"len\":%d,\"hex\":\"",
+                       nsp);
+            if (nsp > 0) append_hex_bytes(buf, sizeof(buf), &pos, spad, nsp);
+            append_str(buf, sizeof(buf), &pos, "\"}");
+        }
+        append_str(buf, sizeof(buf), &pos, "},\n");
+    }
+
+    /* Host overlay-DLL / resim gate at FAIL-FAST. Distinguishes "CD DMA never
+     * finished" from "rollback froze registration mid-splash load". */
+    {
+        int active = 0, valid = 0, regions = 0, last_found = 0;
+        uint32_t last_crc = 0;
+        overlay_loader_get_status(&active, &valid, &regions,
+                                  NULL, 0, NULL, 0, NULL, 0, NULL,
+                                  &last_crc, &last_found);
+        uint64_t disp_native = 0, disp_interp = 0, stale_blocked = 0;
+        uint32_t loads = 0, invalidations = 0, revalidations = 0;
+        overlay_loader_get_counters(&loads, &invalidations, NULL,
+                                    &disp_native, &disp_interp, &stale_blocked,
+                                    NULL, NULL, NULL, NULL, &revalidations);
+        int frozen = overlay_loader_load_frozen();
+        int resim = psx_netplay_is_resimulating();
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"overlay_loader\": {\n"
+            "    \"inprogress\": \"0x%08X\",\n"
+            "    \"load_freeze\": %d,\n"
+            "    \"resimulating\": %d,\n"
+            "    \"loads_allowed\": %d,\n"
+            "    \"active\": %d,\n"
+            "    \"valid_count\": %d,\n"
+            "    \"registered\": %d,\n"
+            "    \"regions_checked\": %d,\n"
+            "    \"last_crc\": \"0x%08X\",\n"
+            "    \"last_file_found\": %d,\n"
+            "    \"loads\": %u,\n"
+            "    \"invalidations\": %u,\n"
+            "    \"revalidations\": %u,\n"
+            "    \"stale_blocked\": %llu,\n"
+            "    \"disp_native\": %llu,\n"
+            "    \"disp_interp\": %llu\n"
+            "  },\n",
+            overlay_loader_get_inprogress(),
+            frozen, resim,
+            (!frozen && !resim) ? 1 : 0,
+            active, valid, overlay_loader_registered_count(), regions,
+            last_crc, last_found,
+            loads, invalidations, revalidations,
+            (unsigned long long)stale_blocked,
+            (unsigned long long)disp_native,
+            (unsigned long long)disp_interp);
     }
 
     /* Recursion fingerprint (build-independent GUEST addresses): the func entered
@@ -699,8 +902,9 @@ static BOOL WINAPI psx_console_ctrl_handler(DWORD type) {
 #endif
 
 static void psx_atexit_handler(void) {
-    /* Only dump if no crash dump has been written yet. We can't easily
-     * detect that, so just always overwrite — last write wins. */
+    /* FAIL-FAST / SEH already wrote the real report. Overwriting with
+     * reason "atexit" destroyed the jalr dump. */
+    if (g_psx_fatal_reason) return;
     psx_crash_trace_dump("atexit", NULL);
 }
 

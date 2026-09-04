@@ -30,16 +30,10 @@
 namespace PSXRecompV4 {
 
 // Pad input mode (per player). Replaces the old analog on/off boolean.
-//   hybrid  — auto-switch DualShock(analog)/digital per the most-recent input:
-//             nudge the stick -> report DualShock (0x73, variable sticks);
-//             press the D-pad -> report a digital pad (0x41) so the game runs
-//             its OWN d-pad path at true digital sensitivity. Mirrors a
-//             DualShock's analog LED toggling on/off (and Tomba Special
-//             Edition's auto-detect). Default.
 //   analog  — always present a DualShock/analog pad (id 0x73). The D-pad is
-//             folded onto the stick at full deflection so it still moves you.
+//             independent from both sticks, matching real hardware. Default.
 //   digital — always present a digital pad (id 0x41); sticks disabled.
-enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
+enum PadMode { PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
 // Renderer IDs shared by game.toml/settings parsing and runtime startup.
 // OpenGL is the default because the Windows software/SDL_Renderer path is slow
@@ -49,6 +43,47 @@ inline constexpr int VIDEO_RENDERER_SOFTWARE = 0;
 inline constexpr int VIDEO_RENDERER_OPENGL = 1;
 inline constexpr int VIDEO_RENDERER_VULKAN = 2;
 inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
+
+// Controller-hotkey bind encoding, mirroring recomp-ui's RECOMP_LAUNCHER_PAD_*
+// (recomp_launcher.h): 0 = unbound, 1..99 = button (1 + SDL button code),
+// 100..999 = axis, 1000+ = a CHORD, encoded as 1000 + a bitmask of SDL button
+// codes. Two buttons held together is the normal case (select+r3), so a real
+// value here is routinely five digits.
+//
+// The bound matters: a naive `< 256` check silently rejects every chord, so a
+// saved rewind_pad = 1272 was dropped on load and pad hotkeys were only ever
+// configurable to single buttons. SDL defines about 21 gamepad buttons, so cap
+// the mask at 32 bits' worth and let the runtime ignore bits no controller can
+// produce.
+inline constexpr int PAD_BIND_MAX = 1000 + (1 << 21);
+inline bool pad_bind_value_ok(long long n) { return n >= 0 && n < PAD_BIND_MAX; }
+
+// FMV present reconstruction, ordered least to most smoothing. The default
+// remains nearest so existing games keep their current FMV presentation unless
+// a package or user setting opts into filtering.
+inline constexpr int VIDEO_FMV_FILTER_NEAREST  = 0;
+inline constexpr int VIDEO_FMV_FILTER_BILINEAR = 1;
+inline constexpr int VIDEO_FMV_FILTER_SHARP    = 2;
+inline constexpr int VIDEO_FMV_FILTER_BICUBIC  = 3;
+inline constexpr int VIDEO_FMV_FILTER_COUNT    = 4;
+inline constexpr int VIDEO_FMV_FILTER_DEFAULT  = VIDEO_FMV_FILTER_NEAREST;
+
+// Canonical settings.toml / game.toml spelling for each value, and its parse.
+inline const char* video_fmv_filter_name(int v) {
+    switch (v) {
+        case VIDEO_FMV_FILTER_NEAREST:  return "nearest";
+        case VIDEO_FMV_FILTER_BILINEAR: return "bilinear";
+        case VIDEO_FMV_FILTER_SHARP:    return "sharp";
+        default:                        return "bicubic";
+    }
+}
+inline bool video_fmv_filter_parse(const std::string& s, int* out) {
+    if (s == "nearest")       { *out = VIDEO_FMV_FILTER_NEAREST;  return true; }
+    else if (s == "bilinear") { *out = VIDEO_FMV_FILTER_BILINEAR; return true; }
+    else if (s == "sharp")    { *out = VIDEO_FMV_FILTER_SHARP;    return true; }
+    else if (s == "bicubic")  { *out = VIDEO_FMV_FILTER_BICUBIC;  return true; }
+    return false;
+}
 
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
@@ -109,9 +144,13 @@ struct WidescreenAspectConeConfig {
     std::array<uint32_t, 3> queue_capacities{};
     std::array<uint32_t, 3> queue_type_masks{};
 };
-// Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
-// "digital" (case-insensitive) and returns `fallback` for anything else.
+// Parse/format a pad mode. Strict game.toml parsing accepts "analog" or
+// "digital" (case-insensitive), returns `fallback` for unknown values, and
+// THROWS on "hybrid" — game-specific switching must not be declared globally.
 int         pad_mode_from_string(const std::string& s, int fallback);
+// Lenient: for a user's settings.toml, where a stale persisted "hybrid" must
+// migrate to analog rather than refuse to launch.
+int         pad_mode_from_settings_string(const std::string& s, int fallback);
 const char* pad_mode_to_string(int mode);
 
 // [runtime] block — consumed by runtime/src/main.cpp. All fields optional;
@@ -242,11 +281,30 @@ struct RuntimeConfig {
     // beside the executable.
     std::string           overlay_capture_persist_dir;
 
-    // turbo_loads: OPT-IN per game. While the game is loading (CD data
-    // stream active, XA/FMV excluded, post-BIOS-handoff only) the frontend
-    // skips wall-clock pacing so the guest runs at host speed — compressing
-    // load wall-time. Streaming titles (e.g. Crash) must leave this off.
+    // turbo_loads: DEPRECATED AND IGNORED. Load acceleration is owned by the
+    // Mods catalog — psx.enhancement.fast-loading ("Fast Loading (host
+    // pacing)") and psx.enhancement.cd-speed, both `game_id = "*"` so they
+    // ship with every title, both default-off, and both exposing the
+    // multiplier / instant-scheduler detail a single opaque bool never could.
+    // recomp-ui correspondingly draws no generic Turbo loads row.
+    //
+    // The key is still parsed so old configs load without error, but the
+    // runtime NO LONGER honours it: it logs one deprecation line naming the
+    // Fast Loading mod and leaves acceleration off. Retired because leaving
+    // the legacy switch live forced turbo on in any title that had not
+    // explicitly migrated, with no UI to turn it back off (MegaManX6Recomp#14
+    // shipped that way in v1.0.4/v1.0.5). Development toggling still works
+    // through the `turbo_loads` TCP debug command.
     bool                  turbo_loads = false;
+    bool                  has_turbo_loads = false;   // key present in game.toml
+
+    // offer_turbo_loads: DEPRECATED AND IGNORED, now that the generic switch
+    // it gated no longer exists. Defaults false and is never consulted; the
+    // migrated titles that set it false stay correct, and the titles that
+    // never set it are no longer punished for it. Parsed only so old configs
+    // load, and so the runtime can tell a developer the key is now a no-op.
+    bool                  offer_turbo_loads = false;
+    bool                  has_offer_turbo_loads = false;
 
     // turbo_audio_sink: while turbo_loads is actively running unpaced, keep
     // rendering the exact guest-time SPU sample budget (so voice/CD state
@@ -289,6 +347,16 @@ struct RuntimeConfig {
     // gcc shards still load). The env var PSX_OVERLAY_BACKEND overrides at runtime.
     std::string           overlay_backend;
 
+    // overlay_region_floor: per-title override of the overlay region floor
+    // (defaults to the boot EXE text end). Titles whose gameplay code loads
+    // at/inside the boot text range (Gran Turismo's secondary EXEs all load
+    // at 0x80010000; Driver 2 streams mission code over its text pages) need
+    // it lowered so that code is overlay-cache eligible instead of falling to
+    // single-instruction interpretation. Same semantics and clamp as the
+    // PSX_OVERLAY_REGION_FLOOR env override, which still takes precedence.
+    bool                  has_overlay_region_floor = false;
+    uint32_t              overlay_region_floor = 0;
+
     // overlay_native_block: per-game overlay function entries that must stay on
     // the dirty-RAM interpreter even when a matching native DLL exists. Intended
     // for small timing-sensitive setup/task routines while the rest of the
@@ -307,6 +375,10 @@ struct RuntimeConfig {
     // supersampling + edge anti-aliasing. Cost scales ~N^2 in fill rate.
     int                   video_supersampling = 1;
 
+    // Optional initial window width declared by the title profile. Zero keeps
+    // the historical fit-to-display behavior; player settings may override it.
+    int                   video_window_width = 0;
+
     // antialiasing: when true the present path uses linear filtering when
     // scaling the framebuffer to the window (smooths the supersample
     // downscale and any window resize). false = nearest (sharp pixels).
@@ -317,10 +389,77 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
+    // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+    // (a 320x192-class movie blown up to the window). Only consulted when
+    // antialiasing is on — AA off means nearest, as it does everywhere else.
+    //   0 nearest   point-sampled; hard pixels, uneven pixel widths at a
+    //               non-integer scale
+    //   1 bilinear  plain GL_LINEAR; smoothest, but blurs the whole texel
+    //   2 sharp     sharp-bilinear; flat texel interiors, ramp confined to a
+    //               one-output-pixel band at the boundary
+    //   3 bicubic   Catmull-Rom; removes most of the staircase while holding
+    //               overall sharpness at the nearest level
+    int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
+
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
     // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
+
+    // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
+    // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
+    // fraction away when it saturates SXY to integer screen pixels; vertices of
+    // a moving mesh therefore snap between whole pixels and the model appears to
+    // shimmer. With this on, the GTE keeps the discarded fraction in a side
+    // cache and the rasterizer places the vertex between native pixels.
+    //
+    // The PS1-visible SXY FIFO stays integer and fully faithful — the game's own
+    // screen-bounds culls and any SXY readback see exactly what hardware would
+    // produce. This is visual-only. Default off (faithful floor).
+    //
+    // Only observable at [video] supersampling >= 2: at native resolution the
+    // corrected position rounds back to the same pixel it started on.
+    bool                  video_geometry_correction = false;
+
+    // perspective_texturing: perspective-correct UV interpolation for textured
+    // world polygons (the PS1 GPU interpolates UV affinely, which warps textures
+    // on large floor/wall polygons as the camera moves). Uses the exact SWC2
+    // projection provenance — a polygon only qualifies when every one of its
+    // position words was written to that DMA packet address by a projection
+    // store — so CPU-built UI and 2D sprites are never touched.
+    //
+    // Default OFF (faithful floor), same as geometry_correction above — but for a
+    // different reason. geometry_correction is off because it is BROKEN at the
+    // coverage we can reach (it moves vertices and splits shared edges); this one
+    // is off because it is a deliberate departure from hardware output that has
+    // only been validated on one title and one renderer. It is structurally safe
+    // — it never moves a vertex, only alters UV interpolation inside a polygon
+    // whose provenance is already proven, so a non-qualifying polygon simply keeps
+    // the PS1's affine interpolation and neighbours can never disagree about a
+    // shared edge. Safe is not the same as validated, so it stays opt-in.
+    //
+    // Players opt in from the launcher's Display panel (unlike
+    // geometry_correction, which has no control at all); per-game with
+    // [video] perspective_texturing = true.
+    bool                  video_perspective_texturing = false;
+
+    // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
+    // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
+    // the same default as the reference implementations — because some games
+    // deliberately rely on integer truncation in their own math; value
+    // validation keeps it SAFE either way, this only trades coverage.
+    // Meaningful only in a pgxp-flavour build; live-tunable over TCP.
+    bool                  video_pgxp_cpu_mode = false;
+
+    // pgxp_tolerance: reject a corrected vertex whose sub-pixel offset from
+    // the native integer position exceeds this many pixels (the truncation-
+    // agreement check already bounds offsets to < 1px; this narrows them
+    // further). Default 0.5 — user-validated on Ape Escape (2026-08-15):
+    // unclamped, sparse hairline background-bleed seams appear where a
+    // corrected triangle borders an uncorrected one; at 0.5 the seams are
+    // gone and only sub-half-pixel misalignment remains. Negative disables
+    // the clamp. Live-tunable over TCP (pgxp verb).
+    double                video_pgxp_tolerance = 0.5;
 
     // offer_vulkan: expose the experimental Vulkan renderer in the launcher.
     // Defaults false even for Vulkan-enabled builds; developers must opt in per
@@ -348,6 +487,13 @@ struct RuntimeConfig {
     // "trinitron". Stored 0..3 to match ScreenKind in runtime/color_lut.h. The
     // PSX_SCREEN env var overrides this at runtime (debug path).
     int                   video_screen_kind = 0;
+
+    // scanlines: present-time horizontal scanline darkening (host enhancement,
+    // orthogonal to crt_filter's colour LUT — the two compose). Off by default;
+    // scanline_strength 0..1 is the dark-gap depth. PSX_SCANLINES /
+    // PSX_SCANLINE_STRENGTH override at runtime (debug path).
+    bool                  video_scanlines = false;
+    double                video_scanline_strength = 0.5;
 
     // auto_skip_fmv: when true, full-motion videos (streaming XA audio + MDEC
     // video) are skipped the instant they're detected — presentation + pacing are
@@ -420,30 +566,30 @@ struct RuntimeConfig {
 
     // ---- [controller] block — game-declared input defaults ----
     // default_mode: the pad input mode this game ships with (see PadMode):
-    // "hybrid" (default) auto-switches DualShock/digital from the player's
-    // input, "analog" pins DualShock (0x73), "digital" pins a digital pad
-    // (0x41). A stick-capable title (e.g. Tomba) ships "hybrid" so the stick
-    // gives variable run speed yet the D-pad keeps its classic digital feel,
-    // with no launcher toggling. Per-install settings.toml [controller]
-    // p1_mode/p2_mode still override. `default_mode` sets both ports;
-    // `p1_mode`/`p2_mode` set one. Legacy `default_analog`/`p1_analog`/
+    // "analog" pins DualShock (0x73), "digital" pins a digital pad (0x41).
+    // Game-specific auto-switching belongs in an enabled trusted mod plugin,
+    // not in this global config surface. Per-install settings.toml
+    // [controller] p1_mode/p2_mode still override. `default_mode` sets both
+    // ports; `p1_mode`/`p2_mode` set one. Legacy `default_analog`/`p1_analog`/
     // `p2_analog` booleans are still accepted (true->analog, false->digital).
     bool                  has_default_mode = false;
-    int                   default_p1_mode  = PAD_MODE_HYBRID;
-    int                   default_p2_mode  = PAD_MODE_HYBRID;
+    int                   default_p1_mode  = PAD_MODE_ANALOG;
+    int                   default_p2_mode  = PAD_MODE_ANALOG;
 
-    // allow_hybrid: whether the launcher offers the "Hybrid" pad mode at all.
-    // Default true (Hybrid | Analog | D-Pad). A game that needs an explicit
-    // analog/digital choice (e.g. one that hard-requires a DualShock) can set
-    // [controller] allow_hybrid = false to drop Hybrid from the selector.
-    bool                  controller_allow_hybrid = true;
+    // p1_device / p2_device: optional per-game default input sources for
+    // fresh settings and launcher-less boots. Same vocabulary as settings.toml:
+    // "none", "keyboard", "auto"/"gamepad"/"controller", or an SDL GUID.
+    // Per-install settings.toml still overrides these defaults.
+    bool                  has_default_p1_device = false;
+    bool                  has_default_p2_device = false;
+    std::string           default_p1_device;
+    std::string           default_p2_device;
 
     // lock_mode: when true the launcher HIDES the whole pad-mode selector
-    // (Hybrid | Analog | D-Pad) and forces every port to default_p1_mode. For a
+    // (Analog | D-Pad) and forces every port to default_p1_mode. For a
     // game that supports exactly one pad type — e.g. Tomba 2, whose driver only
     // works as a plain digital pad because the DualShock config-mode handshake
     // is unhandled — so the player can't pick a broken mode. Supersedes
-    // allow_hybrid (which only hides the Hybrid segment). Default false.
     bool                  controller_lock_mode = false;
 
     // lock_device: when true the launcher HIDES the Player 1/2 controller cards
@@ -461,6 +607,28 @@ struct RuntimeConfig {
     bool                  has_deadzone = false;
     int                   deadzone     = 0;
 
+    // multitap_port: console port that hosts the SCPH-1070 when offline/netplay
+    // arms multitap (players/slot_count >= 3). 1 = Port 1 (default, most games),
+    // 2 = Port 2 (Bomberman Party Edition, Jigsaw Madness, S.C.A.R.S., …).
+    bool                  has_multitap_port = false;
+    int                   multitap_port     = 1;
+
+    // multitap_analog: DualShock-on-tap hack (default true). When true,
+    // multitap bulk seats may report 0x73 + stick bytes; when false (faithful),
+    // tap seats stay plain digital. Overridable by settings.toml / match_caps.
+    bool                  has_multitap_analog = false;
+    bool                  multitap_analog     = true;
+
+    // legacy_pad_config: per-game pad-protocol compatibility opt-in. false (default)
+    // = the modern DualShock config state machine (proper 0x43 enter/exit, config id
+    // 0xF3 only while in config) — required by MMX6 and the correct default for every
+    // title. true = the pre-98aa688 behaviour (config commands always answer 0xF3, no
+    // enter/exit tracking). Only Tomba opts in: its libpad re-detect — triggered by the
+    // launcher Hybrid mode's analog<->digital type flip — manufactures a 1-frame "pad
+    // unplugged" under the modern SM (menu unpause / phantom input). The legacy answers
+    // make that re-detect benign. Scoped per-game; no other title's behaviour changes.
+    // Wired to sio_set_legacy_cfg(); see sio.c g_pad_legacy_cfg.
+    bool                  legacy_pad_config = false;
     // anti_deadzone: minimum radial analog output after leaving deadzone, in
     // raw SDL axis units (0..32767). This is a game-owned response setting used
     // to compensate a title's own internal stick deadzone. Absent => 0.
@@ -580,12 +748,52 @@ struct GameConfig {
     // the union here).
     std::vector<std::filesystem::path> discs;
 
+    // Optional per-disc serials, PARALLEL to `discs` ([game] disc_serials).
+    // Each disc of a set carries its own serial (FF7 US: SCUS-94163 / -64 /
+    // -65), so a set verified against the BOOT disc's serial alone would
+    // report every other disc as "wrong disc" the moment the player selects
+    // it. May be shorter than `discs` (or absent entirely, which every
+    // single-disc title and every port written before this is): a disc with
+    // no serial here is simply not serial-gated -- the ISO header check
+    // still applies. Written by tools/new_project_layout from the same probe
+    // that produced disc_set.json.
+    std::vector<std::string> disc_serials;
+
     // Optional expected disc identity, for the launcher's "Disc verified" badge.
     // disc_crc: full-file CRC32 (IEEE) of the data track. disc_sha1: lowercase
     // hex SHA-1. Either may be absent (has_disc_crc / disc_sha1.empty()).
     bool                  has_disc_crc = false;
     uint32_t              disc_crc = 0;
     std::string           disc_sha1;
+
+    // [netplay] disc mount policy (portable across psxrecomp titles).
+    // Data-track CRC proves "right game"; these prove "same CD geometry"
+    // (GetTN track count / cue layout) so peers cannot join with Track-01-only
+    // dumps vs full Redump multi-track cues. 0 / empty = do not check that field.
+    bool                  netplay_require_cue = false;
+    int                   netplay_required_tracks = 0;
+    bool                  has_netplay_required_leadout = false;
+    uint32_t              netplay_required_leadout_lba = 0;
+    std::string           netplay_required_disc_fp;  // lowercase hex SHA-256
+    // Per-disc TOC fingerprints for a MULTI-DISC set, PARALLEL to [game]
+    // discs ([netplay] required_disc_fps). Every disc of a set has its own
+    // TOC, so a set gated on one fingerprint refuses online play on every
+    // disc but that one -- and the flat required_disc_fp above can only ever
+    // name the boot disc. May be shorter than `discs`, or absent (every
+    // single-disc title): a disc with no fingerprint here falls back to the
+    // flat value, and a set that declares neither is simply not fingerprint-
+    // gated. Values come from the same verify_disc_set.py probe that writes
+    // disc_set.json.
+    std::vector<std::string> netplay_required_disc_fps;
+    // local_viewport = "vertical_split": while real netplay is active, crop
+    // presentation to this peer's left/right split-screen half. This is a
+    // presentation-only helper for titles that still render native split-screen
+    // in netplay; unset keeps every peer seeing the full framebuffer.
+    std::string           netplay_local_viewport;
+    // Optional display aspect to use with local_viewport. Accepted values:
+    // "16:9", "21:9", or "adaptive" (initial 16:9, live-window capped 21:9).
+    // Unset keeps netplay at the title's normal mod-cleared aspect.
+    std::string           netplay_local_viewport_aspect;
 
     // [recompiler] block
     std::filesystem::path seeds_path;     // absolute path to seeds (text or json)
@@ -634,9 +842,20 @@ struct GameConfig {
     // out to be impure only costs a poisoned capture, never a wrong replay.
     std::vector<uint32_t> data_shard_funcs;
 
+    // [recompiler] mod_function_entry_funcs: narrowly selected guest function
+    // entries that dispatch trusted, statically linked mod callbacks. Empty by
+    // default, so projects that do not opt in emit no callback overhead.
+    std::vector<uint32_t> mod_function_entry_funcs;
+
     // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
     // on their generated C bodies (profile/host locality; no guest semantics).
     std::vector<uint32_t> hot_funcs;
+
+    // [recompiler] load_charge_batch: when true, emit function-local cycle
+    // accumulators for load_charge_batch_funcs (or hot_funcs if that list is
+    // empty). Requires regen; guest totals at IRQ/MMIO barriers unchanged.
+    bool                  load_charge_batch = false;
+    std::vector<uint32_t> load_charge_batch_funcs;
 
     // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
     // implementation.  mode=-1 returns vsync_counter_addr while bypassing two
@@ -680,6 +899,9 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Explicit signed lower-bound sites (`slti rt, sx, -W`). The threshold is
+    // moved left by the live reveal margin. Empty by default; regen required.
+    std::vector<uint32_t> ws_cull_slti_lower_sites;
     // [widescreen.cull] bltz_sites — explicit signed LEFT-edge widen sites
     // (`bltz rs, reject` -> psx_ws_cull_bltz), the counterpart to slti_sites.
     // detect_cull_bltz_sites only classifies left-edge bltz for functions
@@ -708,6 +930,17 @@ struct GameConfig {
     // scissor clips the overflow and wrapped off-left coords pass); the
     // vanilla loaded value at 4:3. Empty by default; regen required.
     std::vector<uint32_t> ws_cull_xclip_load_sites;
+    // Exact `bltz MAC0, reject`-style NCLIP/backface rejects that are forced
+    // not-taken only while widescreen reveals extra world. This is deliberately
+    // separate from bltz_sites, whose helper adjusts screen-X edge thresholds.
+    std::vector<uint32_t> ws_cull_nclip_keep_sites;
+    // Exact NCLIP/backface branch sites that use the validated tracked sign
+    // only while wide. Guest MAC0 remains native and 4:3 remains bit-exact.
+    std::vector<uint32_t> ws_cull_nclip_exact_sites;
+    // Exact branch PCs whose reject path is forced not-taken only while
+    // widescreen reveals extra world. Use only after screenshot-validated
+    // evidence that the target is a visibility reject.
+    std::vector<uint32_t> ws_cull_branch_keep_sites;
     // Exact comparison sites whose result is forced only while widescreen
     // reveals extra world. Used for proven object/model participation gates
     // where maximal overdraw is preferable to range guessing. Each entry is
@@ -799,6 +1032,20 @@ struct GameConfig {
     // (native-wide engages); genuine full-2D screens (save/options) still
     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
     bool ws_gte_game_mode = false;
+
+    // [widescreen] precise_nclip — use the runtime's unsaturated GTE projection
+    // provenance for NCLIP/backface tests while classic adaptive widescreen is
+    // active. This is for 3D titles whose wide side geometry otherwise hits the
+    // PS1 SXY +/-1024 clamp and then disappears from game-side visibility tests.
+    // Runtime-only; off by default.
+    bool ws_precise_nclip = false;
+
+    // Optional authoritative game-state gate for titles whose menus also
+    // render enough 3D geometry to fool gte_game_mode. When configured,
+    // native-wide is active only while the guest word matches one listed
+    // value. Runtime-only; both fields must be supplied together.
+    uint32_t ws_gameplay_state_addr = 0;
+    std::vector<uint32_t> ws_gameplay_state_values;
 
     // [widescreen] native_wide — select the newer wide render-target path.
     // Defaults on for compatibility. Titles can keep the original GTE-squash
@@ -941,21 +1188,36 @@ struct UserSettings {
     bool parse_error = false;
 
     // [video]
-    bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
+    bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4
     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
     // both the launcher and the emulator window so they boot at the same size.
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+    // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+    bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
+    // Sub-pixel vertex precision / perspective-correct UVs (see RuntimeConfig).
+    // Both default off — the faithful floor — and are player-selectable.
+    bool has_geometry_correction   = false; bool geometry_correction   = false;
+    bool has_perspective_texturing = false; bool perspective_texturing = false;
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
+    // Scanline post-process (see RuntimeConfig::video_scanlines). Strength stored
+    // 0..1; the launcher ABI carries it as an integer percent.
+    bool has_scanlines         = false; bool   scanlines         = false;
+    bool has_scanline_strength = false; double scanline_strength = 0.5;
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
-    // Turbo through in-game load screens: while the CD data stream is active, run
-    // the guest unpaced (host speed) to compress load wall-time. All guest timing
-    // (VBlanks/callbacks/sectors) is preserved and audio plays through. Default ON
-    // (the per-game game.toml value seeds the launcher toggle; user choice in
-    // settings.toml overrides it).
-    bool has_turbo_loads    = false; bool turbo_loads    = true;
+    // [video] turbo_loads: DEPRECATED AND IGNORED — the legacy home of the
+    // generic Turbo loads switch, back when the launcher drew a row for it.
+    // Load acceleration now lives in the Mods catalog (see
+    // RuntimeConfig::turbo_loads), so this row is neither restored at startup
+    // nor written back out; it survives only to be reported and then dropped
+    // the next time settings.toml is saved. Never re-restore it without also
+    // restoring a UI control — an unreachable persisted value that overrides a
+    // later game.toml change is exactly the write-only latch that shipped
+    // turbo-on to MegaManX6Recomp users who had no way to turn it off.
+    bool has_turbo_loads    = false; bool turbo_loads    = false;
     bool has_fast_boot      = false; bool fast_boot      = false;
     // HLE BIOS tier toggle (see RuntimeConfig::bios_hle). Overrides game.toml.
     bool has_bios_hle       = false; bool bios_hle       = false;
@@ -985,11 +1247,39 @@ struct UserSettings {
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
     bool has_adaptive_view  = false; bool adaptive_view  = false;
+    // [video] rewind: local rewind ring on/off. OFF by default — the ring
+    // holds whole-machine snapshots (2 MB RAM + 1 MB VRAM + 512 KB SPU RAM
+    // each) and captures on a frame cadence, so it is opt-in rather than a
+    // cost every host pays. Env PSX_REWIND still outranks this.
+    bool has_rewind         = false; bool rewind         = false;
+    // [video] rewind_depth: local rewind snap-ring capacity. UI offers
+    // 50 / 100 / 150 / 200 (default 50). Runtime clamps + snaps to those steps.
+    bool has_rewind_depth   = false; int  rewind_depth   = 50;
+    // [video] rewind_interval: frames between local rewind snaps. UI offers
+    // 1 / 4 / 8 / 12 / 15 (default 15).
+    bool has_rewind_interval = false; int rewind_interval = 15;
+    // [hotkeys] controller-only host shortcuts. Values use recomp-ui's
+    // RECOMP_LAUNCHER_PAD_* encoding (0 = unbound, 1+button, 100+axis).
+    bool has_hotkey_pad_rewind = false; int hotkey_pad_rewind = 1272; /* select+r3 */
+    bool has_hotkey_pad_save_state_menu = false; int hotkey_pad_save_state_menu = 2040; /* select+r1 */
+    // fast_forward_pad: hold-to-fast-forward, the controller twin of the
+    // keyboard [KeyMap] Turbo (Tab). 0 = unbound.
+    bool has_hotkey_pad_fast_forward = false; int hotkey_pad_fast_forward = 1528; /* select+l1 */
+    bool has_hotkey_pad_fast_forward_toggle = false; int hotkey_pad_fast_forward_toggle = 0; /* unbound */
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
+    bool has_audio_freq     = false; int  audio_freq     = 44100;
     // [bios] / [disc] / [memcard]
     bool has_bios_path      = false; std::filesystem::path bios_path;
     bool has_disc_path      = false; std::filesystem::path disc_path;
+    // [disc] selected: which image of a MULTI-DISC set ([game] discs in
+    // game.toml) the player last chose, 1-based. Stored as an ordinary
+    // setting so the launcher's Disc Selection dropdown persists across
+    // sessions and an external launcher can drive it like any other row.
+    // Ignored by single-disc titles. When it disagrees with disc_path, the
+    // rule is in resolve_selected_disc() (runtime/src/main.cpp): the index
+    // names the disc, disc_path only survives when it is that same disc.
+    bool has_disc_index     = false; int  disc_index     = 1;
     bool has_memcard_dir    = false; std::filesystem::path memcard_dir;
     // Per-slot memory-card overrides. An explicit card path overrides the
     // <dir>/card<N>.mcd default; the enable flag inserts/removes the card.
@@ -998,22 +1288,37 @@ struct UserSettings {
     bool has_memcard1_enabled = false; bool memcard1_enabled = true;
     bool has_memcard2_enabled = false; bool memcard2_enabled = true;
 
-    // [controller] — per-player input device + pad type. device is one of:
+    // [controller] — per-player input device + pad type + deadzone.
+    // device is one of:
     //   "none"     — no pad in this port (port not connected)
     //   "keyboard" — driven by the keyboard map (input.ini)
     //   "<GUID>"   — an SDL game-controller GUID (SDL_JoystickGetGUIDString)
-    // p1_mode/p2_mode select the emulated pad behaviour (see PadMode):
-    // hybrid (default) / analog / digital. Defaults: P1 keyboard, P2 none.
-    bool has_p1_device = false; std::string p1_device = "keyboard";
-    bool has_p2_device = false; std::string p2_device = "none";
-    // Pad input mode per player (see PadMode): hybrid (default) / analog /
-    // digital. Persisted as p1_mode/p2_mode strings. Legacy p1_analog/p2_analog
-    // booleans are still read for back-compat (true->analog, false->digital).
-    bool has_p1_mode = false; int p1_mode = PAD_MODE_HYBRID;
-    bool has_p2_mode = false; int p2_mode = PAD_MODE_HYBRID;
-    // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
-    // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
-    bool has_deadzone  = false; int  deadzone  = 12000;
+    // Modes (see PadMode): analog / digital. Hybrid is mod-only. Defaults: P1 keyboard,
+    // P2–P5 none. Deadzone default is 10% (3277/32767). TOML keys:
+    // pN_device / pN_mode / pN_deadzone (N=1..5). Legacy bare `deadzone`
+    // still fills any slot that lacks pN_deadzone.
+    static constexpr int kMaxControllerPlayers = 5;
+    bool        has_p_device[kMaxControllerPlayers] = {};
+    std::string p_device[kMaxControllerPlayers] = {
+        "keyboard", "none", "none", "none", "none"};
+    bool has_p_mode[kMaxControllerPlayers] = {};
+    int  p_mode[kMaxControllerPlayers] = {
+        PAD_MODE_ANALOG, PAD_MODE_ANALOG, PAD_MODE_ANALOG,
+        PAD_MODE_ANALOG, PAD_MODE_ANALOG};
+    bool has_p_deadzone[kMaxControllerPlayers] = {};
+    int  p_deadzone[kMaxControllerPlayers] = {
+        3277, 3277, 3277, 3277, 3277};  /* ~10% of 32767 */
+    // Legacy global deadzone (settings.toml `deadzone=`). Applied to slots
+    // that do not have an explicit pN_deadzone. Default 10%.
+    bool has_deadzone  = false; int  deadzone  = 3277;
+    // SCPH-1070 multitap for offline 3+ player seats (settings.toml
+    // [controller] multitap). Default ON when unset. When false, offline
+    // sampling caps at 2 native ports. Netplay lobbies with more than 2
+    // seats always arm multitap in the runtime regardless.
+    bool has_multitap_enabled = false; bool multitap_enabled = true;
+    // DualShock-on-tap hack (settings.toml [controller] multitap_analog).
+    // Default on when unset; game.toml / global prefs may override.
+    bool has_multitap_analog = false; bool multitap_analog = true;
     // Localization: the launcher's chosen language code (feeds RuntimeConfig
     // .language / g_lang). "off"/"jp"/"" = untranslated native game. Persisted to
     // settings.toml [localization].language.
@@ -1065,6 +1370,12 @@ UserSettings load_user_settings(const std::filesystem::path& path);
 
 // Write settings.toml deterministically. Returns false on I/O failure.
 bool save_user_settings(const std::filesystem::path& path, const UserSettings& s);
+
+// Surgical upsert of `key = true|false` under [controller] in game.toml.
+// Preserves comments and unrelated keys. Creates [controller] if missing.
+// Used to persist launcher multitap_analog into the title game config.
+bool upsert_game_toml_controller_bool(const std::filesystem::path& path,
+                                      const char* key, bool value);
 
 // Locate the project root by walking upward from `config_path` until a
 // directory containing `.gitignore`, `.git`, or `CMakeLists.txt` is found.

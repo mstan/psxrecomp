@@ -5,6 +5,7 @@
  */
 
 #include "cpu_state.h"
+#include "psx_bss.h"
 #include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
 #include "debug_server.h"
 #include "crash_trace.h"
@@ -24,6 +25,7 @@ static uint32_t traps_parity_rw(void* ctx, uint32_t addr) {
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
 void psx_exception_longjmp(void);
+void psx_irq_refresh_cause_ip2(void);
 
 /* ── Deterministic TCB scheduler — SCAFFOLDING (plan steps 1-2, INERT) ───────
  * These definitions back psx_scheduler.h. They are NOT yet wired into the live
@@ -59,7 +61,7 @@ typedef struct SchedEscapeEntry {
     uint32_t sp;
 } SchedEscapeEntry;
 #define SCHED_ESCAPE_RING_CAP 256u
-SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
+PSX_BSS SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
 uint64_t g_sched_escape_seq = 0;
 
 static void sched_escape_ring_log(CPUState* cpu, uint32_t reason,
@@ -271,7 +273,7 @@ typedef struct ThreadCtxRingEntry {
     uint32_t cop0_epc;
 } ThreadCtxRingEntry;
 #define THREAD_CTX_RING_CAP 256u
-ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
+PSX_BSS ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
 uint64_t g_thread_ctx_ring_seq = 0;
 
 extern uint64_t s_frame_count;
@@ -340,7 +342,14 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
         uint32_t saved_sr = cpu->read_word(save + 140u);
         cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
     }
+    /* Restore the saved CAUSE, then re-derive IP2. On hardware the IP field is
+     * live interrupt-line state and is never storage, so it cannot meaningfully
+     * be saved and restored: a context captured while an interrupt was pending
+     * and restored after the ack would re-latch a phantom IP2 out of guest
+     * memory. Reload the architecturally-saved bits, then let the single owner
+     * recompute bit 10 from the actual line. */
     cpu->cop0[13] = cpu->read_word(save + 144u);
+    psx_irq_refresh_cause_ip2();
     cpu->gpr[26] = cpu->read_word(save + 128u);
     psx_assert_no_sentinel_pc("restore_context_from_tcb", tcb, cpu->gpr[26]);
     thread_ctx_ring_log(cpu, tcb, cpu->gpr[26], 1);
@@ -695,6 +704,19 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
  * on the old stack (safe: the restored state is complete in CPUState/RAM/devices
  * and every block leader is re-enterable). MUST be called on the scheduler fiber
  * (HLE mode, default) at a block-leader boundary with in_exception == 0. */
+/* Set by resume_at; cleared on first post-resume finish_frame (or abort). */
+static int g_sched_top_level_resume;
+
+int psx_scheduler_top_level_resume_active(void)
+{
+    return g_sched_top_level_resume;
+}
+
+void psx_scheduler_top_level_resume_clear(void)
+{
+    g_sched_top_level_resume = 0;
+}
+
 void psx_scheduler_resume_at(uint32_t resume_pc)
 {
     if (!psx_is_dispatchable(resume_pc)) {
@@ -707,6 +729,15 @@ void psx_scheduler_resume_at(uint32_t resume_pc)
     g_sched_escape.target_tcb = 0;
     g_sched_escape.resume_pc  = resume_pc;
     g_sched_escape.reason     = PSX_RUN_RESUME_CURRENT;
+    /* longjmp abandons every mid-block CPS frame — sentinel RFE must not
+     * treat the new top-level dispatch as a continuable live chain. */
+    g_sched_top_level_resume = 1;
+    /* Publish before the longjmp lands in dispatch: sticky I_STAT can deliver
+     * on the first edge with take_pc=0 otherwise (LEGACY_SENTINEL fork). */
+    {
+        extern void psx_irq_arm_compiled_resume_pc(uint32_t pc);
+        psx_irq_arm_compiled_resume_pc(resume_pc);
+    }
     longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
 }
 
@@ -796,6 +827,16 @@ void psx_scheduler_run(CPUState* cpu)
              * nested-unit gate so IRQ checks are not wedged-off after the escape
              * (backstop for the Ape memcard native<->interp fix). */
             { extern int g_call_unit_depth; g_call_unit_depth = 0; }
+            /* flush_resume / savestate longjmp skips generated bb_defer cleanup. */
+            {
+                extern int g_psx_cyc_bb_defer;
+                extern uint32_t g_psx_cyc_batch;
+                extern uint32_t *g_psx_cyc_local_acc;
+                if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
+                g_psx_cyc_local_acc = NULL;
+                g_psx_cyc_bb_defer = 0;
+                g_psx_cyc_batch = 0;
+            }
         }
 
         switch (g_sched_escape.reason) {
@@ -814,10 +855,12 @@ void psx_scheduler_run(CPUState* cpu)
         }
 
         uint32_t run_pc;
+        int from_top_resume = 0;
         if (g_sched_escape.reason == PSX_RUN_RESUME_CURRENT &&
             g_sched_escape.resume_pc != 0u) {
             /* Same-thread RFE: GPRs already committed by the RFE; just re-dispatch. */
             run_pc = g_sched_escape.resume_pc;
+            from_top_resume = 1;
         } else {
             uint32_t cur = psx_current_tcb_ptr(cpu);
             if (psx_is_valid_tcb(cpu, cur)) {
@@ -837,13 +880,20 @@ void psx_scheduler_run(CPUState* cpu)
 
         cpu->pc = run_pc;
         g_sched_escape.reason = PSX_RUN_CONTINUE;
+        /* Re-arm on the dispatch that consumes RESUME_CURRENT (covers
+         * recover_null_pc continues that skip resume_at). */
+        if (from_top_resume) {
+            extern void psx_irq_arm_compiled_resume_pc(uint32_t pc);
+            psx_irq_arm_compiled_resume_pc(run_pc);
+        }
         psx_dispatch(cpu, run_pc);
 
         /* psx_dispatch returned with NO structured escape => the outermost
          * dispatch saw cpu->pc==0. If a thread yielded to us and then ran to
          * completion, hand control back to its yielder (one-level safety net)
          * instead of tearing down the whole run. Otherwise it's the legacy
-         * top-level abnormal exit. */
+         * top-level abnormal exit — unless an RB top-level resume can recover
+         * at $ra / sticky BB (returning-leaf snap after flush_resume). */
         if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
             g_sched_return_tcb != psx_current_tcb_ptr(cpu)) {
             uint32_t yielder = g_sched_return_tcb;
@@ -853,6 +903,16 @@ void psx_scheduler_run(CPUState* cpu)
             sched_escape_ring_log(cpu, PSX_RUN_YIELD_TO_TCB,
                                   psx_current_tcb_ptr(cpu), yielder, 0);
             continue;
+        }
+        {
+            extern int psx_netplay_rb_recover_null_pc(CPUState *c, uint32_t *out_pc);
+            uint32_t recover_pc = 0;
+            if (psx_netplay_rb_recover_null_pc(cpu, &recover_pc) && recover_pc) {
+                g_sched_escape.target_tcb = 0;
+                g_sched_escape.resume_pc = recover_pc;
+                g_sched_escape.reason = PSX_RUN_RESUME_CURRENT;
+                continue;
+            }
         }
         g_sched_escape.reason = PSX_RUN_GUEST_EXIT;
         g_in_scheduler_run = 0;

@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp phase2 seeds",
   "source": "gen_bios_seeds_from_elf.py over openbios.elf, shell.elf + 5 empirical seeds from openbios_dispatch_miss.json",
-  "seed_count": 646,
+  "seed_count": 647,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -1427,6 +1427,11 @@
       "address": "0xBFC091EC",
       "label": "osDbgPrintf",
       "rationale": "ELF STT_FUNC symbol from openbios.elf"
+    },
+    {
+      "address": "0xBFC095F8",
+      "label": "osDbgPrintf_rodata_guard",
+      "rationale": "Hard-cap osDbgPrintf (0xBFC091EC) before embedded rodata/pointer table; emit walked into SPECIAL 0x3C data and stubbed the whole function (FAIL-FAST rematch OpenBIOS boot)."
     },
     {
       "address": "0xBFC0A500",

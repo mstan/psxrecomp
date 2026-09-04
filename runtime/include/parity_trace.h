@@ -4,7 +4,7 @@
  * freeze-on-trigger ring with an IDENTICAL struct + JSON wire format on BOTH
  * psx-runtime (code under test) and psx-beetle (independent oracle), so a
  * generic sequence-diff tool (tools/parity_diff.py) can locate the FIRST logical
- * divergence between the two timelines — not a frame diff (PRINCIPLES.md "find
+ * divergence between the two timelines — not a frame diff (docs/internal/PRINCIPLES.md "find
  * the first divergence" + "is the value WRONG or is the behavior MISSING").
  *
  * Model (CLAUDE.md ring-buffer doctrine): armed from boot (so the pre-divergence

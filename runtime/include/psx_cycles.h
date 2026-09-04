@@ -1,6 +1,7 @@
 ﻿#ifndef PSXRECOMP_PSX_CYCLES_H
 #define PSXRECOMP_PSX_CYCLES_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -59,6 +60,11 @@ extern uint32_t g_psx_cyc_batch_limit;
 /* GCC/Clang-generated functions can defer deadline probes within a basic
  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
 extern int g_psx_cyc_bb_defer;
+
+/* Emitter-level VLC load-charge batching: when non-NULL, psx_cyc_charge
+ * accumulates into *g_psx_cyc_local_acc instead of g_psx_cyc_batch. Publish
+ * via psx_cyc_local_publish / psx_cyc_batch_flush before IRQ/MMIO barriers. */
+extern uint32_t *g_psx_cyc_local_acc;
 
 /* Advance guest time. Overlay DLLs forward this through their callback shim;
  * normal runtime/generated code keeps the common production path inlined. */
@@ -121,10 +127,27 @@ static inline void psx_advance_cycles(uint32_t cycles) {
  * their pending total in the callback shim rather than these host globals. */
 #if defined(PSX_OVERLAY_DLL_BUILD)
 void overlay_flush_cycles(void);
+static inline void psx_cyc_local_publish(void) { }
 static inline void psx_cyc_batch_flush(void) { overlay_flush_cycles(); }
 #else
+/* Publish function-local charges into the normal batch/advance path while
+ * keeping the local pointer installed (nested charges resume locally). */
+static inline void psx_cyc_local_publish(void) {
+#if !defined(PSX_COSIM)
+    uint32_t *acc = g_psx_cyc_local_acc;
+    if (!acc) return;
+    uint32_t v = *acc;
+    if (!v) return;
+    *acc = 0;
+    g_psx_cyc_local_acc = NULL;
+    psx_advance_cycles(v);
+    g_psx_cyc_local_acc = acc;
+#endif
+}
+
 static inline void psx_cyc_batch_flush(void) {
 #if !defined(PSX_COSIM)
+    psx_cyc_local_publish();
     uint32_t b = g_psx_cyc_batch;
     if (!b) return;
     g_psx_cyc_batch = 0;
@@ -141,15 +164,25 @@ uint64_t psx_get_cycle_count(void);
 struct CPUState;
 void psx_idle_note_check(struct CPUState *cpu, uint32_t check_pc);
 int  psx_idle_skip_is_enabled(void);
+/* Cycles until the nearest IRQ-observable device event (mask-aware); the bound an idle skip may not cross. */
+uint32_t psx_idle_cycles_to_next_observable_event(void);
 extern int      g_idle_skip_enabled;
 extern uint64_t g_idle_skip_count;
 extern uint64_t g_idle_skip_cycles;
 extern uint32_t g_idle_skip_last_pc;
 extern uint32_t g_idle_skip_last_quantum;
 
+/* Post-load probe cycle diagnostics (optional; main.cpp soft-load tooling). */
+extern int      g_plp_cycle_diag;
+extern uint64_t g_plp_adv_calls;
+extern uint32_t g_plp_adv_max_chunk;
+extern uint64_t g_plp_adv_sum;
+extern uint64_t g_plp_svc_calls;
+
 /* Save-state restore: re-anchor the deadline device model after psx_cycle_count
- * is overwritten from a snapshot. */
-void psx_cycles_resync_after_restore(void);
+ * is overwritten from a snapshot. Pass the live CPU so GTE/muldiv completion
+ * stamps and load-absorb give-back are rewound with the guest clock. */
+void psx_cycles_resync_after_restore(struct CPUState *cpu);
 
 /* Soft rematch / session_reboot: zero the guest clock and deadline bookkeeping.
  * Soft-exit longjmps out of vblank (inside psx_devices_service_to_now) leave

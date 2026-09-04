@@ -10,7 +10,9 @@
  * be inspected with grep/jq even after the process terminated. */
 
 #include "starvation_ring.h"
+#include "psx_bss.h"
 #include "psx_cycles.h"
+#include "psx_netplay.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +44,7 @@ extern int psx_get_in_exception(void);
 
 #if STARVATION_RING_ENABLED
 
-static StarvationEntry s_ring[STARVATION_RING_CAP];
+static PSX_BSS StarvationEntry s_ring[STARVATION_RING_CAP];
 static uint64_t        s_seq = 0;
 static uint64_t        s_last_heartbeat_us = 0;
 static int             s_dump_done = 0;
@@ -190,18 +192,26 @@ void starvation_ring_dump(const char *path) {
     if (!f) return;
     uint64_t total = s_seq;
     uint64_t avail = total < STARVATION_RING_CAP ? total : STARVATION_RING_CAP;
-    fprintf(f, "{\"meta\":{\"total\":%llu,\"shown\":%llu,"
-            "\"last_heartbeat_us\":%llu,\"now_us\":%llu,"
-            "\"psx_cycle_count\":%llu,"
-            "\"current_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\","
-            "\"in_exception\":%u,\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\"}}\n",
-            (unsigned long long)total, (unsigned long long)avail,
-            (unsigned long long)s_last_heartbeat_us,
-            (unsigned long long)host_us_now(),
-            (unsigned long long)psx_get_cycle_count(),
-            g_debug_current_func_addr, g_debug_last_store_pc,
-            (unsigned)psx_get_in_exception(),
-            i_stat, i_mask);
+    {
+        char net_arch[24];
+        int max_players = 0, player_count = 0;
+        (void)psx_netplay_diag_snapshot(net_arch, sizeof(net_arch),
+                                        &max_players, &player_count);
+        fprintf(f, "{\"meta\":{\"total\":%llu,\"shown\":%llu,"
+                "\"last_heartbeat_us\":%llu,\"now_us\":%llu,"
+                "\"psx_cycle_count\":%llu,"
+                "\"current_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\","
+                "\"in_exception\":%u,\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+                "\"net_arch\":\"%s\",\"max_players\":%d,\"player_count\":%d}}\n",
+                (unsigned long long)total, (unsigned long long)avail,
+                (unsigned long long)s_last_heartbeat_us,
+                (unsigned long long)host_us_now(),
+                (unsigned long long)psx_get_cycle_count(),
+                g_debug_current_func_addr, g_debug_last_store_pc,
+                (unsigned)psx_get_in_exception(),
+                i_stat, i_mask,
+                net_arch, max_players, player_count);
+    }
     uint64_t start = total > avail ? total - avail : 0;
     for (uint64_t i = start; i < total; i++) {
         StarvationEntry *e = &s_ring[i & (STARVATION_RING_CAP - 1)];

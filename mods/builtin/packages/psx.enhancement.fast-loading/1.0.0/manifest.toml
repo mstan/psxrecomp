@@ -1,0 +1,46 @@
+format_version = 5
+id = "psx.enhancement.fast-loading"
+version = "1.0.0"
+name = "Fast Loading (host pacing)"
+author = "psxrecomp"
+description = "Speeds up the wall-clock pacing of loads without changing anything the game can observe. Every guest frame, CD interrupt and callback still happens on schedule."
+resolver = "declarative"
+save_compatibility = "shared"
+
+# Loading speed is a property of the emulated hardware, not of any particular
+# disc, so this ships with the framework and applies to every game.
+[[target]]
+game_id = "*"
+
+[[feature]]
+id = "fast-loading"
+name = "Fast Loading (host pacing)"
+description = "Disabled by default. Host pacing is the safe accelerator: it only changes how fast real time is fed to a load, so the guest cannot desync. It does speed the game up while a load is detected, which some speedrun routes rely on NOT happening -- if that is you, leave this off and use CD Speed instead."
+group = "Quality of Life"
+default_enabled = false
+
+[[option]]
+feature = "fast-loading"
+id = "multiplier"
+label = "Host speed multiplier"
+description = "How much faster than real time a load may run. 1 is authentic. 2-32 is the useful range; larger values keep working but stop helping once the host, not the pacing, is the limit. Ignored while Uncapped is ticked."
+group = "Quality of Life"
+type = "integer"
+min = 1
+max = 1024
+step = 1
+default = 4
+disabled_by = "uncapped"
+
+[[option]]
+feature = "fast-loading"
+id = "uncapped"
+label = "Uncapped (as fast as the host allows)"
+description = "Run loads at whatever speed this machine can manage, ignoring the multiplier above."
+group = "Quality of Life"
+type = "boolean"
+default = "false"
+
+[[plugin]]
+feature = "fast-loading"
+id = "psx.fast-loading"

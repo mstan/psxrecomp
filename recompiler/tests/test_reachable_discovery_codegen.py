@@ -139,6 +139,10 @@ def main():
                 failures.append("dispatch guard does not accept a continuation PC")
             if dispatch.count("entry->range_count, addr)") != 2:
                 failures.append("dispatch guards do not validate from their resume PC")
+            if "int psx_game_text_native_ok_full(uint32_t addr)" not in dispatch:
+                failures.append("full-range straight-line handoff guard was not emitted")
+            if "dirty_ram_text_native_ok_ranges(" not in dispatch:
+                failures.append("full-range handoff guard lost exact range validation")
             if "psx_native_bad_entry(" in full:
                 failures.append("reachable main image incorrectly used overlay codegen")
             if "=== Exact-Entry Function Analysis ===" not in output:

@@ -13,6 +13,24 @@
 #include <sys/socket.h>
 #endif
 
+static int socket_would_block(void)
+{
+#if defined(_WIN32)
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+static int socket_interrupted(void)
+{
+#if defined(_WIN32)
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
 static const char *B64 =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -89,7 +107,7 @@ static int send_all(int fd, const void *buf, size_t len)
         ssize_t n = send(fd, p + sent, len - sent, 0);
 #endif
         if (n < 0) {
-            if (errno == EINTR) {
+            if (socket_interrupted()) {
                 continue;
             }
             return -1;
@@ -177,7 +195,7 @@ int rnet_ws_read_text(int fd, char *buf, size_t cap, int *closed)
         return -1;
     }
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (socket_would_block()) {
             return 0;
         }
         return -1;

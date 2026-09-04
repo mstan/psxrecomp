@@ -48,11 +48,10 @@ typedef struct { uint64_t cp; uint32_t pc; uint64_t hash; uint32_t istat, imask;
 static Entry    g_ring[RING_N];
 static uint64_t g_cp      = 0;          /* checkpoints crossed so far */
 static uint64_t g_chain   = 1469598103934665603ULL; /* cumulative FNV over checkpoints */
-static uint64_t g_stride  = 4096;       /* guest cycles per checkpoint (coordinator sets) */
-static uint64_t g_next_cp = 0;          /* next cycle at which to checkpoint */
+static uint64_t g_stride  = 4096;       /* retired instructions per checkpoint */
+static uint64_t g_next_cp = 0;          /* icount at which to take the next checkpoint */
 static uint32_t g_last_leader_pc = 0;   /* set by cosim_block, reported at checkpoints */
-static uint64_t g_pending_first_cycle = 0;
-static uint64_t g_pending_count = 0;
+static uint64_t g_icount  = 0;          /* retirement events (cosim_instr calls) */
 
 /* lockstep control (written by TCP thread, read by guest thread).
  * The guest parks at EVERY checkpoint boundary (a deterministic guest cycle = multiple
@@ -77,25 +76,29 @@ void cosim_block(uint32_t pc) { g_last_leader_pc = pc; }
 uint32_t cosim_last_block(void) { return g_last_leader_pc; }
 
 uint32_t cosim_cycles_to_next_checkpoint(void) {
-    uint64_t now = psx_cycle_count;
-    if (now >= g_next_cp) return 0;
-    uint64_t d = g_next_cp - now;
-    return d > 0xFFFFFFFFULL ? 0xFFFFFFFFu : (uint32_t)d;
+    return 0;   /* checkpoints are icount-keyed; no cycle sub-step cap needed */
 }
 
-/* Cycle-keyed checkpoint — called from psx_advance_cycles (both backends, identical
- * per-instruction charges). Folds a full-state hash into the chain at each guest-cycle
- * stride and parks at the coordinator's stop cycle. This is the alignment clock. */
-static void cosim_record_checkpoint(uint64_t cycle, uint32_t pc) {
+/* Instruction-count-keyed checkpoint — taken inside cosim_instr, which both
+ * backends call exactly once per retirement event (a branch and its delay slot
+ * retire as ONE event in both the dirty-RAM interp and the emitted code). That
+ * makes checkpoint k "the state after k*stride retirements" by construction, so
+ * the two instances always hash the SAME architectural position. The guest-cycle
+ * clock is part of the hash (cosim_state.c), so any cycle-accounting drift shows
+ * up as a chain divergence AT an exact instruction instead of silently skewing
+ * where the two instances park (the old cycle-keyed design parked at the first
+ * instruction boundary after the stride cycle, which the two backends could
+ * reach at different retirement positions — phantom divergences). */
+static void cosim_record_checkpoint(uint64_t icount, uint32_t pc) {
     uint64_t h = cosim_state_hash(NULL);
     uint64_t cp = ++g_cp;
-    g_chain = fold(fold(g_chain, cycle), h);
+    g_chain = fold(fold(g_chain, icount), h);
     Entry *e = &g_ring[cp & (RING_N - 1u)];
     e->cp = cp; e->pc = pc; e->hash = h;
-    e->istat = i_stat; e->imask = i_mask; e->cycle = cycle;
+    e->istat = i_stat; e->imask = i_mask; e->cycle = psx_cycle_count;
 
     /* deterministic park: consume one checkpoint of budget, else block for `step`.
-     * The guest ALWAYS stops here (a fixed cycle boundary), never at a wall-time point. */
+     * The guest ALWAYS stops here (a fixed icount boundary), never at a wall-time point. */
     if (g_run_budget > 0) { g_run_budget--; return; }
     g_parked = 1;
     while (g_run_budget <= 0) {
@@ -107,29 +110,24 @@ static void cosim_record_checkpoint(uint64_t cycle, uint32_t pc) {
 }
 
 void cosim_tick(void) {
-    uint64_t now = psx_cycle_count;
-    if (now < g_next_cp) return;
-
-    if (g_cp == 0 && now == 0 && g_next_cp == 0) {
-        cosim_record_checkpoint(0, g_last_leader_pc);
-        g_next_cp = g_stride ? g_stride : 1;
-        return;
-    }
-
-    while (now >= g_next_cp) {
-        if (g_pending_count == 0) g_pending_first_cycle = g_next_cp;
-        g_pending_count++;
-        g_next_cp += g_stride ? g_stride : 1;
-    }
+    /* Retained for the psx_advance_cycles call sites; checkpointing moved to
+     * the icount key in cosim_instr (see cosim_record_checkpoint comment). */
 }
 
 void cosim_instr(uint32_t pc) {
     g_last_leader_pc = pc;
-    while (g_pending_count > 0) {
-        uint64_t cycle = g_pending_first_cycle;
-        g_pending_first_cycle += g_stride ? g_stride : 1;
-        g_pending_count--;
-        cosim_record_checkpoint(cycle, pc);
+    g_icount++;
+    if (g_cp == 0 && g_next_cp == 0) {
+        /* Initial park at the very first retirement: the coordinator gains
+         * control before the guest free-runs (unless PSX_COSIM_START_CYCLE
+         * set a free-run target, which makes g_next_cp nonzero). */
+        cosim_record_checkpoint(g_icount, pc);
+        g_next_cp = g_icount + (g_stride ? g_stride : 1);
+        return;
+    }
+    if (g_icount >= g_next_cp) {
+        cosim_record_checkpoint(g_icount, pc);
+        g_next_cp = g_icount + (g_stride ? g_stride : 1);
     }
 }
 
@@ -200,8 +198,9 @@ static void handle_line(sock_t s, char *line) {
     if (sscanf(line, "%31s", cmd) != 1) { send_line(s, "err empty\n"); return; }
 
     if (!strcmp(cmd, "status")) {
-        snprintf(out, sizeof out, "cp %llu cycle %llu chain %016llx stride %llu parked %d\n",
+        snprintf(out, sizeof out, "cp %llu cycle %llu icnt %llu chain %016llx stride %llu parked %d\n",
                  (unsigned long long)g_cp, (unsigned long long)psx_cycle_count,
+                 (unsigned long long)g_icount,
                  (unsigned long long)g_chain, (unsigned long long)g_stride, g_parked);
         send_line(s, out); return;
     }
@@ -229,9 +228,10 @@ static void handle_line(sock_t s, char *line) {
         while (g_run_budget > 0 && spins < 1200000) { COSIM_SLEEP(1); spins++; }
         /* small settle so g_parked/g_chain reflect the checkpoint just recorded */
         int s2 = 0; while (!g_parked && g_run_budget <= 0 && s2 < 2000) { COSIM_SLEEP(1); s2++; }
-        snprintf(out, sizeof out, "%s cp %llu cycle %llu chain %016llx\n",
+        snprintf(out, sizeof out, "%s cp %llu cycle %llu icnt %llu chain %016llx\n",
                  g_parked ? "parked" : "running",
                  (unsigned long long)g_cp, (unsigned long long)psx_cycle_count,
+                 (unsigned long long)g_icount,
                  (unsigned long long)g_chain);
         send_line(s, out); return;
     }
@@ -369,8 +369,9 @@ void cosim_init(void) {
     unsigned short port = 4600;
     const char *e = getenv("PSX_COSIM_PORT");
     if (e && *e) port = (unsigned short)atoi(e);
-    /* Stride fixed at launch (env) so the checkpoint cycle boundaries are identical in
-     * both processes before either runs a single instruction — no set-stride race. */
+    /* Stride fixed at launch (env) so the checkpoint icount boundaries are identical
+     * in both processes before either runs a single instruction — no set-stride race.
+     * Both stride and start are in RETIRED INSTRUCTIONS (icount), not guest cycles. */
     const char *st = getenv("PSX_COSIM_STRIDE");
     if (st && *st) { unsigned long long v = strtoull(st, 0, 10); if (v) g_stride = v; }
     const char *sc = getenv("PSX_COSIM_START_CYCLE");

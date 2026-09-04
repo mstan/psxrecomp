@@ -1,0 +1,2 @@
+# Optional: Project Studio GUI
+customtkinter>=5.2

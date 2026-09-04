@@ -1,0 +1,126 @@
+name: Nightly source release
+
+# Publishes the current head of `master` as a rolling `nightly` pre-release
+# with a full source archive attached. No per-OS builds run here -- this is a
+# source snapshot only. The reason it exists rather than pointing people at
+# GitHub's auto-generated "Source code (zip)": those archives omit submodules,
+# and a psxrecomp tree without lib/recomp-net and lib/retcomm-rbengine does not
+# configure.
+#
+# Behaviour:
+#   * Runs nightly (and on demand via workflow_dispatch).
+#   * If `master` has not moved since the last nightly, it does nothing.
+#   * The `nightly` tag and release are replaced each run, so there is exactly
+#     one nightly at a time and it never displaces the versioned "Latest".
+#   * Creating the release with GITHUB_TOKEN does not fire other workflows,
+#     so cli-release.yml (release: published) is NOT triggered by this.
+on:
+  schedule:
+    - cron: "17 6 * * *"   # 06:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-source-release
+  cancel-in-progress: false
+
+env:
+  NIGHTLY_TAG: nightly
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compare with previous nightly
+        id: prev
+        run: |
+          head=$(git rev-parse HEAD)
+          prev=$(git rev-parse -q --verify "refs/tags/$NIGHTLY_TAG^{commit}" || true)
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          if [ -n "$prev" ] && [ "$prev" = "$head" ] && [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "master ($head) unchanged since last nightly; nothing to publish."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build source archives
+        if: steps.prev.outputs.changed == 'true'
+        id: archive
+        run: |
+          set -euo pipefail
+          date=$(date -u +%Y%m%d)
+          short=$(git rev-parse --short=10 HEAD)
+          name="psxrecomp-src-nightly-${date}-${short}"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage"
+          # Tracked files only, submodules included, no .git directories.
+          git ls-files -z --recurse-submodules | xargs -0 cp --parents -t "$stage"
+          printf '%s\n' "$(git rev-parse HEAD)" > "$stage/NIGHTLY_COMMIT"
+          git submodule status --recursive > "$stage/NIGHTLY_SUBMODULES"
+          mkdir -p dist
+          tar -C "$RUNNER_TEMP" -czf "dist/$name.tar.gz" "$name"
+          (cd "$RUNNER_TEMP" && zip -q -r "$GITHUB_WORKSPACE/dist/$name.zip" "$name")
+          (cd dist && sha256sum "$name.tar.gz" "$name.zip" > SHA256SUMS)
+          ls -l dist
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        if: steps.prev.outputs.changed == 'true'
+        env:
+          PREV: ${{ steps.prev.outputs.prev }}
+          HEAD_SHA: ${{ steps.prev.outputs.head }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated nightly source snapshot of \`master\` at ${HEAD_SHA}."
+            echo
+            echo "The attached archives contain the full tree **including submodules**"
+            echo "(\`lib/recomp-net\`, \`lib/retcomm-rbengine\`), which GitHub's auto-generated"
+            echo "source archives leave out. Set up a game project from it with the"
+            echo "scripts in \`tools/new_project_layout/\` -- see \`docs/GAME_PROJECT_SETUP.md\`."
+            echo
+            echo "This tag moves every night; do not pin to it."
+            echo
+            if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
+              echo "### Changes since previous nightly (${PREV})"
+              echo
+              git log --no-merges --format='- %h %s' "$PREV..HEAD" | head -200
+              n=$(git rev-list --count --no-merges "$PREV..HEAD")
+              if [ "$n" -gt 200 ]; then echo "- ... and $((n-200)) more"; fi
+            else
+              echo "### Changes"
+              echo
+              echo "First nightly, or previous nightly commit no longer reachable."
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Replace nightly release
+        if: steps.prev.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.prev.outputs.head }}
+          TITLE: "Nightly ${{ steps.archive.outputs.date }} (${{ steps.archive.outputs.short }})"
+        run: |
+          set -euo pipefail
+          gh release delete "$NIGHTLY_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create "$NIGHTLY_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$HEAD_SHA" \
+            --title "$TITLE" \
+            --notes-file notes.md \
+            --prerelease --latest=false \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS

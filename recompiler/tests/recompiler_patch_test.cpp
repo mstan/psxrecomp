@@ -142,6 +142,36 @@ buffer_ms = 60
     check(audio_config.runtime.audio_buffer_ms == 60,
           "parser preserves per-game audio buffer target");
 
+    const auto controller_defaults = write_config(root, "controller-defaults", R"toml(
+[controller]
+p1_device = "keyboard"
+p2_device = "gamepad"
+p2_mode = "digital"
+)toml");
+    const auto controller_defaults_config =
+        PSXRecompV4::load_game_config(controller_defaults);
+    check(controller_defaults_config.runtime.has_default_p1_device &&
+              controller_defaults_config.runtime.default_p1_device == "keyboard" &&
+              controller_defaults_config.runtime.has_default_p2_device &&
+              controller_defaults_config.runtime.default_p2_device == "gamepad" &&
+              controller_defaults_config.runtime.default_p2_mode ==
+                  PSXRecompV4::PAD_MODE_DIGITAL,
+          "parser preserves per-game controller device defaults");
+
+    const auto netplay_viewport = write_config(root, "netplay-viewport", R"toml(
+[runtime]
+
+[netplay]
+local_viewport = "vertical_split"
+local_viewport_aspect = "adaptive"
+)toml");
+    const auto netplay_viewport_config =
+        PSXRecompV4::load_game_config(netplay_viewport);
+    check(netplay_viewport_config.netplay_local_viewport == "vertical_split",
+          "parser preserves netplay local viewport mode");
+    check(netplay_viewport_config.netplay_local_viewport_aspect == "adaptive",
+          "parser preserves netplay local viewport aspect");
+
     const auto bad_audio_buffer = write_config(root, "bad-audio-buffer", R"toml(
 [runtime]
 
@@ -205,6 +235,24 @@ negsub_sites = ["0x80012340"]
     check(negsub_config.ws_cull_negsub_sites ==
               std::vector<uint32_t>{0x80012340u},
           "parser preserves negsub cull sites");
+
+    const auto branch_keep = write_config(root, "branch-keep", R"toml(
+[widescreen.cull]
+branch_keep_sites = ["0x80012340"]
+)toml");
+    const auto branch_keep_config = PSXRecompV4::load_game_config(branch_keep);
+    check(branch_keep_config.ws_cull_branch_keep_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves branch keep sites");
+
+    const auto nclip_exact = write_config(root, "nclip-exact", R"toml(
+[widescreen.cull]
+nclip_exact_sites = ["0x80012340"]
+)toml");
+    const auto nclip_exact_config = PSXRecompV4::load_game_config(nclip_exact);
+    check(nclip_exact_config.ws_cull_nclip_exact_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves exact NCLIP branch sites");
 
     const auto vxrange = write_config(root, "vxrange", R"toml(
 [widescreen.cull]
@@ -680,6 +728,26 @@ void codegen_tests() {
               std::string::npos,
           "activation bias gains the same isolated resident-object lead");
 
+    PSXRecomp::CodeGenConfig branch_keep_config;
+    branch_keep_config.ws_cull_branch_keep_sites.insert(0x80010000u);
+    const std::string branch_keep = generate_first_instruction(
+        0x14400002u, {}, false, branch_keep_config); // bne v0,zero,+2
+    check(branch_keep.find(
+              "psx_ws_x_margin() > 0 ? 0 : (cpu->gpr[2] != cpu->gpr[0])") !=
+              std::string::npos &&
+              branch_keep.find("ws branch keep") != std::string::npos,
+          "codegen emits guarded branch keep predicate");
+
+    PSXRecomp::CodeGenConfig nclip_exact_config;
+    nclip_exact_config.ws_cull_nclip_exact_sites.insert(0x80010000u);
+    const std::string nclip_exact = generate_first_instruction(
+        0x04400002u, {}, false, nclip_exact_config); // bltz v0,+2
+    check(nclip_exact.find(
+              "gte_nclip_precise_bltz((int32_t)cpu->gpr[2])") !=
+              std::string::npos &&
+              nclip_exact.find("ws exact nclip") != std::string::npos,
+          "codegen emits title-scoped exact NCLIP predicate");
+
     PSXRecomp::CodeGenConfig plane_nx_config;
     plane_nx_config.ws_cull_plane_nx_sites.insert(0x80010000u);
     const std::string plane_nx = generate_first_instruction(
@@ -814,6 +882,19 @@ void gte_codegen_classification_tests() {
                 all_ok = false;
             }
         };
+        const auto expect_zero_destination = [&](uint32_t word,
+                                                 const std::string& read,
+                                                 const char *kind) {
+            const std::string code = generate_first_instruction(word, {}, false);
+            if (code.find("cpu->gpr[0] =") != std::string::npos ||
+                code.find(read) == std::string::npos ||
+                code.find("psx_gte_read(cpu, 0)") == std::string::npos) {
+                fmt::print(stderr,
+                           "FAIL  full-game GTE {} reg {} writes $zero or drops read/timing\n",
+                           kind, reg);
+                all_ok = false;
+            }
+        };
 
         const uint32_t cop2 = 0x12u << 26;
         expect(cop2 | (0x00u << 21) | (2u << 16) | (uint32_t(reg) << 11),
@@ -822,6 +903,18 @@ void gte_codegen_classification_tests() {
         expect(cop2 | (0x02u << 21) | (2u << 16) | (uint32_t(reg) << 11),
                fmt::format("gte_read_ctrl(cpu, {})", reg),
                PSXRecompGTERegisters::ctrl_read_needs_helper(reg), "CFC2");
+        expect_zero_destination(
+            cop2 | (0x00u << 21) | (0u << 16) | (uint32_t(reg) << 11),
+            PSXRecompGTERegisters::data_read_needs_helper(reg)
+                ? fmt::format("gte_read_data(cpu, {})", reg)
+                : fmt::format("cpu->gte_data[{}]", reg),
+            "MFC2");
+        expect_zero_destination(
+            cop2 | (0x02u << 21) | (0u << 16) | (uint32_t(reg) << 11),
+            PSXRecompGTERegisters::ctrl_read_needs_helper(reg)
+                ? fmt::format("gte_read_ctrl(cpu, {})", reg)
+                : fmt::format("cpu->gte_ctrl[{}]", reg),
+            "CFC2");
         expect(cop2 | (0x04u << 21) | (2u << 16) | (uint32_t(reg) << 11),
                fmt::format("gte_write_data(cpu, {}", reg),
                PSXRecompGTERegisters::data_write_needs_helper(reg), "MTC2");
@@ -931,6 +1024,38 @@ void jump_table_producer_codegen_test() {
           "alias regression fixture reaches the table when ownership is absent");
 }
 
+void cfg_codegen_load_delay_test() {
+    constexpr uint32_t base = 0x80003590u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = base;
+    exe.header.file_size = 20u;
+    append_word(exe.code_data, 0x8F5A4C38u); // lw k0,0x4c38(k0)
+    append_word(exe.code_data, 0x03400825u); // move at,k0 (must see old k0)
+    append_word(exe.code_data, 0xAC3A4C38u); // sw k0,0x4c38(at)
+    append_word(exe.code_data, 0x03E00008u); // jr ra
+    append_word(exe.code_data, 0x00000000u); // delay-slot nop
+
+    PSXRecomp::Function function{};
+    function.start_addr = base;
+    function.end_addr = base + 20u;
+    function.size = 20u;
+    function.name = "cfg_load_delay";
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator generator(exe);
+    const std::string code = generator.generate_function(function, cfg).full_code;
+
+    const size_t deferred = code.find("uint32_t psx_ldd_80003590 =");
+    const size_t successor = code.find("cpu->gpr[1] = cpu->gpr[26]");
+    const size_t writeback = code.find(
+        "cpu->gpr[26] = psx_ldd_80003590;  /* load-delay writeback */");
+    check(deferred != std::string::npos && successor != std::string::npos &&
+          writeback != std::string::npos && deferred < successor &&
+          successor < writeback,
+          "CFG codegen preserves MIPS-I dependent load-delay value semantics");
+}
+
 } // namespace
 
 int main() {
@@ -945,6 +1070,7 @@ int main() {
         codegen_tests();
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();
+        cfg_codegen_load_delay_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

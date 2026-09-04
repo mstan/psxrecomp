@@ -23,13 +23,19 @@ Usage:
   coverage_vault.py merge --vault DIR [--captures captures.json]
                           [--addendum captures.addendum.jsonl] [--cache CACHE_DIR]
   coverage_vault.py stats --vault DIR
+  coverage_vault.py compact --vault DIR --output compacted.json
+  coverage_vault.py compact --vault DIR --apply
+                            [--prune-cache] [--prune-stale-temp]
+                            [--drop-invalid-evidence]
   coverage_vault.py compact-addendum --addendum captures.addendum.jsonl
                                       --persist-dir IMMUTABLE_DIR
 """
-import argparse, json, os, shutil, hashlib, sys, contextlib
+import argparse, base64, json, os, shutil, hashlib, sys, contextlib, re, time
 
 CAP_NAME = "overlay_captures.json"
 CACHE_SUB = "cache"
+EVIDENCE_FIELDS = ("executed_pcs", "dispatch_entry_pcs",
+                   "static_dispatch_entry_pcs", "function_entry_pcs", "seeds")
 
 def _variant_key(region):
     b = region.get("bytes_b64", "") or ""
@@ -67,6 +73,193 @@ def _load_list(path):
                     tgt[fld] = sorted(set(tgt.get(fld, [])) |
                                       set(r.get(fld, [])))
     return list(index.values())
+
+def _iter_json_array(path, chunk_size=1024 * 1024):
+    """Stream objects from a top-level JSON array without loading the file.
+
+    Legacy Tomba 2 manifests exceeded 1 GiB and contain tens of millions of PC
+    strings. json.load() expands those strings several-fold in memory, which is
+    exactly why interrupted merges left multi-gigabyte temporary files behind.
+    """
+    decoder = json.JSONDecoder()
+    with open(path, encoding="utf-8") as source:
+        buffer = ""
+        eof = False
+
+        def fill():
+            nonlocal buffer, eof
+            chunk = source.read(chunk_size)
+            if chunk:
+                buffer += chunk
+            else:
+                eof = True
+
+        fill()
+        while not buffer.strip() and not eof:
+            fill()
+        start = len(buffer) - len(buffer.lstrip())
+        if start >= len(buffer) or buffer[start] != "[":
+            raise ValueError("root is not a JSON array: %s" % path)
+        buffer = buffer[start + 1:]
+        expect_value = True
+        while True:
+            while True:
+                stripped = buffer.lstrip()
+                buffer = stripped
+                if buffer or eof:
+                    break
+                fill()
+            if not buffer:
+                raise ValueError("unterminated JSON array: %s" % path)
+            if buffer[0] == "]":
+                if buffer[1:].strip() or not eof:
+                    tail = buffer[1:] + source.read()
+                    if tail.strip():
+                        raise ValueError("trailing data after JSON array: %s" % path)
+                return
+            if not expect_value:
+                if buffer[0] != ",":
+                    raise ValueError("expected ',' between array items: %s" % path)
+                buffer = buffer[1:]
+                expect_value = True
+                continue
+            while True:
+                try:
+                    value, end = decoder.raw_decode(buffer)
+                    break
+                except json.JSONDecodeError:
+                    if eof:
+                        raise ValueError("invalid or truncated JSON array: %s" % path)
+                    fill()
+            if not isinstance(value, dict):
+                raise ValueError("capture array item is not an object: %s" % path)
+            yield value
+            buffer = buffer[end:]
+            expect_value = False
+
+def _address(value, field):
+    try:
+        return int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        raise ValueError("invalid %s address: %r" % (field, value))
+
+def _compact_region(region, drop_invalid_evidence=False):
+    """Split one legacy broad capture into execution-evidence page runs.
+
+    The four-byte tail matches write_json_window(): a branch in the last word
+    of a retained page needs the next page's delay-slot instruction. Every
+    evidence address must lie in the original byte image; malformed input fails
+    closed rather than silently losing coverage.
+    """
+    load = _address(region.get("load_addr"), "load_addr")
+    size = region.get("size")
+    if not isinstance(size, int) or size <= 0:
+        raise ValueError("invalid capture size at 0x%08X: %r" % (load, size))
+    try:
+        image = base64.b64decode(region.get("bytes_b64", ""), validate=True)
+    except Exception as exc:
+        raise ValueError("invalid bytes_b64 at 0x%08X: %s" % (load, exc))
+    if len(image) != size:
+        raise ValueError("capture size mismatch at 0x%08X: size=%d bytes=%d" %
+                         (load, size, len(image)))
+    # 8 MB dev-RAM aware: titles running the 8MB enhancement stream code into
+    # the extended banks (0x200000..0x7FFFFF); the old 2 MB mask corrupted
+    # their capture addresses and rejected legitimate regions.
+    phys_lo = load & 0x7FFFFF
+    phys_hi = phys_lo + size
+    if phys_hi > 8 * 1024 * 1024:
+        raise ValueError("capture exceeds PSX RAM at 0x%08X" % load)
+
+    parsed = {}
+    pages = set()
+    evidence_entries = 0
+    invalid_evidence = 0
+    for field in EVIDENCE_FIELDS:
+        values = region.get(field, []) or []
+        if not isinstance(values, list):
+            raise ValueError("%s is not a list at 0x%08X" % (field, load))
+        entries = []
+        for value in values:
+            address = _address(value, field)
+            phys = address & 0x7FFFFF
+            if phys < phys_lo or phys >= phys_hi or (phys & 3):
+                if not drop_invalid_evidence:
+                    raise ValueError(
+                        "%s address 0x%08X is outside/alignment-invalid for "
+                        "capture 0x%08X+%d (use --drop-invalid-evidence only "
+                        "for a known-corrupt legacy vault)" %
+                        (field, address, load, size))
+                invalid_evidence += 1
+                continue
+            entries.append((phys, "0x%08X" % address))
+            pages.add(phys >> 12)
+            evidence_entries += 1
+        parsed[field] = entries
+    if not pages:
+        return [], evidence_entries, invalid_evidence
+
+    ordered = sorted(pages)
+    runs = []
+    first = previous = ordered[0]
+    for page in ordered[1:] + [None]:
+        if page is not None and page == previous + 1:
+            previous = page
+            continue
+        run_lo = max(phys_lo, first << 12)
+        run_hi = min(phys_hi, ((previous + 1) << 12) + 4)
+        compact = {k: v for k, v in region.items()
+                   if k not in EVIDENCE_FIELDS and
+                      k not in ("load_addr", "size", "bytes_b64")}
+        compact["load_addr"] = "0x%08X" % (load + run_lo - phys_lo)
+        compact["size"] = run_hi - run_lo
+        compact["bytes_b64"] = base64.b64encode(
+            image[run_lo - phys_lo:run_hi - phys_lo]).decode("ascii")
+        for field in EVIDENCE_FIELDS:
+            compact[field] = sorted({text for phys, text in parsed[field]
+                                     if run_lo <= phys < run_hi})
+        runs.append(compact)
+        if page is None:
+            break
+        first = previous = page
+    return runs, evidence_entries, invalid_evidence
+
+def compact_capture_manifest(source, output=None, drop_invalid_evidence=False):
+    """Stream, crop, and content-deduplicate a legacy capture manifest."""
+    index = {}
+    stats = {"source_regions": 0, "source_bytes": 0,
+             "source_evidence_entries": 0, "invalid_evidence_entries": 0,
+             "dropped_data_regions": 0}
+    for region in _iter_json_array(source):
+        stats["source_regions"] += 1
+        stats["source_bytes"] += int(region.get("size", 0) or 0)
+        compacted, evidence_entries, invalid_evidence = _compact_region(
+            region, drop_invalid_evidence)
+        stats["source_evidence_entries"] += evidence_entries
+        stats["invalid_evidence_entries"] += invalid_evidence
+        if not compacted:
+            stats["dropped_data_regions"] += 1
+        for record in compacted:
+            key = _variant_key(record)
+            if key not in index:
+                index[key] = record
+                continue
+            target = index[key]
+            for field in EVIDENCE_FIELDS:
+                target[field] = sorted(set(target.get(field, [])) |
+                                       set(record.get(field, [])))
+    records = sorted(index.values(), key=lambda r: (
+        _address(r.get("load_addr"), "load_addr"), _variant_key(r)))
+    stats["output_variants"] = len(records)
+    stats["output_bytes"] = sum(r["size"] for r in records)
+    stats["output_evidence_entries"] = sum(
+        len(r.get(field, [])) for r in records for field in EVIDENCE_FIELDS)
+    stats["max_output_region"] = max((r["size"] for r in records), default=0)
+    if stats["source_evidence_entries"] and not records:
+        raise RuntimeError("compaction lost all execution evidence")
+    if output:
+        os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+        _atomic_write_json(output, records)
+    return records, stats
 
 def _load_addendum(path):
     """Load every valid append-only history record, ignoring a torn tail.
@@ -378,14 +571,105 @@ def cmd_stats(vault):
     print("  captures: %d variant(s), %d executed PC(s)" % (len(regs), pcs))
     print("  cache:    %d DLL(s)" % ndll)
 
+def _print_compact_stats(source, stats):
+    print("coverage_vault: compacted analysis for %s" % source)
+    print("  regions: %d -> %d (%d data-only dropped)" %
+          (stats["source_regions"], stats["output_variants"],
+           stats["dropped_data_regions"]))
+    print("  bytes:   %d -> %d (saved %d; max output region %d)" %
+          (stats["source_bytes"], stats["output_bytes"],
+           stats["source_bytes"] - stats["output_bytes"],
+           stats["max_output_region"]))
+    print("  evidence entries: %d source -> %d deduplicated" %
+          (stats["source_evidence_entries"],
+           stats["output_evidence_entries"]))
+    if stats["invalid_evidence_entries"]:
+        print("  invalid legacy evidence dropped: %d" %
+              stats["invalid_evidence_entries"])
+
+def _prune_stale_manifest_temps(vault_json, minimum_age_hours=24):
+    directory = os.path.dirname(vault_json) or "."
+    basename = os.path.basename(vault_json)
+    pattern = re.compile(re.escape(basename) + r"\.\d+\.tmp$")
+    cutoff = time.time() - minimum_age_hours * 3600
+    removed = []
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if (pattern.fullmatch(name) and os.path.isfile(path) and
+                os.path.getmtime(path) <= cutoff):
+            size = os.path.getsize(path)
+            os.unlink(path)
+            removed.append((path, size))
+    return removed
+
+def cmd_compact(vault, output=None, apply=False, prune_cache=False,
+                prune_stale_temp=False, stale_temp_hours=24,
+                drop_invalid_evidence=False):
+    vault = os.path.abspath(vault)
+    source = os.path.join(vault, CAP_NAME)
+    if not os.path.isfile(source):
+        raise ValueError("vault manifest does not exist: %s" % source)
+    if apply and output:
+        raise ValueError("compact accepts either --apply or --output, not both")
+    if not apply and not output:
+        raise ValueError("compact requires --output for a preview or --apply")
+    if (prune_cache or prune_stale_temp) and not apply:
+        raise ValueError("pruning requires --apply")
+
+    if apply:
+        with _exclusive_lock(source):
+            records, stats = compact_capture_manifest(
+                source, drop_invalid_evidence=drop_invalid_evidence)
+            _atomic_write_json(source, records)
+            removed_temps = (_prune_stale_manifest_temps(
+                source, stale_temp_hours) if prune_stale_temp else [])
+            cache = os.path.join(vault, CACHE_SUB)
+            cache_bytes = 0
+            cache_files = 0
+            if prune_cache and os.path.isdir(cache):
+                for root, _dirs, files in os.walk(cache):
+                    for name in files:
+                        path = os.path.join(root, name)
+                        cache_files += 1
+                        cache_bytes += os.path.getsize(path)
+                shutil.rmtree(cache)
+    else:
+        records, stats = compact_capture_manifest(
+            source, output, drop_invalid_evidence)
+        removed_temps = []
+        cache_bytes = cache_files = 0
+
+    _print_compact_stats(source, stats)
+    if output:
+        print("  preview: %s" % os.path.abspath(output))
+    if removed_temps:
+        print("  stale temp files removed: %d (%d bytes)" %
+              (len(removed_temps), sum(size for _path, size in removed_temps)))
+    if cache_files:
+        print("  obsolete cache files removed: %d (%d bytes)" %
+              (cache_files, cache_bytes))
+    return stats
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["merge", "stats", "compact-addendum"])
+    ap.add_argument("cmd", choices=["merge", "stats", "compact",
+                                    "compact-addendum"])
     ap.add_argument("--vault", help="vault directory (kept gitignored/private)")
     ap.add_argument("--captures", help="source overlay_captures.json to merge in")
     ap.add_argument("--addendum", help="append-only overlay capture history (.jsonl)")
     ap.add_argument("--cache", help="source cache dir (e.g. build/cache/<game_id>) to merge in")
     ap.add_argument("--persist-dir", help="immutable capture snapshot directory")
+    ap.add_argument("--output", help="write a compacted preview here; leaves vault unchanged")
+    ap.add_argument("--apply", action="store_true",
+                    help="atomically replace the vault manifest with compacted evidence")
+    ap.add_argument("--prune-cache", action="store_true",
+                    help="with --apply, remove old content-keyed cache generations")
+    ap.add_argument("--prune-stale-temp", action="store_true",
+                    help="with --apply, remove old <manifest>.<pid>.tmp files")
+    ap.add_argument("--stale-temp-hours", type=float, default=24,
+                    help="minimum age for --prune-stale-temp (default: 24)")
+    ap.add_argument("--drop-invalid-evidence", action="store_true",
+                    help="drop impossible unaligned/out-of-region PCs from a known-corrupt legacy vault")
     a = ap.parse_args()
     if a.cmd == "compact-addendum":
         if not a.addendum or not a.persist_dir:
@@ -394,6 +678,14 @@ def main():
         return 0
     if not a.vault:
         ap.error("%s requires --vault" % a.cmd)
+    if a.cmd == "compact":
+        try:
+            cmd_compact(a.vault, a.output, a.apply, a.prune_cache,
+                        a.prune_stale_temp, a.stale_temp_hours,
+                        a.drop_invalid_evidence)
+        except (ValueError, RuntimeError) as exc:
+            ap.error(str(exc))
+        return 0
     if a.cmd == "stats":
         cmd_stats(a.vault)
         return 0

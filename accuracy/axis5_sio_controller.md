@@ -150,14 +150,13 @@ will still see our HYBRID auto-flip yank it back to digital — exactly the kind
 of "type flips underneath the game" desync the deferred-request machinery was
 built to avoid but cannot prevent, because we never learned the pad is locked.
 
-### D7 — **`0x4D` rumble-map is a canned constant, not an echo-back map** (semantic)
-Beetle's `0x4D` echoes the previous `rumble_magic[]` while latching the new
-mapping bytes (`dualshock.cpp:993-1024`); the map then routes `0x42` weak/strong
-rumble params (`dualshock.cpp:617-644`). Ours returns a fixed
-`{0xF3,0x5A,0,0,0,0,0,0}` (`sio.c:812`/`830`) and implements **no rumble at
-all.** Acceptable (no rumble output device), but a game that *reads back* the
-`0x4D` map to confirm rumble init will get the wrong echo and may decide rumble
-is absent. Low player-visible impact (no rumble hardware anyway).
+### D7 — **`0x4D` rumble-map negotiation and host output** (resolved)
+Resolved: `0x4D` now echoes the previous six-byte motor map while latching the
+new map. Mapped motor bytes from later `0x42` polls are retained per slot and
+forwarded to SDL's low/high-frequency rumble channels by the frontend. The
+protocol path is pinned by `sio_dualshock_rumble_test`; legacy savestates remain
+loadable and receive the conventional `{0x00,0x01,0xFF,...}` map with stopped
+motors.
 
 ### D8 — **`0x45` analog-status byte is hard-coded `0x03` (analog on)** (semantic)
 Beetle `0x4501` reports `transmit_buffer[1] = analog_mode ? 0x01 : 0x00`
@@ -289,9 +288,8 @@ every title — which is exactly what the LEGACY comment predicted, letting the
    The flag, legacy SIO branches, config key, debug command, helper script, and
    Tomba opt-in were removed. All titles use the modern DualShock state machine.
 
-5. **[P2] Echo-back `0x4D` rumble map** (D7). Even with no rumble output,
-   echo the previous `rumble_magic[]` bytes (`dualshock.cpp:993-1024`) so a game
-   that confirms rumble-init reads sane values. Low visible impact.
+5. **[DONE 2026-08-06] Echo-back `0x4D` rumble map and forward motors.** The
+   SIO model now routes negotiated weak/strong values to the SDL frontend.
 
 6. **[P2] Move pad ACK/IRQ timing onto the cycle-paced shifter** (D1). Remove
    the pad fast-path bypass (`sio.c:1386`) so pad bytes use

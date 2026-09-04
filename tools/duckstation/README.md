@@ -10,7 +10,71 @@ PSXRecomp v4 uses a patched build of [stenzek/duckstation](https://github.com/st
 - **`tools/duckstation/build.sh`** — runs CMake (Visual Studio 17 2022, x64, Release) and MSBuild on `duckstation-qt`. Requires the Visual Studio 2022 "Desktop development with C++" workload (CMake + MSBuild come with it).
 - **`tools/fix_duckstation_deps_paths.py`** — helper used by `setup.sh` to rewrite stale `_IMPORT_PREFIX` values in the extracted prebuilt deps.
 
-## First-time setup
+## First-time setup -- Linux / macOS
+
+Use `tools/duckstation_oracle.py`. It installs outside any game repo, into the
+shared RetComM data root, so one build serves every title:
+
+```text
+~/.local/share/retcomm/oracle/duckstation/     ($RETCOMM_DATA_DIR, or $RETCOMM_ORACLE_DIR)
+  src/     pinned upstream checkout with the oracle patch applied
+  build/   cmake/ninja tree
+  app/     the portable install that actually gets run
+  oracle.json
+```
+
+```bash
+P=psxrecomp/tools
+python3 $P/duckstation_oracle.py doctor          # can this machine build it?
+python3 $P/duckstation_oracle.py all             # fetch + patch + build + install
+python3 $P/duckstation_oracle.py start --disc disc/game.cue
+python3 $P/duckstation_oracle.py status
+python3 $P/duckstation_oracle.py stop
+```
+
+`gpu_parity.py --start-oracle --disc <cue>` will do the `start` step for you
+when nothing is answering on 4371.
+
+### Arch, CachyOS, NixOS: the build runs in a container
+
+DuckStation's CMake refuses to configure on Arch-family and NixOS hosts, and
+the note above that check states you do not have permission to distribute
+patches modifying its build system. Its build scripts are CC-BY-NC-ND-4.0.
+
+So the tool detects the refusal up front and builds in an environment upstream
+supports: `ubuntu:22.04` via podman/docker, installing packages with upstream's
+own `scripts/appimage/install-packages.sh`, copied verbatim out of the pinned
+checkout. On a distro upstream accepts, the build runs directly on the host.
+Force either path with `build --container` / `build --no-container`.
+
+### Notes that cost an afternoon to find
+
+* The binary's RUNPATH points at the build environment, and Qt needs its plugin
+  tree. `install` copies `dep/prebuilt/<platform>/{lib,plugins}` next to the
+  binary and writes a `run-oracle` launcher that sets `LD_LIBRARY_PATH` and
+  `QT_PLUGIN_PATH`, then verifies with `ldd` that nothing is unresolved.
+* An unofficial build shows a modal warning dialog before the core thread
+  starts. Under `-nogui` it is invisible, so the process sits blocked with no
+  port and no error. `install` sets DuckStation's own
+  `[UI] UnofficialBuildWarningConfirmed = true` key instead of patching that
+  behavior.
+* `install` seeds DuckStation's own default `settings.ini` by running it
+  briefly, then merges only the handful of keys an oracle needs.
+* Wayland support is off by default (`-DENABLE_WAYLAND=OFF`) because an
+  offscreen oracle never opens a Wayland surface. `build --wayland` re-enables
+  it.
+* The oracle server only starts when a system boots. An idle DuckStation with
+  nothing loaded will never open the port.
+
+### The pin
+
+`tools/duckstation/pin.json` is the single source of truth for the upstream
+base. Both this tool and the Windows `setup.sh` read it, so the two platforms
+cannot drift onto different trees. The prebuilt-dependency version and SHA-256
+come from the checkout's own `dep/PREBUILT-VERSION` and
+`dep/PREBUILT-SHA256SUMS`.
+
+## First-time setup -- Windows
 
 ```bash
 cd <psxrecomp-v4>
@@ -46,7 +110,7 @@ The pinned base SHA lives in one place only: `UPSTREAM_BASE` at the top of `tool
 
 ## Protocol parity with native runtime
 
-Both servers implement the same JSON-over-newline command set where possible so that `tools/debug_client.py compare <cmd>` diffs state between them. See `TCP_COMMANDS.md` at the v4 root for the full command table with "native-only / duckstation-only / both" annotations.
+Both servers implement the same JSON-over-newline command set where possible so that `tools/debug_client.py compare <cmd>` diffs state between them. See `docs/TCP_COMMANDS.md` for the full command table with "native-only / duckstation-only / both" annotations.
 
 ## First-time setup: the `duckstation-qt.rcc` resource file
 

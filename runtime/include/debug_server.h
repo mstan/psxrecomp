@@ -6,7 +6,8 @@
  * Includes a 36000-frame ring buffer for retroactive state queries.
  *
  * Same public API names as nesrecomp/snesrecomp debug servers
- * so TCP.md and DEBUG.md documentation is reusable across projects.
+ * so docs/TCP_COMMANDS.md and docs/internal/DEBUG.md documentation is
+ * reusable across projects.
  */
 #ifndef PSXRECOMP_DEBUG_SERVER_H
 #define PSXRECOMP_DEBUG_SERVER_H

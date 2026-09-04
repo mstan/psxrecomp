@@ -63,6 +63,13 @@ class StrictTranslator {
 public:
     // Translate a single decoded instruction. Pure function — no state.
     static TranslateResult translate(const PSXRecomp::DecodedInstruction& d);
+
+private:
+    // The per-opcode translation body; translate() wraps its c_code with the
+    // shared PGXP hook grammar (CodeGenerator::append_pgxp_hooks).
+    static TranslateResult translate_impl(const PSXRecomp::DecodedInstruction& d);
+
+public:
 };
 
 } // namespace PSXRecompV4

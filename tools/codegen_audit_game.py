@@ -2,7 +2,7 @@
 
 Sibling of `codegen_audit.py` (which audits BIOS strict-translator emit).
 The two emit conventions differ enough that the audit passes themselves
-diverge — see `docs/audit_inventory.md` for the rationale.
+diverge — see `docs/internal/audit_inventory.md` for the rationale.
 
 Tomba / game-emit characteristics:
   - Direct function calls: `func_XXXXXXXX(cpu);`

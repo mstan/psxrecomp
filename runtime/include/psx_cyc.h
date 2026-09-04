@@ -50,6 +50,8 @@ enum { PSX_CYC_BATCH_SOFT = 64u };
 static inline void psx_cyc_bb_defer_begin(void) { }
 static inline void psx_cyc_bb_defer_end(void) { }
 static inline void psx_cyc_bb_defer_flush(void) { overlay_flush_cycles(); }
+static inline void psx_cyc_local_begin(uint32_t *acc) { (void)acc; }
+static inline void psx_cyc_local_end(void) { }
 #else
 static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
 static inline void psx_cyc_bb_defer_end(void) {
@@ -57,12 +59,33 @@ static inline void psx_cyc_bb_defer_end(void) {
     if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
 }
 static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
+
+/* Install a function-local charge sink (MotK VLC leaves). Soft-cap publish
+ * at 1<<28 so uint32 cannot wrap; IRQ/MMIO still go through batch_flush. */
+static inline void psx_cyc_local_begin(uint32_t *acc) {
+#if !defined(PSX_COSIM)
+    if (acc) *acc = 0;
+    g_psx_cyc_local_acc = acc;
+#else
+    (void)acc;
+#endif
+}
+static inline void psx_cyc_local_end(void) {
+#if !defined(PSX_COSIM)
+    psx_cyc_local_publish();
+    g_psx_cyc_local_acc = NULL;
+#endif
+}
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
 static inline void psx_cyc_bb_defer_cleanup(int *guard) {
     (void)guard;
     psx_cyc_bb_defer_end();
+}
+static inline void psx_cyc_local_cleanup(uint32_t **guard) {
+    (void)guard;
+    psx_cyc_local_end();
 }
 #endif
 
@@ -84,6 +107,23 @@ static inline void psx_cyc_charge(uint32_t cycles) {
         return;
     }
 #if !defined(PSX_COSIM)
+    /* Emitter-gated VLC path: stack local, no deadline probe. */
+    if (g_psx_cyc_local_acc) {
+        uint32_t prior = *g_psx_cyc_local_acc;
+        if (cycles <= UINT32_MAX - prior && (prior + cycles) < (1u << 28)) {
+            *g_psx_cyc_local_acc = prior + cycles;
+            return;
+        }
+        *g_psx_cyc_local_acc = 0;
+        {
+            uint32_t *saved = g_psx_cyc_local_acc;
+            g_psx_cyc_local_acc = NULL;
+            if (prior) psx_advance_cycles(prior);
+            g_psx_cyc_local_acc = saved;
+        }
+        *g_psx_cyc_local_acc = cycles;
+        return;
+    }
     {
         uint32_t prior = g_psx_cyc_batch;
         uint32_t sum = prior + cycles;

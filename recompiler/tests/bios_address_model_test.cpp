@@ -160,6 +160,14 @@ int main(int argc, char** argv) {
     sweep(0xBFC00000u, 0xBFC80000u);            // BIOS ROM KSEG1 (mask path)
     sweep(0x80000000u, 0x80200000u);            // RAM KSEG0 (mask path)
 
+    // Main RAM aliases cover the first 8 MiB of physical space. Dispatch
+    // normalization must agree with memory access normalization at every
+    // mirror, including the exact 0x80200000 boundary seen in indirect calls.
+    expect_eq(model.normalize(0x00200000u), 0x00000000u, "normalize.ram_mirror", 0x00200000u);
+    expect_eq(model.normalize(0x007FFFFCu), 0x001FFFFCu, "normalize.ram_mirror", 0x007FFFFCu);
+    expect_eq(model.normalize(0x80200000u), 0x00000000u, "normalize.ram_mirror", 0x80200000u);
+    expect_eq(model.normalize(0xA07FFFFCu), 0x001FFFFCu, "normalize.ram_mirror", 0xA07FFFFCu);
+
     // --- kbless / rom-keyed accessors match the SCPH1001 constants --------
     if (!model.has_kbless()) { std::fprintf(stderr, "FAIL: no kbless window\n"); g_failures++; }
     expect_eq(model.kbless_ram_lo(),  0x500u,   "kbless_ram_lo", 0);

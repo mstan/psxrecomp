@@ -44,6 +44,12 @@ extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
+static int g_test_precise_nclip_enabled;
+extern "C" int gpu_ws_precise_nclip_enabled(void) {
+    return g_test_precise_nclip_enabled;
+}
+extern "C" void gpu_pgxp_rederive_enable(void) {}
+extern "C" uint32_t memory_get_ram_bytes(void) { return 2u * 1024u * 1024u; }
 extern "C" void psx_ws_note_gte_project(int) {}
 extern "C" {
 uint64_t s_frame_count = 0;
@@ -488,7 +494,15 @@ int test_precise_sxy_invalidation() {
     for (uint8_t reg = 0; reg < 32; ++reg) {
         gte_test_set_precise_valid_mask(0xFu);
         gte_write_data(&cpu, reg, 0x12345678u);
-        const uint32_t expected = (reg >= 12 && reg <= 15) ? 0u : 0xFu;
+        /* The PGXP shadow drops exactly the register(s) the guest wrote:
+         * SXY0/SXY1 clear their own slot; SXY2 and SXYP clear both mirrors
+         * (regs 14+15). The untouched slots stay live — their register
+         * values did not change (SXYP's hardware FIFO shift makes 12/13
+         * stale in VALUE, which validate-on-read handles at use; liveness
+         * alone is not a correctness claim). */
+        uint32_t expected = 0xFu;
+        if (reg == 12 || reg == 13) expected &= ~(1u << (reg - 12));
+        else if (reg == 14 || reg == 15) expected &= ~0xCu;
         const uint32_t actual = gte_test_get_precise_valid_mask();
         if (actual != expected)
             return fail_value("precise SXY invalidation", 0, reg,
@@ -538,6 +552,49 @@ int test_precise_sxy_invalidation() {
         gte_test_get_geometry_generation() != 1u)
         return fail_value("timeline generation wrap", 0, 0, 0, 1u,
                           gte_test_get_precision_generation());
+    return 0;
+}
+
+int test_precise_nclip_is_title_scoped() {
+    CPUState cpu{};
+    gte_precision_tracking_set(1);
+    g_test_precise_nclip_enabled = 1;
+
+    /* Native determinant is +1. The validated 16.16 positions have a negative
+     * exact determinant, so only the title-scoped branch helper may see it. */
+    const uint32_t packed[3] = {0x00000001u, 0xFFFFFFFEu, 0xFFFFFFFFu};
+    const int32_t x16[3] = {101245, -109694, -34340};
+    const int32_t y16[3] = {19509, -59658, -20365};
+    for (uint32_t i = 0; i < 3; ++i) {
+        cpu.gte_data[12 + i] = packed[i];
+        gte_test_seed_precise_projection(i, packed[i], x16[i], y16[i], 100);
+    }
+    uint64_t hit0 = 0, fallback0 = 0, disagree0 = 0;
+    gte_nclip_precise_stats(&hit0, &fallback0, &disagree0);
+    gte_execute(&cpu, 0x06u);
+    uint64_t hit1 = 0, fallback1 = 0, disagree1 = 0;
+    gte_nclip_precise_stats(&hit1, &fallback1, &disagree1);
+    if (cpu.gte_data[24] != 1u || hit1 != hit0 + 1u ||
+        fallback1 != fallback0 || disagree1 != disagree0 + 1u)
+        return fail_value("precise NCLIP preserves guest MAC0", 0, 0x06u,
+                          0, 1u, cpu.gte_data[24]);
+    if (!gte_nclip_precise_bltz(1) || gte_nclip_precise_bltz(2))
+        return fail_value("title-scoped precise NCLIP predicate", 0, 0x06u,
+                          0, 1u, 0u);
+
+    /* A stale packed-word shadow must fail closed to the native sign and count
+     * as a fallback, never as a precise hit. */
+    gte_test_seed_precise_projection(0, packed[0] ^ 1u,
+                                     x16[0], y16[0], 100);
+    gte_execute(&cpu, 0x06u);
+    uint64_t hit2 = 0, fallback2 = 0, disagree2 = 0;
+    gte_nclip_precise_stats(&hit2, &fallback2, &disagree2);
+    g_test_precise_nclip_enabled = 0;
+    if (cpu.gte_data[24] != 1u || hit2 != hit1 ||
+        fallback2 != fallback1 + 1u || disagree2 != disagree1 ||
+        gte_nclip_precise_bltz(1))
+        return fail_value("stale precise NCLIP falls back natively", 0, 0x06u,
+                          0, 1u, cpu.gte_data[24]);
     return 0;
 }
 
@@ -653,6 +710,7 @@ int main() {
     if (int rc = test_command_marshaling()) return rc;
     if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
+    if (int rc = test_precise_nclip_is_title_scoped()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");
     return 0;

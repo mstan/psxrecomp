@@ -131,6 +131,11 @@ static inline int pst_w_pod(PstW *w, const void *src, size_t nbytes, size_t elem
     const uint8_t *s = (const uint8_t *)src;
     if (!elem || (nbytes % elem) != 0) return 0;
     if (elem == 1) return pst_w_bytes(w, src, nbytes);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    /* Host LE: wire bytes match native POD layout — skip per-element swizzle. */
+    if (elem == 2 || elem == 4 || elem == 8)
+        return pst_w_bytes(w, src, nbytes);
+#endif
     for (size_t off = 0; off < nbytes; off += elem) {
         if (elem == 2) {
             uint16_t v;
@@ -155,6 +160,10 @@ static inline int pst_r_pod(PstR *r, void *dst, size_t nbytes, size_t elem) {
     uint8_t *d = (uint8_t *)dst;
     if (!elem || (nbytes % elem) != 0) return 0;
     if (elem == 1) return pst_r_bytes(r, dst, nbytes);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    if (elem == 2 || elem == 4 || elem == 8)
+        return pst_r_bytes(r, dst, nbytes);
+#endif
     for (size_t off = 0; off < nbytes; off += elem) {
         if (elem == 2) {
             uint16_t v;

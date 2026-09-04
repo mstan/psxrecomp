@@ -17,6 +17,9 @@ def main() -> int:
     cli = (ROOT / "recompiler/src/main_cli.cpp").read_text(encoding="utf-8")
     bios = (ROOT / "recompiler/src/main_bios.cpp").read_text(encoding="utf-8")
     package = (ROOT / "tools/build_cli.py").read_text(encoding="utf-8")
+    new_project_cmake = (
+        ROOT / "tools/new_project_layout/templates/CMakeLists.txt.in"
+    ).read_text(encoding="utf-8")
 
     require(cli, 'bios_config = \\"psxrecomp/bios/{}\\"',
             "generated game.toml does not name its BIOS profile")
@@ -33,6 +36,23 @@ def main() -> int:
     require(cli, 'set(PSX_RECOMP_UI OFF CACHE BOOL \\"\\" FORCE)',
             "self-contained CLI projects must not require a game-owned "
             "recomp-ui checkout")
+    require(cli, 'PSXRecomp runtime is missing:',
+            "generated CLI project does not fail clearly when psxrecomp/ "
+            "is missing")
+    require(cli, 'git submodule update --init --recursive',
+            "generated CLI project missing-runtime error lacks the git "
+            "submodule recovery command")
+    require(cli, '$RuntimeCMake = Join-Path $Root',
+            "generated PowerShell build script lacks a runtime.cmake "
+            "preflight")
+    require(cli, '[ ! -f \\"$ROOT/psxrecomp/runtime/runtime.cmake\\" ]',
+            "generated shell build script lacks a runtime.cmake preflight")
+    require(new_project_cmake, 'PSXRecomp runtime is missing:',
+            "new-project-layout CMake template does not fail clearly when "
+            "psxrecomp/ is missing")
+    require(new_project_cmake, 'git submodule update --init --recursive',
+            "new-project-layout missing-runtime error lacks the git "
+            "submodule recovery command")
 
     copy_pos = cli.find('fmt::print("[1/4] Copying build framework')
     game_pos = cli.find('fmt::print("[2/4] Recompiling game executable')

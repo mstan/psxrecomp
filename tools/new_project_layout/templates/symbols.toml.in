@@ -1,0 +1,11 @@
+# @GAME_NAME@ — progressive symbol map (partial decomp)
+# Discover → label here → manipulate via PSX_FN_* (tools/sync_symbols.py).
+# Gate emit=true only when the entry is safe to own for AOT / host hooks.
+# See psxrecomp/docs/SYMBOLS.md.
+
+[[func]]
+pc = @ENTRY_PC@
+name = "BootEntry"
+emit = false
+status = "guessed"
+note = "SYSTEM.CNF / EXE entry PC (probe seed)"

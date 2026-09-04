@@ -213,6 +213,23 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-31 (GPU DMA2 review correction — source gate passed):**
+  The first fork review found two valid timing defects in the DMA2 candidate. The
+  linked-list engine now reads and emits one live payload word at each
+  one-clock boundary. A CPU rewrite after an earlier word transfers can now
+  affect a later word. The optional widescreen prepass now fingerprints its
+  cached nodes and commands. It discards all cached transform metadata if live
+  RAM differs. The second fork review found three more valid issues. Late
+  service now consumes every elapsed DMA boundary. Header and link rewrites
+  now invalidate cached prepass topology at the exact header-read boundary.
+  The obsolete opt-in polygon-drop filter was removed. The focused regressions
+  and full build pass. The runtime suite passes 61 of 62 enabled tests. The
+  remaining `mod_runtime_test` crash reproduces on the unchanged upstream base,
+  and two pre-existing tests remain disabled. Fresh Spot and Vampire Hunter D
+  builds also pass their
+  600-frame headless gates. Visible software-renderer routes and another fork
+  review are still required before the public branch can change.
+
 - **2026-07-28 (per-game host audio cushion — implemented, parser validated):**
   Added `[audio] buffer_ms` as a runtime-only developer setting with a guarded
   30–500 ms range. The compatibility default remains 180 ms, preserving the
@@ -338,7 +355,7 @@ on a fixed region -> next.
   GUID if the dropdown index is stale.
 
 - **2026-07-20 (lobby default → public host):**
-  `psx_lobby_default_url` now `ws://netplay.technicallycomputers.ca:8765`
+  `psx_lobby_default_url` now `ws://netplay.retcomm.net:8765`
   (match SNES); override still `PSX_NET_LOBBY_URL`. Synced MotK vendored
   `psx_lobby_client.{c,h}` + recomp-net `docs/lobby.md`.
 
@@ -602,7 +619,7 @@ on a fixed region -> next.
   Proprietary `recomp-net-server` (Rust) owns WS lobby + privacy/docs;
   removed C `servers/lobby` from open `recomp-net`. Client WS helpers
   vendored at `runtime/src/lobby_ws/`. Default
-  `ws://netplay.technicallycomputers.ca:8765`.
+  `ws://netplay.retcomm.net:8765`.
 
 - **2026-07-19 (netplay lobby server + launcher menus):**
   Lobby WS+JSON owned by proprietary `recomp-net-server` (was C
@@ -766,7 +783,7 @@ on a fixed region -> next.
   config_loader (+ settings.toml bios_hle mirror), PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO
   env, startup banner bios_backend=/bios_boot=. PSX_HLE_SCHEDULER spike folded in
   (default via psx_hle_scheduler_set_default, env wins). (5) OBSERVABILITY — always-on
-  16K HLE ring (route LLE/HLE/boot-skip) + hle_dump TCP command (TCP_COMMANDS.md).
+  16K HLE ring (route LLE/HLE/boot-skip) + hle_dump TCP command (../TCP_COMMANDS.md).
   Regen era-consistent: BIOS + Tomba + MMX6 images (emitter changed). NEXT: Tomba
   save+load validation under BOTH backends (user drives); overlay-shard cg-tag refresh
   per title; grow the handler set (UnDeliverEvent, RCnt, A0 libc) with kernel-decompile

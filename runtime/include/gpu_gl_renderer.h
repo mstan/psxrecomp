@@ -23,11 +23,13 @@ int  gl_renderer_init_context(struct SDL_Window *win);
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
 
-/* Presentation-only frame interpolation. High-refresh sub-presents blend the
- * two most recent stable display images; guest simulation timing is unchanged. */
+/* Presentation-only temporal blending. High-refresh sub-presents blend the two
+ * most recent stable display images on the owning render thread/context; this
+ * does not generate motion vectors or true intermediate object positions. */
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
-                                   int blend_mode);
+                                   double source_hz, int blend_mode);
 void gl_renderer_set_interpolation_suspended(int suspended);
+int gl_renderer_interpolation_owns_cadence(void);
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,
@@ -46,8 +48,20 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w);
 
+/* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
+ * caller owns them and may free them on return. Passing NULL clears it.
+ * Returns 0 only if a texture could not be created. */
+int  gl_renderer_set_bezel(const void *rgba, int w, int h);
+int  gl_renderer_has_bezel(void);
+
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
+
+/* §33: re-present the last Live frame captured before Swap (or from a VRAM
+ * snapshot when interpolation owned the last present). Used during rollback
+ * resim so the window keeps a wall-clock present cadence without reading
+ * mid-resim VRAM. Returns 1 if a Swap happened, 0 if no hold is available. */
+int gl_renderer_present_hold_last(void);
 
 /* Sync the authoritative FBO down to CPU VRAM if the GPU side is ahead (else
  * a no-op). Screenshots and the debug server call this before reading CPU
@@ -65,6 +79,32 @@ void gl_renderer_flush_cpu_uploads(void);
  * reloaded identical frame still reaches the window (double/triple buffer). */
 void gl_renderer_invalidate_present(void);
 
+/* After savestate restore: push the CPU VRAM mirror into the GL FBO. Needed
+ * when the load happened while GP1 depth24 was on — the normal path skips
+ * framebuffer-sized uploads, which also skipped the full-VRAM boot_state
+ * blit and left post-FMV menus without texture pages. */
+void gl_renderer_restage_vram_after_savestate(void);
+
+/* Netplay dual-raster: every GP0 also writes software VRAM @ 1× (snaps /
+ * digests / GPUREAD authority) while the OpenGL hr FBO keeps settings-scale
+ * SSAA for present-only. Never enables glReadPixels; CPU stays current. */
+void gl_renderer_set_cpu_auth_dual(int on);
+
+/* FMV present reconstruction, settings.toml [video] fmv_filter. Takes the
+ * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
+ * Only consulted while video antialiasing is on; AA off is always nearest. */
+void gl_renderer_set_fmv_filter(int cfg_value);
+int  gl_renderer_cpu_auth_dual(void);
+
+/* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).
+ * take() returns deltas since the previous take/reset. Safe no-ops when GL is
+ * inactive. rect_dirty tests the current present-tile dirty bits. */
+void gl_renderer_present_probe_reset(void);
+void gl_renderer_present_probe_take(uint64_t *skip_delta, uint64_t *swap_delta,
+                                    uint64_t *dirty_mark_delta,
+                                    int *force_remaining);
+int  gl_renderer_present_rect_dirty(int disp_x, int disp_y, int w, int h);
+
 /* THE present path for 15-bit frames: blit the display region straight from
  * the authoritative VRAM FBO into a letterboxed rect (no readback).
  * Deterministic — used for every 15-bit frame. linear = filter on scale.
@@ -81,6 +121,14 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
+
+/* Scanline post-process (host display setting). on toggles the effect; strength
+ * (0..1) is the depth of the dark gap between PS1 scanlines. Applied at the
+ * native display-line pitch in the present/interpolation shaders, and faded in
+ * with output scale so it never shimmers on a sub-2x window. gl_renderer_get_
+ * scanlines returns the on flag and (via out-param) the current strength. */
+void gl_renderer_set_scanlines(int on, float strength);
+int  gl_renderer_get_scanlines(float *strength);
 
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */

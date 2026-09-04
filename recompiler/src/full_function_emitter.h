@@ -34,10 +34,12 @@ namespace PSXRecompV4 {
 struct EmitStats {
     uint32_t functions_emitted = 0;
     uint32_t functions_skipped = 0;  // e.g. FPU functions
+    uint32_t functions_interpreted = 0;  // fail-closed correctness fallback
     uint32_t total_instructions = 0;
     uint32_t dispatch_entries = 0;
     uint32_t continuation_entries = 0;
     std::vector<std::pair<uint32_t, std::string>> skipped;  // (addr, reason)
+    std::vector<std::pair<uint32_t, std::string>> interpreted;  // (addr, reason)
 };
 
 // A continuation label: the return point inside a calling function after
@@ -102,7 +104,8 @@ private:
         uint32_t                    rom_end,
         std::vector<ContinuationLabel>& out_continuations,
         const std::set<uint32_t>&   injected_cross_targets,
-        std::vector<ContinuationLabel>& out_cross_targets);
+        std::vector<ContinuationLabel>& out_cross_targets,
+        std::string*                out_interpreter_reason);
 
     // Emit the dispatch table.
     static void emit_dispatch(

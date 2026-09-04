@@ -45,7 +45,7 @@ struct BiosProfile {
 void usage(const char* program) {
     fmt::print(
         "Usage:\n"
-        "  {} build --disc <game.cue|bin|iso> --bios <PS1_BIOS.BIN> "
+        "  {} build --disc <game.cue|bin|iso|chd> --bios <PS1_BIOS.BIN> "
         "--output <directory> [--name <title>]\n\n"
         "The output contains generated game/BIOS C, game.toml, CMakeLists.txt,\n"
         "and build scripts. No compiler toolchain is bundled.\n"
@@ -312,11 +312,11 @@ int build_project(const Options& options, const fs::path& exe_dir) {
         find_bios_profile(framework_source, bios_profile);
 
     std::set<uint32_t> seeds = {image.entry_point()};
-    for (uint32_t address = image.load_address(); address + 4 <= image.end_address(); address += 4) {
+    for (uint32_t address = image.load_address(); address + 4 <= image.analysis_end_address(); address += 4) {
         auto word = image.read_word(address);
         if (!word || ((*word >> 26) & 0x3F) != 0x03) continue;
         uint32_t target = (address & 0xF0000000u) | ((*word & 0x03FFFFFFu) << 2);
-        if (target >= image.load_address() && target < image.end_address()) seeds.insert(target);
+        if (target >= image.load_address() && target < image.analysis_end_address()) seeds.insert(target);
     }
     std::string seed_text = fmt::format("# Auto-generated JAL targets for {}\n", serial);
     for (uint32_t seed : seeds) seed_text += fmt::format("0x{:08X}\n", seed);
@@ -381,10 +381,17 @@ int build_project(const Options& options, const fs::path& exe_dir) {
 
     const std::string cmake = fmt::format(
         "cmake_minimum_required(VERSION 3.20)\n"
+        "set(PSXRECOMP_ROOT \"${{CMAKE_CURRENT_SOURCE_DIR}}/psxrecomp\")\n"
+        "if(NOT EXISTS \"${{PSXRECOMP_ROOT}}/runtime/runtime.cmake\")\n"
+        "  message(FATAL_ERROR\n"
+        "    \"PSXRecomp runtime is missing: ${{PSXRECOMP_ROOT}}/runtime/runtime.cmake\\n\"\n"
+        "    \"This generated project needs the psxrecomp framework tree at ${{PSXRECOMP_ROOT}}.\\n\"\n"
+        "    \"If this project came from git, run: git submodule update --init --recursive\\n\"\n"
+        "    \"If this project came from psxrecomp.exe, regenerate it from the full CLI zip and keep the generated psxrecomp/ folder.\")\n"
+        "endif()\n"
         "project({} C CXX)\n"
         "set(CMAKE_C_STANDARD 99)\n"
         "set(CMAKE_CXX_STANDARD 17)\n"
-        "set(PSXRECOMP_ROOT \"${{CMAKE_CURRENT_SOURCE_DIR}}/psxrecomp\")\n"
         "set(PSX_RECOMP_UI OFF CACHE BOOL \"\" FORCE)\n"
         "set(PSXRECOMP_BIOS_STEMS \"{}\" CACHE STRING \"\" FORCE)\n"
         "include(\"${{PSXRECOMP_ROOT}}/runtime/runtime.cmake\")\n"
@@ -404,6 +411,11 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     write_file(options.output / "build.ps1",
         "$ErrorActionPreference = 'Stop'\n"
         "$Root = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
+        "$RuntimeCMake = Join-Path $Root 'psxrecomp/runtime/runtime.cmake'\n"
+        "if (-not (Test-Path -LiteralPath $RuntimeCMake)) {\n"
+        "  Write-Error \"PSXRecomp runtime is missing: $RuntimeCMake`nThis generated project needs the psxrecomp framework tree at '$Root\\psxrecomp'.`nIf this project came from git, run: git submodule update --init --recursive`nIf this project came from psxrecomp.exe, regenerate it from the full CLI zip and keep the generated psxrecomp folder.\"\n"
+        "  exit 1\n"
+        "}\n"
         "cmake -S $Root -B (Join-Path $Root 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF\n"
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
         "cmake --build (Join-Path $Root 'build') --config Release --parallel\n"
@@ -412,6 +424,13 @@ int build_project(const Options& options, const fs::path& exe_dir) {
         "#!/usr/bin/env sh\n"
         "set -eu\n"
         "ROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+        "if [ ! -f \"$ROOT/psxrecomp/runtime/runtime.cmake\" ]; then\n"
+        "  echo \"error: PSXRecomp runtime is missing: $ROOT/psxrecomp/runtime/runtime.cmake\" >&2\n"
+        "  echo \"This generated project needs the psxrecomp framework tree at $ROOT/psxrecomp.\" >&2\n"
+        "  echo \"If this project came from git, run: git submodule update --init --recursive\" >&2\n"
+        "  echo \"If this project came from psxrecomp.exe, regenerate it from the full CLI zip and keep the generated psxrecomp folder.\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
         "cmake -S \"$ROOT\" -B \"$ROOT/build\" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF\n"
         "cmake --build \"$ROOT/build\" --config Release --parallel\n");
     write_file(options.output / ".gitignore",
@@ -422,6 +441,10 @@ int build_project(const Options& options, const fs::path& exe_dir) {
         "## Build\n\n"
         "Install CMake, Ninja, and a C/C++ compiler. SDL3 is fetched automatically.\n"
         "Then run `sh build.sh` on macOS/Linux or `.\\build.ps1` in PowerShell.\n\n"
+        "This project must keep the generated `psxrecomp/` framework folder beside\n"
+        "`CMakeLists.txt`. If it is missing, restore it from source control with\n"
+        "`git submodule update --init --recursive` or regenerate the project from\n"
+        "the full PSXRecomp CLI zip.\n\n"
         "SDL3 is the default. To use SDL2 explicitly, configure once with\n"
         "`cmake -S . -B build -DPSX_SDL_BACKEND=SDL2`; later build-script runs\n"
         "preserve that cached selection.\n\n"

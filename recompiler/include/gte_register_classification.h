@@ -8,7 +8,12 @@
 namespace PSXRecompGTERegisters {
 
 constexpr bool data_read_needs_helper(uint8_t reg) {
-    return (reg >= 8 && reg <= 11) || reg == 15 || reg == 23 ||
+    /* Must cover every reg gte_read_data() treats specially (gte.cpp):
+     * 1,3,5,8-11 sign-extend; 7,16-19 mask to 16 bits; 15 mirrors 14;
+     * 28/29 pack IRGB; 31 computes LZCR. 23 kept from the legacy set. */
+    return reg == 1 || reg == 3 || reg == 5 || reg == 7 ||
+           (reg >= 8 && reg <= 11) || reg == 15 ||
+           (reg >= 16 && reg <= 19) || reg == 23 ||
            reg == 28 || reg == 29 || reg == 31;
 }
 
@@ -19,7 +24,10 @@ constexpr bool data_write_needs_helper(uint8_t reg) {
 }
 
 constexpr bool ctrl_read_needs_helper(uint8_t reg) {
-    return reg == 26 || reg == 27 || reg == 29 || reg == 30 || reg == 31;
+    /* Must cover every reg gte_read_ctrl() sign-extends (gte.cpp):
+     * 4, 12, 20, 26, 27, 29, 30. 31 kept from the legacy set. */
+    return reg == 4 || reg == 12 || reg == 20 || reg == 26 ||
+           reg == 27 || reg == 29 || reg == 30 || reg == 31;
 }
 
 constexpr bool ctrl_write_needs_helper(uint8_t reg) {
@@ -37,11 +45,11 @@ constexpr uint32_t helper_mask(bool (*predicate)(uint8_t)) {
 /* Independent architectural expectations. These deliberately do not derive
  * from one another: changing a predicate requires an explicit review of the
  * register mask, rather than letting both emitter tests agree on a bad table. */
-static_assert(helper_mask(data_read_needs_helper)  == 0xB0808F00u,
+static_assert(helper_mask(data_read_needs_helper)  == 0xB08F8FAAu,
               "GTE data-read helper set changed");
 static_assert(helper_mask(data_write_needs_helper) == 0xF08FFFAAu,
               "GTE data-write helper set changed");
-static_assert(helper_mask(ctrl_read_needs_helper)  == 0xEC000000u,
+static_assert(helper_mask(ctrl_read_needs_helper)  == 0xEC101010u,
               "GTE control-read helper set changed");
 static_assert(helper_mask(ctrl_write_needs_helper) == 0xEC101010u,
               "GTE control-write helper set changed");

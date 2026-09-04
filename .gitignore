@@ -29,6 +29,8 @@ recompiler/build-cli/
 recompiler/build-t2/
 runtime/build/
 runtime/build-msvc/
+runtime/build-*/
+runtime/build-*.exe
 test_msvc/
 
 # Recompiler output (derivative of copyrighted Sony BIOS, regenerate locally)
@@ -68,7 +70,8 @@ psx_out.txt
 
 # Probe / scratch artifacts
 # All ad-hoc diagnostic dumps land under probes/ so the repo root stays clean.
-# Runtime data (memcards) is intentionally NOT covered: card*.mcd, dummy.*.mcr.
+# Runtime memcards are not covered here either — see the *.mcr / /*.mcd rules
+# below; the tracked fixtures live in runtime/tests/fixtures/memcards/.
 probes/
 
 # Ad-hoc scratch tools (underscore prefix convention).
@@ -99,9 +102,14 @@ games/*/*
 !games/*/game.toml
 !games/*/seeds.txt
 
-# Per-game memcards created at runtime
+# Memcards. Cards a run creates are scratch: *.mcr anywhere, and any .mcd
+# dropped at the repo root (the runtime writes card1.mcd/card2.mcd next to the
+# project root when no explicit path is configured). The only tracked cards are
+# test fixtures: runtime/tests/fixtures/memcards/ (see the README there) plus
+# the runtime/tests/test_* fixtures re-included further down.
 *.mcr
-!dummy.*.mcr
+/*.mcd
+!runtime/tests/fixtures/memcards/*
 
 # macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
 /dist/
@@ -109,9 +117,24 @@ games/*/*
 # Session-scratch debug scripts (hardcoded local paths; kept on disk, not tracked)
 tools/_options_session/
 
-# Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
+# Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked).
+# The *.exe rule alone missed extension-less Linux binaries, and three of them
+# (test_netplay_snap_ring, test_netplay_hash_confirm, test_netplay_input_hist)
+# were committed as a result — the snap-ring one from before boot_state grew its
+# VRAM-incremental queries, so it could no longer be rebuilt from the tree it sat
+# in. Ignore everything matching test_* here except the tracked sources/fixtures.
 runtime/tests/*.exe
+runtime/tests/test_*
+!runtime/tests/test_*.c
+!runtime/tests/test_*.cpp
+!runtime/tests/test_*.py
+!runtime/tests/test_*.mcd
+!runtime/tests/test_dir/
 
 # transient split-gen build dirs
 recompiler/build-splitgen/
 recompiler/build-*/
+
+# Project Studio GUI venv (customtkinter)
+tools/new_project_layout/.venv/
+tools/new_project_layout/project_studio_repos.json

@@ -21,8 +21,8 @@ assert "/*vulkan_offered*/" in config_cpp
 assert '"Software"' in main
 assert '"OpenGL (Recommended)"' in main
 assert '"Vulkan"' in main
-assert "gi.renderer_labels      = kPsxRendererLabels;" in main
-assert "gi.num_renderers        = vulkan_offered ? 3 : 2;" in main
+assert "gi->renderer_labels = kPsxRendererLabels;" in main
+assert "gi->num_renderers = vulkan_offered_b ? 3 : 2;" in main
 assert "ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1)" in main
 assert "settings requested Vulkan, but this game does not" in main
 

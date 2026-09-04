@@ -1,3 +1,20 @@
+// ---------------------------------------------------------------------------
+// BasicBlockAnalyzer is NOT on any live path.
+//
+// Nothing in the tree constructs it: the live basic-block walker is
+// ControlFlowAnalyzer::analyze_function (control_flow.cpp), built at
+// main_psx.cpp:932/954/1138 and rebuilt in
+// CodeGenerator::generate_file's mid-function split pre-pass. This file is
+// still compiled and therefore still hashed into the codegen tag, so a change
+// here invalidates caches without changing any emitted byte.
+//
+// It is kept, and kept CORRECT, rather than deleted: it already bounded its
+// walk properly, and its bounds are now the analysis bound
+// (PS1Executable::analysis_end_address) so wiring it up could never
+// reintroduce the guard-word-as-block-leader defect (bead beads-eio.3.100).
+// Do not "fix" a discovery bug by editing this file — measure which walker
+// runs first.
+// ---------------------------------------------------------------------------
 #include "basic_block.h"
 #include <algorithm>
 
@@ -24,19 +41,19 @@ std::vector<uint32_t> BasicBlockAnalyzer::find_leaders() {
             // The instruction after the delay slot is a leader (fall-through target).
             // Delay slot is at i+1, so i+2 is the next block's start.
             uint32_t fall_through = instr.address + 8; // skip instr + delay slot
-            if (fall_through < exe_.end_address()) {
+            if (fall_through < exe_.analysis_end_address()) {
                 leaders.push_back(fall_through);
             }
 
             // The branch/jump target is also a leader.
             if (instr.is_branch && instr.branch_target != 0 &&
                 instr.branch_target >= exe_.load_address() &&
-                instr.branch_target < exe_.end_address()) {
+                instr.branch_target < exe_.analysis_end_address()) {
                 leaders.push_back(instr.branch_target);
             }
             if (instr.is_jump && instr.jump_target != 0 &&
                 instr.jump_target >= exe_.load_address() &&
-                instr.jump_target < exe_.end_address()) {
+                instr.jump_target < exe_.analysis_end_address()) {
                 leaders.push_back(instr.jump_target);
             }
         }
@@ -125,27 +142,27 @@ BasicBlock BasicBlockAnalyzer::build_block(uint32_t start_addr) {
 
             if (branch_instr->is_branch) {
                 // Conditional: fall-through + taken target
-                if (fall_through < exe_.end_address())
+                if (fall_through < exe_.analysis_end_address())
                     block.successors.push_back(fall_through);
                 if (branch_instr->branch_target >= exe_.load_address() &&
-                    branch_instr->branch_target < exe_.end_address())
+                    branch_instr->branch_target < exe_.analysis_end_address())
                     block.successors.push_back(branch_instr->branch_target);
             } else if (branch_instr->is_jump) {
                 if (branch_instr->is_jr_ra) {
                     // Function return — no successor within this function
                 } else if (branch_instr->opcode == 0x03) {
                     // JAL — control returns here; fall-through is successor
-                    if (fall_through < exe_.end_address())
+                    if (fall_through < exe_.analysis_end_address())
                         block.successors.push_back(fall_through);
                 } else if (branch_instr->jump_target >= exe_.load_address() &&
-                           branch_instr->jump_target < exe_.end_address()) {
+                           branch_instr->jump_target < exe_.analysis_end_address()) {
                     block.successors.push_back(branch_instr->jump_target);
                 }
             }
         } else if (term_it) {
             // Straight-line end: fall through to next instruction
             uint32_t fall_through = block.end_addr + 4;
-            if (fall_through < exe_.end_address())
+            if (fall_through < exe_.analysis_end_address())
                 block.successors.push_back(fall_through);
         }
     }
@@ -180,7 +197,7 @@ std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
         uint32_t start = leaders[li];
         uint32_t next_leader = (li + 1 < leaders.size())
             ? leaders[li + 1]
-            : exe_.end_address();
+            : exe_.analysis_end_address();
 
         // Only create a block if start_addr is in the decoded range
         if (addr_to_idx_.count(start) == 0) continue;
@@ -258,20 +275,20 @@ std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
 
             if (branch_instr->is_branch) {
                 // Conditional: two successors
-                if (after_branch < exe_.end_address())
+                if (after_branch < exe_.analysis_end_address())
                     block.successors.push_back(after_branch);
                 if (branch_instr->branch_target >= exe_.load_address() &&
-                    branch_instr->branch_target < exe_.end_address())
+                    branch_instr->branch_target < exe_.analysis_end_address())
                     block.successors.push_back(branch_instr->branch_target);
             } else { // jump
                 if (branch_instr->is_jr_ra) {
                     // Return: no intra-function successors
                 } else if (branch_instr->opcode == 0x03) { // JAL
                     // JAL: fall-through after delay slot
-                    if (after_branch < exe_.end_address())
+                    if (after_branch < exe_.analysis_end_address())
                         block.successors.push_back(after_branch);
                 } else if (branch_instr->jump_target >= exe_.load_address() &&
-                           branch_instr->jump_target < exe_.end_address()) {
+                           branch_instr->jump_target < exe_.analysis_end_address()) {
                     block.successors.push_back(branch_instr->jump_target);
                 } else if (branch_instr->opcode == 0x08 || branch_instr->opcode == 0x09) {
                     // JR/JALR to register — dynamic target, can't statically determine
@@ -280,10 +297,10 @@ std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
         } else {
             // Straight-line: fall through
             uint32_t fall_through = block.end_addr + 4;
-            if (fall_through < exe_.end_address() && fall_through < next_leader) {
+            if (fall_through < exe_.analysis_end_address() && fall_through < next_leader) {
                 // Only add if it's in range (typically the next block)
             }
-            if (fall_through < exe_.end_address())
+            if (fall_through < exe_.analysis_end_address())
                 block.successors.push_back(fall_through);
         }
 

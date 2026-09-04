@@ -20,7 +20,7 @@
  * come from the canon model, so the shadow can never diverge in WHICH note
  * plays — only in the interpolation/headroom of HOW it is rendered.
  *
- * See PRINCIPLES.md "Verified-Enhancement HLE Is Allowed; Load-Bearing HLE Is
+ * See docs/internal/PRINCIPLES.md "Verified-Enhancement HLE Is Allowed; Load-Bearing HLE Is
  * Not" and docs/SHADOW_ENHANCEMENTS.md. ShadowVerifier attribution: see
  * audio_shadow.h.
  */

@@ -11,15 +11,29 @@
 # build-time dependency of the runtime target (see psxrecomp_add_runtime_target)
 # so the failure surfaces first, names the missing files, and states the fix.
 #
-# Invoked via: cmake -DSOURCES=<;-list> -DTARGET=.. -DGAME_CONFIG=.. \
-#                    -DRECOMPILER=.. -DDOC=.. -P check_generated_sources.cmake
+# Invoked via:
+#   cmake -DSOURCES_FILE=<path> -DTARGET=.. -DGAME_CONFIG=.. \
+#         -DRECOMPILER=.. -DDOC=.. -P check_generated_sources.cmake
+# or (small lists only; Windows CreateProcess is ~8191 chars):
+#   cmake -DSOURCES=<;-list> ...
 
-if(NOT DEFINED SOURCES)
-    message(FATAL_ERROR "check_generated_sources.cmake requires SOURCES")
+set(_sources "")
+if(DEFINED SOURCES_FILE AND SOURCES_FILE)
+    if(NOT EXISTS "${SOURCES_FILE}")
+        message(FATAL_ERROR
+            "check_generated_sources.cmake: SOURCES_FILE does not exist:\n"
+            "  ${SOURCES_FILE}")
+    endif()
+    file(STRINGS "${SOURCES_FILE}" _sources)
+elseif(DEFINED SOURCES)
+    set(_sources ${SOURCES})
+else()
+    message(FATAL_ERROR
+        "check_generated_sources.cmake requires SOURCES_FILE or SOURCES")
 endif()
 
 set(_missing "")
-foreach(_src IN LISTS SOURCES)
+foreach(_src IN LISTS _sources)
     if(_src AND NOT EXISTS "${_src}")
         list(APPEND _missing "${_src}")
     endif()

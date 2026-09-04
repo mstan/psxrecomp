@@ -7,6 +7,7 @@
 // records this substitution explicitly.
 
 #include "strict_translator.h"
+#include "pgxp_hook_emitter.h"   /* shared PGXP hook grammar */
 #include "gte_register_classification.h"
 
 #include <cstdint>
@@ -63,6 +64,36 @@ TranslateResult unsupported(const PSXRecomp::DecodedInstruction& d, const std::s
 } // namespace
 
 TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction& d) {
+    TranslateResult r = translate_impl(d);
+    if (!r.supported) return r;
+    const uint32_t opcode = (d.raw >> 26) & 0x3F;
+    /* Shared PGXP hook grammar (ENHANCEMENTS.md G1.10). LWC2/SWC2 capture
+     * their raw word inside translate_impl and are skipped here. */
+    if (opcode != 0x32 && opcode != 0x3A && !r.c_code.empty())
+        PSXRecomp::append_pgxp_hooks(d.raw, r.c_code);
+    /* The deferred load-delay variant assigns into the function-scope
+     * psx_ldd_<addr> temp instead of the GPR; hook it with that temp as the
+     * loaded value (the shadow keys on the value, not on where it lands —
+     * the emitter's later writeback makes the GPR match). */
+    if (r.load_dest >= 0 && !r.c_code_deferred.empty()) {
+        const uint32_t rs = (d.raw >> 21) & 0x1F;
+        const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
+        /* Newline, never a space: if the deferred emission ever ends on a
+         * preprocessor directive (the block-cycles annotations already do
+         * elsewhere in this file), a space-joined hook lands on the directive
+         * line and is silently discarded -- the PR #171 defect. Unconditional
+         * "\n" is always valid where the space was, so non-directive
+         * emissions are unaffected apart from whitespace. */
+        r.c_code_deferred = fmt::format(
+            "{{ uint32_t _pgxa = cpu->gpr[{}] + {}; {}\n    "
+            "PGXP_LOAD(0x{:08X}u, _pgxa, psx_ldd_{:08X}); }}",
+            static_cast<int>(rs), static_cast<int>(offset),
+            r.c_code_deferred, d.raw, d.address);
+    }
+    return r;
+}
+
+TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruction& d) {
     TranslateResult r;
 
     // NOP (raw == 0, i.e. SLL $zero,$zero,0) — emit as a comment with no semantics.
@@ -1405,14 +1436,18 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
             : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))", static_cast<int>(rs), static_cast<int>(offset));
         bool special = PSXRecompGTERegisters::data_write_needs_helper(rt);
+        /* The raw loaded word is captured for the PGXP hook: a masked
+         * register write must validate against the word as loaded. */
         if (special) {
             r.c_code = gte_stall + fmt::format(
-                "gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));",
-                static_cast<int>(rt), addr);
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                "gte_write_data(cpu, {}, _pgxv); PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                addr, static_cast<int>(rt), d.raw);
         } else {
             r.c_code = gte_stall + fmt::format(
-                "cpu->gte_data[{}] = psx_cyc_lwc2_read(cpu, {});",
-                static_cast<int>(rt), addr);
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                "cpu->gte_data[{}] = _pgxv; PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                addr, static_cast<int>(rt), d.raw);
         }
         r.comment = fmt::format("lwc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));
@@ -1431,20 +1466,18 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         std::string value = PSXRecompGTERegisters::data_read_needs_helper(rt)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));
-        if (offset == 0) {
+        {
+            std::string addr = offset == 0
+                ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
+                : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))",
+                              static_cast<int>(rs), static_cast<int>(offset));
             r.c_code = gte_stall + fmt::format(
                 "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word(cpu->gpr[{}], {}); "
-                "gte_precision_store_word(cpu->gpr[{}], {});",
-                d.address, static_cast<int>(rs), value,
-                static_cast<int>(rs), static_cast<int>(rt));
-        } else {
-            r.c_code = gte_stall + fmt::format(
-                "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {}); "
-                "gte_precision_store_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
-                d.address, static_cast<int>(rs), static_cast<int>(offset), value,
-                static_cast<int>(rs), static_cast<int>(offset), static_cast<int>(rt));
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = {}; "
+                "cpu->write_word(_pgxa, _pgxv); "
+                "gte_precision_store_word(_pgxa, {}); "
+                "PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                d.address, addr, value, static_cast<int>(rt), d.raw);
         }
         r.comment = fmt::format("swc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));

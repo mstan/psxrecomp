@@ -1,0 +1,33 @@
+format_version = 5
+id = "psx.enhancement.pgxp"
+version = "1.0.0"
+name = "PGXP Precision (geometry + textures)"
+author = "psxrecomp"
+description = "Sub-pixel vertex precision and perspective-correct texturing (the PGXP technique): the runtime shadows the GTE's full-precision projections and follows them to the GPU, so 3D polygons stop wobbling between whole pixels and large floor/wall textures stop warping. Visual-only: the game's own math, culling and readback see exactly what real hardware produces."
+resolver = "declarative"
+save_compatibility = "shared"
+
+# Sub-pixel precision is a property of the emulated GTE/GPU pair, not of any
+# particular disc, so this ships with the framework and applies to every game.
+[[target]]
+game_id = "*"
+
+[[feature]]
+id = "pgxp"
+name = "PGXP Precision"
+description = "Disabled by default (the faithful floor). Corrections are validated per vertex against the exact packet words the game drew with and clamped to half a pixel, so 2D sprites and UI are never touched and a vertex the tracker cannot prove simply draws the faithful way. Most effective on a build compiled with the PGXP hook variant; on other builds coverage is reduced but never harmful. Needs supersampling >= 2 to be visible."
+group = "Visual"
+default_enabled = false
+
+[[option]]
+feature = "pgxp"
+id = "cpu_mode"
+label = "CPU-mode propagation"
+description = "Also track precision through CPU arithmetic (register repacking math). Off matches the reference implementations' default; on can raise coverage in games that rebuild vertices with integer math. Always safe either way - validation rejects anything stale."
+group = "Visual"
+type = "boolean"
+default = "false"
+
+[[plugin]]
+feature = "pgxp"
+id = "psx.pgxp"

@@ -24,6 +24,8 @@ int mdec_dma_read_ready(void);
  * widescreen present pins such frames to native 4:3 (FMVs are authored 4:3
  * and get no GTE squash to compensate the stretch). */
 int mdec_recently_active(uint32_t within_frames);
+/* Guest cycles since last colour decode; UINT64_MAX if never / reset. */
+uint64_t mdec_color_age_cycles(void);
 
 typedef struct MDECDebugState {
     uint32_t command;
@@ -78,6 +80,11 @@ void mdec_debug_dma_in_start(uint32_t addr, uint32_t words);
 void mdec_debug_dma_in_end(uint32_t addr, uint32_t words);
 void mdec_debug_dma_out_start(uint32_t addr, uint32_t words);
 void mdec_debug_dma_out_end(uint32_t addr, uint32_t words);
+
+/* boot_state / savestate: full MDEC FIFO + tables (required for FMV resume). */
+uint32_t mdec_snapshot_bytes(void);
+void     mdec_snapshot_write(uint8_t *p);
+int      mdec_snapshot_read(const uint8_t *p, uint32_t len);
 
 #ifdef __cplusplus
 }

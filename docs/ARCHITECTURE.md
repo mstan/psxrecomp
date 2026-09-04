@@ -147,7 +147,7 @@ Three GPU backends behind one interface:
   request it, otherwise the runtime falls back to OpenGL.
 
 Widescreen (a genuine wider GTE FOV, not a stretch) is opt-in and gen-time; see
-[`WIDESCREEN.md`](../WIDESCREEN.md) and
+[`WIDESCREEN.md`](WIDESCREEN.md) and
 [`docs/internal/NATIVE_WIDE_PLAN.md`](internal/NATIVE_WIDE_PLAN.md).
 
 ## The oracle model (how correctness is checked)
@@ -163,7 +163,7 @@ checking is done by querying both, never by sharing state in one process. There
 is also a first-divergence **co-sim** build that cycle-locksteps the compiled
 backend against the interpreter. See
 [`docs/internal/COSIM_ORACLE.md`](internal/COSIM_ORACLE.md),
-[`docs/config_schema.md`](config_schema.md), and [`TCP_COMMANDS.md`](../TCP_COMMANDS.md).
+[`docs/config_schema.md`](config_schema.md), and [`TCP_COMMANDS.md`](TCP_COMMANDS.md).
 
 ## Configuration
 

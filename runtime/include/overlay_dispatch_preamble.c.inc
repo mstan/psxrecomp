@@ -93,6 +93,16 @@ void psx_rfe_mark_escape(void) {
     overlay_flush_cycles();
     g_cbs.rfe_mark_escape();
 }
+/* Stale-static guard (ABI v22). The emitter emits this at block entry and
+ * before every direct jal, but it is DEFINED IN THE GENERATED DISPATCH SHARD
+ * (executable side), so an overlay DLL cannot resolve it without this shim.
+ * Its absence is what made 107 shards fail to link on the 2026-09-02 bump.
+ * NULL-guarded: returning 0 sends the guest down the dispatcher path, which is
+ * slower but never wrong -- the opposite choice (returning 1) would let an
+ * overlay run native code the guard was trying to reject. */
+int psx_game_text_native_ok(uint32_t addr) {
+    return g_cbs.game_text_native_ok ? g_cbs.game_text_native_ok(addr) : 0;
+}
 /* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
  * emits these; forward to the runtime's real impls so native overlays charge cycles on
  * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a
@@ -202,6 +212,10 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
 int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
     return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
 }
+int psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm) {
+    int32_t bound = (int32_t)(int16_t)(uint16_t)imm;
+    return ((int32_t)sx < bound - psx_ws_x_margin()) ? 1 : 0;
+}
 int psx_ws_cull_bltz(uint32_t v) {
     return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
 }
@@ -265,4 +279,27 @@ uint32_t psx_ws_angle_widen(uint32_t vanilla) {
 void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
 }
+#if defined(PSX_PGXP) && PSX_PGXP
+/* PGXP dataflow-shadowing hooks (pgxp_hooks.h; docs/ENHANCEMENTS.md G1.10). Only a
+ * pgxp-flavour shard (compiled -DPSX_PGXP=1, flavor bit set) references these
+ * — base-flavour shards preprocess the PGXP_*() macros away, so this block is
+ * compiled out of them entirely. Forwards to the host engine through the
+ * appended-last table; every hook no-ops on a host that predates it
+ * (precision shadowing is visual-only, never load-bearing). */
+void psx_pgxp_load(struct CPUState *cpu, uint32_t instr, uint32_t addr, uint32_t value) {
+    if (g_cbs.pgxp && g_cbs.pgxp->load) g_cbs.pgxp->load(cpu, instr, addr, value);
+}
+void psx_pgxp_store(struct CPUState *cpu, uint32_t instr, uint32_t addr, uint32_t value) {
+    if (g_cbs.pgxp && g_cbs.pgxp->store) g_cbs.pgxp->store(cpu, instr, addr, value);
+}
+void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2) {
+    if (g_cbs.pgxp && g_cbs.pgxp->alu) g_cbs.pgxp->alu(cpu, instr, result, s1, s2);
+}
+void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr, uint32_t hi, uint32_t lo, uint32_t s1, uint32_t s2) {
+    if (g_cbs.pgxp && g_cbs.pgxp->muldiv) g_cbs.pgxp->muldiv(cpu, instr, hi, lo, s1, s2);
+}
+void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr) {
+    if (g_cbs.pgxp && g_cbs.pgxp->cop2) g_cbs.pgxp->cop2(cpu, instr, value, addr);
+}
+#endif /* PSX_PGXP */
 /* ----------------------------------------------------------------------- */

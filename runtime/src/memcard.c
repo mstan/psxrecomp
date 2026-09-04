@@ -83,12 +83,37 @@ static void memcard_format(uint8_t *data) {
     memcpy(&data[63 * 128], &data[0], 128);
 }
 
+/* mkdir -p: create each path component (guest sandbox is <memcard>/netplay). */
 static void memcard_ensure_dir(const char* dir) {
+    char tmp[512];
+    size_t len;
+    size_t i;
     if (!dir || !dir[0]) return;
+    strncpy(tmp, dir, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    len = strlen(tmp);
+    while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
+        tmp[--len] = '\0';
+    }
+    for (i = 1; i < len; i++) {
+        if (tmp[i] == '/' || tmp[i] == '\\') {
 #ifdef _WIN32
-    (void)_mkdir(dir);
+            if (i == 2 && tmp[1] == ':')
+                continue;
+#endif
+            tmp[i] = '\0';
+#ifdef _WIN32
+            (void)_mkdir(tmp);
 #else
-    (void)mkdir(dir, 0755);
+            (void)mkdir(tmp, 0755);
+#endif
+            tmp[i] = '/';
+        }
+    }
+#ifdef _WIN32
+    (void)_mkdir(tmp);
+#else
+    (void)mkdir(tmp, 0755);
 #endif
 }
 

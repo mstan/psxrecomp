@@ -21,6 +21,9 @@
 #include "gpu_render.h"
 #include "gpu_vk_renderer.h"
 #include "gpu_sw_renderer.h"
+#include "host_osd.h"
+#include "psx_savestate_menu.h"
+#include "psx_rewind.h"
 #include "crash_trace.h"
 #include "gpu_vk_upload.h"
 
@@ -39,6 +42,7 @@ int  vk_renderer_present_wide(int a,int b,int c,int d){(void)a;(void)b;(void)c;(
 void vk_renderer_present_cpu(const uint32_t*p,int w,int h,int l,int f){(void)p;(void)w;(void)h;(void)l;(void)f;}
 void vk_renderer_present_blank(void){}
 void vk_renderer_sync_cpu(void){}
+void vk_renderer_restage_vram_after_savestate(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
@@ -401,8 +405,19 @@ static int            s_geo_mirror_suppress = 0;   /* open batch: skip the wide 
                                                     * (full-screen overlay rect draws its
                                                     * own full-width wide pass instead) */
 
-/* Textured batch: 18 floats/vert (pos,uv,col,tpage,clut,depth,raw,limits). */
-#define TEXV 18
+/* Sub-pixel vertex override + perspective UV weights for the next triangle
+ * ([video] geometry_correction / perspective_texturing; see gpu_render.h).
+ * gpu.c sets these immediately before the matching gr_draw_*_triangle and they
+ * are consumed by it. All-zero == the faithful integer/affine path. */
+static int   s_pc_valid = 0;           /* sub-pixel positions present */
+static float s_pc_x[3], s_pc_y[3];     /* native VRAM px, fractional  */
+static int   s_pq_valid = 0;           /* perspective weights present */
+static float s_pq[3];
+
+/* Textured batch: 19 floats/vert (pos,uv,col,tpage,clut,depth,raw,limits,q).
+ * q is the perspective weight ([video] perspective_texturing); 0 = affine,
+ * which the vertex shader turns into w == 1.0 — the faithful default. */
+#define TEXV 19
 typedef struct { float v[TEXV]; } TexVert;
 #define VK_TBUF_VERTS 24576               /* multiple of 3 */
 static VkBuffer       s_tbuf;
@@ -1224,7 +1239,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
     VkVertexInputBindingDescription bind = {0};
-    VkVertexInputAttributeDescription attrs[8]; uint32_t nattr;
+    VkVertexInputAttributeDescription attrs[9]; uint32_t nattr;
     if (prog == 0) {            /* GEO */
         vs = s_mod_geo_v; fs = s_mod_geo_f; layout = s_pl_geo;
         bind = (VkVertexInputBindingDescription){ 0, sizeof(Vert), VK_VERTEX_INPUT_RATE_VERTEX };
@@ -1242,7 +1257,8 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
         attrs[5] = (VkVertexInputAttributeDescription){ 5, 0, VK_FORMAT_R32_SFLOAT, 48 };
         attrs[6] = (VkVertexInputAttributeDescription){ 6, 0, VK_FORMAT_R32_SFLOAT, 52 };
         attrs[7] = (VkVertexInputAttributeDescription){ 7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 56 };
-        nattr = 8;
+        attrs[8] = (VkVertexInputAttributeDescription){ 8, 0, VK_FORMAT_R32_SFLOAT, 72 };  /* a_q */
+        nattr = 9;
     } else {                    /* BLIT (vertex-less: rect from push constant) */
         vs = s_mod_blit_v; fs = s_mod_blit_f; layout = s_pl_blit;
         nattr = 0;
@@ -1393,11 +1409,13 @@ int vk_renderer_init_context(SDL_Window *win) {
 }
 
 static void cpres_cache_free(void);   /* fwd: CPU-present resource cache */
+static void osd_staging_free(void);
 void vk_renderer_shutdown(void) {
     if (!s_dev) return;
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
+    osd_staging_free();       /* host toast OSD staging */
     for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
         if (s_staging_cache[i].buf)
             staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
@@ -1490,6 +1508,134 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
     return 1;
 }
 
+/* Copy host toast into the swapchain (must still be TRANSFER_DST). Opaque
+ * overwrite — host_osd bakes an opaque panel so no blend pass is needed. */
+static VkBuffer       s_osd_buf  = VK_NULL_HANDLE;
+static VkDeviceMemory s_osd_mem  = VK_NULL_HANDLE;
+static void          *s_osd_map  = NULL;
+static VkDeviceSize   s_osd_cap  = 0;
+
+static void osd_staging_free(void) {
+    if (s_osd_buf) {
+        staging_destroy(s_osd_buf, s_osd_mem);
+        s_osd_buf = VK_NULL_HANDLE;
+        s_osd_mem = VK_NULL_HANDLE;
+    }
+    s_osd_map = NULL;
+    s_osd_cap = 0;
+}
+
+static void vk_osd_copy_rect(VkCommandBuffer cb, VkImage sc,
+                             const uint32_t *px, int w, int h,
+                             int x, int y, VkDeviceSize buf_off) {
+    if (!px || w <= 0 || h <= 0) return;
+    int dw = w, dh = h;
+    if (x + dw > (int)s_sc_extent.width) dw = (int)s_sc_extent.width - x;
+    if (y + dh > (int)s_sc_extent.height) dh = (int)s_sc_extent.height - y;
+    if (dw < 1 || dh < 1) return;
+    memcpy((uint8_t *)s_osd_map + (size_t)buf_off, px,
+           (size_t)w * (size_t)h * 4u);
+    VkBufferImageCopy bc = {0};
+    bc.bufferOffset = buf_off;
+    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bc.imageSubresource.layerCount = 1;
+    bc.imageOffset.x = x;
+    bc.imageOffset.y = y;
+    bc.imageExtent.width = (uint32_t)dw;
+    bc.imageExtent.height = (uint32_t)dh;
+    bc.imageExtent.depth = 1;
+    bc.bufferRowLength = (uint32_t)w;
+    bc.bufferImageHeight = (uint32_t)h;
+    p_vkCmdCopyBufferToImage(cb, s_osd_buf, sc,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+}
+
+static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
+    const uint32_t *text_px = NULL, *vol_px = NULL, *rw_px = NULL, *ssm_px = NULL;
+    int tw = 0, th = 0, vw = 0, vh = 0, rw = 0, rh = 0, sw = 0, sh = 0;
+    const int have_text = host_osd_image(&text_px, &tw, &th) && text_px;
+    const int have_vol = host_osd_volume_image(&vol_px, &vw, &vh) && vol_px;
+    const int have_rw = psx_rewind_overlay_image(&rw_px, &rw, &rh) && rw_px;
+    const int have_ssm =
+        psx_savestate_menu_overlay_image(&ssm_px, &sw, &sh) && ssm_px;
+    if (!have_text && !have_vol && !have_rw && !have_ssm) {
+        host_osd_present_done();
+        return;
+    }
+    /* Only BGRA swapchains match ARGB8888 LE packing used by host_osd. */
+    if (s_sc_format != VK_FORMAT_B8G8R8A8_UNORM &&
+        s_sc_format != VK_FORMAT_B8G8R8A8_SRGB) {
+        host_osd_present_done();
+        return;
+    }
+    VkDeviceSize text_bytes =
+        have_text ? (VkDeviceSize)tw * (VkDeviceSize)th * 4u : 0;
+    VkDeviceSize vol_bytes =
+        have_vol ? (VkDeviceSize)vw * (VkDeviceSize)vh * 4u : 0;
+    VkDeviceSize rw_bytes =
+        have_rw ? (VkDeviceSize)rw * (VkDeviceSize)rh * 4u : 0;
+    VkDeviceSize ssm_bytes =
+        have_ssm ? (VkDeviceSize)sw * (VkDeviceSize)sh * 4u : 0;
+    VkDeviceSize bytes = text_bytes + vol_bytes + rw_bytes + ssm_bytes;
+    if (bytes > s_osd_cap) {
+        p_vkQueueWaitIdle(s_queue);
+        osd_staging_free();
+        if (!make_staging(bytes, &s_osd_buf, &s_osd_mem, &s_osd_map)) {
+            host_osd_present_done();
+            return;
+        }
+        s_osd_cap = bytes;
+    }
+    const int margin = 8;
+    VkDeviceSize off = 0;
+    if (have_text) {
+        vk_osd_copy_rect(cb, sc, text_px, tw, th, margin, margin, off);
+        off += text_bytes;
+    }
+    if (have_vol) {
+        int x = ((int)s_sc_extent.width > vw + margin)
+                    ? ((int)s_sc_extent.width - vw - margin)
+                    : margin;
+        int y = ((int)s_sc_extent.height > vh)
+                    ? (((int)s_sc_extent.height - vh) / 2)
+                    : margin;
+        vk_osd_copy_rect(cb, sc, vol_px, vw, vh, x, y, off);
+        off += vol_bytes;
+    }
+    if (have_rw) {
+        float slide = psx_rewind_slide();
+        int x = ((int)s_sc_extent.width > rw)
+                    ? (((int)s_sc_extent.width - rw) / 2)
+                    : 0;
+        int y = (int)s_sc_extent.height - (int)((float)rh * slide + 0.5f);
+        vk_osd_copy_rect(cb, sc, rw_px, rw, rh, x, y, off);
+        off += rw_bytes;
+    }
+    if (have_ssm) {
+        int x = ((int)s_sc_extent.width > sw)
+                    ? (((int)s_sc_extent.width - sw) / 2)
+                    : 0;
+        int y = ((int)s_sc_extent.height > sh)
+                    ? (((int)s_sc_extent.height - sh) / 2)
+                    : 0;
+        vk_osd_copy_rect(cb, sc, ssm_px, sw, sh, x, y, off);
+    }
+    host_osd_present_done();
+}
+
+static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr);
+
+static void finish_present(VkCommandBuffer cb, VkImage sc,
+                           uint32_t img_idx, uint32_t fr) {
+    vk_osd_blit(cb, sc);
+    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    submit_present(cb, img_idx, fr);
+}
+
 static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
     p_vkEndCommandBuffer(cb);
     /* Present command buffers write the acquired swapchain image with
@@ -1561,10 +1707,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
                      sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 
-    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    submit_present(cb, idx, fr);
+    finish_present(cb, sc, idx, fr);
     perf_snapshot_present();
     return 1;
 }
@@ -1580,10 +1723,7 @@ void vk_renderer_present_blank(void) {
     VkClearColorValue black = {{0,0,0,1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
-    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    submit_present(cb, idx, fr);
+    finish_present(cb, sc, idx, fr);
     perf_snapshot_present();
 }
 
@@ -1676,10 +1816,7 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
     blit.dstOffsets[0] = dst[0]; blit.dstOffsets[1] = dst[1];
     p_vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    submit_present(cb, idx, fr);
+    finish_present(cb, sc, idx, fr);
 
     /* Cached resources are rewritten next frame: wait for this frame's copy +
      * blit to complete first (FMV cadence is 15-24 fps; one idle-wait per
@@ -1737,10 +1874,7 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
                      1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    submit_present(cb, idx, fr);
+    finish_present(cb, sc, idx, fr);
     perf_snapshot_present();
     return 1;
 }
@@ -2172,7 +2306,12 @@ static void flush_cpu_upload(void) {
 
 /* GPU -> CPU mirror: drain batches, pack, copy the whole raw mirror down. */
 static void ensure_cpu(void) {
+    extern int psx_netplay_active(void);
     if (!s_ready || !s_gpu_dirty || !s_vram) return;
+    if (psx_netplay_active()) {
+        s_gpu_dirty = 0;
+        return;
+    }
     flush_cpu_upload();   /* readback overwrites s_vram: pending writes land first */
     flush_tex_batch(); flush_geometry();
     /* Readback must reflect ALL current hr content, not just the incremental
@@ -2246,7 +2385,7 @@ static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
 static int s_depth24_skip_up = 0;
 static DirtyRect s_d24_skip_fb;
 
-static int depth24_is_fb_transfer(int w, int h) {
+static int depth24_is_fb_transfer(int x, int y, int w, int h) {
     if (!gpu_display_is_depth24() || w <= 0 || h <= 0) return 0;
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
@@ -2254,9 +2393,36 @@ static int depth24_is_fb_transfer(int w, int h) {
     int fb_h = (int)di.height;
     if (fb_w < 8) fb_w = 8;
     if (fb_h < 1) fb_h = 1;
+    /* See GL: 256×256 pages must not match the half-FB area heuristic. */
+    if (w <= 256 && h <= 256) return 0;
+    {
+        int dx = (int)(di.display_x & 1023u);
+        int dy = (int)(di.display_y & 511u);
+        int x0 = x & (VRAM_W - 1), y0 = y & (VRAM_H - 1);
+        if (x0 + w <= dx || x0 >= dx + fb_w || y0 + h <= dy || y0 >= dy + fb_h)
+            return 0;
+    }
     if (h >= fb_h - 8 && h <= fb_h + 16 && w >= (fb_w * 3) / 4) return 1;
     if ((int64_t)w * (int64_t)h >= ((int64_t)fb_w * fb_h) / 2) return 1;
     return 0;
+}
+
+static void depth24_mark_scanout_band(void) {
+    GpuDisplayInfo di;
+    int fb_w, fb_h, x0, y0, x1, y1;
+    if (!gpu_display_is_depth24()) return;
+    gpu_get_display_info(&di);
+    fb_w = (int)((di.width * 3u + 1u) / 2u);
+    fb_h = (int)di.height;
+    if (fb_w < 8) fb_w = 8;
+    if (fb_h < 1) fb_h = 1;
+    x0 = (int)(di.display_x & 1023u);
+    y0 = (int)(di.display_y & 511u);
+    x1 = x0 + fb_w - 1;
+    y1 = y0 + fb_h - 1;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    rect_add(&s_d24_skip_fb, x0, y0, x1, y1);
 }
 
 static void depth24_clear_skipped_fb(void) {
@@ -2283,12 +2449,31 @@ static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *dat
     sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
     depth24_upload_policy();
-    if (s_depth24_skip_up && depth24_is_fb_transfer(w, h)) {
-        int x0 = x & (VRAM_W - 1), y0 = y & (VRAM_H - 1);
-        rect_add(&s_d24_skip_fb, x0, y0, x0 + w - 1, y0 + h - 1);
+    if (s_depth24_skip_up && depth24_is_fb_transfer(x, y, w, h)) {
+        /* Full-VRAM savestate restore: stage FBO; mark scanout band only. */
+        if (w >= VRAM_W && h >= VRAM_H) {
+            up_add_transfer(x, y, w, h);
+            rect_clear(&s_d24_skip_fb);
+            depth24_mark_scanout_band();
+            return;
+        }
+        depth24_mark_scanout_band();
         return;
     }
     up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
+}
+
+void vk_renderer_restage_vram_after_savestate(void) {
+    if (!s_ctx_ok || !s_vram) return;
+    s_up_nrects = 0;
+    rect_clear(&s_d24_skip_fb);
+    s_depth24_skip_up = 0;
+    up_add_transfer(0, 0, VRAM_W, VRAM_H);
+    flush_cpu_upload();
+    if (gpu_display_is_depth24()) {
+        s_depth24_skip_up = 1;
+        depth24_mark_scanout_band();
+    }
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
     ensure_cpu();   /* sync GPU-rendered content down to the CPU mirror first */
@@ -2563,15 +2748,46 @@ static void vkb_set_color_modulation(int r, int g, int b, int raw) {
     s_mod_r = r; s_mod_g = g; s_mod_b = b; s_mod_raw = raw ? 1 : 0;
 }
 
+/* Sub-pixel / perspective overrides for the next triangle. */
+static void vkb_set_precise_triangle(int enabled,
+                                     int32_t x0,int32_t y0, int32_t x1,int32_t y1,
+                                     int32_t x2,int32_t y2) {
+    s_pc_valid = enabled ? 1 : 0;
+    if (s_pc_valid) {
+        /* 16.16 native VRAM px -> float; the VK pipeline is float end-to-end. */
+        s_pc_x[0] = (float)x0 / 65536.0f;  s_pc_y[0] = (float)y0 / 65536.0f;
+        s_pc_x[1] = (float)x1 / 65536.0f;  s_pc_y[1] = (float)y1 / 65536.0f;
+        s_pc_x[2] = (float)x2 / 65536.0f;  s_pc_y[2] = (float)y2 / 65536.0f;
+    }
+}
+static void vkb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+    s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
+    s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
+    /* The corrected-triangle tally lives in the software rasterizer and backs
+     * gpu_texture_correction_hits() — the "is this doing anything on this
+     * title" counter. Forward so it reads the same on every backend. */
+    sw_set_perspective_triangle(enabled, q0, q1, q2);
+}
+/* The override describes exactly one triangle; drop it once submitted so a
+ * later prim can never inherit it. */
+static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
+
+/* Position a vertex: the sub-pixel value when geometry_correction supplied one
+ * for this triangle, else the integer GP0 position. */
+#define PCX(i, v) (s_pc_valid ? s_pc_x[i] : (float)(v))
+#define PCY(i, v) (s_pc_valid ? s_pc_y[i] : (float)(v))
+
 static void vkb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t c){
     geo_prim_begin();
     float col[3]; col555(c, col);
-    tri3((float)x0,(float)y0,col, (float)x1,(float)y1,col, (float)x2,(float)y2,col);
+    tri3(PCX(0,x0),PCY(0,y0),col, PCX(1,x1),PCY(1,y1),col, PCX(2,x2),PCY(2,y2),col);
+    precise_consumed();
 }
 static void vkb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2){
     geo_prim_begin();
     float a[3],b[3],cc[3]; col555(c0,a); col555(c1,b); col555(c2,cc);
-    tri3((float)x0,(float)y0,a, (float)x1,(float)y1,b, (float)x2,(float)y2,cc);
+    tri3(PCX(0,x0),PCY(0,y0),a, PCX(1,x1),PCY(1,y1),b, PCX(2,x2),PCY(2,y2),cc);
+    precise_consumed();
 }
 /* Full-screen-overlay wide pass (pause gray-filter / load fade): draw a flat
  * rect covering the FULL wide width [0, wide_w) x [y, y+h) directly into the
@@ -2788,7 +3004,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
     for (int i = 0; i < 3; i++) {
         float *vp = s_tmap[s_tbase + s_tcount + i].v;
-        vp[0] = (float)xs[i];   vp[1] = (float)ys[i];
+        vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
         vp[2] = (float)us[i];   vp[3] = (float)vs[i];
         vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2]; vp[7] = 1.0f;
         vp[8]  = (float)base_x;  vp[9]  = (float)base_y;
@@ -2796,10 +3013,14 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         vp[12] = (float)depth;   vp[13] = (float)rawtex;
         vp[14] = (float)lim[0];  vp[15] = (float)lim[1];
         vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+        vp[18] = s_pq_valid ? s_pq[i] : 0.0f;   /* a_q; 0 = affine */
         if (xs[i] < bx0) bx0 = xs[i]; if (xs[i] > bx1) bx1 = xs[i];
         if (ys[i] < by0) by0 = ys[i]; if (ys[i] > by1) by1 = ys[i];
     }
     s_tcount += 3;
+    /* A sub-pixel-corrected vertex lies in [int, int+1) of the integer position
+     * it was rounded from, so widen the readback rect by one pixel. */
+    if (s_pc_valid) { bx1 += 1; by1 += 1; }
     /* mark dirty for later readback/pack (clamped to draw area) */
     if (bx0 < s_da_x1) bx0 = s_da_x1; if (by0 < s_da_y1) by0 = s_da_y1;
     if (bx1 > s_da_x2) bx1 = s_da_x2; if (by1 > s_da_y2) by1 = s_da_y2;
@@ -2832,6 +3053,7 @@ static void vkb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
     gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL);
+    precise_consumed();
 }
 static void vkb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,
                                               int x1,int y1,int u1,int v1,uint32_t c1,
@@ -2842,6 +3064,7 @@ static void vkb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
     float col[9];
     col888(c0, &col[0]); col888(c1, &col[3]); col888(c2, &col[6]);
     gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL);
+    precise_consumed();
 }
 static void vkb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){
     gpu_textured_rect(x,y,w,h, u,v, u+w,v+h, cx,cy,tp, s_semi_en?s_semi_mode:-1);
@@ -3058,6 +3281,8 @@ static const GpuRenderBackend VK_BACKEND = {
     .set_mask_bits                 = vkb_set_mask_bits,
     .set_texture_window            = vkb_set_texture_window,
     .set_color_modulation          = vkb_set_color_modulation,
+    .set_precise_triangle          = vkb_set_precise_triangle,
+    .set_perspective_triangle      = vkb_set_perspective_triangle,
     .fill_rect                     = vkb_fill_rect,
     .copy_rect                     = vkb_copy_rect,
     .draw_flat_triangle            = vkb_draw_flat_triangle,

@@ -113,9 +113,49 @@ typedef struct DMACDROMHistoryEntry {
     uint32_t last_words[DMA_CDROM_HISTORY_WORDS];
 } DMACDROMHistoryEntry;
 
+/* GPU (CH2) linked-list / ordering-table walk observability.
+ *
+ * These counters make DMA2 geometry loss countable without screenshots:
+ *   - starts_dropped: the guest asked for a new OT transfer while the previous
+ *     walk was still running. start_async_gpu_linked_list() returns early in
+ *     that case, so a whole ordering table is never sent to GP0.
+ *   - chcr_reads_in_walk: guest polls of CHCR(2) while the linked-list walk is
+ *     still active, useful for distinguishing timeout loops from blind aborts.
+ */
+typedef struct {
+    uint32_t pc;      /* guest PC of the CHCR store that aborted the walk */
+    uint32_t chcr;    /* CHCR value after that store */
+    uint32_t nodes;   /* ordering-table nodes walked before the abort */
+    uint32_t words;   /* DMA words read before the abort, including headers */
+    uint32_t cycles;  /* guest cycles the walk had been running */
+    uint32_t polls;   /* guest reads of CHCR(2) during this walk */
+} DMAGpuOtCancel;
+
+#define DMA_GPU_OT_CANCEL_RING 8
+
+typedef struct {
+    uint64_t starts;
+    uint64_t starts_dropped;
+    uint64_t completes;
+    uint64_t cancels;
+    uint32_t nodes_last;
+    uint32_t nodes_max;
+    uint32_t words_last;
+    uint32_t words_max;
+    uint64_t cycles_last;
+    uint64_t cycles_max;
+    uint8_t  active;
+    uint64_t chcr_reads_total;
+    uint64_t chcr_reads_in_walk;
+    uint32_t initiator_pc;
+    uint32_t cancel_ring_count;
+    DMAGpuOtCancel cancel_ring[DMA_GPU_OT_CANCEL_RING];
+} DMAGpuOtStats;
+
 uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries);
 void dma_debug_clear_trace(void);
 void dma_debug_get_state(DMADebugState* out);
+void dma_debug_get_gpu_ot_stats(DMAGpuOtStats* out);
 uint64_t dma_debug_get_cdrom_history(const DMACDROMHistoryEntry** out_entries);
 void dma_debug_clear_cdrom_history(void);
 

@@ -49,6 +49,8 @@ typedef struct SpuVoiceState {
     uint16_t phase;         /* sub-sample phase counter (0..0x1000) */
     uint16_t env_level;     /* live ADSR envelope level (0..0x7FFF) */
     uint8_t  adsr_phase;    /* 0=attack 1=decay 2=sustain 3=release */
+    int16_t  vol_cur_l;     /* live effective L volume (sweep-aware, full int16) */
+    int16_t  vol_cur_r;     /* live effective R volume (sweep-aware, full int16) */
 } SpuVoiceState;
 
 typedef struct SpuGlobalState {
@@ -62,10 +64,28 @@ typedef struct SpuGlobalState {
     uint32_t eon;           /* reverb mode (0x1F801D98/9A) */
     uint32_t endx;          /* end-block reached latch (0x1F801D9C/9E) */
     uint32_t active_mask;   /* recomp-local "still voicing" mask */
+
+    /* ---- SPU DSP fidelity state (issue #103: IRQ/reverb/noise/sweeps) ---- */
+    uint16_t irq_flag;      /* SPU IRQ latch (mirrors SPUSTAT bit 6) */
+    uint16_t reverb_on;     /* SPUCNT bit 7 (reverb work-area write enable) */
+    uint32_t irq_addr;      /* IRQ address as a BYTE address (reg 0x1F801DA4 << 3) */
+    uint32_t reverb_mbase;  /* reverb work area start, byte address (mBASE << 3) */
+    uint32_t reverb_cur;    /* current reverb buffer address (byte, advances @22050Hz) */
+    uint32_t capture_pos;   /* capture-buffer write offset (0..0x3FE, wraps at 0x400) */
+    uint16_t noise_lfsr;    /* live noise shift register value */
+    uint16_t noise_pad;     /* reserved / alignment */
+    uint32_t sweep_l_mask;  /* voices whose LEFT volume register is in sweep mode */
+    uint32_t sweep_r_mask;  /* voices whose RIGHT volume register is in sweep mode */
+    uint32_t sweep_main;    /* bit0 = main L in sweep mode, bit1 = main R */
 } SpuGlobalState;
 
 void spu_get_voice_state(int voice, SpuVoiceState* out);
 void spu_get_global_state(SpuGlobalState* out);
+/* SPUCNT (0x1F801DAA) alone. The sample-event scheduler gates on one ctrl bit
+ * per device-service call; building the full SpuGlobalState there (register
+ * sweep + three 24-voice loops) was ~40% of emu-thread time during the Capcom
+ * FMV's MMIO-polling loop (gdb-sampled 2026-09-01). */
+uint16_t spu_ctrl_read(void);
 /* Debug peek into SPU sample RAM (spu_ram TCP command). */
 uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len);
 
@@ -76,7 +96,10 @@ typedef enum {
     SPU_EV_KEYON     = 1,
     SPU_EV_KEYOFF    = 2,
     SPU_EV_END_STOP  = 3,   /* loop_end without repeat → voice silenced */
-    SPU_EV_END_LOOP  = 4    /* loop_end with repeat → cur_addr=repeat_addr */
+    SPU_EV_END_LOOP  = 4,   /* loop_end with repeat → cur_addr=repeat_addr */
+    SPU_EV_IRQ       = 5    /* SPU RAM IRQ-address hit → I_STAT bit 9 raised;
+                               voice=0xFF (not voice-attributable), addr=byte
+                               address that matched */
 } SpuEventKind;
 
 typedef struct SpuEvent {
@@ -100,8 +123,11 @@ void     spu_event_reset(void);
 uint32_t spu_read(uint32_t addr);
 void spu_write(uint32_t addr, uint32_t value);
 
-/* DMA channel 4 interface */
+/* DMA channel 4 interface. spu_dma_read reads one 32-bit word from SPU RAM
+ * at the current transfer address, advances the address by 4, and runs the
+ * SPU IRQ-address check (SPU RAM -> CPU direction, DICR direction bit 0). */
 void spu_dma_write(uint32_t word);
+uint32_t spu_dma_read(void);
 int spu_dma_ready(void);
 
 /* CD-ROM XA/CDDA input path. Samples are stereo 44.1 kHz PCM entering the
@@ -126,8 +152,8 @@ typedef struct {
     int16_t  s[4];     /* decoded samples sample_idx-1 .. +2 (block-edge clamped) */
     float    frac;     /* fractional sub-sample phase in [0,1) */
     uint16_t env;      /* env_level (0..0x7FFF) */
-    int16_t  vol_l;    /* per-voice L volume (direct_volume-decoded) */
-    int16_t  vol_r;    /* per-voice R volume */
+    int16_t  vol_l;    /* per-voice L volume, 1.14 scale (effective int16 >> 1) */
+    int16_t  vol_r;    /* per-voice R volume, same scale */
     uint8_t  active;
 } SpuShadowVoiceTapPub;
 
@@ -142,6 +168,21 @@ typedef struct {
  * frames filled by the most recent spu_render block. */
 const void* spu_shadow_tap_buffer(void);
 int         spu_shadow_tap_count(void);
+
+uint32_t spu_snapshot_bytes(void);
+void     spu_snapshot_write(uint8_t *p);
+int      spu_snapshot_read(const uint8_t *p, uint32_t len);
+uint8_t *spu_get_ram_ptr(void);
+uint32_t spu_get_ram_bytes(void);
+
+/* Split digests of the snap wire (regs / voices / DSP tail) for Win↔Linux
+ * aux bisect. PSX_RB_SPU_PARTS=1 prints these on rb live dig. */
+typedef struct SpuSnapPartDigests {
+    uint32_t regs;
+    uint32_t voices;
+    uint32_t tail;
+} SpuSnapPartDigests;
+void spu_snapshot_part_digests(SpuSnapPartDigests *out);
 
 #ifdef __cplusplus
 }

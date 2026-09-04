@@ -2,13 +2,14 @@
  * See parity_trace.h. Self-contained (no runtime internals) so the SAME TU
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
 #include "parity_trace.h"
+#include "psx_bss.h"
 #include <string.h>
 
 #define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
                                   * so the parked-thread1 divergence is in-window,
                                   * not just the wedge tail (~7.5 MB ring). */
 
-static ParityEntry s_ring[PARITY_RING_CAP];
+static PSX_BSS ParityEntry s_ring[PARITY_RING_CAP];
 static uint64_t    s_seq      = 0;
 static uint32_t    s_armed    = 0;
 static uint32_t    s_frozen   = 0;
@@ -17,14 +18,14 @@ static uint32_t    s_watched_tcb   = 0;
 static uint32_t    s_trigger       = 0;
 static uint32_t    s_epc_off       = 0x88u;
 static uint32_t    s_state_off     = 0x00u;
-static uint32_t    s_watch[PARITY_WATCH_MAX];
+static PSX_BSS uint32_t    s_watch[PARITY_WATCH_MAX];
 static int         s_watch_count   = 0;
 
 /* Per-watch-word last-writer table (see parity_trace_note_write). */
-static uint32_t    s_wpc[PARITY_WATCH_MAX];
-static uint64_t    s_wcycle[PARITY_WATCH_MAX];
-static uint32_t    s_wframe[PARITY_WATCH_MAX];
-static uint32_t    s_wtcb[PARITY_WATCH_MAX];
+static PSX_BSS uint32_t    s_wpc[PARITY_WATCH_MAX];
+static PSX_BSS uint64_t    s_wcycle[PARITY_WATCH_MAX];
+static PSX_BSS uint32_t    s_wframe[PARITY_WATCH_MAX];
+static PSX_BSS uint32_t    s_wtcb[PARITY_WATCH_MAX];
 static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_write */
 
 /* Dedicated READ ring (see parity_trace_note_read). One ParityEntry per read of a
@@ -32,7 +33,7 @@ static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_wr
  * Each row carries reader provenance (pc/cycle/frame + addr in epc, value in target
  * & the matched watch slot) AND the current last-WRITER metadata for that slot, so
  * a single read row answers "who read what value, that whom last wrote". */
-static ParityEntry s_rring[PARITY_RING_CAP];
+static PSX_BSS ParityEntry s_rring[PARITY_RING_CAP];
 static uint64_t    s_rseq = 0;
 
 /* Frame + guest-cycle stamps: each host process defines these accessors

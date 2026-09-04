@@ -7,7 +7,7 @@
  * mode (native-overlay / dirty-RAM-interp / static), and the in-progress
  * native overlay function. The goal is to diff two runs of the SAME route
  * (native-overlay OFF vs ON) and find the FIRST interrupt/DMA ordering
- * divergence relative to game code (PRINCIPLES.md #3, handoff Priority 2).
+ * divergence relative to game code (docs/internal/PRINCIPLES.md #3, handoff Priority 2).
  *
  * Design: ALWAYS-ON (Release too), eviction-bounded ring. Records EDGES /
  * EVENTS, never per-poll samples — native code calls psx_check_interrupts at

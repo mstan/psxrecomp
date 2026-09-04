@@ -45,6 +45,7 @@
 #include "full_function_emitter.h"
 #include "function_discovery.h"
 #include "mips_decoder.h"
+#include "write_if_changed.h"
 
 namespace fs = std::filesystem;
 
@@ -185,19 +186,8 @@ std::vector<uint8_t> load_file_strict(const fs::path& p, size_t expected_size) {
 }
 
 void write_file(const fs::path& p, const std::string& content) {
-    fs::create_directories(p.parent_path());
-    const fs::path tmp = p.string() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            throw std::runtime_error(fmt::format("cannot open output file for write: {}", tmp.string()));
-        }
-        f.write(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!f) {
-            throw std::runtime_error(fmt::format("write error on: {}", tmp.string()));
-        }
-    }
-    fs::rename(tmp, p);
+    // Preserve mtime when bytes match (Ninja incremental after regen).
+    (void)write_file_if_changed(p, content);
 }
 
 // ----- Output emission ---------------------------------------------------
@@ -711,6 +701,8 @@ std::string make_unsupported_json_discovery(const PSXRecompV4::DiscoveryResult& 
 
 int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
                    const std::optional<std::string>& cc_override) {
+    fs::create_directories(out_dir);
+
     // 1. Load + validate BIOS file.
     const auto rom = load_file_strict(bios_path, kBiosSize);
     const std::string sha = sha256_hex(rom);
@@ -779,6 +771,9 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
                   const std::string& declared_sha = {},
                   const std::vector<PSXRecompV4::BiosVectorTable>& bios_vectors = {},
                   const std::vector<PSXRecompV4::BiosAlias>& bios_aliases = {}) {
+    // Setup zips omit generated/; ensure the out_dir exists before emit.
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model — the single source of truth
     // for every relocation window discovery and the emitter use.
     PSXRecompV4::FullFunctionEmitter::set_address_model(&model);
@@ -857,10 +852,17 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
         dr, sha, out_dir.string(), out_stem, bios_vectors, bios_aliases);
 
     std::fprintf(stdout,
-        "psxrecomp-bios: EMIT OK  emitted=%u  skipped=%u  instructions=%u  "
+        "psxrecomp-bios: EMIT OK  emitted=%u  interpreted=%u  skipped=%u  instructions=%u  "
         "dispatch_entries=%u\n",
-        stats.functions_emitted, stats.functions_skipped,
+        stats.functions_emitted, stats.functions_interpreted, stats.functions_skipped,
         stats.total_instructions, stats.dispatch_entries);
+
+    if (stats.functions_interpreted > 0) {
+        std::fprintf(stdout, "psxrecomp-bios: interpreter fallbacks:\n");
+        for (const auto& [addr, reason] : stats.interpreted) {
+            std::fprintf(stdout, "  0x%08X: %s\n", addr, reason.c_str());
+        }
+    }
 
     if (stats.functions_skipped > 0) {
         std::fprintf(stdout, "psxrecomp-bios: skipped functions:\n");
@@ -877,6 +879,8 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
 int run_discover(const fs::path& bios_path, const fs::path& out_dir,
                  const fs::path& seed_path,
                  const PSXRecompV4::BiosAddressModel& model) {
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model (discovery follows J/JAL
     // targets through its relocation windows).
     PSXRecompV4::FunctionDiscovery::set_address_model(&model);

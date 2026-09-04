@@ -140,7 +140,7 @@ struct GTEState {
 };
 
 // === GTE Operations ===
-void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0);
+void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr = 0x0180001u);
 void gte_rtps(GTEState* gte, uint32_t instr);
 void gte_rtpt(GTEState* gte, uint32_t instr);
 void gte_nclip(GTEState* gte, uint32_t instr);

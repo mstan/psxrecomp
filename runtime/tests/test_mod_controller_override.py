@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the game-owned controller-mode override lifecycle."""
+"""Guard trusted-plugin controller presentation lifecycle."""
 
 from pathlib import Path
 
@@ -11,26 +11,30 @@ HEADER = (ROOT / "runtime" / "include" / "mod_plugins.h").read_text(
 )
 
 for symbol in (
-    "PSX_MOD_CONTROLLER_HYBRID",
     "PSX_MOD_CONTROLLER_ANALOG",
     "PSX_MOD_CONTROLLER_DIGITAL",
+    "PSXModControllerInput",
+    "PSXModControllerPresentationCallback",
     "psx_mod_set_controller_mode_override",
+    "psx_mod_set_controller_presentation_policy",
 ):
     assert symbol in HEADER, f"missing trusted-plugin controller API: {symbol}"
 
-reset = """g_mod_controller_mode_override[0] = -1;
-    g_mod_controller_mode_override[1] = -1;"""
+assert "PSX_MOD_CONTROLLER_HYBRID" not in HEADER
+
+reset_override = "g_mod_controller_mode_override.fill(-1);"
+reset_policy = "policy = ModControllerPresentationPolicy{};"
 activate = "mod_runtime_activate_plugins();"
-apply = """if (g_mod_controller_mode_override[0] >= 0)
-        p1_mode = g_mod_controller_mode_override[0];
-    if (g_mod_controller_mode_override[1] >= 0)
-        p2_mode = g_mod_controller_mode_override[1];"""
+apply = "player_mode[i] = g_mod_controller_mode_override[i];"
 
-assert reset in MAIN, "controller overrides must reset before every activation pass"
-assert activate in MAIN, "plugins must activate after controller overrides reset"
-assert apply in MAIN, "controller overrides must replace the resolved launch modes"
-assert MAIN.index(reset) < MAIN.index(activate) < MAIN.index(apply), (
-    "reset/activate must precede controller override application"
-)
+for snippet in (reset_override, reset_policy, activate, apply):
+    assert snippet in MAIN, (
+        f"missing controller presentation lifecycle step: {snippet}"
+    )
 
-print("mod controller override lifecycle guard passed")
+assert MAIN.index(reset_override) < MAIN.index(activate) < MAIN.index(apply)
+assert MAIN.index(reset_policy) < MAIN.index(activate) < MAIN.index(apply)
+assert "controller_policy_resolve_mode(" in MAIN
+assert "controller_policy_resolve_override_mode(" in MAIN
+
+print("mod controller presentation lifecycle guard passed")

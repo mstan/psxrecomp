@@ -2,12 +2,16 @@
 """cosim.py — first-divergence co-simulation coordinator. See COSIM_ORACLE.md.
 
 Launches two clean psx-cosim instances (each its own complete deterministic PSX),
-advances BOTH to the same guest-cycle checkpoints, and compares their full-state chain
-hashes. The first checkpoint whose chains differ brackets the first divergence; the
+advances BOTH to the same retired-instruction-count (icount) checkpoints, and compares
+their full-state chain hashes. Checkpoints are icount-keyed (stride / --max /
+--start-cycle are all in retired instructions, where a branch+delay-slot retires as
+ONE event), so both sides always hash the same architectural position; the guest-cycle
+clock is inside the hash, so cycle-accounting drift is itself a detectable divergence.
+The first checkpoint whose chains differ brackets the first divergence; the
 per-subsystem `sub` hashes + the ring `window` say WHAT and WHERE.
 
 The two instances are NOT interleaved on one timeline — they are two independent
-deterministic runs, sampled at matched guest cycles. Validity rests ENTIRELY on
+deterministic runs, sampled at matched icounts. Validity rests ENTIRELY on
 determinism, which is why you MUST pass the gates first:
 
   # GATE 1 — determinism/hashing: two of the SAME backend must NEVER diverge.
@@ -42,6 +46,27 @@ def tail_file(path, max_bytes=8192):
 
 def launch(mode, port, stride, start_cycle):
     os.makedirs(LOGDIR, exist_ok=True)
+    # Two instances sharing one runtime dir race on mods/state.toml publish
+    # (temp-file rename collision, ENOENT). The mods root is EXE-DIR-relative
+    # (main.cpp: exe_dir_from_argv(argv[0]) / "mods"), NOT cwd-relative — so
+    # instance B needs its OWN exe copy, not just its own cwd. COSIM_CWD_B
+    # names B's runtime dir; B runs the exe found there (override: COSIM_EXE_B).
+    cwd = CWD
+    exe = EXE
+    cwd_b = os.environ.get("COSIM_CWD_B", "")
+    if cwd_b and port != 4600 and str(port).endswith("1"):
+        cwd = cwd_b
+        exe_b = os.environ.get("COSIM_EXE_B",
+                               os.path.join(cwd_b, os.path.basename(EXE)))
+        if not os.path.isfile(exe_b):
+            raise RuntimeError(
+                f"instance B exe not found: {exe_b} — copy the freshly built "
+                f"exe into COSIM_CWD_B (its mods/ root is exe-dir-relative)")
+        if os.path.getmtime(exe_b) < os.path.getmtime(EXE) - 1:
+            raise RuntimeError(
+                f"instance B exe is STALE: {exe_b} is older than {EXE} — "
+                f"copy the freshly built exe into COSIM_CWD_B")
+        exe = exe_b
     env = dict(os.environ)
     env["PSX_HEADLESS"] = "1"
     env["PSX_COSIM_PORT"] = str(port)
@@ -56,8 +81,8 @@ def launch(mode, port, stride, start_cycle):
         env["PSX_FORCE_INTERP"] = "1"
     log_path = os.path.join(LOGDIR, f"cosim_{mode}_{port}_{os.getpid()}.log")
     log_file = open(log_path, "wb")
-    p = subprocess.Popen([EXE, "--headless", "--no-launcher", "--game", GAME],
-                         cwd=CWD, env=env,
+    p = subprocess.Popen([exe, "--headless", "--no-launcher", "--game", GAME],
+                         cwd=cwd, env=env,
                          stdout=log_file, stderr=subprocess.STDOUT,
                          creationflags=0x00000200)
     p._cosim_log_path = log_path
@@ -150,13 +175,15 @@ def main():
     ap.add_argument("--a", default="compiled", choices=["compiled", "interp"])
     ap.add_argument("--b", default="interp",   choices=["compiled", "interp"])
     ap.add_argument("--stride", type=int, default=65536)
-    ap.add_argument("--max", type=int, default=1_500_000_000)  # ~2650 frames
+    ap.add_argument("--max", type=int, default=1_500_000_000,
+                    help="stop after this many retired instructions (icount units)")
     ap.add_argument("--porta", type=int, default=4600)
     ap.add_argument("--portb", type=int, default=4601)
     ap.add_argument("--inject-at", type=int, default=0)
     ap.add_argument("--inject", default="")   # e.g. ram:100000:1  or reg:2:1
     ap.add_argument("--start-cycle", type=int, default=0,
-                    help="free-run to this absolute guest cycle before checkpointing")
+                    help="free-run to this absolute retired-instruction count "
+                         "(icount) before checkpointing")
     ap.add_argument("--cpudiff-at-cp", type=int, default=0,
                     help="step both to this checkpoint and field-diff the CPU dump")
     args = ap.parse_args()
@@ -173,8 +200,11 @@ def main():
             for _ in range(max(0, n)):
                 cmd(sa, "step 1", timeout=1200)
                 cmd(sb, "step 1", timeout=1200)
-            da = parse_cpu(cmd(sa, "cpu"))
-            db = parse_cpu(cmd(sb, "cpu"))
+            ra = cmd(sa, "cpu"); rb = cmd(sb, "cpu")
+            da = parse_cpu(ra)
+            db = parse_cpu(rb)
+            print(f"A cpu dump: {ra}", flush=True)
+            print(f"B cpu dump: {rb}", flush=True)
             print(f"CPU field-diff at cp {args.cpudiff_at_cp}  (A={args.a} B={args.b}):", flush=True)
             diffs = [k for k in da if da.get(k) != db.get(k)]
             if not diffs:
@@ -259,9 +289,12 @@ def main():
                       f"  A: {ra}\n  B: {rb}", flush=True); return
             cyc_a, cyc_b = ra.get("cycle"), rb.get("cycle")
             if cyc_a != cyc_b:
-                print(f"[WARN] cycle skew A={cyc_a} B={cyc_b} at cp {ra.get('cp')} — "
-                      f"the two runs are NOT parking at the same cycle (harness "
-                      f"nondeterminism, not a guest divergence). Investigate before trusting.",
+                print(f"[TIMING] cycle skew A={cyc_a} B={cyc_b} at cp {ra.get('cp')} "
+                      f"icnt A={ra.get('icnt')} B={rb.get('icnt')} — checkpoints are "
+                      f"icount-keyed, so BOTH sides hashed the state after the same "
+                      f"retired-instruction count; a cycle difference here is a REAL "
+                      f"cycle-accounting divergence between the backends (the clock is "
+                      f"in the chain hash, so the chain should differ too).",
                       flush=True)
             if ca != cb:
                 print(f"\n*** FIRST DIVERGENCE at checkpoint cp={ra.get('cp')} "

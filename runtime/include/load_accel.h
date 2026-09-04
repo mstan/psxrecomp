@@ -31,6 +31,8 @@ void psx_vsync_query_hle_set_horizon_any(int on);
 void psx_vsync_query_hle_add_event_horizon_site(uint32_t return_pc);
 void psx_vsync_query_hle_add_extra_event_horizon_site(uint32_t return_pc);
 void psx_vsync_query_hle_stats_json(char* buf, int cap);
+/* Cumulative VSync(-1) event-horizon skips (for post-load probe deltas). */
+void psx_vsync_query_hle_horizon_totals(uint64_t *hits, uint64_t *cycles);
 
 #ifdef __cplusplus
 }

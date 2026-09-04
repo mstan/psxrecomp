@@ -38,9 +38,19 @@
 
 /* ---- Stubs for sio.c's external dependencies ---- */
 uint32_t i_stat = 0;
+uint32_t i_mask = 0;
 uint32_t g_debug_current_func_addr = 0;
+uint32_t g_debug_last_store_pc = 0;
 int psx_get_in_exception(void) { return 0; }
 uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
+uint32_t psx_read_word(uint32_t addr) { (void)addr; return 0; }
+/* sio.c gates card-transfer deferral on `psx_get_cycle_count() < deadline`
+ * (s_card_ct_defer_until_cyc). A constant clock would defer forever and stall
+ * the state machine, so the stub advances monotonically. */
+uint64_t psx_get_cycle_count(void) {
+    static uint64_t t;
+    return t += 64;
+}
 uint32_t memory_get_sr(void) { return 0; }
 void debug_server_poll(void) {}
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
@@ -112,10 +122,15 @@ static uint8_t card_xchg(uint8_t tx, int slot) {
                   | (slot ? CTRL_SLOT : 0);
     sio_write(SIO_CTRL, ctrl);
     sio_write(SIO_TX_DATA, tx);
-    sio_tick(2000);
+    /* The cycle-paced SIO walker deliberately emits at most one edge per
+     * call.  Advance the byte shift and its ACK as separate hardware events
+     * instead of assuming one oversized tick collapses both. */
+    sio_advance(1088);
     uint8_t rx = (uint8_t)sio_read(SIO_RX_DATA);
+    sio_advance(170);
     /* Acknowledge IRQ between bytes (BIOS pattern) */
     sio_write(SIO_CTRL, ctrl | CTRL_ACK);
+    i_stat &= ~0x80u;
     return rx;
 }
 

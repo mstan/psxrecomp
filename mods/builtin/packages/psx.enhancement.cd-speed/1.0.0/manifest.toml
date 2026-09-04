@@ -1,0 +1,58 @@
+format_version = 5
+id = "psx.enhancement.cd-speed"
+version = "1.0.0"
+name = "CD Speed"
+author = "psxrecomp"
+description = "Emulated CD drive speed. Shortens loads without speeding the game up, so it does not disturb movement or timing-based routes."
+resolver = "declarative"
+save_compatibility = "shared"
+
+# Loading speed is a property of the emulated hardware, not of any particular
+# disc, so this ships with the framework and applies to every game.
+[[target]]
+game_id = "*"
+
+[[feature]]
+id = "cd-speed"
+name = "CD Speed"
+description = "Disabled by default. Divides the emulated sector delay, so the drive delivers data sooner while the game itself keeps running at normal speed. Unlike host pacing this changes WHEN the game receives CD interrupts, so a high value can expose timing bugs -- raise it gradually and back off if a load stalls. FMV and CD audio always keep authentic timing."
+group = "Quality of Life"
+default_enabled = false
+
+[[option]]
+feature = "cd-speed"
+id = "multiplier"
+label = "CD speed multiplier"
+description = "1 is authentic 1x. Try 2-32; higher is faster but likelier to trip a timing bug. Any positive value is accepted so you can find this game's limit. Ignored while Instant is ticked."
+group = "Quality of Life"
+type = "integer"
+min = 1
+max = 1024
+step = 1
+default = 4
+disabled_by = "instant"
+
+[[option]]
+feature = "cd-speed"
+id = "instant"
+label = "Instant (bounded scheduler)"
+description = "Deliver sectors as fast as the bounded instant scheduler allows instead of using a multiplier. Fastest and riskiest."
+group = "Quality of Life"
+type = "boolean"
+default = "false"
+
+[[option]]
+feature = "cd-speed"
+id = "instant_budget"
+label = "Instant sectors per frame"
+description = "How many sectors the instant scheduler may deliver per frame. Lower is gentler on games that dislike bursts. Only used while Instant is ticked."
+group = "Quality of Life"
+type = "integer"
+min = 1
+max = 256
+step = 1
+default = 32
+
+[[plugin]]
+feature = "cd-speed"
+id = "psx.cd-speed"

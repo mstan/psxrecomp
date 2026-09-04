@@ -1,0 +1,51 @@
+name: Fetch psxrecomp portable toolchain
+description: >
+  Download cmake-clang-v1 from retcomm-toolchains and export TOOLCHAIN_DIR /
+  PSXRECOMP_TOOLCHAIN_DIR / BPE_TOOLCHAIN_DIR for later packaging steps.
+
+inputs:
+  artifact:
+    description: Platform pack id (linux-x64, windows-x64, macos-arm64, macos-x64)
+    required: true
+  framework:
+    description: Path to the psxrecomp checkout (contains tools/fetch_toolchain.sh)
+    required: false
+    default: psxrecomp
+  dl-dir:
+    description: Download cache directory
+    required: false
+    default: .cache/toolchain-dl
+  out-dir:
+    description: Unpack directory
+    required: false
+    default: .cache/toolchain-pack
+  repo:
+    description: GitHub owner/name for toolchain releases
+    required: false
+    default: TechnicallyComputers/retcomm-toolchains
+
+outputs:
+  toolchain-dir:
+    description: Absolute path to the unpacked toolchain root (bin/ present)
+    value: ${{ steps.fetch.outputs.toolchain-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: fetch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        SCRIPT="${{ inputs.framework }}/tools/fetch_toolchain.sh"
+        if [[ ! -f "${SCRIPT}" ]]; then
+          echo "::error::missing ${SCRIPT}"
+          exit 1
+        fi
+        chmod +x "${SCRIPT}"
+        bash "${SCRIPT}" \
+          --artifact "${{ inputs.artifact }}" \
+          --dl-dir "${{ inputs.dl-dir }}" \
+          --out-dir "${{ inputs.out-dir }}" \
+          --repo "${{ inputs.repo }}"

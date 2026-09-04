@@ -55,19 +55,96 @@ struct PS1ExeHeader {
 
 static_assert(sizeof(PS1ExeHeader) == 2048, "PS1ExeHeader must be exactly 2048 bytes");
 
+// --------------------------------------------------------------------------
+// Analysis-bound tag: how many TRAILING bytes of the payload are guard words
+// --------------------------------------------------------------------------
+//
+// Overlay capture DELIBERATELY appends a coherent guard instruction past the
+// end of a dirty-page run (runtime/src/overlay_capture.c, write_json_window:
+// `size += 4u`, pinned by runtime/tests/test_interpreter_perf_guards.py). A
+// MIPS branch sitting at the run's final word (...FFC) always executes its
+// delay slot in the NEXT page (...000); supplying that one word lets overlay
+// codegen emit exact semantics and lets the range manifest hash/watch it.
+//
+// So the guard word is a legal DELAY-SLOT SOURCE but an ILLEGAL BLOCK LEADER:
+// the word AFTER it does not exist in the image, so a control transfer AT the
+// guard word could never have its mandatory delay slot emitted. The
+// recompiler must therefore carry two distinct bounds — a READ bound (the
+// whole payload, so a delay slot at the guard word resolves) and an ANALYSIS
+// bound (short of the guard words, so discovery and block construction can
+// never lead there).
+//
+// The producer that wrapped the capture states the count explicitly, in a
+// magic-tagged field in the otherwise-zero tail of the 2048-byte PS-X EXE
+// header (tools/compile_overlays.py, make_psxexe). The recompiler is TOLD
+// rather than inferring the count from the payload size: an inference from
+// `size % 4096 == 4` fits every capture written by the current format but
+// would silently shift underneath any future change to capture granularity,
+// and pre-2026-07-25 captures are page-exact with no guard word at all.
+//
+// An absent or malformed tag means ZERO guard bytes, which is exactly what
+// every genuine PS-X EXE (the BIOS, a retail main executable) is: those images
+// have no guard word, their analysis bound equals their read bound, and their
+// analysis is bit-for-bit unchanged by this mechanism.
+namespace exe_tag {
+// Offsets are into the 2048-byte header. Retail headers use only
+// [0x00, 0x4C) plus an ASCII region string ending well before 0x100; the tail
+// is zero-filled. The 8-byte magic makes a false positive on a real EXE
+// effectively impossible even if some image did carry bytes there.
+inline constexpr uint32_t kGuardMagicOffset = 0x7E0u;
+inline constexpr uint32_t kGuardCountOffset = 0x7E8u;  // uint32, little-endian
+inline constexpr char     kGuardMagic[8] =
+    {'P', 'S', 'X', 'R', 'G', 'R', 'D', '1'};
+// A guard run exists to cover branch delay slots at a page edge; one word is
+// what the capture format appends. Cap the accepted value at a page so a
+// corrupt tag can never shrink analysis to nothing.
+inline constexpr uint32_t kMaxGuardBytes = 4096u;
+}  // namespace exe_tag
+
+// Decode the analysis-bound tag. Returns 0 when the tag is absent, when the
+// magic does not match, or when the declared count is not a sane, strictly
+// interior, instruction-aligned trailer of `file_size` bytes of payload.
+uint32_t decode_analysis_guard_bytes(const PS1ExeHeader& header,
+                                     uint32_t file_size);
+
 // Parsed PS1 executable with code data
 class PS1Executable {
 public:
     PS1ExeHeader header;
     std::vector<uint8_t> code_data;  // Raw binary (file_size bytes)
 
+    // Trailing bytes of code_data that exist ONLY to supply architectural
+    // delay slots to instructions inside the analysis bound. Read-legal,
+    // analysis-illegal. See the exe_tag comment above. Zero for every image
+    // that is not an overlay capture wrapped by compile_overlays.
+    uint32_t analysis_guard_bytes = 0;
+
     // Computed properties
     uint32_t load_address() const { return header.load_address; }
     uint32_t entry_point() const { return header.initial_pc; }
     uint32_t code_size() const { return header.file_size; }
+
+    // READ bound: one past the last byte the image physically supplies. Used
+    // by read_word so a mandatory delay slot living at a guard word resolves.
     uint32_t end_address() const { return header.end_address(); }
 
-    // Access code as 32-bit words (for MIPS disassembly)
+    // ANALYSIS bound: one past the last byte that may be DISCOVERED, made a
+    // block leader, or made a block's exit instruction. Equal to
+    // end_address() unless the producer declared trailing guard words.
+    uint32_t analysis_end_address() const {
+        const uint32_t hi = end_address();
+        return (analysis_guard_bytes < hi - load_address())
+                   ? hi - analysis_guard_bytes
+                   : hi;
+    }
+
+    bool has_analysis_guard() const { return analysis_guard_bytes != 0; }
+
+    // Access code as 32-bit words (for MIPS disassembly).
+    //
+    // Deliberately bounded by end_address(), NOT analysis_end_address(): the
+    // entire point of a guard word is that it is readable so that a transfer
+    // at the last analysable word can emit its delay slot.
     std::optional<uint32_t> read_word(uint32_t address) const {
         if (address < load_address() || address >= end_address()) {
             return std::nullopt;  // Out of range

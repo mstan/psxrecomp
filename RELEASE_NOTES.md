@@ -1,3 +1,14 @@
+# v0.3.2-alpha
+
+- Replaces OpenGL temporal frame blending's shared second context and
+  presentation thread with a deadline-driven path on the renderer's original
+  thread and context. All OpenGL swaps now have one owner, no application mutex
+  spans pacing or driver work, and the stock path is unchanged when disabled.
+- Documents the feature as temporal blending rather than motion-vector frame
+  generation and adds cadence plus context-ownership regression tests.
+
+---
+
 # PSXRecomp OpenBIOS integration
 
 OpenBIOS is now a first-class, redistributable runtime backend.

@@ -205,6 +205,37 @@ extern void     gte_precision_timeline_invalidate(void);
 extern void     gte_precision_speculative_begin(void);
 extern void     gte_precision_speculative_end(void);
 extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
+extern void     gte_precision_tracking_set(int enabled);
+/* Sub-pixel vertex precision ([video] geometry_correction). Enables the side
+ * cache that retains the 16.16 projection fraction the GTE discards when it
+ * saturates SXY to integer screen pixels. Guest-visible GTE state is
+ * unchanged — this is a visual-only enhancement, default off. */
+extern void     gte_geometry_correction_set(int enabled);
+extern int      gte_geometry_correction_enabled(void);
+/* Corrected vertices consumed since the last gte_geometry_correction_set —
+ * the "is this actually doing anything on this title" counter. */
+extern uint32_t gte_geometry_correction_hits(void);
+/* Lookup census: attempted, hit, and the two miss classes. The position table
+ * is exact, so miss_unrecorded counts genuine tracking-coverage gaps. */
+extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
+                                              uint32_t *miss_unrecorded,
+                                              uint32_t *miss_ambiguous);
+
+/* Exact NCLIP audit coverage: precise = all three SXY shadows are coherent and
+ * word-validated; fallback = native integer-only; disagreements counts cases
+ * where sub-pixel and guest-visible integer signs differ. MAC0 stays native. */
+extern void     gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
+                                        uint64_t *disagreements);
+/* Title-scoped widescreen cull consumer. Returns the exact tracked NCLIP sign
+ * only when it belongs to the supplied native MAC0; otherwise preserves the
+ * native comparison. This does not change guest-visible GTE state. */
+extern int      gte_nclip_precise_bltz(int32_t native_mac0);
+
+/* PGXP dataflow-shadowing hook macros (PGXP_LOAD/STORE/ALU/MULDIV/COP2).
+ * The emitter writes them unconditionally; they expand to real calls only
+ * under -DPSX_PGXP=1 (the pgxp build variant) and to ((void)0) otherwise.
+ * Pulled in here so every generated translation unit sees them. */
+#include "pgxp_hooks.h"
 
 /* ============================================================================
  * Dispatch call contract (Bug D / wild-return family fix)

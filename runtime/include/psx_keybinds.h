@@ -19,14 +19,17 @@ extern "C" {
  * This is the KEYBOARD map only. Game-controller (gamepad) button mapping is a
  * separate concern handled by input.ini (see main.cpp load_input_config).
  *
- * Two players. Player 1 defaults reproduce the framework's historical hardcoded
- * keyboard mapping (so out-of-the-box behaviour is unchanged); Player 2 is
- * unbound by default (fill it in to drive a second keyboard player).
+ * Up to PSXKB_MAX_PLAYERS keyboard players (P1..P5). Every player ships with the
+ * same default keyboard map (the framework's historical P1 layout); "Reset to
+ * Defaults" restores that map for any slot. Simultaneous multi-keyboard play
+ * still needs distinct binds per slot — only one physical keyboard.
  *
  * The launcher's Controls page edits these live through the rebind API below
  * (get/set/reset/save) and persists to the same keybinds.ini; the runtime
  * re-reads the file at startup via psx_keybinds_init.
  */
+
+#define PSXKB_MAX_PLAYERS 5
 
 /* Button indices — stable order, matches the order keybinds.ini writes and the
  * order the launcher's rebind chips are laid out. Keep in sync with kButtons[]
@@ -53,8 +56,7 @@ typedef struct {
 } PsxPlayerBinds;
 
 typedef struct {
-    PsxPlayerBinds p1;
-    PsxPlayerBinds p2;
+    PsxPlayerBinds player[PSXKB_MAX_PLAYERS]; /* [0]=P1 .. [4]=P5 */
 } PsxKeyBinds;
 
 /* Initialize from <exe_dir>/keybinds.ini. Generates a default file if one does
@@ -65,7 +67,7 @@ void psx_keybinds_init(const char *exe_path);
 /* Read-only view of the current bindings. */
 const PsxKeyBinds *psx_keybinds_get(void);
 
-/* ── Runtime read helpers (keyboard -> PSX pad), player is 1 or 2 ──────────── */
+/* ── Runtime read helpers (keyboard -> PSX pad), player is 1..PSXKB_MAX_PLAYERS */
 
 /* Build the 16-bit ACTIVE-LOW PSX button word for `player` from the SDL
  * keyboard state (bits per the standard PSX pad word; unbound inputs never
@@ -85,13 +87,19 @@ int psx_keybinds_dpad_active(const uint8_t *keys, int player);
 
 /* ── Rebind API (launcher Controls page) ──────────────────────────────────── */
 /* Buttons are indexed 0..PSX_KB_COUNT-1 (see PsxKeybindButton). Scancodes, not
- * keycodes (keybinds.ini stores SDL scancode names). */
+ * keycodes (keybinds.ini stores SDL scancode names). Players are 1-based. */
 int          psx_keybinds_button_count(void);
 const char  *psx_keybinds_button_name(int button);          /* "up".."rs_right" */
 const char  *psx_keybinds_button_label(int button);         /* pretty, e.g. "Cross" */
 SDL_Scancode psx_keybinds_get_button(int player, int button);
 void         psx_keybinds_set_button(int player, int button, SDL_Scancode sc);
-/* Reset one player's bindings to the built-in defaults (P2 = all unbound). */
+/* Alternate (secondary) binding per control: both the primary and the alt
+ * assert the input (e.g. cross = X, Mouse1). Stored in keybinds.ini as a
+ * comma-separated second name; SDL_SCANCODE_UNKNOWN = no alt. */
+SDL_Scancode psx_keybinds_get_button_alt(int player, int button);
+void         psx_keybinds_set_button_alt(int player, int button, SDL_Scancode sc);
+/* Reset one player's bindings to the shared built-in primary defaults and
+ * clear that player's alternate bindings. */
 void         psx_keybinds_reset_player(int player);
 /* Persist the current bindings to keybinds.ini (path resolved by
  * psx_keybinds_init; call that first). */

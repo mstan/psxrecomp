@@ -1,0 +1,71 @@
+name: Stage psxrecomp setup SDK
+description: >
+  Copy emitters, OpenBIOS profiles, retcomm-sdk.json, portable toolchain, and
+  Windows MinGW runtime DLLs into an existing setup-host stage directory.
+
+inputs:
+  stage:
+    description: Absolute or workspace-relative stage directory
+    required: true
+  framework:
+    description: Path to the psxrecomp checkout
+    required: false
+    default: psxrecomp
+  sdk-overlay:
+    description: Legacy optional overlay (prefer CLI/tools inside the submodule)
+    required: false
+    default: ''
+  recompiler-build:
+    description: Build dir containing psxrecomp-game / psxrecomp-bios
+    required: false
+    default: build-recompiler
+  toolchain-dir:
+    description: Unpacked toolchain root (defaults to env PSXRECOMP_TOOLCHAIN_DIR / TOOLCHAIN_DIR / BPE_TOOLCHAIN_DIR)
+    required: false
+    default: ''
+  host-exe:
+    description: Optional host .exe path for Windows DLL bundling
+    required: false
+    default: ''
+  runtime-bin:
+    description: MinGW bin dir for runtime DLLs (Windows)
+    required: false
+    default: ''
+  allow-no-toolchain:
+    description: If true, warn instead of failing when toolchain is unset
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        SCRIPT="${{ inputs.framework }}/tools/stage_setup_sdk.sh"
+        if [[ ! -f "${SCRIPT}" ]]; then
+          echo "::error::missing ${SCRIPT}"
+          exit 1
+        fi
+        chmod +x "${SCRIPT}"
+        args=(
+          --stage "${{ inputs.stage }}"
+          --framework "${{ inputs.framework }}"
+          --recompiler-build "${{ inputs.recompiler-build }}"
+        )
+        if [[ -n "${{ inputs.sdk-overlay }}" ]]; then
+          args+=(--sdk-overlay "${{ inputs.sdk-overlay }}")
+        fi
+        if [[ -n "${{ inputs.toolchain-dir }}" ]]; then
+          args+=(--toolchain-dir "${{ inputs.toolchain-dir }}")
+        fi
+        if [[ "${{ inputs.allow-no-toolchain }}" == "true" ]]; then
+          args+=(--allow-no-toolchain)
+        fi
+        if [[ -n "${{ inputs.host-exe }}" ]]; then
+          args+=(--host-exe "${{ inputs.host-exe }}")
+        fi
+        if [[ -n "${{ inputs.runtime-bin }}" ]]; then
+          args+=(--runtime-bin "${{ inputs.runtime-bin }}")
+        fi
+        bash "${SCRIPT}" "${args[@]}"

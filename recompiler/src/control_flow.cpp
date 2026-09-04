@@ -175,15 +175,33 @@ ControlFlowInstr ControlFlowAnalyzer::analyze_instruction(uint32_t addr, uint32_
     return cf;
 }
 
+uint32_t ControlFlowAnalyzer::analysis_walk_hi(const Function& func) const {
+    const uint32_t analysis_hi = exe_.analysis_end_address();
+    const uint32_t walk_lo =
+        func.alias_walk_lo ? func.alias_walk_lo : func.start_addr;
+    // Only clamp when the clamp still leaves a non-empty walk. A function that
+    // begins at or past the analysis bound is a degenerate discovery artefact;
+    // leave its range alone so the emitter's mandatory-delay-slot check keeps
+    // failing closed on it rather than silently producing an empty CFG.
+    if (func.end_addr > analysis_hi && analysis_hi > walk_lo) return analysis_hi;
+    return func.end_addr;
+}
+
+// NOTE: find_block_boundaries / build_basic_blocks / link_basic_blocks /
+// detect_loops below are NOT on the live path — analyze_function does its own
+// single-pass walk (see the comment there). They are kept in sync with the
+// analysis bound anyway so wiring them up can never reintroduce the
+// guard-word-as-block-leader defect.
 std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& func) {
     std::set<uint32_t> boundaries;
+    const uint32_t walk_hi = analysis_walk_hi(func);
 
     // Function start is always a boundary
     boundaries.insert(func.start_addr);
 
     // Scan all instructions in function
     uint32_t addr = func.start_addr;
-    while (addr < func.end_addr) {
+    while (addr < walk_hi) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt.has_value()) {
             break;
@@ -195,7 +213,7 @@ std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& fu
             ControlFlowInstr cf = analyze_instruction(addr, instr);
 
             // If branch/jump has a target, target is a boundary
-            if (cf.target != 0 && cf.target >= func.start_addr && cf.target < func.end_addr) {
+            if (cf.target != 0 && cf.target >= func.start_addr && cf.target < walk_hi) {
                 boundaries.insert(cf.target);
             }
 
@@ -204,7 +222,7 @@ std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& fu
                 cf.type == ControlFlowType::JumpLink ||
                 cf.type == ControlFlowType::JumpLinkReg) {
                 uint32_t fall_through = addr + 8; // After delay slot
-                if (fall_through < func.end_addr) {
+                if (fall_through < walk_hi) {
                     boundaries.insert(fall_through);
                 }
             }
@@ -215,7 +233,7 @@ std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& fu
                 cf.type == ControlFlowType::JumpRegister ||
                 cf.type == ControlFlowType::Return) {
                 uint32_t after_delay = addr + 8;
-                if (after_delay < func.end_addr) {
+                if (after_delay < walk_hi) {
                     boundaries.insert(after_delay);
                 }
             }
@@ -232,6 +250,7 @@ std::map<uint32_t, BasicBlock> ControlFlowAnalyzer::build_basic_blocks(
     const std::set<uint32_t>& boundaries) {
 
     std::map<uint32_t, BasicBlock> blocks;
+    const uint32_t walk_hi = analysis_walk_hi(func);
     std::vector<uint32_t> boundary_vec(boundaries.begin(), boundaries.end());
     std::sort(boundary_vec.begin(), boundary_vec.end());
 
@@ -242,7 +261,7 @@ std::map<uint32_t, BasicBlock> ControlFlowAnalyzer::build_basic_blocks(
         if (i + 1 < boundary_vec.size()) {
             block.end_addr = boundary_vec[i + 1] - 4;
         } else {
-            block.end_addr = func.end_addr - 4;
+            block.end_addr = walk_hi - 4;
         }
 
         if (block.end_addr < block.start_addr) continue;
@@ -357,8 +376,14 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     // all stay intra-function. The emitted alias enters via goto to its
     // start_addr block; walk_lo is the host's start.
     uint32_t walk_lo = func.alias_walk_lo ? func.alias_walk_lo : func.start_addr;
+    // Discovery/block-construction bound. Normally exactly func.end_addr; on
+    // an overlay capture that carries trailing delay-slot guard words it stops
+    // short of them, so the guard word can never become a block leader or a
+    // block's exit instruction (its own delay slot does not exist). It stays
+    // READABLE: a transfer at walk_hi - 4 still emits its slot from the guard.
+    const uint32_t walk_hi = analysis_walk_hi(func);
     cfg.function_start = walk_lo;
-    cfg.function_end = func.end_addr;
+    cfg.function_end = walk_hi;
     cfg.producer_lo = func.producer_lo;
     cfg.producer_hi = func.producer_hi;
 
@@ -372,17 +397,17 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         // aliases produce identical CFGs.
         boundary_vec.push_back(func.start_addr);
         for (uint32_t e : func.alias_group_entries) {
-            if (e >= walk_lo && e < func.end_addr) boundary_vec.push_back(e);
+            if (e >= walk_lo && e < walk_hi) boundary_vec.push_back(e);
         }
     }
     auto add_boundary = [&](uint32_t target) {
-        if (target >= walk_lo && target < func.end_addr) {
+        if (target >= walk_lo && target < walk_hi) {
             boundary_vec.push_back(target);
         }
     };
 
     // Scan instructions for branches/jumps to find block starts
-    for (uint32_t addr = walk_lo; addr < func.end_addr; addr += 4) {
+    for (uint32_t addr = walk_lo; addr < walk_hi; addr += 4) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt) continue;
         uint32_t instr = *instr_opt;
@@ -390,13 +415,13 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         if (is_control_flow(instr)) {
             ControlFlowInstr cf = analyze_instruction(addr, instr);
 
-            if (cf.target != 0 && cf.target >= walk_lo && cf.target < func.end_addr) {
+            if (cf.target != 0 && cf.target >= walk_lo && cf.target < walk_hi) {
                 add_boundary(cf.target);
             }
 
             // After delay slot is a new block
             uint32_t after_delay = addr + 8;
-            if (after_delay < func.end_addr) {
+            if (after_delay < walk_hi) {
                 add_boundary(after_delay);
             }
         }
@@ -408,7 +433,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     for (size_t i = 0; i < boundary_vec.size(); i++) {
         BasicBlock block;
         block.start_addr = boundary_vec[i];
-        block.end_addr = (i + 1 < boundary_vec.size()) ? boundary_vec[i + 1] - 4 : func.end_addr - 4;
+        block.end_addr = (i + 1 < boundary_vec.size()) ? boundary_vec[i + 1] - 4 : walk_hi - 4;
 
         if (block.end_addr < block.start_addr) continue;
 
@@ -445,7 +470,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         // Add successors — only targets within this function's block set
         auto in_func = [&](uint32_t addr) {
             return addr >= walk_lo &&
-                   addr < func.end_addr &&
+                   addr < walk_hi &&
                    std::binary_search(boundary_vec.begin(), boundary_vec.end(), addr);
         };
         if (block.exit_instr.type == ControlFlowType::Branch) {

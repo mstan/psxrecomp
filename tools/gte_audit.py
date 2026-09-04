@@ -8,7 +8,7 @@ the generated C file.
 Migration note: the original BIOS-only version scanned the entire ROM
 including data regions, producing false positives in `0xBFC75xxx+`.
 This version filters to declared code regions only — which closes the
-data-region false-positive bug class noted in `docs/audit_inventory.md`.
+data-region false-positive bug class noted in `docs/internal/audit_inventory.md`.
 
 Usage:
   python tools/gte_audit.py --config bios/SCPH1001.toml

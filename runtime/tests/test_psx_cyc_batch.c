@@ -8,6 +8,7 @@ uint64_t psx_next_service_cycle = 0;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int g_psx_cyc_bb_defer = 0;
+uint32_t *g_psx_cyc_local_acc = 0;
 int psx_in_device_service = 0;
 int g_event_step_conservative = 0;
 int g_ls_replay_active = 0;
@@ -33,6 +34,7 @@ static void reset_clock(uint64_t deadline) {
     g_psx_cyc_batch = 0;
     g_psx_cyc_batch_limit = 0;
     g_psx_cyc_bb_defer = 0;
+    g_psx_cyc_local_acc = 0;
     service_count = 0;
 }
 
@@ -73,5 +75,22 @@ int main(void) {
     psx_cyc_charge(1u);
     assert(psx_cycle_count == 1u);
     assert(service_count == 1);
+
+    /* Emitter-level local accumulator: charges stay off the published clock
+     * until local_publish / batch_flush; guest total at the barrier matches. */
+    reset_clock(1000u);
+    {
+        uint32_t acc = 0;
+        psx_cyc_local_begin(&acc);
+        for (int i = 0; i < 100; i++) psx_cyc_charge(5u);
+        assert(psx_cycle_count == 0u);
+        assert(g_psx_cyc_batch == 0u);
+        assert(acc == 500u);
+        psx_cyc_bb_defer_flush();
+        assert(psx_cycle_count == 500u);
+        assert(acc == 0u);
+        psx_cyc_local_end();
+        assert(g_psx_cyc_local_acc == 0);
+    }
     return 0;
 }

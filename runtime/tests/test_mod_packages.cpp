@@ -88,7 +88,13 @@ static std::string manifest(const std::string& id, const std::string& version,
         "id = \"" + id + "\"\n"
         "version = \"" + version + "\"\n"
         "name = \"" + id + "\"\n"
+        "author = \"Test Author\"\n"
+        "source_name = \"Upstream project\"\n"
+        "source_url = \"https://example.com/project\"\n"
         "resolver = \"declarative\"\n"
+        "[[author_link]]\n"
+        "name = \"Test Author\"\n"
+        "url = \"https://example.com/author\"\n"
         "[[target]]\n"
         "game_id = \"SLUS-TEST\"\n" + extra;
 }
@@ -143,6 +149,14 @@ int main() {
     ModPackageManager manager(root);
     std::string error;
     check(manager.scan(&error), error.c_str());
+    const ModPackage& metadata_package =
+        manager.packages().at("base.mod").at("1.0.0");
+    check(metadata_package.source_url == "https://example.com/project",
+          "package source URL must be retained");
+    check(metadata_package.author_links.size() == 1 &&
+              metadata_package.author_links[0].name == "Test Author" &&
+              metadata_package.author_links[0].url == "https://example.com/author",
+          "package author links must be retained");
     write_deflated_package(root / "zip.psxmod");
     check(manager.install_archive(root / "zip.psxmod", nullptr, nullptr, &error),
           error.c_str());
@@ -498,6 +512,77 @@ int main() {
     check(feature_reload.resolve("SLUS-TEST").fingerprint ==
               partial_compatible.fingerprint,
           "feature state must resolve deterministically after reload");
+
+    fs::create_directories(root / "selected", ec);
+    write_text(root / "selected/bezel.png", "not a decoded image");
+    write_text(root / "packages/resource.mod/1.0.0/manifest.toml",
+               "format_version = 5\n"
+               "id = \"resource.mod\"\n"
+               "version = \"1.0.0\"\n"
+               "name = \"Resource Mod\"\n"
+               "resolver = \"declarative\"\n"
+               "[[target]]\n"
+               "game_id = \"SLUS-TEST\"\n"
+               "[[feature]]\n"
+               "id = \"bezel\"\n"
+               "name = \"Bezel\"\n"
+               "[[resource]]\n"
+               "feature = \"bezel\"\n"
+               "id = \"artwork\"\n"
+               "label = \"Artwork\"\n"
+               "description = \"Pick image\"\n"
+               "file_patterns = \"*.png,*.jpg\"\n"
+               "file_description = \"Image files\"\n"
+               "required = false\n");
+    write_text(root / "packages/required-resource.mod/1.0.0/manifest.toml",
+               "format_version = 5\n"
+               "id = \"required-resource.mod\"\n"
+               "version = \"1.0.0\"\n"
+               "name = \"Required Resource Mod\"\n"
+               "resolver = \"declarative\"\n"
+               "[[target]]\n"
+               "game_id = \"SLUS-TEST\"\n"
+               "[[feature]]\n"
+               "id = \"bezel\"\n"
+               "name = \"Bezel\"\n"
+               "[[resource]]\n"
+               "feature = \"bezel\"\n"
+               "id = \"artwork\"\n"
+               "label = \"Artwork\"\n"
+               "required = true\n");
+    check(feature_reload.scan(&error), error.c_str());
+    check(feature_reload.set_feature_enabled(
+              "resource.mod", "bezel", true, &error), error.c_str());
+    ModResolution resource_unset = feature_reload.resolve("SLUS-TEST");
+    check(resource_unset.ok && resource_unset.resources.empty(),
+          "optional resources must be omitted when no path is selected");
+    check(feature_reload.set_feature_resource_path(
+              "resource.mod", "bezel", "artwork",
+              root / "selected/bezel.png", &error), error.c_str());
+    ModResolution resource_selected = feature_reload.resolve("SLUS-TEST");
+    check(resource_selected.ok && resource_selected.resources.size() == 1 &&
+              resource_selected.resources[0].id == "artwork" &&
+              resource_selected.resources[0].path ==
+                  root / "selected/bezel.png",
+          "selected feature resource path must enter the committed plan");
+    check(feature_reload.save_state(&error), error.c_str());
+    ModPackageManager resource_reload(root);
+    check(resource_reload.scan(&error), error.c_str());
+    check(resource_reload.load_state(&error), error.c_str());
+    check(resource_reload.feature_resource_path(
+              "resource.mod", "bezel", "artwork") ==
+              root / "selected/bezel.png",
+          "feature resource paths must survive save/reload");
+    check(resource_reload.set_feature_enabled(
+              "required-resource.mod", "bezel", true, &error), error.c_str());
+    ModResolution resource_required = resource_reload.resolve("SLUS-TEST");
+    check(!resource_required.ok,
+          "required enabled resources must reject launch while unset");
+    check(resource_reload.set_feature_resource_path(
+              "required-resource.mod", "bezel", "artwork",
+              root / "selected/bezel.png", &error), error.c_str());
+    check(resource_reload.resolve("SLUS-TEST").ok,
+          "required enabled resources must resolve after selecting a path");
 
     write_text(root / "packages/parametric.mod/1.0.0/manifest.toml",
                "format_version = 3\n"
@@ -1270,6 +1355,200 @@ int main() {
                "[[target]]\ngame_id=\"SLUS-TEST\"\n");
     check(!ModPackageManager::read_manifest(root / "bad.toml", invalid, &error),
           "unsafe package id must be rejected");
+
+    /* Catalog roots. mods/bundled is build output that every build wipes and
+     * re-stages; mods/installed belongs to the launcher and a build never
+     * touches it. Before the split both lived in mods/packages, so a rebuild
+     * deleted every mod the player had installed. */
+    {
+        const fs::path split_root = root / "split";
+        /* Pre-split layout: a build-staged package and a player install,
+         * indistinguishable in the same tree. */
+        write_text(split_root / "packages/psx.builtin/1.0.0/manifest.toml",
+                   manifest("psx.builtin", "1.0.0"));
+        write_text(split_root / "packages/player.mod/1.0.0/manifest.toml",
+                   manifest("player.mod", "1.0.0"));
+        /* The current build has already staged its own copy of the builtin. */
+        write_text(split_root / "bundled/psx.builtin/1.0.0/manifest.toml",
+                   manifest("psx.builtin", "1.0.0"));
+
+        ModPackageManager split(split_root);
+        check(split.scan(&error), error.c_str());
+        check(!fs::exists(split_root / "packages"),
+              "the legacy mods/packages tree must be migrated away");
+        check(fs::exists(split_root / "installed/player.mod/1.0.0/manifest.toml"),
+              "a player-installed package must migrate into mods/installed");
+        check(!fs::exists(split_root / "installed/psx.builtin"),
+              "a package the build also staged must not migrate to installed");
+        check(split.packages().at("psx.builtin").at("1.0.0").origin ==
+                  ModPackageOrigin::Bundled,
+              "a package under mods/bundled must be Bundled");
+        check(split.packages().at("player.mod").at("1.0.0").origin ==
+                  ModPackageOrigin::Installed,
+              "a migrated player package must be Installed");
+
+        check(!split.remove_version("psx.builtin", "1.0.0", &error),
+              "a bundled package must not be removable");
+
+        /* What a rebuild does: wipe bundled/ and re-stage it. The player's
+         * installed catalog must survive untouched. */
+        fs::remove_all(split_root / "bundled", ec);
+        write_text(split_root / "bundled/psx.builtin/1.0.0/manifest.toml",
+                   manifest("psx.builtin", "1.0.0"));
+        ModPackageManager rebuilt(split_root);
+        check(rebuilt.scan(&error), error.c_str());
+        check(rebuilt.packages().count("player.mod") == 1,
+              "a rebuild must not delete a player-installed package");
+        check(rebuilt.packages().count("psx.builtin") == 1,
+              "a rebuild must re-stage the bundled catalog");
+
+        /* An installed package of the same id shadows the bundled one, and
+         * says so rather than winning silently. */
+        write_text(split_root / "installed/psx.builtin/1.0.0/manifest.toml",
+                   manifest("psx.builtin", "1.0.0"));
+        ModPackageManager shadowed(split_root);
+        check(shadowed.scan(&error), error.c_str());
+        const ModPackage& shadow =
+            shadowed.packages().at("psx.builtin").at("1.0.0");
+        check(shadow.origin == ModPackageOrigin::Installed &&
+                  shadow.shadows_bundled,
+              "an installed package must shadow the bundled one and record it");
+
+        /* A manifest that cannot be parsed must be named, never skipped in
+         * silence -- an author's typo used to produce a mod that simply did
+         * not exist, with nothing anywhere explaining why. */
+        write_text(split_root / "installed/broken.mod/1.0.0/manifest.toml",
+                   "format_version = 5\nid = \"broken.mod\"\n");
+        ModPackageManager broken(split_root);
+        check(broken.scan(&error), error.c_str());
+        check(broken.packages().count("broken.mod") == 0,
+              "an unparseable package must not load");
+        check(std::any_of(broken.scan_errors().begin(),
+                          broken.scan_errors().end(),
+                          [](const std::string& e) {
+                              return e.find("broken.mod") != std::string::npos;
+                          }),
+              "an unparseable manifest must be reported by scan_errors()");
+    }
+
+    /* Channels. A feature carries its own maturity: a package is the trust and
+     * installation boundary, and tying the two forced a whole catalog down to
+     * the maturity of its least finished feature. */
+    {
+        const fs::path chan_root = root / "channel";
+        const std::string mixed =
+            "format_version = 6\n"
+            "id = \"chan.mod\"\n"
+            "version = \"1.0.0\"\n"
+            "name = \"Channel Mod\"\n"
+            "[[target]]\n"
+            "game_id = \"SLUS-TEST\"\n"
+            "[[feature]]\n"
+            "id = \"solid\"\n"
+            "name = \"Solid\"\n"
+            "[[feature]]\n"
+            "id = \"rough\"\n"
+            "name = \"Rough\"\n"
+            "channel = \"experimental\"\n"
+            "[[feature]]\n"
+            "id = \"probe\"\n"
+            "name = \"Probe\"\n"
+            "channel = \"developer\"\n"
+            "[[option]]\n"
+            "feature = \"probe\"\n"
+            "id = \"depth\"\n"
+            "label = \"Depth\"\n"
+            "type = \"boolean\"\n"
+            "default = \"false\"\n";
+        write_text(chan_root / "bundled/chan.mod/1.0.0/manifest.toml", mixed);
+
+        /* A local build sees all three. */
+        ModPackageManager local(chan_root);
+        local.set_developer_channel_visible(true);
+        check(local.scan(&error), error.c_str());
+        const ModPackage& all = local.packages().at("chan.mod").at("1.0.0");
+        check(all.features.size() == 3, "a local build must see every channel");
+        check(all.features[0].channel == ModChannel::Stable &&
+                  all.features[1].channel == ModChannel::Experimental &&
+                  all.features[2].channel == ModChannel::Developer,
+              "each feature must carry its own channel");
+
+        /* A release build must not carry the developer feature at all --
+         * absent, not hidden -- nor the options that only served it. */
+        ModPackageManager shipped(chan_root);
+        shipped.set_developer_channel_visible(false);
+        check(shipped.scan(&error), error.c_str());
+        const ModPackage& published = shipped.packages().at("chan.mod").at("1.0.0");
+        check(published.features.size() == 2,
+              "a release build must drop developer-channel features");
+        check(std::none_of(published.features.begin(), published.features.end(),
+                           [](const ModFeature& f) { return f.id == "probe"; }),
+              "the developer feature must be absent from a release build");
+        check(std::none_of(published.options.begin(), published.options.end(),
+                           [](const ModOption& o) { return o.feature_id == "probe"; }),
+              "options serving a dropped feature must go with it");
+        check(published.features[1].channel == ModChannel::Experimental,
+              "an experimental feature still ships");
+
+        /* A package whose every feature is developer-channel simply is not
+         * there on a release build, rather than listing with nothing in it. */
+        write_text(chan_root / "bundled/dev.only/1.0.0/manifest.toml",
+                   "format_version = 6\n"
+                   "id = \"dev.only\"\n"
+                   "version = \"1.0.0\"\n"
+                   "name = \"Dev Only\"\n"
+                   "channel = \"developer\"\n"
+                   "[[target]]\n"
+                   "game_id = \"SLUS-TEST\"\n"
+                   "[[feature]]\n"
+                   "id = \"instrument\"\n"
+                   "name = \"Instrument\"\n");
+        ModPackageManager dev_only(chan_root);
+        dev_only.set_developer_channel_visible(false);
+        check(dev_only.scan(&error), error.c_str());
+        check(dev_only.packages().count("dev.only") == 0,
+              "a developer-only package must not load in a release build");
+        ModPackageManager dev_seen(chan_root);
+        dev_seen.set_developer_channel_visible(true);
+        check(dev_seen.scan(&error), error.c_str());
+        check(dev_seen.packages().count("dev.only") == 1,
+              "a developer-only package must load in a local build");
+        check(dev_seen.packages().at("dev.only").at("1.0.0")
+                  .features[0].channel == ModChannel::Developer,
+              "a feature must inherit its package's channel by default");
+
+        /* The key is version-gated like every other format addition, and only
+         * the three names are accepted. */
+        ModPackage rejected;
+        write_text(chan_root / "v5-feature-channel.toml",
+                   "format_version = 5\n"
+                   "id = \"old.mod\"\n"
+                   "version = \"1.0.0\"\n"
+                   "name = \"Old\"\n"
+                   "[[target]]\n"
+                   "game_id = \"SLUS-TEST\"\n"
+                   "[[feature]]\n"
+                   "id = \"f\"\n"
+                   "name = \"F\"\n"
+                   "channel = \"experimental\"\n");
+        check(!ModPackageManager::read_manifest(
+                  chan_root / "v5-feature-channel.toml", rejected, &error),
+              "a per-feature channel must require format_version 6");
+        write_text(chan_root / "bad-channel.toml",
+                   "format_version = 6\n"
+                   "id = \"bad.mod\"\n"
+                   "version = \"1.0.0\"\n"
+                   "name = \"Bad\"\n"
+                   "channel = \"beta\"\n"
+                   "[[target]]\n"
+                   "game_id = \"SLUS-TEST\"\n"
+                   "[[feature]]\n"
+                   "id = \"f\"\n"
+                   "name = \"F\"\n");
+        check(!ModPackageManager::read_manifest(
+                  chan_root / "bad-channel.toml", rejected, &error),
+              "an unknown channel name must be rejected");
+    }
 
     fs::remove_all(root, ec);
     if (failures) {

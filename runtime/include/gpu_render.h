@@ -39,6 +39,22 @@ void gr_set_mask_bits(int set_bit, int check_bit);
 void gr_set_texture_window(uint32_t raw);
 void gr_set_color_modulation(int r, int g, int b, int raw_texture);
 
+/* Sub-pixel vertex override for the NEXT triangle ([video] geometry_correction).
+ * x/y are signed 16.16 screen coordinates carrying the projection fraction the
+ * GTE discarded; the integer positions still passed to gr_draw_*_triangle
+ * remain authoritative for anything that must stay faithful (dirty-rect
+ * tracking, the software path's native VRAM write). enabled == 0 clears the
+ * override. Backends that do not implement it ignore the call, so the integer
+ * path is what they draw. The override is consumed by the next triangle. */
+void gr_set_precise_triangle(int enabled,
+                             int32_t x0, int32_t y0,
+                             int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2);
+/* Perspective-correct UV weights for the NEXT triangle ([video]
+ * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
+ * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
+void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+
 /* Primitives */
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
 void gr_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
@@ -119,6 +135,13 @@ typedef struct GpuRenderBackend {
     void (*set_mask_bits)(int set_bit, int check_bit);
     void (*set_texture_window)(uint32_t raw);
     void (*set_color_modulation)(int r, int g, int b, int raw_texture);
+    /* Optional (NULL = unsupported, facade no-ops): sub-pixel vertex override
+     * and perspective UV weights for the next triangle. See gr_* above. */
+    void (*set_precise_triangle)(int enabled,
+                                 int32_t x0, int32_t y0,
+                                 int32_t x1, int32_t y1,
+                                 int32_t x2, int32_t y2);
+    void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,

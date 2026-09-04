@@ -184,8 +184,11 @@ KEYING for interior shards: key/validate by the COVERED block ranges + a hash of
 ONLY the covered instruction bytes (NOT a guessed enclosing host range — that's
 what pulled in volatile/data bytes). The loader validates only those covered
 ranges. Dispatch priority for a PC: full host > recovered host > interior
-fragment > sljit > interp; an interior shard covers only its exact legal entries,
-never claims the whole host.
+fragment > interp; an interior shard covers only its exact legal entries,
+never claims the whole host. (This chain listed an `sljit` tier between the
+interior fragment and the interpreter when written; the sljit tier was removed
+in `5b7e69b4`, 2026-07-15. Shards are produced by gcc or the bundled tcc today,
+and both land in the host/fragment classes above.)
 
 PHASES: P1 separate the build classes (stop poisoning — REGION_TRUSTED only emits
 the all-roots DLL). P2 interior-entry fragment compiler (do this FIRST for the FMV

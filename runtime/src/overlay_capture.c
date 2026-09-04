@@ -356,9 +356,12 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
              * stabilize region keys, but they are not MIPS execution barriers.
              * Adjacent dirty pages were already folded into this run. */
             const uint32_t ram_size = 2u * 1024u * 1024u;
+            uint32_t guard_bytes = 0u;
             if (phys <= ram_size && size <= ram_size - phys &&
-                phys + size <= ram_size - 4u)
+                phys + size <= ram_size - 4u) {
                 size += 4u;
+                guard_bytes = 4u;
+            }
             uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
             in_run = 0;
 
@@ -395,6 +398,15 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
             fprintf(f, "    \"schema\": \"psxrecomp overlay capture v2\",\n");
             fprintf(f, "    \"load_addr\": \"0x%08X\",\n", virt);
             fprintf(f, "    \"size\": %u,\n", size);
+            /* How many of the trailing bytes above are the delay-slot guard,
+             * i.e. NOT part of the dirty-page run.  The consumer must keep
+             * them READABLE (a branch at the run's last word emits its slot
+             * from here) while never discovering them as code: the word after
+             * a guard word is not in this region at all.  Stated explicitly so
+             * the recompiler is TOLD rather than inferring it from `size`
+             * (tools/compile_overlays.py capture_guard_bytes ->
+             * recompiler/include/ps1_exe_parser.h exe_tag). */
+            fprintf(f, "    \"guard_bytes\": %u,\n", guard_bytes);
             fprintf(f, "    \"bytes_b64\": \"");
             write_b64(f, ram_base + phys, size);
             fprintf(f, "\",\n");
@@ -784,7 +796,38 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
     return capture_commit_temp(temp_path, reason, sequence);
 }
 
-static uint64_t overlay_capture_write_current(const char *reason)
+static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
+                                   const uint32_t *exec_pc_bitmap,
+                                   uint32_t scope_lo, uint32_t scope_hi,
+                                   int include_halo)
+{
+    const uint32_t ram_size = 2u * 1024u * 1024u;
+    memset(bitmap, 0, (size_t)bw * sizeof(uint32_t));
+    if (scope_hi > ram_size) scope_hi = ram_size;
+    if (scope_lo >= scope_hi) return;
+    uint32_t first_page = scope_lo >> 12;
+    uint32_t last_page = (scope_hi - 1u) >> 12;
+    uint32_t scan_lo = include_halo && first_page ? first_page - 1u : first_page;
+    uint32_t scan_hi = include_halo && last_page + 1u < ram_size / 4096u
+                     ? last_page + 1u : last_page;
+    for (uint32_t page = scan_lo; page <= scan_hi; page++) {
+        uint32_t first_exec_word = page * (4096u / 4u);
+        int observed = 0;
+        for (uint32_t b = 0; b < 4096u / 4u / 32u; b++) {
+            if (exec_pc_bitmap[(first_exec_word >> 5) + b]) {
+                observed = 1;
+                break;
+            }
+        }
+        if (observed && (page >> 5) < bw)
+            bitmap[page >> 5] |= 1u << (page & 31u);
+    }
+}
+
+static uint64_t overlay_capture_write_current(const char *reason,
+                                              uint32_t scope_lo,
+                                              uint32_t scope_hi,
+                                              int include_halo)
 {
     extern uint8_t *memory_get_ram_ptr(void);
     uint32_t bw = dirty_ram_get_bitmap_word_count();
@@ -793,7 +836,8 @@ static uint64_t overlay_capture_write_current(const char *reason)
     if (!s_active) return 0;
     bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
     if (!bitmap) return 0;
-    for (uint32_t i = 0; i < bw; i++) bitmap[i] = dirty_ram_get_bitmap_word(i);
+    capture_executed_pages(bitmap, bw, g_dirty_ram_exec_pc_bitmap,
+                           scope_lo, scope_hi, include_halo);
     sig = write_and_commit_snapshot(bw, bitmap,
                                     g_dirty_ram_dispatch_pc_bitmap,
                                     g_dirty_ram_exec_pc_bitmap,
@@ -806,7 +850,12 @@ static uint64_t overlay_capture_write_current(const char *reason)
 
 void overlay_capture_write_json(void)
 {
-    (void)overlay_capture_write_current("shutdown-or-manual");
+    /* Sticky dirty pages describe everything written since boot. They do not
+     * describe a coherent code variant: mutable data between two code pages
+     * can otherwise merge them into a giant region that changes every run.
+     * Final/manual captures use the same executed-page scope as autocapture. */
+    (void)overlay_capture_write_current("shutdown-or-manual",
+                                        0, 2u * 1024u * 1024u, 0);
 }
 
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
@@ -845,7 +894,8 @@ void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
          * Fall back to a synchronous durable commit rather than let the RAM
          * overwrite bind old evidence to new bytes. If storage itself fails,
          * report the unavoidable loss but still clear the stale association. */
-        if (!overlay_capture_write_current("preserve-sync-fallback"))
+        if (!overlay_capture_write_current("preserve-sync-fallback",
+                                           evidence_lo, evidence_hi, 1))
             fprintf(stderr,
                 "psxrecomp: ERROR: could not preserve outgoing overlay evidence; discarding stale epoch\n");
     }
@@ -900,6 +950,13 @@ int overlay_capture_count(void)
 #define AUTOCAP_MIN_DISPATCHES  128u   /* catches ~120/s FMV helper gaps    */
 #define AUTOCAP_MIN_INSNS       100000ull /* long compute gap pressure gate */
 #define AUTOCAP_COOLDOWN_FRAMES 300u   /* >= ~5 s between auto-fires        */
+/* Host-time twins of the two frame gates, at their 60 Hz equivalents. Each
+ * gate opens on whichever budget expires FIRST: frame counting alone
+ * deadlocks recovery, because the stall autocapture exists to fix is exactly
+ * when vblanks stop arriving (at 0.26 fps, 120 frames is ~8 minutes of wall
+ * clock). At full speed the budgets coincide, so cadence is unchanged. */
+#define AUTOCAP_CHECK_MS        2000ull
+#define AUTOCAP_COOLDOWN_MS     5000ull
 #define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
 #define AUTOCAP_WRITE_RETRY_MAX_FRAMES 60u /* cap failed-I/O retry at ~1 s */
 
@@ -919,6 +976,28 @@ static uint32_t s_autocap_futile     = 0;    /* futile skips (telemetry)      */
 static uint64_t s_autocap_provider_sig_pending = 0;
 static uint64_t s_autocap_provider_retry_frame = 0;
 static unsigned s_autocap_provider_attempts = 0;
+static uint64_t s_autocap_last_check_ms = 0; /* host twin of last_check      */
+static uint64_t s_autocap_next_ok_ms    = 0; /* host twin of next_ok         */
+
+static uint64_t autocap_now_ms(void) { return (uint64_t)SDL_GetTicks64(); }
+
+/* Wedge visibility: which pre-sample gate the tick last returned at, and
+ * when the pressure sample last completed. A latched gate is silent from
+ * outside — triggers, futility and pressure counters simply stop moving —
+ * so record it and let autocompile_status report it. */
+static uint64_t s_autocap_last_sample_ms = 0;
+static int      s_autocap_gate_hit       = 0;
+
+/* Gate identifiers, in the order overlay_autocapture_tick() tests them. */
+enum {
+    AUTOCAP_GATE_NONE = 0,      /* reached the pressure sample          */
+    AUTOCAP_GATE_WRITE_JOIN,    /* worker finished, snapshot requeued   */
+    AUTOCAP_GATE_WRITE_RETRY,   /* manifest write failed, retrying      */
+    AUTOCAP_GATE_PROVIDER,      /* compile request pending              */
+    AUTOCAP_GATE_DISABLED,      /* autocapture off / capture inactive   */
+    AUTOCAP_GATE_WRITE_BUSY,    /* worker thread still running          */
+    AUTOCAP_GATE_INTERVAL,      /* check budget not yet elapsed         */
+};
 
 typedef struct {
     uint8_t *ram;
@@ -964,6 +1043,47 @@ uint64_t overlay_autocapture_last_insns_delta(void) {
 void overlay_autocapture_get_futility(uint32_t *backoff, uint32_t *futile) {
     if (backoff) *backoff = s_autocap_backoff;
     if (futile)  *futile  = s_autocap_futile;
+}
+
+/* Wedge report: the latched gate and time since the last completed pressure
+ * sample. Sampling is host-time paced, so a long dry stretch means a gate
+ * latched — autocapture is wedged and nothing new will ever compile — not
+ * that the game is merely slow. (Seen live: a full disk made the manifest
+ * write retry forever; the only outward symptom was "the game got slow".) */
+const char *overlay_autocapture_gate_name(void) {
+    switch (s_autocap_gate_hit) {
+    case AUTOCAP_GATE_WRITE_JOIN:  return "write-join";
+    case AUTOCAP_GATE_WRITE_RETRY: return "write-retry";
+    case AUTOCAP_GATE_PROVIDER:    return "provider-pending";
+    case AUTOCAP_GATE_DISABLED:    return "disabled";
+    case AUTOCAP_GATE_WRITE_BUSY:  return "write-busy";
+    case AUTOCAP_GATE_INTERVAL:    return "interval";
+    default:                       return "none";
+    }
+}
+
+/* Milliseconds since the last completed pressure sample; 0 before the first
+ * sample (nothing to conclude yet). */
+uint64_t overlay_autocapture_ms_since_sample(void) {
+    if (!s_autocap_last_sample_ms) return 0;
+    uint64_t now = autocap_now_ms();
+    return now > s_autocap_last_sample_ms ? now - s_autocap_last_sample_ms : 0;
+}
+
+void overlay_autocapture_get_gates(int *capture_active, int *write_state,
+                                   int *write_job_pending,
+                                   unsigned *write_job_attempts,
+                                   int *provider_pending,
+                                   unsigned *provider_attempts) {
+    if (capture_active)     *capture_active     = s_active;
+    if (write_state)        *write_state        =
+        SDL_AtomicGet(&s_autocap_write_state);
+    if (write_job_pending)  *write_job_pending  = s_autocap_write_job ? 1 : 0;
+    if (write_job_attempts) *write_job_attempts =
+        s_autocap_write_job ? s_autocap_write_job->attempts : 0u;
+    if (provider_pending)   *provider_pending   =
+        s_autocap_provider_sig_pending != 0;
+    if (provider_attempts)  *provider_attempts  = s_autocap_provider_attempts;
 }
 
 #ifdef PSX_OVERLAY_CAPTURE_TEST
@@ -1027,6 +1147,8 @@ static int autocap_provider_request_try(const CodeProvider *cp, uint64_t frame)
             s_autocap_backoff <<= 1;
         s_autocap_next_ok = frame +
             (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+        s_autocap_next_ok_ms = autocap_now_ms() +
+            AUTOCAP_COOLDOWN_MS * (uint64_t)s_autocap_backoff;
         s_autocap_provider_sig_pending = 0;
         s_autocap_provider_retry_frame = 0;
         s_autocap_provider_attempts = 0;
@@ -1088,46 +1210,10 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
     memcpy(job->exec_pc_bitmap, g_dirty_ram_exec_pc_bitmap,
            sizeof(g_dirty_ram_exec_pc_bitmap));
     if (scoped) {
-        memset(job->bitmap, 0, (size_t)bw * sizeof(uint32_t));
-        uint32_t first_page = scope_lo >> 12;
-        uint32_t last_page = (scope_hi - 1u) >> 12;
-        for (uint32_t page = first_page; page <= last_page; page++) {
-            uint32_t first_exec_word = page * (4096u / 4u);
-            int observed = 0;
-            for (uint32_t b = 0; b < 4096u / 4u / 32u; b++) {
-                if (job->exec_pc_bitmap[(first_exec_word >> 5) + b]) {
-                    observed = 1;
-                    break;
-                }
-            }
-            if (observed)
-                job->bitmap[page >> 5] |= 1u << (page & 31u);
-        }
-        /* Preserve a one-page EXECUTED halo on both sides of a scoped DMA
-         * overwrite.  The overwritten page can contain either the ...FFC
-         * control transfer or the ...000 delay slot; the paired instruction
-         * may live in the neighboring page and must come from this same
-         * coherent pre-write RAM snapshot.  Only executed neighbors qualify,
-         * so a sector overwrite cannot pull unrelated dirty history into an
-         * unbounded capture.  Evidence clearing remains limited to the pages
-         * actually overwritten by DMA. */
-        uint32_t halo_lo = first_page > 0u ? first_page - 1u : first_page;
-        uint32_t ram_pages = (uint32_t)(ram_size >> 12);
-        uint32_t halo_hi = last_page + 1u < ram_pages
-                         ? last_page + 1u : last_page;
-        for (uint32_t page = halo_lo; page <= halo_hi; page++) {
-            if (page >= first_page && page <= last_page) continue;
-            uint32_t first_exec_word = page * (4096u / 4u);
-            int observed = 0;
-            for (uint32_t b = 0; b < 4096u / 4u / 32u; b++) {
-                if (job->exec_pc_bitmap[(first_exec_word >> 5) + b]) {
-                    observed = 1;
-                    break;
-                }
-            }
-            if (observed)
-                job->bitmap[page >> 5] |= 1u << (page & 31u);
-        }
+        /* DMA preservation includes a one-page executed halo so an ...FFC
+         * control transfer and its ...000 delay slot remain coherent. */
+        capture_executed_pages(job->bitmap, bw, job->exec_pc_bitmap,
+                               scope_lo, scope_hi, 1);
     } else {
         for (uint32_t i = 0; i < bw; i++)
             job->bitmap[i] = dirty_ram_get_bitmap_word(i);
@@ -1141,8 +1227,7 @@ static int autocap_write_start(void)
 {
     /* Periodic convergence needs executed code, not every sticky dirty page in
      * RAM. Evidence-scoping keeps the background manifest proportional to live
-     * coverage and avoids multi-megabyte rewrites every cooldown. Shutdown still
-     * emits the legacy full current snapshot once. */
+     * coverage and avoids multi-megabyte rewrites every cooldown. */
     AutocapWriteJob *job = capture_snapshot_create(
         0, 2u * 1024u * 1024u, 1);
     if (!job) return 0;
@@ -1258,6 +1343,7 @@ void overlay_autocapture_tick(void)
     const CodeProvider *cp = code_provider_active();
 
     if (SDL_AtomicGet(&s_autocap_write_state) == 2) {
+        s_autocap_gate_hit = AUTOCAP_GATE_WRITE_JOIN;
         AutocapWriteJob *job = s_autocap_write_job;
         SDL_WaitThread(s_autocap_write_thread, NULL);
         s_autocap_write_thread = NULL;
@@ -1287,6 +1373,7 @@ void overlay_autocapture_tick(void)
      * not discard an already-cleared evidence epoch. Retry the same immutable
      * snapshot at bounded cadence before considering another periodic fire. */
     if (s_autocap_write_job) {
+        s_autocap_gate_hit = AUTOCAP_GATE_WRITE_RETRY;
         AutocapWriteJob *job = s_autocap_write_job;
         if (SDL_AtomicGet(&s_autocap_write_state) == 0 &&
             s_frame_count >= job->retry_frame &&
@@ -1299,14 +1386,29 @@ void overlay_autocapture_tick(void)
     }
 
     if (s_autocap_provider_sig_pending) {
+        s_autocap_gate_hit = AUTOCAP_GATE_PROVIDER;
         (void)autocap_provider_request_try(cp, s_frame_count);
         return;
     }
 
-    if (!s_autocap_enabled || !s_active) return;
-    if (SDL_AtomicGet(&s_autocap_write_state) != 0) return;
-    if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES) return;
+    if (!s_autocap_enabled || !s_active) {
+        s_autocap_gate_hit = AUTOCAP_GATE_DISABLED;
+        return;
+    }
+    if (SDL_AtomicGet(&s_autocap_write_state) != 0) {
+        s_autocap_gate_hit = AUTOCAP_GATE_WRITE_BUSY;
+        return;
+    }
+    const uint64_t now_ms = autocap_now_ms();
+    if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES &&
+        now_ms - s_autocap_last_check_ms < AUTOCAP_CHECK_MS) {
+        s_autocap_gate_hit = AUTOCAP_GATE_INTERVAL;
+        return;
+    }
     s_autocap_last_check = s_frame_count;
+    s_autocap_last_check_ms = now_ms;
+    s_autocap_last_sample_ms = now_ms;
+    s_autocap_gate_hit = AUTOCAP_GATE_NONE;
 
     uint64_t disp  = g_dirty_window_dispatches;
     uint64_t delta = disp - s_autocap_last_disp;
@@ -1321,13 +1423,15 @@ void overlay_autocapture_tick(void)
         return;
     if (cdrom_load_in_progress()) return;          /* coherent moment only  */
     if (cp->busy && cp->busy()) return;
-    if (s_frame_count < s_autocap_next_ok) return; /* cooldown (x backoff)  */
+    if (s_frame_count < s_autocap_next_ok && now_ms < s_autocap_next_ok_ms)
+        return;                                    /* cooldown (x backoff)  */
 
     /* Snapshot coherent inputs for the player-shareable coverage manifest;
      * a worker writes/hashes it, then a later vblank applies futility/backoff.
      * Unchanged content with no new candidates backs off without a provider run. */
     s_autocap_last_fire = s_frame_count;
     s_autocap_next_ok = s_frame_count + AUTOCAP_COOLDOWN_FRAMES;
+    s_autocap_next_ok_ms = now_ms + AUTOCAP_COOLDOWN_MS;
     if (autocap_write_start()) {
         /* The queued job now owns this coherent evidence epoch. Start the next
          * one immediately so later periodic manifests contain only newly seen

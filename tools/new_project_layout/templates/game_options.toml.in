@@ -1,0 +1,12 @@
+# Native in-game OPTION persistence (optional).
+# Declared next to game.toml; read by the recompiler (init-store hooks) and
+# runtime (restore / save). Omit [[option]] rows until the title needs them.
+# See psxrecomp GameOptions / runtime game_options.c.
+#
+# [[option]]
+# name = "example"
+# addr = "0x80000000"
+# size = 1
+# init_store_pc = "0x80000000"
+# min = 0
+# max = 1

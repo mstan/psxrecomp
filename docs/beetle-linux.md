@@ -19,6 +19,11 @@ git checkout 5759277b          # "audit pass" — last C++-tree base we target
 patch -p1 < ../docs/beetle_wtrace_hook.patch
 patch -p1 < ../docs/beetle_sio_trace_hook.patch
 patch -p1 < ../docs/beetle_cdcmd_trace_hook.patch
+# cdcmd re-inserts the wtrace globals + typedefs — drop the duplicate block
+# in libretro.cpp / mednafen/psx/psx.h if the build errors on redefinition.
+# Also needed (not yet in docs/*.patch): rtrace/irq callbacks, guest-cycle
+# accumulator, PS_CDC::PSXRecomp_GetDecodeVolume, cdc/dma irq peeks. Apply
+# from a prior local beetle-psx tree or re-land those hooks by hand.
 ```
 
 `beetle_cdcmd_trace_hook.patch` adds a CD-command trace callback (fires per
@@ -41,6 +46,16 @@ cd ../runtime
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF -DPSX_DEBUG_TOOLS=ON
 ninja -C build psx-beetle
 
-# Headless run (picks the next free port from 4380 if taken; watch stderr)
-xvfb-run -a ./runtime/build/psx-beetle ../bios/SCPH1001.BIN --disc <game.cue>
+# Run (SDL window; use software renderer if GL context is flaky).
+# Beetle looks for lowercase scph5501.bin in the BIOS directory (SHA1
+# 0555C6FA… — SCPH-5501). Symlink or copy next to SCPH1001.BIN.
+# Default debug port is 4380 (override with --port).
+SDL_RENDER_DRIVER=software ./runtime/build/psx-beetle ../bios/SCPH1001.BIN --disc <game.cue> --port 4380
+
+# Headless (if xvfb is installed):
+# xvfb-run -a ./runtime/build/psx-beetle ../bios/SCPH1001.BIN --disc <game.cue>
 ```
+
+Wire smoke: `{"cmd":"ping"}` → `backend=beetle`. Screenshot via `screenshot`.
+`gpu_frame_dump` is a **native** (psx-runtime) command — Beetle does not
+expose GP0 OT dumps yet; compare visuals via `screenshot` / `vram_peek`.

@@ -8,6 +8,9 @@ extern "C" {
 
 typedef void (*PSXModVBlankCallback)(void);
 typedef void (*PSXModActivationCallback)(void);
+struct CPUState;
+typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
+                                            uint32_t address);
 
 /*
  * Register a trusted, statically linked plugin implementation. Package
@@ -18,11 +21,64 @@ int psx_mod_register_activation_plugin(const char* id,
                                        PSXModActivationCallback callback);
 int psx_mod_register_vblank_plugin(const char* id,
                                    PSXModVBlankCallback callback);
+int psx_mod_register_function_entry_plugin(
+    const char* id, uint32_t address, PSXModFunctionEntryCallback callback);
+/* Called only from generated functions explicitly listed by the game config. */
+void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);
 uint8_t psx_mod_read_byte(uint32_t address);
 void psx_mod_write_byte(uint32_t address, uint8_t value);
+uint16_t psx_mod_read_half(uint32_t address);
+void psx_mod_write_half(uint32_t address, uint16_t value);
+uint32_t psx_mod_read_word(uint32_t address);
+void psx_mod_write_word(uint32_t address, uint32_t value);
+/*
+ * Replace one guest instruction and route that address through the runtime's
+ * executable-RAM path. Use this instead of psx_mod_write_word for code so a
+ * restored save state cannot leave the compiled instruction stale.
+ */
+void psx_mod_write_code_word(uint32_t address, uint32_t value);
+
+/*
+ * Allocate opt-in enhancement memory from Expansion 1. Until the first
+ * allocation, the region remains hardware-faithful open bus. The returned
+ * KSEG0 address is accessible through normal generated guest loads.
+ */
+uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
+
+/*
+ * Allocate guest memory that is also addressable by 24-bit GPU linked-list
+ * tags. This is intended for opt-in enhanced primitive/ordering-table arenas;
+ * without an allocation the aperture remains unmapped and DMA stays faithful.
+ */
+uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size, uint32_t alignment);
+
+/* Current per-side widescreen reveal in native game pixels (zero at 4:3). */
+int32_t psx_mod_widescreen_x_margin(void);
+
+/*
+ * Width, in native game pixels, of the picture the guest is currently
+ * scanning out -- the same value the presenter uses, derived from the display
+ * mode and the GP1(06h) horizontal range.
+ *
+ * Why this exists: a plugin that draws its own overlay primitives needs to
+ * know where the right-hand edge of the screen is, and it cannot work that
+ * out for itself. GPUSTAT carries the horizontal-resolution bits, so a plugin
+ * can recover the coarse MODE width (256/320/512/640, or 368), but the
+ * visible width also depends on the GP1(06h) X1/X2 range, which is write-only
+ * and mirrored nowhere the plugin can read. Ape Escape is the worked example:
+ * it scans out 384 while its mode width is 368, and a plugin that assumed the
+ * usual 320 put its HUD row 68 pixels short of the edge.
+ *
+ * Returns 0 if the display geometry is not yet established, in which case the
+ * caller should skip drawing rather than substitute a guess.
+ */
+uint32_t psx_mod_display_width(void);
+
+/* Height companion to psx_mod_display_width(); same conventions. */
+uint32_t psx_mod_display_height(void);
 
 /*
  * Read the committed value of one of this package's declared options, as the
@@ -46,6 +102,14 @@ void psx_mod_write_byte(uint32_t address, uint8_t value);
  */
 int psx_mod_option_value(const char* package_id, const char* feature_id,
                          const char* option_id, char* out, uint32_t out_size);
+/*
+ * Read the committed owner-selected path for a resource declared by the
+ * package feature whose trusted plugin is currently running. Returns 0 when
+ * the feature has no selected path for that resource; plugins then leave the
+ * stock presentation unchanged.
+ */
+int psx_mod_current_resource_path(const char* resource_id,
+                                  char* out, uint32_t out_size);
 
 /*
  * Request a fixed host display aspect before renderer/window initialization.
@@ -72,13 +136,15 @@ int psx_mod_set_native_vblank_rate(uint32_t frames_per_second);
 /*
  * Enable presentation-only frame interpolation while leaving guest VBlank,
  * game logic, timers, and audio at their stock cadence. The OpenGL presenter
- * blends between completed guest frames at the requested output rate.
+ * temporally blends completed guest frames at the requested output rate on its
+ * owning render thread/context. It does not derive motion vectors or generate
+ * true intermediate object positions.
  * A value of zero follows the measured host-display refresh rate.
  */
 int psx_mod_set_frame_interpolation(uint32_t frames_per_second);
 /*
- * Choose how the OpenGL presenter combines completed frames. Linear is the
- * legacy full-frame crossfade. Motion-adaptive retains interpolation for
+ * Choose how the OpenGL presenter combines completed frames. Linear is a
+ * full-frame crossfade. Motion-adaptive retains temporal blending for
  * small temporal changes but switches large changes cleanly to reduce the
  * double-image trails produced by moving objects.
  */
@@ -88,20 +154,91 @@ enum {
 };
 int psx_mod_set_frame_interpolation_blend(uint32_t blend_mode);
 int psx_mod_set_auto_skip_fmv(int enabled);
+/*
+ * Draw still artwork behind the game image in OpenGL letterbox/pillarbox
+ * margins. The image path is an owner-selected mod resource; with no enabled
+ * mod/resource path, the margins remain the historical black clear.
+ */
+int psx_mod_set_bezel_artwork(const char* path);
 
 /*
- * Override one player's resolved controller presentation mode for this launch.
- * This is intentionally a trusted-plugin API, not a generic launcher setting:
- * games may hide Hybrid from their normal selector while offering it as an
- * explicit game-owned mod.
+ * Upper bounds for the two loading-speed knobs below. Both are generous on
+ * purpose: games surface them to players as free-form integers, and neither
+ * can corrupt guest state (see the notes on each setter). They exist to reject
+ * nonsense, not to curate a list of "blessed" speeds.
  */
+#define PSX_MOD_LOAD_ACCEL_MAX  1024u
+#define PSX_MOD_DISC_SPEED_MAX  1024u
+
+/*
+ * Accelerate only the wall-clock pacing of sustained non-XA data loads while
+ * preserving every guest VBlank, CD deadline, interrupt, and callback.
+ * wall_clock_multiplier accepts 1..PSX_MOD_LOAD_ACCEL_MAX, or zero for
+ * uncapped host speed (1 is a no-op, i.e. authentic pacing).
+ * release_frames controls how many guest frames acceleration may remain active
+ * after the load predicate clears; zero is the precise/speedrun-safe policy.
+ */
+int psx_mod_set_load_acceleration(uint32_t wall_clock_multiplier,
+                                  uint32_t release_frames);
+
+/*
+ * Select guest-visible CD timing for a game-owned loading feature. divisor
+ * divides the emulated sector delay, so it IS the speed multiplier: 1 is
+ * authentic timing, higher is faster, up to PSX_MOD_DISC_SPEED_MAX. Zero
+ * selects the bounded "instant" scheduler, and instant_max_per_frame (1..256)
+ * applies only in that case. cdrom.c floors the divided delay at
+ * CDROM_MIN_DELAY and leaves XA streaming at authentic timing, so no value
+ * here can produce a zero-delay storm or speed up FMV audio. Unlike host load
+ * acceleration this changes WHEN the guest receives CD interrupts and can
+ * expose game timing bugs, which is why it is a separate, opt-in knob.
+ */
+int psx_mod_set_disc_speed(uint32_t divisor,
+                           uint32_t instant_max_per_frame);
+
+/* Controller presentation values exposed to trusted game-owned plugins. */
 enum {
-    PSX_MOD_CONTROLLER_HYBRID = 0,
     PSX_MOD_CONTROLLER_ANALOG = 1,
     PSX_MOD_CONTROLLER_DIGITAL = 2
 };
+/*
+ * Per-sample input facts for an opt-in controller presentation policy. The
+ * runtime owns SDL sampling and SIO delivery; the game-owned plugin owns only
+ * the policy decision of whether this sample should present as DualShock
+ * analog or a digital pad.
+ */
+typedef struct PSXModControllerInput {
+    uint32_t struct_size;
+    uint32_t player;
+    uint32_t sio_slot;
+    uint32_t configured_mode;
+    uint32_t current_mode;
+    uint32_t stick_active;
+    uint32_t dpad_active;
+    uint32_t buttons;
+    uint32_t lx;
+    uint32_t ly;
+    uint32_t rx;
+    uint32_t ry;
+} PSXModControllerInput;
+typedef uint32_t (*PSXModControllerPresentationCallback)(
+    const PSXModControllerInput* input);
+/*
+ * Override one player's resolved controller presentation mode for this launch.
+ * This is intentionally a trusted-plugin API, not a generic launcher setting.
+ */
 int psx_mod_set_controller_mode_override(uint32_t player,
                                          uint32_t controller_mode);
+/*
+ * Let a game-owned plugin choose analog/digital presentation for one player on
+ * every input sample. The initial mode is used for boot/hotplug before the
+ * first sample. config_capable should be non-zero when the selected policy may
+ * present a DualShock, even if a later sample currently reports digital.
+ */
+int psx_mod_set_controller_presentation_policy(
+    uint32_t player,
+    PSXModControllerPresentationCallback callback,
+    uint32_t initial_mode,
+    int config_capable);
 
 /*
  * Register a C plugin before main() on the compilers supported by the runtime.

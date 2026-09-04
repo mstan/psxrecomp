@@ -197,5 +197,5 @@ Recommended split of labour:
 ## Related
 
 - `docs/config_schema.md` — `[widescreen.cull]` schema
-- `WIDESCREEN.md` — native-wide / adaptive view design
+- `docs/WIDESCREEN.md` — native-wide / adaptive view design
 - `docs/COMPILING_OVERLAYS.md` — how captures become compiled overlay DLLs

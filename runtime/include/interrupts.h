@@ -24,6 +24,15 @@ struct CPUState;
 
 void interrupts_init(void);
 
+/* Save-state restore: re-anchor host-only IRQ pacing after psx_cycle_count is
+ * overwritten from a snapshot. Clears absolute-cycle cooldowns / deferred
+ * switches that would otherwise strand delivery until the restored clock
+ * catches up to the pre-load host timeline (warm-reload picture freeze). */
+void interrupts_resync_after_restore(void);
+
+/* Netplay diag: last VBLANK irqctx exit/restore (+ v0) for peer diff. */
+void interrupts_log_last_vblank_irqctx(const char *tag);
+
 /* Central IRQ-raise choke point: sets the I_STAT bit AND records the raise edge
  * into the always-on device-event ring (device_trace) with the guest cycle.
  * Every hardware source (VBLANK/GPU/CDROM/DMA/timers/SIO/SPU) funnels its raise
@@ -43,6 +52,17 @@ int psx_interrupt_delivery_needed(const struct CPUState* cpu);
 void psx_interrupt_delivery_diag(uint64_t *need_defer, uint64_t *need_irq,
                                  uint64_t *skip_none, uint64_t *skip_sr,
                                  uint64_t *skip_cooldown, uint64_t *skip_nested);
+
+/* Hot-path counters for psx_check_interrupts (monotonic). Any out_* may be NULL.
+ * entry     = every call
+ * fast_sr   = early return: pending I_STAT but IEc/IM2 clear
+ * fast_none = early return: nothing pending
+ * mid       = total_checks (past fast paths; toward / into deliver eval)
+ * eval      = reached irq_deliver_eval label
+ * irq_deliv = g_irq_deliver_count (any HW IRQ exception taken) */
+void psx_interrupt_check_path_diag(uint64_t *entry, uint64_t *fast_sr,
+                                   uint64_t *fast_none, uint64_t *mid,
+                                   uint64_t *eval, uint64_t *irq_deliv);
 /* Interrupt check with the compiled guest PC to resume if a game-installed
  * handler later RFEs to the sentinel outside the synchronous host window. */
 void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
@@ -60,6 +80,17 @@ void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_p
 void interrupts_advance_cycles(uint32_t cycles);
 void interrupts_service_scheduled_events(void);
 uint32_t interrupts_cycles_to_vblank(void);
+/* While IRQ9 is enabled, expose the next 44.1-kHz sample as a first-class
+ * device deadline so the CPU can observe and acknowledge an IRQ before the
+ * following sample. UINT32_MAX means inactive. PSX_SPU_SAMPLE_EVENTS=0 is a
+ * diagnostic opt-out. */
+uint32_t psx_spu_sample_event_cycles_to_next(void);
+void psx_spu_sample_event_service(void);
+/* VBlank phase within the current frame (0 .. VBLANK_CYCLES-1). Persisted in
+ * BS_SEC_IRQ (and selfcheck's out-of-band latch) so resim keeps the snap's
+ * phase. Legacy 8-byte IRQ sections still rebase to 0 on load. */
+uint32_t interrupts_get_cycles_since_vblank(void);
+void     interrupts_set_cycles_since_vblank(uint32_t v);
 
 /* Cycle-budgeted precise event slicing: minimum guest-CPU-cycle distance to the
  * next DELIVERABLE hardware interrupt (source raises its I_STAT bit AND that bit
@@ -69,6 +100,27 @@ uint32_t cycles_to_next_event(void);
 
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
+
+/* Most recent block-leader IRQ-check guest PC / compiled resume latch.
+ * Used by the post-savestate freeze probe (vblank-time "where was the game"). */
+uint32_t psx_last_irq_check_pc(void);
+uint32_t psx_compiled_irq_resume_pc(void);
+/* True when the current IRQ poll has a materialized CPUState/register context
+ * matching its resume PC. Dirty-RAM synthetic pump sites may expose a committed
+ * resume PC for IRQ timing before the live CPUState is safe to serialize. */
+int psx_irq_resume_context_snapshot_safe(void);
+int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc);
+int psx_irq_resume_context_snapshot_site(void);
+uint32_t psx_irq_resume_context_snapshot_pc(void);
+/* Soft-return / netplay BYE: drop sticky resume latches so rematch dig0 snaps
+ * cannot inherit a prior-match game PC (see pick_snap_resume_pc). */
+void psx_irq_clear_resume_latches(void);
+/* Arm compiled IRQ resume before top-level flush_resume / savestate dispatch
+ * so a latched I_STAT cannot take LEGACY_SENTINEL with take_pc=0. */
+void psx_irq_arm_compiled_resume_pc(uint32_t pc);
+uint64_t psx_last_irq_check_cycle(void);
+uint64_t psx_interrupt_total_checks(void);
+uint32_t psx_interrupt_fast_maintenance(void);
 
 /* Snapshot internal counters for the freeze_check diagnostic.  Any out_*
  * pointer may be NULL.  All counters are monotonically non-decreasing

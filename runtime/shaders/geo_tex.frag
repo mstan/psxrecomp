@@ -11,6 +11,8 @@ layout(location = 3) flat in ivec2 v_clut;    /* CLUT base, VRAM px */
 layout(location = 4) flat in int   v_depth;   /* 0=4bit 1=8bit 2=15bit */
 layout(location = 5) flat in int   v_raw;     /* 1 = no colour modulation */
 layout(location = 6) flat in ivec4 v_limits;  /* prim uv bounds (inclusive) */
+layout(location = 7) smooth in vec2 v_uv_p;   /* perspective-correct UV */
+layout(location = 8) flat   in int  v_persp;  /* 1 = use v_uv_p, else affine */
 
 layout(set = 0, binding = 0) uniform usampler2D u_vram;
 
@@ -52,21 +54,29 @@ vec3 col5(int raw) {
 }
 void main() {
     int stp; vec3 rgb;
+    /* v_persp is 0 for every prim unless [video] perspective_texturing is on
+     * AND this prim's packet carried full GTE projection provenance, so the
+     * default is the PS1's affine (noperspective) mapping. */
+    vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;
     if (pc.u_filter == 0) {
-        int raw = fetch_texel(int(floor(v_uv.x)), int(floor(v_uv.y)));
+        int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));
         if (raw == 0) discard;
         rgb = col5(raw);
         stp = (raw >> 15) & 1;
     } else {
         /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base
          * (cutout + STP authority), the neighbours lie toward the sub-texel
-         * offset and clamp to v_limits, and each texel's weight is gated by its
-         * opacity with the colour renormalised. */
-        int iu = int(floor(v_uv.x)), iv = int(floor(v_uv.y));
-        float fx = v_uv.x - float(iu) - 0.5, fy = v_uv.y - float(iv) - 0.5;
+         * offset and clamp to v_limits. Transparent neighbours are ignored and
+         * the colour is renormalised, but a transparent base stays cut out.
+         * v_uv is aligned for PS1 top-left point sampling; recenter the
+         * bilinear footprint so 1x rect tiles sample their own texels. */
+        uv += vec2(pc.u_shift);
+        int iu = int(floor(uv.x)), iv = int(floor(uv.y));
+        float fx = uv.x - float(iu) - 0.5, fy = uv.y - float(iv) - 0.5;
         int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;
         fx = abs(fx); fy = abs(fy);
         int c00 = fetch_texel(iu, iv);
+        if (c00 == 0) discard;
         int c10 = fetch_texel(iu + sx, iv);
         int c01 = fetch_texel(iu, iv + sy);
         int c11 = fetch_texel(iu + sx, iv + sy);
@@ -75,7 +85,6 @@ void main() {
         float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;
         float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;
         float opac = w00 + w10 + w01 + w11;
-        if (opac < 0.5) discard;
         rgb = (col5(c00) * w00 + col5(c10) * w10 + col5(c01) * w01 + col5(c11) * w11) / opac;
         float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10
                     + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;

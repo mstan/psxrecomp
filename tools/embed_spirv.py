@@ -10,7 +10,7 @@ file extension.
 Usage:
   embed_spirv.py --glslc <glslc> --out <header.h> shader1.vert shader2.frag ...
 """
-import argparse, os, subprocess, sys, struct
+import argparse, os, subprocess, sys, struct, tempfile
 
 STAGE = {".vert": "vert", ".frag": "frag", ".comp": "comp"}
 
@@ -32,9 +32,19 @@ def main():
            "#define PSX_VK_SHADERS_SPV_H",
            "#include <stdint.h>", ""]
 
-    for sh in a.shaders:
+    # Scratch dir for the intermediate .spv files. It MUST NOT be the shader
+    # source dir: every runtime target (psx-runtime, psx-oracle, each game exe)
+    # runs this script over the SAME shaders, and under `ninja -j N` two of them
+    # overlap. Writing "<shader>.spv" next to the source made them race — one
+    # process removed the file the other had just written, and the loser died
+    # with FileNotFoundError on a shader it had compiled successfully. Keeping
+    # the scratch per-invocation makes concurrent runs independent, and the
+    # TemporaryDirectory also stops a crash from leaving .spv litter in the
+    # source tree.
+    with tempfile.TemporaryDirectory(prefix="psx_spirv_") as scratch:
+      for sh in a.shaders:
         name, stage = ident(sh)
-        spv = sh + ".spv"
+        spv = os.path.join(scratch, os.path.basename(sh) + ".spv")
         cmd = [a.glslc, "--target-env=vulkan1.1", "-O", sh, "-o", spv]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:

@@ -23,16 +23,21 @@ OpenBIOS; then a retail BIOS is required and the player is prompted for one.
 
 ## What counts as "chosen"
 
-Only a deliberate act by the player:
+A deliberate act by the player:
 
 - `--bios <path>` on the command line, or
 - a BIOS selected in the launcher / settings, which is then remembered.
 
-**Finding a BIOS file on disk does not count.** Earlier versions searched
-directories near the executable and would quietly adopt whatever they found.
-That made behaviour depend on what happened to be lying around — two players
-with identical builds could get different BIOSes. Discovery is no longer a
-selection mechanism.
+**Setup / Generate first-run discovery.** When there is no `bios.cfg` yet (and
+no settings pick), install & build looks next to the executable / project for a
+validated retail dump (`SCPH1001.BIN` and common filename variants; size + CRC
+must match the compiled-in retail image). If found, that path is written to
+`bios.cfg` and used for Generate & Play. If not found, the build stays on
+**OpenBIOS** with no prompt.
+
+Discovery does **not** run when `bios.cfg` already exists — including after the
+player cleared the pick to OpenBIOS. Play-time resolution still never invents a
+BIOS from random files on disk once a choice has been recorded.
 
 A player who has chosen a BIOS can clear that choice and go back to OpenBIOS;
 the choice is not permanent.
@@ -116,6 +121,44 @@ not valid under the other. Savestates therefore record which BIOS was active and
 refuse to load under a different one. Without that check, switching BIOS would
 silently corrupt a restored state — the only quiet failure mode in this design,
 which is why it is enforced rather than warned about.
+
+Slot files are also isolated on disk under the per-game memcard root:
+
+- `<memcard_dir>/openbios/state_*_slot*.pst`
+- `<memcard_dir>/scph1001/state_*_slot*.pst`
+
+On first configure, any legacy loose `<memcard_dir>/state_*_slot*.pst` files are
+moved once by `.pst` header `bios_checksum` (bundled OpenBIOS wordsum →
+`openbios/`, otherwise → `scph1001/`). Memory cards stay in `<memcard_dir>/`;
+netplay guest sandbox remains `<memcard_dir>/netplay/` (unscoped).
+
+## Netplay lobby settle
+
+Online and LAN lobbies advertise a per-peer BIOS offer and freeze a single
+session BIOS at host Start (`openbios` or `scph1001`):
+
+- **Online:** `bios_offer` on `set_ready` → host publishes
+  `match_caps.session_bios`.
+- **LAN:** peers append offer fields on `MOTK3 JOIN`; host broadcasts them on
+  `MOTK4 UPDATE` and includes the settled token on `MOTK1 START`.
+
+Settle rule (same for both):
+
+- **OpenBIOS** if any seated peer prefers OpenBIOS, or any peer cannot run
+  SCPH-1001 (no linked retail backend and/or no validated dump), or a peer
+  sends no offer (legacy client).
+- **SCPH-1001** only when every seated peer can run it and nobody selected
+  OpenBIOS.
+
+Every peer applies that session BIOS before boot. Mixed BIOSes are invalid for
+rollback (kernel RAM layout differs). If the session settles to SCPH-1001 but a
+peer has no validated dump, that peer **aborts the launch** rather than silently
+falling back to OpenBIOS (which would desync immediately).
+
+Session BIOS is **ephemeral**: it affects only that match’s runtime boot. It
+does **not** rewrite `bios.cfg`, `settings.toml`, or the launcher Settings BIOS
+row. Soft-return shows the player’s durable preference again; the next Start
+re-settles from offers as usual.
 
 ## Why both are compiled in
 

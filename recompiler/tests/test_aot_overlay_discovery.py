@@ -1398,9 +1398,15 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
 '''
         for reader in ('complete', 'coverage'):
             with tempfile.TemporaryDirectory() as tmp:
-                final = os.path.join(tmp, "00010000_DEADBEEF.dll")
+                # Name the shard with the platform's real extension. The
+                # coverage reader re-derives the shard path from the .ranges
+                # name via overlay_ext(), so a hardcoded ".dll" made it lock
+                # <stem>.so.pair-lock on Linux while the writer held
+                # <stem>.dll.pair-lock -- different files, no contention, and
+                # the reader sailed through the publication window.
+                final = os.path.join(tmp, "00010000_DEADBEEF" + MOD.overlay_ext())
                 ranges = os.path.splitext(final)[0] + '.ranges'
-                staged = os.path.join(tmp, ".new.dll")
+                staged = os.path.join(tmp, ".new" + MOD.overlay_ext())
                 staged_ranges = os.path.join(tmp, ".new.ranges")
                 paused = os.path.join(tmp, "paused")
                 pathlib.Path(final).write_bytes(b"OLD-DLL")
@@ -3405,9 +3411,17 @@ def check_full_candidate_cli_fastpath(recompiler):
 
         game_toml = ROOT / 'tools' / 'cycle_testrom' / 'game.toml'
         cache_root = tmp / 'cache'
+        # MUST match compile_overlays.py's cache_dir exactly, including the
+        # _gc<config-hash> component — a prefill staged one directory off is
+        # simply not found, and the run then compiles for real instead of
+        # taking the fast path this test exists to assert. This drifted when
+        # the config hash was added to the cache path and went unnoticed
+        # because the test could not get past the BIOS-profile probe to reach
+        # the assertion (issue #72).
         leaf = (cache_root / 'CYCT-00101' / 'gcc' / MOD.cache_arch_abi() /
                 f'cg{MOD.codegen_ver(str(runtime_include))}_'
-                f'{MOD.codegen_hash(str(runtime_include)):08x}')
+                f'{MOD.codegen_hash(str(runtime_include)):08x}_'
+                f'gc{MOD.overlay_config_hash(recompiler, str(game_toml)):08x}')
         leaf.mkdir(parents=True)
         pair_id = 0x123456789ABCDEF0
         captured_bytes = b'\x08\x00\xE0\x03\x00\x00\x00\x00'
@@ -3468,6 +3482,13 @@ def check_full_candidate_cli_fastpath(recompiler):
             '--game-toml', str(game_toml),
             '--recompiler', recompiler,
             '--runtime-include', str(runtime_include),
+            # This fixture stages a SYNTHETIC runtime_include in a temp dir, so
+            # the framework root cannot be derived from it the way a normal
+            # invocation derives it. Naming the root explicitly is exactly what
+            # --project-root is for; without it the recompiler would probe
+            # dirname(game.toml) for the BIOS profile and every shard would die
+            # with "no BIOS profile found" (issue #72).
+            '--project-root', str(ROOT),
             '--gcc', gcc,
             '--out-dir', str(cache_root),
             '--jobs', '1',
@@ -3537,6 +3558,87 @@ def check_resident_marker_fixed_point():
         assert not marker.exists()
 
 
+def check_packaged_game_toml_resolves_bios_profile(recompiler):
+    """A game.toml OUTSIDE the framework root must still find a BIOS profile.
+
+    Regression for issue #72. compile_overlays.py spawns the recompiler with
+    cwd = dirname(game.toml), and that cwd is also where the recompiler probes
+    for bios/SCPH1001.toml when the config carries no explicit bios_config
+    (--ws-config deliberately does not adopt the config's paths). For a
+    PACKAGED config — packaging/release/game.toml — the directory holds neither
+    a profile nor a vendored framework, so every shard died with
+    "FATAL: no BIOS profile found" and the cache silently failed to build.
+
+    Two assertions, because the fix has two halves:
+      1. --project-root makes the probe search a directory we name.
+      2. compile_overlays.py defaults that root to the framework (derived from
+         the required --runtime-include), so the invocation the packager prints
+         works as written, with no new flag.
+    """
+    profile_rel = pathlib.Path('bios') / 'SCPH1001.toml'
+    assert (ROOT / profile_rel).is_file(), 'framework must ship a BIOS profile'
+
+    with tempfile.TemporaryDirectory() as td:
+        # A directory with no profile under it and no framework one level down:
+        # the packaged-config shape.
+        staged = pathlib.Path(td) / 'packaging' / 'release'
+        staged.mkdir(parents=True)
+        exe = staged / 'frag.psx'
+        exe.write_bytes(b'not-a-ps-x-exe')
+
+        def run(extra):
+            return subprocess.run(
+                [recompiler, str(exe), '--overlay',
+                 '--out-dir', str(pathlib.Path(td) / 'out')] + extra,
+                cwd=str(staged), capture_output=True, text=True, timeout=60)
+
+        # Without a root, the probe searches the packaged dir and fails — and
+        # the message must NAME that directory, or the cause is invisible.
+        bare = run([])
+        assert 'no BIOS profile found' in bare.stderr, bare.stderr
+        assert str(staged) in bare.stderr.replace('/', os.sep), bare.stderr
+
+        # With the framework as the root, profile resolution succeeds. The run
+        # still fails afterwards (frag.psx is not a real PS-X EXE) — what this
+        # asserts is that it got PAST the profile probe.
+        rooted = run(['--project-root', str(ROOT)])
+        assert 'no BIOS profile found' not in rooted.stderr, rooted.stderr
+
+        # A vendored framework one level down under an arbitrary name (Ape
+        # Escape vendors it as psxrecomp-v4) must also resolve.
+        vendored = pathlib.Path(td) / 'gamerepo'
+        (vendored / 'psxrecomp-v4' / 'bios').mkdir(parents=True)
+        shutil.copy(ROOT / profile_rel, vendored / 'psxrecomp-v4' / profile_rel)
+        nested = run(['--project-root', str(vendored)])
+        assert 'no BIOS profile found' not in nested.stderr, nested.stderr
+
+        # A non-directory root is a caller error and must fail loudly rather
+        # than silently falling back to the cwd probe.
+        bogus = run(['--project-root', str(exe)])
+        assert bogus.returncode == 1, bogus.stderr
+        assert 'is not a directory' in bogus.stderr, bogus.stderr
+
+    # Half 2: the default. compile_overlays.py must derive the framework root
+    # from --runtime-include so no caller has to pass the flag.
+    class _Args:
+        pass
+    args = _Args()
+    args.runtime_include = str(ROOT / 'runtime' / 'include')
+    args.project_root = None
+    derived = MOD.recompiler_project_root_args(args)
+    assert derived == ['--project-root', str(ROOT)], derived
+    # An explicit value wins over the derivation.
+    args.project_root = str(ROOT / 'tools')
+    assert MOD.recompiler_project_root_args(args) == [
+        '--project-root', str(ROOT / 'tools')]
+    # A --runtime-include that does not sit under a framework root yields no
+    # flag at all, so a caller that used to work is never altered.
+    args.project_root = None
+    args.runtime_include = str(pathlib.Path(tempfile.gettempdir()) /
+                               'nonexistent' / 'runtime' / 'include')
+    assert MOD.recompiler_project_root_args(args) == []
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -3575,6 +3677,7 @@ def main():
     check_full_hosted_fixed_point(args.recompiler)
     check_full_candidate_cli_fastpath(args.recompiler)
     check_resident_marker_fixed_point()
+    check_packaged_game_toml_resolves_bios_profile(args.recompiler)
 
     data = bytearray(0x200)
 

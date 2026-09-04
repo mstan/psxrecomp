@@ -36,6 +36,20 @@ int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
     return 1;
 }
 
+int iso_read_subq(void* handle, uint32_t lba, uint8_t* buffer, int size,
+                  int* valid) {
+    if (!handle || !buffer || size < 12 || !valid) return 0;
+    bool crc_valid = false;
+    if (!static_cast<PS1::ISOReader*>(handle)->ReadSubChannelQ(
+            lba, buffer, &crc_valid)) return 0;
+    *valid = crc_valid ? 1 : 0;
+    return 1;
+}
+
+int iso_has_subq_replacements(void* handle) {
+    return handle && static_cast<PS1::ISOReader*>(handle)->HasSubChannelReplacements();
+}
+
 uint32_t iso_sector_count(void* handle) {
     if (!handle) return 0;
     auto* reader = static_cast<PS1::ISOReader*>(handle);

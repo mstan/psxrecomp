@@ -1,0 +1,23 @@
+# Deprecated stub — use the full template:
+#
+#   docs/ci/templates/setup-release.yml
+#
+# Install:
+#   cp psxrecomp/docs/ci/templates/setup-release.yml .github/workflows/release.yml
+#
+# Guide: docs/GAME_PROJECT_SETUP.md
+# Actions: docs/ci/README.md
+
+name: Release builds (see docs/ci/templates/setup-release.yml)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  redirect:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "Copy psxrecomp/docs/ci/templates/setup-release.yml to .github/workflows/release.yml"
+          echo "See psxrecomp/docs/GAME_PROJECT_SETUP.md"
+          exit 1

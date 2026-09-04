@@ -1,7 +1,10 @@
 #include "mod_runtime.h"
 
 #include "disc_path.h"
+#include "iso_reader.h"
 #include "mod_packages.h"
+#include "mod_plugins.h"
+#include "gpu.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -33,6 +36,14 @@
 
 extern "C" uint8_t psx_read_byte(uint32_t addr);
 extern "C" void psx_write_byte(uint32_t addr, uint8_t value);
+extern "C" uint16_t psx_read_half(uint32_t addr);
+extern "C" void psx_write_half(uint32_t addr, uint16_t value);
+extern "C" uint32_t psx_read_word(uint32_t addr);
+extern "C" void psx_write_word(uint32_t addr, uint32_t value);
+extern "C" uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
+extern "C" uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size,
+                                                  uint32_t alignment);
+extern "C" int psx_ws_x_margin(void);
 extern "C" void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 extern "C" int fntrace_is_game_started(void);
 
@@ -58,10 +69,22 @@ struct RuntimeMods {
     bool main_applied = false;
     bool disc_enabled = false;
     bool disc_guard_failed = false;
+    const ModResolution::Plugin* current_plugin = nullptr;
 };
 
 RuntimeMods& state() {
     static RuntimeMods value;
+    return value;
+}
+
+struct FunctionEntryPlugin {
+    std::string id;
+    uint32_t address = 0;
+    PSXModFunctionEntryCallback callback = nullptr;
+};
+
+std::vector<FunctionEntryPlugin>& function_entry_plugins() {
+    static std::vector<FunctionEntryPlugin> value;
     return value;
 }
 
@@ -84,6 +107,22 @@ std::string selected_value(const ModPackage& package, const ModOption& option) {
         if (value != selection->second.values.end()) return value->second;
     }
     return option.default_value;
+}
+
+/* Resolve the manifest's disabled_by link against the CURRENT selection: the
+ * named boolean sibling being true makes this option inert. Both the launcher
+ * (greys the control) and psx_mod_option_value (returns the default instead of
+ * a stale value) go through this, so the UI and the plugins can never disagree
+ * about whether a control counts. */
+bool option_is_disabled(const ModPackage& package, const ModOption& option) {
+    if (option.disabled_by.empty()) return false;
+    for (const ModOption& other : package.options) {
+        if (other.feature_id != option.feature_id ||
+            other.id != option.disabled_by)
+            continue;
+        return selected_value(package, other) == "true";
+    }
+    return false;
 }
 
 void build_disc_index(RuntimeMods& s) {
@@ -116,13 +155,104 @@ void set_error(const std::string& error) {
     state().error = error;
 }
 
+void apply_main_write(const ModResolution::Write& write) {
+    if (write.fields.empty()) {
+        for (size_t i = 0; i < write.replacement.size(); ++i)
+            psx_write_byte((uint32_t)write.location + (uint32_t)i,
+                           write.replacement[i]);
+        dirty_ram_mark_executable_range(
+            (uint32_t)write.location & 0x1FFFFFFFu,
+            (uint32_t)write.replacement.size());
+        return;
+    }
+    for (const ModResolution::Write::Field& field : write.fields) {
+        for (size_t i = 0; i < field.replacement.size(); ++i)
+            psx_write_byte(
+                (uint32_t)write.location +
+                    (uint32_t)field.offset + (uint32_t)i,
+                field.replacement[i]);
+        dirty_ram_mark_executable_range(
+            ((uint32_t)write.location +
+             (uint32_t)field.offset) & 0x1FFFFFFFu,
+            (uint32_t)field.replacement.size());
+    }
+}
+
+bool restored_main_matches_plan(const RuntimeMods& s, uint32_t& failed_at) {
+    std::map<uint32_t, uint8_t> desired;
+    for (const ModResolution::Write& write : s.plan.writes) {
+        if (write.target != ModPatchTarget::MainExe) continue;
+        if (write.fields.empty()) {
+            for (size_t i = 0; i < write.replacement.size(); ++i)
+                desired[(uint32_t)write.location + (uint32_t)i] =
+                    write.replacement[i];
+        } else {
+            for (const ModResolution::Write::Field& field : write.fields) {
+                for (size_t i = 0; i < field.replacement.size(); ++i)
+                    desired[
+                        (uint32_t)write.location +
+                        (uint32_t)field.offset + (uint32_t)i] =
+                        field.replacement[i];
+            }
+        }
+    }
+
+    for (const ModResolution::Write& write : s.plan.writes) {
+        if (write.target != ModPatchTarget::MainExe) continue;
+        for (size_t i = 0; i < write.expected.size(); ++i) {
+            const uint32_t address =
+                (uint32_t)write.location + (uint32_t)i;
+            const uint8_t observed = psx_read_byte(address);
+            if (observed == write.expected[i]) continue;
+            const auto replacement = desired.find(address);
+            if (replacement != desired.end() &&
+                observed == replacement->second)
+                continue;
+            failed_at = address;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool sha256_file(const std::filesystem::path& path, std::string& out,
                  std::string* error) {
     out.clear();
     if (path.empty()) return true;
-    const std::filesystem::path input = resolve_disc_path(path).data;
+    const DiscPathResolution resolved = resolve_disc_path(path);
+    const std::filesystem::path input = resolved.data;
     psx_sha256_ctx hash;
     psx_sha256_init(&hash);
+    std::string extension = resolved.mount.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    if (extension == ".chd") {
+        PS1::ISOReader disc;
+        if (!disc.Open(resolved.mount.string())) {
+            if (error) *error =
+                "cannot decode image fingerprint: " + resolved.mount.string();
+            return false;
+        }
+        std::array<uint8_t, 2352> sector{};
+        for (uint32_t lba = 0; lba < disc.GetSectorCount(); ++lba) {
+            if (!disc.ReadRawSector(lba, sector.data())) {
+                if (error) *error =
+                    "cannot finish decoding image fingerprint: " +
+                    resolved.mount.string();
+                return false;
+            }
+            psx_sha256_update(&hash, sector.data(), sector.size());
+        }
+        uint8_t digest[32];
+        psx_sha256_final(&hash, digest);
+        std::ostringstream text;
+        for (uint8_t byte : digest)
+            text << std::hex << std::setw(2) << std::setfill('0')
+                 << (unsigned)byte;
+        out = text.str();
+        return true;
+    }
+
     std::array<uint8_t, 1024 * 1024> buffer{};
     std::ifstream file(input, std::ios::binary);
     if (!file) {
@@ -187,6 +317,53 @@ std::filesystem::path raw_image_path(const std::filesystem::path& path,
 bool sha256_disc_range(const std::filesystem::path& image,
                        ModPatchTarget target, uint64_t location, size_t size,
                        std::string& out, std::string* error) {
+    std::string extension = image.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    if (extension == ".chd") {
+        PS1::ISOReader disc;
+        if (!disc.Open(image.string())) {
+            if (error) *error = "cannot open stock CHD range: " + image.string();
+            return false;
+        }
+        psx_sha256_ctx hash;
+        psx_sha256_init(&hash);
+        std::array<uint8_t, 2352> sector{};
+        size_t remaining = size;
+        uint64_t at = location;
+        const uint64_t sector_size =
+            target == ModPatchTarget::DiscRaw ? 2352u : 2048u;
+        while (remaining != 0) {
+            const uint64_t lba64 = at / sector_size;
+            if (lba64 >= disc.GetSectorCount()) {
+                if (error) *error = "overlay expected range exceeds stock CHD";
+                return false;
+            }
+            const size_t within = (size_t)(at % sector_size);
+            const bool read_ok =
+                target == ModPatchTarget::DiscRaw
+                    ? disc.ReadRawSector((uint32_t)lba64, sector.data())
+                    : disc.ReadSector((uint32_t)lba64, sector.data());
+            if (!read_ok) {
+                if (error) *error = "cannot decode stock CHD overlay range";
+                return false;
+            }
+            const size_t chunk =
+                std::min(remaining, (size_t)sector_size - within);
+            psx_sha256_update(&hash, sector.data() + within, chunk);
+            at += chunk;
+            remaining -= chunk;
+        }
+        uint8_t digest[32];
+        psx_sha256_final(&hash, digest);
+        std::ostringstream text;
+        for (uint8_t byte : digest)
+            text << std::hex << std::setw(2) << std::setfill('0')
+                 << (unsigned)byte;
+        out = text.str();
+        return true;
+    }
+
     const std::filesystem::path source = raw_image_path(image, error);
     if (source.empty()) return false;
     std::ifstream file(source, std::ios::binary);
@@ -435,11 +612,24 @@ int provider_package_get(void*, int index, RecompLauncherCModPackage* out) {
     copy_text(out->version, sizeof(out->version), package->version);
     copy_text(out->name, sizeof(out->name), package->name);
     copy_text(out->author, sizeof(out->author), package->author);
+    out->author_link_count = std::min(
+        (int)package->author_links.size(), RECOMP_LAUNCHER_MOD_AUTHOR_LINK_MAX);
+    for (int i = 0; i < out->author_link_count; ++i) {
+        copy_text(out->author_links[i].name, sizeof(out->author_links[i].name),
+                  package->author_links[(size_t)i].name);
+        copy_text(out->author_links[i].url, sizeof(out->author_links[i].url),
+                  package->author_links[(size_t)i].url);
+    }
     copy_text(out->description, sizeof(out->description), package->description);
     copy_text(out->license, sizeof(out->license), package->license);
+    copy_text(out->source_name, sizeof(out->source_name), package->source_name);
+    copy_text(out->source_url, sizeof(out->source_url), package->source_url);
     out->enabled = package_has_enabled_feature(*package);
     out->option_count = (int)package->options.size();
-    out->removable = !out->enabled;
+    /* A bundled package is build output. Offering to remove it would succeed
+     * and then be silently undone by the next build. */
+    out->removable = !out->enabled &&
+                     package->origin == ModPackageOrigin::Installed;
     return 1;
 }
 
@@ -463,6 +653,7 @@ int provider_option_get(void*, const char* package_id, int index,
     out->max_value = option.max_value;
     out->step = option.step;
     out->choice_count = (int)option.choices.size();
+    out->disabled = option_is_disabled(*package, option) ? 1 : 0;
     return 1;
 }
 
@@ -539,9 +730,34 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     copy_text(out->package_version, sizeof(out->package_version), package->version);
     copy_text(out->package_name, sizeof(out->package_name), package->name);
     copy_text(out->name, sizeof(out->name), feature->name);
-    copy_text(out->author, sizeof(out->author), package->author);
+    copy_text(out->author, sizeof(out->author),
+              feature->author.empty() ? package->author : feature->author);
+    out->author_link_count = std::min(
+        (int)package->author_links.size(), RECOMP_LAUNCHER_MOD_AUTHOR_LINK_MAX);
+    for (int i = 0; i < out->author_link_count; ++i) {
+        copy_text(out->author_links[i].name, sizeof(out->author_links[i].name),
+                  package->author_links[(size_t)i].name);
+        copy_text(out->author_links[i].url, sizeof(out->author_links[i].url),
+                  package->author_links[(size_t)i].url);
+    }
     copy_text(out->description, sizeof(out->description), feature->description);
+    copy_text(out->source_name, sizeof(out->source_name), package->source_name);
+    copy_text(out->source_url, sizeof(out->source_url), package->source_url);
     copy_text(out->group, sizeof(out->group), feature->group);
+    out->hidden = feature->hidden ? 1 : 0;
+    switch (feature->channel) {
+        case ModChannel::Experimental:
+            out->channel = RECOMP_MOD_CHANNEL_EXPERIMENTAL;
+            break;
+        case ModChannel::Developer:
+            /* Only reachable on a local developer build: a shipped catalog
+             * carries no developer-channel feature to report. */
+            out->channel = RECOMP_MOD_CHANNEL_DEVELOPER;
+            break;
+        case ModChannel::Stable:
+            out->channel = RECOMP_MOD_CHANNEL_STABLE;
+            break;
+    }
     out->enabled =
         state().manager.feature_enabled(package->id, feature->id) ? 1 : 0;
     out->option_count =
@@ -583,6 +799,7 @@ int provider_feature_option_get(void*, const char* package_id,
     out->max_value = option.max_value;
     out->step = option.step;
     out->choice_count = (int)option.choices.size();
+    out->disabled = option_is_disabled(*package, option) ? 1 : 0;
     return 1;
 }
 
@@ -636,6 +853,69 @@ int provider_feature_set_option(void*, const char* package_id,
                 package_id, option_id, value, &error);
         return state().manager.set_feature_option(
             package_id, feature_id, option_id, value, &error);
+    });
+}
+
+int provider_feature_resource_count(void*, const char* package_id,
+                                    const char* feature_id) {
+    if (!package_id || !feature_id) return 0;
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return 0;
+    return (int)std::count_if(
+        package->resources.begin(), package->resources.end(),
+        [&](const ModResource& resource) {
+            return resource.feature_id == feature_id;
+        });
+}
+
+int provider_feature_resource_get(void*, const char* package_id,
+                                  const char* feature_id, int index,
+                                  RecompLauncherCModResource* out) {
+    if (!package_id || !feature_id || !out || index < 0) return 0;
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return 0;
+    for (const ModResource& resource : package->resources) {
+        if (resource.feature_id != feature_id) continue;
+        if (index-- != 0) continue;
+        const std::filesystem::path path =
+            state().manager.feature_resource_path(
+                package_id, feature_id, resource.id);
+        std::error_code ec;
+        const bool directory =
+            resource.format == "directory" || resource.format == "folder";
+        const bool verified = !path.empty() &&
+            (directory ? std::filesystem::is_directory(path, ec)
+                       : std::filesystem::is_regular_file(path, ec));
+        std::memset(out, 0, sizeof(*out));
+        copy_text(out->id, sizeof(out->id), resource.id);
+        copy_text(out->label, sizeof(out->label), resource.label);
+        copy_text(out->description, sizeof(out->description),
+                  resource.description);
+        copy_text(out->path, sizeof(out->path), path.string());
+        copy_text(out->status, sizeof(out->status),
+                  path.empty() ? "Not selected" :
+                      (verified ? "Selected" : "Selected path is missing"));
+        copy_text(out->file_patterns, sizeof(out->file_patterns),
+                  resource.file_patterns);
+        copy_text(out->file_description, sizeof(out->file_description),
+                  resource.file_description);
+        out->required = resource.required ? 1 : 0;
+        out->verified = verified ? 1 : 0;
+        copy_text(out->format, sizeof(out->format), resource.format);
+        return 1;
+    }
+    return 0;
+}
+
+int provider_feature_resource_set_path(void*, const char* package_id,
+                                       const char* feature_id,
+                                       const char* resource_id,
+                                       const char* path) {
+    if (!package_id || !feature_id || !resource_id || !path) return 0;
+    return mutate([&](std::string& error) {
+        return state().manager.set_feature_resource_path(
+            package_id, feature_id, resource_id,
+            std::filesystem::path(path), &error);
     });
 }
 
@@ -693,8 +973,9 @@ int provider_version_get(void*, const char* package_id, int index,
     copy_text(out->version, sizeof(out->version), version->first);
     const ModPackage* selected = selected_package(package_id);
     out->selected = selected && selected->version == version->first;
-    out->removable = !out->selected ||
-                     !selected || !package_has_enabled_feature(*selected);
+    out->removable = (!out->selected || !selected ||
+                      !package_has_enabled_feature(*selected)) &&
+                     version->second.origin == ModPackageOrigin::Installed;
     return 1;
 }
 
@@ -763,6 +1044,17 @@ int provider_commit(void*, const char* image_path) {
     return 1;
 }
 
+int provider_commit_netplay(void*, const char* image_path) {
+    (void)image_path;
+    std::string error;
+    if (!mod_runtime_clear_for_netplay(&error)) {
+        set_error(error);
+        return 0;
+    }
+    state().error.clear();
+    return 1;
+}
+
 const char* provider_error(void*) {
     return state().error.c_str();
 }
@@ -790,6 +1082,12 @@ RecompLauncherCModProvider provider = {
     provider_feature_set_option,
     provider_diagnostic_count,
     provider_diagnostic_get,
+    nullptr, /* archive_extension — PSX defaults */
+    nullptr, /* archive_description */
+    provider_commit_netplay,
+    provider_feature_resource_count,
+    provider_feature_resource_get,
+    provider_feature_resource_set_path,
 };
 #endif
 
@@ -826,6 +1124,11 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         if (error) *error = s.error;
         return false;
     }
+    /* A manifest that fails to parse used to be skipped in silence, so a mod
+     * author's typo produced a mod that simply did not exist. Name every one. */
+    for (const std::string& scan_error : s.manager.scan_errors())
+        std::fprintf(stderr, "psxrecomp: mod manifest ignored: %s\n",
+                     scan_error.c_str());
     if (!sha256_file(exe_path, s.exe_sha256, &s.error)) {
         /* Release installs commonly do not carry a loose PS-X EXE; game-id and
          * expected-byte guards remain available in that case. */
@@ -833,6 +1136,28 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         s.error.clear();
     }
     s.initialized = true;
+    return true;
+}
+
+bool mod_runtime_clear_for_netplay(std::string* error) {
+    RuntimeMods& s = state();
+    if (!s.initialized) {
+        if (error) error->clear();
+        return true;
+    }
+    s.plan = {};
+    s.validation = {};
+    s.raw_disc_index.clear();
+    s.user_disc_index.clear();
+    s.raw_overlay_index.clear();
+    s.user_overlay_index.clear();
+    s.effective_disc_path.clear();
+    s.main_applied = false;
+    s.disc_enabled = false;
+    s.disc_guard_failed = false;
+    s.error.clear();
+    if (error) error->clear();
+    std::fprintf(stdout, "psxrecomp: mods cleared for netplay (vanilla session)\n");
     return true;
 }
 
@@ -928,31 +1253,41 @@ extern "C" void mod_runtime_on_dispatch(uint32_t target) {
     }
     for (const ModResolution::Write& write : s.plan.writes) {
         if (write.target != ModPatchTarget::MainExe) continue;
-        if (write.fields.empty()) {
-            for (size_t i = 0; i < write.replacement.size(); ++i)
-                psx_write_byte((uint32_t)write.location + (uint32_t)i,
-                               write.replacement[i]);
-            dirty_ram_mark_executable_range(
-                (uint32_t)write.location & 0x1FFFFFFFu,
-                (uint32_t)write.replacement.size());
-        } else {
-            for (const ModResolution::Write::Field& field : write.fields) {
-                for (size_t i = 0; i < field.replacement.size(); ++i)
-                    psx_write_byte(
-                        (uint32_t)write.location +
-                            (uint32_t)field.offset + (uint32_t)i,
-                        field.replacement[i]);
-                dirty_ram_mark_executable_range(
-                    ((uint32_t)write.location +
-                     (uint32_t)field.offset) & 0x1FFFFFFFu,
-                    (uint32_t)field.replacement.size());
-            }
-        }
+        apply_main_write(write);
     }
     s.main_applied = true;
     if (!s.plan.writes.empty())
         std::fprintf(stdout, "psxrecomp: applied mod plan %s\n",
                      s.plan.fingerprint.c_str());
+}
+
+extern "C" void mod_runtime_on_savestate_loaded(void) {
+    using namespace PSXRecompV4;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return;
+
+    if (!s.main_applied) {
+        uint32_t failed_at = 0;
+        if (!restored_main_matches_plan(s, failed_at)) {
+            std::fprintf(stderr,
+                "psxrecomp: mod plan %s rejected after savestate restore at "
+                "0x%08X (expected-byte guard failed)\n",
+                s.plan.fingerprint.c_str(), (unsigned)failed_at);
+            return;
+        }
+    }
+
+    bool applied = false;
+    for (const ModResolution::Write& write : s.plan.writes) {
+        if (write.target != ModPatchTarget::MainExe) continue;
+        apply_main_write(write);
+        applied = true;
+    }
+    s.main_applied = true;
+    if (applied)
+        std::fprintf(stdout,
+            "psxrecomp: reapplied mod plan %s after savestate restore\n",
+            s.plan.fingerprint.c_str());
 }
 
 extern "C" void mod_runtime_enable_disc_patches(void) {
@@ -963,16 +1298,22 @@ extern "C" void mod_runtime_activate_plugins(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
-    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        s.current_plugin = &plugin;
         mod_invoke_activation_plugin(plugin.id);
+        s.current_plugin = nullptr;
+    }
 }
 
 extern "C" void mod_runtime_on_vblank(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
-    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        s.current_plugin = &plugin;
         mod_invoke_vblank_plugin(plugin.id);
+        s.current_plugin = nullptr;
+    }
 }
 
 extern "C" int psx_mod_game_started(void) {
@@ -1001,12 +1342,111 @@ extern "C" int psx_mod_option_value(const char* package_id,
     return 1;
 }
 
+extern "C" int psx_mod_current_resource_path(const char* resource_id,
+                                             char* out, uint32_t out_size) {
+    using namespace PSXRecompV4;
+    if (out && out_size) out[0] = '\0';
+    if (!resource_id || !resource_id[0] || !out || out_size == 0)
+        return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok || !s.current_plugin) return 0;
+    for (const ModResolution::Resource& resource : s.plan.resources) {
+        if (resource.package_id != s.current_plugin->package_id ||
+            resource.feature_id != s.current_plugin->feature_id ||
+            resource.id != resource_id)
+            continue;
+        const std::string text = resource.path.string();
+        if (text.empty() || text.size() + 1 > (size_t)out_size) return 0;
+        std::memcpy(out, text.c_str(), text.size() + 1);
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" uint8_t psx_mod_read_byte(uint32_t address) {
     return psx_read_byte(address);
 }
 
 extern "C" void psx_mod_write_byte(uint32_t address, uint8_t value) {
     psx_write_byte(address, value);
+}
+
+extern "C" uint16_t psx_mod_read_half(uint32_t address) {
+    return psx_read_half(address);
+}
+
+extern "C" void psx_mod_write_half(uint32_t address, uint16_t value) {
+    psx_write_half(address, value);
+}
+
+extern "C" uint32_t psx_mod_read_word(uint32_t address) {
+    return psx_read_word(address);
+}
+
+extern "C" void psx_mod_write_word(uint32_t address, uint32_t value) {
+    psx_write_word(address, value);
+}
+
+extern "C" void psx_mod_write_code_word(uint32_t address, uint32_t value) {
+    psx_write_word(address, value);
+    dirty_ram_mark_executable_range(address & 0x1FFFFFFFu, 4u);
+}
+
+extern "C" uint32_t psx_mod_alloc_guest_memory(uint32_t size,
+                                                uint32_t alignment) {
+    return psx_mod_memory_alloc(size, alignment);
+}
+
+extern "C" uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size,
+                                                  uint32_t alignment) {
+    return psx_mod_gpu_dma_memory_alloc(size, alignment);
+}
+
+extern "C" int32_t psx_mod_widescreen_x_margin(void) {
+    return (int32_t)psx_ws_x_margin();
+}
+
+/*
+ * The presenter's own view of the scanned-out picture. Plugins that draw
+ * overlay primitives need the real edge, and the visible width depends on the
+ * GP1(06h) horizontal range, which GPUSTAT does not carry -- so a plugin
+ * cannot derive this itself. Zero means "not established yet"; the header
+ * tells callers to skip drawing rather than guess.
+ */
+extern "C" uint32_t psx_mod_display_width(void) {
+    GpuDisplayInfo info;
+    std::memset(&info, 0, sizeof(info));
+    gpu_get_display_info(&info);
+    return info.width;
+}
+
+extern "C" uint32_t psx_mod_display_height(void) {
+    GpuDisplayInfo info;
+    std::memset(&info, 0, sizeof(info));
+    gpu_get_display_info(&info);
+    return info.height;
+}
+
+extern "C" int psx_mod_register_function_entry_plugin(
+    const char* id, uint32_t address, PSXModFunctionEntryCallback callback) {
+    using namespace PSXRecompV4;
+    if (!id || !*id || !address || !callback) return 0;
+    auto& plugins = function_entry_plugins();
+    const auto duplicate = std::find_if(
+        plugins.begin(), plugins.end(), [&](const FunctionEntryPlugin& item) {
+            return item.id == id && item.address == address;
+        });
+    if (duplicate != plugins.end()) return 0;
+    plugins.push_back(FunctionEntryPlugin{id, address, callback});
+    return 1;
+}
+
+extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
+    using namespace PSXRecompV4;
+    if (!cpu) return;
+    for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
+        if (plugin.address == address) plugin.callback(cpu, address);
+    }
 }
 
 extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,

@@ -1,0 +1,9 @@
+# Vendored archives are opt-in. Only libchdr — the one dependency the build
+# cannot satisfy locally — is committed; tools/ci/vendor_deps.sh stages the
+# rest here on demand for air-gapped builds, and those must not be committed
+# (SDL3 alone is ~15 MB).
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.zip
+!libchdr-*.tar.gz

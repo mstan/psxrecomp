@@ -11,7 +11,7 @@ FunctionAnalyzer::FunctionAnalyzer(const PS1Executable& exe) : exe_(exe) {}
 
 void FunctionAnalyzer::add_forced_entry(uint32_t addr) {
     // Validate address is within the EXE range
-    if (addr >= exe_.header.load_address && addr < exe_.end_address()) {
+    if (addr >= exe_.header.load_address && addr < exe_.analysis_end_address()) {
         forced_entry_points_.push_back(addr);
     }
 }
@@ -783,7 +783,7 @@ bool resolve_exact_bounded_jump_table(
     };
     if (producer_lo == 0u && producer_hi == 0u) {
         producer_lo = exe.header.load_address;
-        producer_hi = exe.end_address();
+        producer_hi = exe.analysis_end_address();
     }
     if (producer_lo >= producer_hi || (producer_lo & 3u) != 0u ||
         (producer_hi & 3u) != 0u) {
@@ -1120,8 +1120,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
 
     fmt::print("\n=== Exact-Entry Function Analysis ===\n\n");
 
+    // Discovery bound, NOT the read bound. An overlay capture deliberately
+    // carries trailing delay-slot guard words (ps1_exe_parser.h exe_tag):
+    // readable so a branch at the last analysable word can emit its slot, but
+    // never admissible as code themselves, because the word after a guard
+    // word does not exist in the image.
     auto in_exe = [&](uint32_t addr) {
-        return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;
+        return addr >= exe_.header.load_address && addr < exe_.analysis_end_address() && (addr & 3u) == 0;
     };
 
     auto producer_for = [&](uint32_t addr) -> int {
@@ -1274,7 +1279,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                     } else {
                         ExactJumpTable table;
                         uint32_t producer_lo = exe_.header.load_address;
-                        uint32_t producer_hi = exe_.end_address();
+                        uint32_t producer_hi = exe_.analysis_end_address();
                         if (entry_producer >= 0) {
                             producer_lo = producer_ranges[entry_producer].first;
                             producer_hi = producer_ranges[entry_producer].second;
@@ -1346,7 +1351,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> candidate_evidence;
         for (size_t i = 0; i < round_entries.size(); i++) {
             uint32_t hard_cap = (i + 1 < round_entries.size())
-                ? round_entries[i + 1] : exe_.end_address();
+                ? round_entries[i + 1] : exe_.analysis_end_address();
             ExactWalkResult wr = walk(round_entries[i], hard_cap);
             candidate_targets.insert(wr.direct_jal_targets.begin(),
                                      wr.direct_jal_targets.end());
@@ -1381,7 +1386,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
             auto owner_it = std::prev(target_it);
             auto next_it = std::next(target_it);
             uint32_t hard_cap = next_it != known_entries.end()
-                ? *next_it : exe_.end_address();
+                ? *next_it : exe_.analysis_end_address();
             ExactWalkResult owner_walk = walk(*owner_it, hard_cap);
             if (owner_walk.visited.count(target)) {
                 known_entries.erase(target_it);
@@ -1401,7 +1406,11 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
 
     for (size_t i = 0; i < starts_vec.size(); i++) {
         uint32_t entry = starts_vec[i];
-        uint32_t hard_cap = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : exe_.end_address();
+        // The final entry's cap is the ANALYSIS end, not the image end, so a
+        // walk that falls through the last real word of an overlay capture
+        // stops there instead of absorbing the trailing guard word into
+        // func.end_addr (which made the guard word the last block's leader).
+        uint32_t hard_cap = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : exe_.analysis_end_address();
         ExactWalkResult wr = walk(entry, hard_cap);
         if (wr.visited.empty()) continue;
 
@@ -1446,7 +1455,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     for (size_t i = 0; i < starts_vec.size(); i++) {
         uint32_t host_start = starts_vec[i];
         uint32_t hard_cap = (i + 1 < starts_vec.size())
-            ? starts_vec[i + 1] : exe_.end_address();
+            ? starts_vec[i + 1] : exe_.analysis_end_address();
         ExactWalkResult wr = walk(host_start, hard_cap);
         if (wr.visited.empty()) continue;
         uint32_t host_end = *wr.visited.rbegin() + 4u;
@@ -1492,7 +1501,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     std::vector<uint32_t> return_addresses;
 
     uint32_t current_addr = exe_.header.load_address;
-    uint32_t end_addr = exe_.end_address();
+    uint32_t end_addr = exe_.analysis_end_address();
 
     fmt::print("Scanning {} KB of code for function returns...\n",
                (end_addr - current_addr) / 1024);
@@ -1546,7 +1555,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     fmt::print("Following JAL call targets to discover additional functions...\n");
 
     uint32_t exe_start = exe_.header.load_address;
-    uint32_t exe_end   = exe_.end_address();
+    uint32_t exe_end   = exe_.analysis_end_address();
 
     for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
         auto word_opt = exe_.read_word(addr);
@@ -1841,7 +1850,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     // tables minted as function starts (those never walk as clean code:
     // ~44% of random data words carry an invalid primary opcode).
     auto in_exe_p3 = [&](uint32_t a) {
-        return a >= exe_.header.load_address && a < exe_.end_address() && (a & 3u) == 0;
+        return a >= exe_.header.load_address && a < exe_.analysis_end_address() && (a & 3u) == 0;
     };
     // Same primary-opcode validity table as is_likely_data_section so the two
     // agree on what "clean code" means (COP2/GTE, LWC2/SWC2 are valid PS1 ops).

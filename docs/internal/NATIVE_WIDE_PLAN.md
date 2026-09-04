@@ -207,7 +207,7 @@ Once native-wide reaches parity, remove the squash codepath entirely:
 `s_ws_xnum/xden`, the present-stretch (`g_logical_w` stretch semantics),
 `gte_set_display_aspect` squash math, `psx_ws_backdrop_x` squash, the
 depth-gated un-squash, and the now-dead compensation patches. Update
-`WIDESCREEN.md`. No dual-mode left behind.
+`../WIDESCREEN.md`. No dual-mode left behind.
 
 ---
 

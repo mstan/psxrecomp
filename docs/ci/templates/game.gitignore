@@ -1,0 +1,81 @@
+# Suggested .gitignore for a PSXRecomp game repository.
+# setup_project copies the New Project Layout equivalent (gitignore.in).
+# Adjust title-specific disc dirs (e.g. /motk/ /bpe/) if you use them.
+
+# Build outputs
+/build/
+/build-*/
+/out/
+/.happypath/
+
+# Setup-host: leave generated/ gitignored (users generate locally).
+# Titles that still CI-build from committed game C may track generated/ instead.
+/generated/
+
+# Release packaging
+/release-stage/
+/dist/
+*.zip
+
+# Local PlayStation assets (never commit)
+/bios/
+/isos/
+/saves/
+/prepared_disc/
+/disc/
+.settings/
+
+# Disc / image / memcard formats
+*.bin
+*.cue
+*.iso
+*.img
+*.sub
+*.ccd
+*.mcd
+*.mcr
+*.chd
+*.car
+SCPH*.BIN
+
+bios.cfg
+disc.cfg
+rom.cfg
+settings.toml
+
+# Local analysis scratch — GPU frame captures / parity dumps (the default
+# --out for tools/gpu_frame_*.py and gpu_parity.py) and asset rips pulled off
+# the disc. Multi-hundred-MB binaries land here and are rejected by GitHub's
+# 100 MB blob limit, and ripped disc content must never be committed at all.
+/analysis/
+
+# Ghidra / local analysis
+/ghidra/projects/
+*.gpr
+*.rep/
+*.lock
+*.lock~
+
+# Editor / cache
+.vs/
+.vscode/
+*.user
+*.log
+.DS_Store
+__pycache__/
+
+# Runtime artifacts from psx-runtime launches
+psx_crash.txt
+psx_last_run_report.json
+psx_screenshot.bmp
+psx_freeze_heartbeat.json
+.psxrecomp_last_generate
+.psxrecomp_write_probe
+starvation_dump.jsonl
+
+# Diagnostic dumps (root-level) — keep catalog / probe trackable
+/*.json
+/*.bmp
+/*.png
+!/catalog_identity.json
+!/disc_probe.json

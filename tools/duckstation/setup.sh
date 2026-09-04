@@ -16,7 +16,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DUCK="$REPO_ROOT/duckstation"
 PATCH="$REPO_ROOT/tools/duckstation/psxrecomp_oracle.patch"
-UPSTREAM_BASE="ffb33c281d196eb8ee0f559085ca285de7cdd51b"  # stenzek/master at time of daa1808
+# The pin lives in pin.json so this script and duckstation_oracle.py (the
+# Linux/macOS path) can never drift onto different upstream bases.
+UPSTREAM_BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream_base"])' "$REPO_ROOT/tools/duckstation/pin.json")"
 
 log() { echo "[duckstation-setup] $*"; }
 

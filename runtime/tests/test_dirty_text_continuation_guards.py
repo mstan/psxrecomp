@@ -9,6 +9,8 @@ def main() -> int:
     root = Path(__file__).resolve().parents[2]
     memory = (root / "runtime/src/memory.c").read_text(encoding="utf-8")
     interp = (root / "runtime/src/dirty_ram_interp.c").read_text(encoding="utf-8")
+    compat = (root / "runtime/src/game_dispatch_compat.c").read_text(encoding="utf-8")
+    runtime_cmake = (root / "runtime/runtime.cmake").read_text(encoding="utf-8")
 
     start = memory.index("int dirty_ram_text_native_ok_ranges_from(")
     end = memory.index("\n/* Preserve the generated-code ABI", start)
@@ -29,12 +31,22 @@ def main() -> int:
         raise AssertionError("legacy generated-code ABI is not preserved")
 
     handoff = "clean_game_text_miss && interp_enter_compiled(cpu, "
-    if interp.count(handoff) != 2:
-        raise AssertionError("expected transfer and call-return continuation handoffs")
+    if interp.count(handoff) != 1:
+        raise AssertionError("expected one suffix-validated transfer handoff")
     if "interp_enter_compiled(cpu, target)" not in interp:
         raise AssertionError("missing transfer-boundary continuation handoff")
+    if "psx_game_text_native_ok_full(pc) &&" not in interp:
+        raise AssertionError("straight-line handoff lacks full-range validation")
     if "interp_enter_compiled(cpu, pc)" not in interp:
         raise AssertionError("missing call-return continuation handoff")
+    if "PSX_GAME_DISPATCH_HAS_NATIVE_OK_FULL" not in compat:
+        raise AssertionError("older generated dispatchers lost full-guard compatibility")
+    if compat.count("int psx_game_text_native_ok_full(uint32_t addr)") != 3:
+        raise AssertionError("full-guard compatibility branches are incomplete")
+    if compat.count("int psx_game_text_native_ok_full(uint32_t addr)\n{\n    (void)addr;\n    return 0;\n}") != 3:
+        raise AssertionError("a dispatcher without the full ABI may accept an unsafe handoff")
+    if "has_game_dispatch_native_ok_full" not in runtime_cmake:
+        raise AssertionError("runtime does not detect the generated full-range ABI")
 
     print("dirty-text continuation guards: ok")
     return 0

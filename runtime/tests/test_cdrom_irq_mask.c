@@ -1,9 +1,7 @@
 /*
  * Validate PS1 CD-ROM interrupt mask matching.
  *
- * Build:
- *   cc -std=c99 -Wall -Wextra -Werror -I../src \
- *      -o test_cdrom_irq_mask test_cdrom_irq_mask.c
+ * Build/run: ctest -R cdrom_irq_mask_test
  */
 #include "cdrom_irq.h"
 

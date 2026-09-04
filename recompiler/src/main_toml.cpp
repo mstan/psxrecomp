@@ -93,7 +93,7 @@ static std::string id_from_exe(const fs::path& exe_path) {
 static std::set<uint32_t> find_jal_targets(const PSXRecomp::PS1Executable& exe) {
     std::set<uint32_t> targets;
     const uint32_t base = exe.load_address();
-    const uint32_t end = exe.end_address();
+    const uint32_t end = exe.analysis_end_address();
 
     for (uint32_t addr = base; addr + 4 <= end; addr += 4) {
         auto word = exe.read_word(addr);
@@ -116,7 +116,7 @@ static std::set<uint32_t> find_jal_targets(const PSXRecomp::PS1Executable& exe) 
 static std::set<uint32_t> find_after_return(const PSXRecomp::PS1Executable& exe) {
     std::set<uint32_t> after_ret;
     const uint32_t base = exe.load_address();
-    const uint32_t end = exe.end_address();
+    const uint32_t end = exe.analysis_end_address();
 
     for (uint32_t addr = base; addr + 8 <= end; addr += 4) {
         auto word = exe.read_word(addr);

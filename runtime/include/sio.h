@@ -7,6 +7,50 @@
 extern "C" {
 #endif
 
+/* Logical pad count. Default 2 (port1=pad0, port2=pad1).
+ * PSX_MAX_PLAYERS 5..7: one SCPH-1070 (sio_set_multitap_port) + opposite pad.
+ * PSX_MAX_PLAYERS 8: dual multitap (port1 pads 0–3, port2 pads 4–7). */
+#ifndef PSX_MAX_PLAYERS
+#define PSX_MAX_PLAYERS 2
+#endif
+#if PSX_MAX_PLAYERS < 1 || PSX_MAX_PLAYERS > 8
+#error "PSX_MAX_PLAYERS must be in 1..8"
+#endif
+
+/* Per-pad table initializer: repeat one element PSX_MAX_PLAYERS times.
+ *
+ *     static uint16_t pad_buttons[PSX_MAX_PLAYERS] = { PSX_PAD_INIT(0xFFFF) };
+ *
+ * GNU's [0 ... PSX_MAX_PLAYERS - 1] = x range designator says this in one
+ * token, but it is a GCC extension with no MSVC equivalent, so the element
+ * list is expanded by the preprocessor instead. Each PSX_PAD_REP_n is written
+ * flat rather than recursively so no nested macro call is involved and the
+ * expansion is identical under both the conforming and the traditional MSVC
+ * preprocessor. Variadic so a braced element ({ 0x80, 0x80, 0x80, 0x80 })
+ * survives argument splitting. The 1..8 bound above is what makes the ladder
+ * finite; a value outside it fails the #error before reaching an undefined
+ * PSX_PAD_REP_n. The count always matches the array extent because both are
+ * spelled PSX_MAX_PLAYERS. */
+#define PSX_PAD_REP_1(...) __VA_ARGS__
+#define PSX_PAD_REP_2(...) __VA_ARGS__, __VA_ARGS__
+#define PSX_PAD_REP_3(...) __VA_ARGS__, __VA_ARGS__, __VA_ARGS__
+#define PSX_PAD_REP_4(...) __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__
+#define PSX_PAD_REP_5(...) \
+    __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__
+#define PSX_PAD_REP_6(...) \
+    __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, \
+    __VA_ARGS__
+#define PSX_PAD_REP_7(...) \
+    __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, \
+    __VA_ARGS__, __VA_ARGS__
+#define PSX_PAD_REP_8(...) \
+    __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, \
+    __VA_ARGS__, __VA_ARGS__, __VA_ARGS__
+/* Two layers so PSX_MAX_PLAYERS expands to its value before the ## paste. */
+#define PSX_PAD_REP_JOIN(n, ...) PSX_PAD_REP_##n(__VA_ARGS__)
+#define PSX_PAD_REP_EXPAND(n, ...) PSX_PAD_REP_JOIN(n, __VA_ARGS__)
+#define PSX_PAD_INIT(...) PSX_PAD_REP_EXPAND(PSX_MAX_PLAYERS, __VA_ARGS__)
+
 /* SIO0 register base: 0x1F801040 */
 #define SIO_BASE 0x1F801040
 
@@ -57,14 +101,42 @@ uint32_t sio_cycles_to_irq(uint32_t i_mask);
 uint64_t sio_get_advance_called(void);
 uint64_t sio_get_advance_with_work(void);
 
+/* SCPH-1070 multitap. Off by default. When enabled (PSX_MAX_PLAYERS>=5):
+ *   multitap_port==0 (console Port 1): tap on phys0 → logical pads 0–3,
+ *     phys1 → logical 4.
+ *   multitap_port==1 (console Port 2): phys0 → logical 0, tap on phys1 →
+ *     logical pads 1–4 (Bomberman Party Edition and a few others).
+ * Bulk 0x80 responses follow the real TAP/REQ latch (psx-spx): REQ=1 in the
+ * third command byte arms the *next* transfer; empty tap slots are fine. */
+void sio_set_multitap(int enabled);
+int  sio_get_multitap(void);
+/* phys_port: 0 = console Port 1, 1 = console Port 2. Default 0. */
+void sio_set_multitap_port(int phys_port);
+int  sio_get_multitap_port(void);
+/* Tomba-only legacy pad config path ([controller] legacy_pad_config). */
+void sio_set_legacy_cfg(int enabled);
+int  sio_get_legacy_cfg(void);
+/* 1 when multitap is armed and `logical_slot` is a tap pad (not the lone
+ * pad on the opposite console port). SCPH-1070 taps are treated as plain
+ * digital controllers (0x41) by default — DualShock/analog on a tap is not
+ * reliable across titles. Opt in with sio_set_multitap_analog(1) (hack). */
+int  sio_pad_on_multitap(int logical_slot);
+/* Opt-in DualShock-on-tap hack. Off by default. When on, tap seats may
+ * report 0x73 + stick bytes in multitap bulk status (and host/netplay
+ * sampling stops forcing digital). game.toml [controller] multitap_analog /
+ * settings.toml / lobby match_caps may enable this. */
+void sio_set_multitap_analog(int enabled);
+int  sio_get_multitap_analog(void);
+
 /* Update pad button state. Buttons use PS1 convention: 0=pressed, 1=released.
    Bit layout: SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT,
                L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE
-   sio_set_pad_state targets port 1 (slot 0); the _slot form targets either. */
+   sio_set_pad_state targets logical pad 0; the _slot form targets
+   logical pad 0 .. PSX_MAX_PLAYERS-1. */
 void sio_set_pad_state(uint16_t buttons);
 void sio_set_pad_state_slot(int slot, uint16_t buttons);
 
-/* Set the analog stick state + pad type for a slot. enabled selects the
+/* Set the analog stick state + pad type for a logical pad. enabled selects the
  * emulated pad: 0 = digital (poll id 0x41), 1 = DualShock/analog (poll id
  * 0x73, with the four 0..255 stick axes appended; 0x80 = centred). */
 void sio_set_pad_analog(int slot, int enabled,
@@ -79,22 +151,36 @@ void sio_set_pad_analog(int slot, int enabled,
 void sio_set_pad_sticks(int slot, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
 void sio_request_pad_type(int slot, int analog);
 
-/* Connect / disconnect a pad on a slot (0=port1, 1=port2). By default no pads
- * are connected during initial BIOS boot. */
+/* Connect / disconnect a logical pad (0 .. PSX_MAX_PLAYERS-1). By default no
+ * pads are connected during initial BIOS boot. */
 void sio_connect_pad(int slot);
 void sio_set_pad_connected(int slot, int connected);
 
-/* Declare whether the pad on a slot is a config-capable DualShock (1) or a
- * plain digital controller (0). A real digital controller (SCPH-1080, poll id
- * 0x41) does NOT answer the config-mode commands (0x43/0x44/0x45/0x46/0x47/
- * 0x4C/0x4D/0x4F) — it returns hi-z / no ACK, so a game's pad driver classifies
- * it as digital-only and just polls with 0x42. A DualShock answers them. Set
- * from the per-player pad mode (DIGITAL => 0, ANALOG/HYBRID => 1) at boot/
- * hotplug. Default is 1 (config-capable) so existing analog/hybrid behaviour is
- * unchanged. */
+/* Netplay / rematch: force a peer-identical pad topology + idle bus.
+ * Immediate digital (not deferred type_req), connected seats 0..slot_count-1,
+ * pad FSM IDLE, cleared response buffer. Call at session start and before
+ * dig0 snap so baseline_ext/sio pads cannot fork on local DualShock vs
+ * keyboard seeding. */
+void sio_netplay_canonicalize_session_pads(int slot_count);
+
+/* Declare whether the pad on a logical slot is a config-capable DualShock (1)
+ * or a plain digital controller (0). A real digital controller (SCPH-1080,
+ * poll id 0x41) does NOT answer the config-mode commands (0x43/0x44/0x45/
+ * 0x46/0x47/0x4C/0x4D/0x4F) — it returns hi-z / no ACK, so a game's pad
+ * driver classifies it as digital-only and just polls with 0x42. A DualShock
+ * answers them. Set from the per-player pad mode (DIGITAL => 0, ANALOG/HYBRID
+ * => 1) at boot/hotplug. Default is 1 (config-capable) so existing
+ * analog/hybrid behaviour is unchanged. */
 void sio_set_pad_config_capable(int slot, int capable);
 
-/* Return current pad button state (for debug server). _slot targets either. */
+/* Read the raw DualShock motor state selected by the guest's 0x4D rumble map
+ * and most recent 0x42 poll. `small` is the fixed-strength high-frequency
+ * motor byte; `large` is the variable-strength low-frequency motor byte.
+ * The frontend translates these values to its host controller API. */
+void sio_get_pad_rumble(int slot, uint8_t *small, uint8_t *large);
+
+/* Return current pad button state (for debug server). _slot targets a logical
+ * pad 0 .. PSX_MAX_PLAYERS-1. */
 uint16_t sio_get_pad_buttons(void);
 uint16_t sio_get_pad_buttons_slot(int slot);
 
@@ -106,7 +192,7 @@ uint16_t sio_peek_stat(void);
 uint16_t sio_peek_ctrl(void);
 uint8_t  sio_peek_rx_data(void);
 
-/* Debug accessors: is a pad connected on the slot, and is it in analog mode. */
+/* Debug accessors: is a logical pad connected, and is it in analog mode. */
 int sio_get_pad_connected(int slot);
 int sio_get_pad_analog(int slot);
 void sio_get_pad_sticks(int slot, uint8_t out[4]);
@@ -150,6 +236,57 @@ uint32_t sio_get_seq(void);
  * from the VBlank handler — doesn't preempt an in-flight card
  * transaction by issuing 0x01 on the SIO bus mid-read. */
 int sio_card_protocol_active(void);
+
+/* 1 while a card txn/protocol is live or a card ACK just fired. interrupts.c
+ * uses this to defer in-exception ChangeThread so the game's SIO IntRP can
+ * finish its A6C10/B4E38 handshake (Ape Escape LOAD). */
+int sio_should_defer_thread_switch(void);
+
+/* -------------------------------------------------------------------------
+ * Ape Escape LOAD GAME — IMPORTANT memcard path
+ *
+ * LibCardIntRP needs one distinct IRQ7 edge per nest pop. SIO pacing (MT=1),
+ * ACK defer, I_MASK.7 hold, and nest IRQ pulses below exist so presence-probe
+ * → directory → file-list can complete.
+ * EXPERIMENT (TwistedMetal4Recomp): formerly netplay-inert / MotK-uncapped;
+ * ungated for local netplay desync testing. PSX_APE_CARD_UNSTICK=0 disables
+ * nest repair + bit7 hold. See ApeEscapeRecomp/docs/APE_MEMCARD_LOAD.md.
+ * ------------------------------------------------------------------------- */
+
+/* Post-probe handoff ring: bit7 enable → TX 0x57 (debug_server card_handoff). */
+typedef struct {
+    uint8_t  kind;   /* 1=probe_abort 2=b7_set 3=b7_clear 4=tx 5=card_ack
+                      * 6=unstick 7=select_flush_ack 8=ack_deferred_istat7
+                      * 9=nest_irq_pulse 10=b7_hold */
+    uint8_t  byte;
+    uint16_t imask;
+    uint32_t pc;
+    uint32_t func;
+    uint32_t a6c10;
+    uint32_t b4e30;
+    uint32_t b4e38;
+    uint64_t cyc;
+} SioCardHandoffEntry;
+const SioCardHandoffEntry *sio_get_card_handoff(int *idx_out, int *count_out);
+int sio_card_handoff_cap(void);
+int sio_card_handoff_armed(void);
+void sio_card_handoff_on_imask(uint32_t old_mask, uint32_t new_mask);
+/* Ape Escape: 1 while libcard nest is stuck post-probe — keep I_MASK.7 so
+ * IntRP can finish (BIOS otherwise clears bit7 ~tens of cycles after SELECT
+ * abort, before the pending SIO edge is taken). */
+int sio_card_should_hold_imask_bit7(void);
+/* Ape Escape: nest repair pump when the guest waiter polls RAM only
+ * (no SIO MMIO → sio_tick never runs). IRQ re-edge only — never poke A6C10 /
+ * invent B4E38. */
+void sio_ape_card_unstick_pump(void);
+
+/* Netplay deferred-present coexistence: 1 while native memcard SIO is
+ * busy and still making progress. Callers keep s_present_pending and
+ * retry later so BB-edge finish_frame does not run mid card busy-wait
+ * (Ape Escape empty-starfield wedge; same class of risk on other titles).
+ * Returns 0 after ~10 VBlanks with no SIO seq progress so a wedged card
+ * FSM cannot stall commit forever (mirrors VBlank-for-SIO stale escape). */
+int sio_hold_present_for_card(void);
 
 /* Snapshot SIO IRQ-pacing internals for the freeze_check diagnostic. */
 void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,

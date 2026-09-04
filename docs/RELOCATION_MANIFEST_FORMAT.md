@@ -123,7 +123,7 @@ form.
 ## First-iteration scope
 
 Today's first manifest entries cover only the two dark RAM windows
-identified in `docs/CASE_A_AOT_GAP.md`:
+identified in `docs/internal/CASE_A_AOT_GAP.md`:
 
 | name | dst_ram_addr | length | entrypoints |
 |---|---|---|---|

@@ -43,6 +43,22 @@ void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
  * 0 if not found (fall through to interpreter). */
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
 
+/* Freeze new DLL discovery/load (lazy try_load_region, live publish commit,
+ * rescan). Already-registered natives keep running. Required for rollback
+ * resim / selfcheck: overlay registration is host-only and not in the snap,
+ * so a load mid-pass#1 that is visible at the start of pass#2 forks BB-edge
+ * IRQ cadence (matched clocks, mismatched GPRs). */
+void overlay_loader_set_load_freeze(int freeze);
+int  overlay_loader_load_frozen(void);
+
+/* Drop the negative lazy-lookup memo (host-only). Call on snap restore so
+ * resim#1 and resim#2 take the same dispatch path. */
+void overlay_loader_clear_lazy_miss(void);
+
+/* After RAM restore: bust overlay candidate gen fast-path + static-match
+ * cache so native vs interp is re-decided against restored bytes. */
+void overlay_loader_resync_validation_after_restore(void);
+
 /* Step 2.8: re-scan the cache dir for DLLs compiled after init and clear the
  * checked-regions memo so the next dispatch reconsiders the cache. Idempotent
  * (loaded DLLs stay loaded); emu thread only. */
@@ -120,6 +136,12 @@ int      overlay_loader_lazy_manifest_overflow(void);
 uint64_t overlay_loader_candidate_overflow(void);
 uint64_t overlay_loader_pair_aliases(void);
 int      overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap);
+
+/* Overlay CI wrapper early-return attribution (PSX_POST_LOAD_PROBE). */
+void overlay_loader_get_ci_skip_diag(uint64_t *unit, uint64_t *supp,
+                                     uint64_t *none, uint64_t *sr,
+                                     uint64_t *deliv, uint64_t *enter);
+int  overlay_loader_call_unit_depth(void);
 
 #ifdef __cplusplus
 }

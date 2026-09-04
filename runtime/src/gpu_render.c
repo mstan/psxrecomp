@@ -25,6 +25,8 @@ static const GpuRenderBackend SW_BACKEND = {
     .set_mask_bits                 = sw_set_mask_bits,
     .set_texture_window            = sw_set_texture_window,
     .set_color_modulation          = sw_set_color_modulation,
+    .set_precise_triangle          = sw_set_precise_triangle,
+    .set_perspective_triangle      = sw_set_perspective_triangle,
     .fill_rect                     = sw_fill_rect,
     .copy_rect                     = sw_copy_rect,
     .draw_flat_triangle            = sw_draw_flat_triangle,
@@ -101,6 +103,15 @@ void gr_set_semi_transparency(int e, int m)          { g_b->set_semi_transparenc
 void gr_set_mask_bits(int s, int c)                  { g_b->set_mask_bits(s, c); }
 void gr_set_texture_window(uint32_t raw)             { g_b->set_texture_window(raw); }
 void gr_set_color_modulation(int r, int g, int b, int raw) { g_b->set_color_modulation(r, g, b, raw); }
+void gr_set_precise_triangle(int enabled, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2) {
+    if (g_b->set_precise_triangle)
+        g_b->set_precise_triangle(enabled, x0, y0, x1, y1, x2, y2);
+}
+void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+    if (g_b->set_perspective_triangle)
+        g_b->set_perspective_triangle(enabled, q0, q1, q2);
+}
 void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
 void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {

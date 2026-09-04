@@ -45,6 +45,9 @@ void vk_renderer_present_blank(void);
  * server, 24-bit present). No-op when the Vulkan path is inactive. */
 void vk_renderer_sync_cpu(void);
 
+/* After savestate restore: push CPU VRAM into the Vulkan image (see GL twin). */
+void vk_renderer_restage_vram_after_savestate(void);
+
 /* Set the present policy: 1=tear-free, 0=IMMEDIATE (lowest latency, may tear),
  * -1=MAILBOX. Tear-free prefers MAILBOX because the frontend already paces
  * frames; unsupported modes fall back to FIFO (always available). */

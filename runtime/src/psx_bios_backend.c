@@ -16,6 +16,7 @@
 
 #include <string.h>
 
+#include "bios_hle.h"
 #include "cpu_state.h"
 #include "psx_bios_backend.h"
 
@@ -43,11 +44,13 @@ int g_psx_dispatch_depth = 0;
 
 void psx_dispatch(CPUState *cpu, uint32_t addr)
 {
+    if (!psx_bios_active || !psx_bios_active->dispatch) return;
     psx_bios_active->dispatch(cpu, addr);
 }
 
 void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t return_addr)
 {
+    if (!psx_bios_active || !psx_bios_active->dispatch_call) return;
     psx_bios_active->dispatch_call(cpu, addr, return_addr);
 }
 
@@ -81,6 +84,11 @@ int psx_bios_activate(const PsxBiosBackend *backend)
     psx_bios_image              = *backend->image;
     psx_bios_kernel_bodies      = backend->kernel_bodies;
     psx_bios_kernel_body_count  = backend->kernel_body_count;
+    /* Soft-return rematch can switch OPENBIOS ↔ SCPH without process exit.
+     * Drop the prior image's call-HLE / boot-skip hook immediately so a
+     * sticky SCPH DeliverEvent path cannot run against OpenBIOS ROM bytes
+     * before session_reboot re-runs psx_bios_hle_plan + configure. */
+    psx_bios_hle_configure(0, 0);
     return 1;
 }
 

@@ -63,9 +63,18 @@ struct CodeGenConfig {
     // See docs/DATA_SHARDS.md. Empty = no hooks (default).
     std::set<uint32_t> data_shard_funcs;
 
+    // Trusted game-mod entry hooks ([recompiler] mod_function_entry_funcs).
+    // Only explicitly listed guest functions call the runtime dispatcher.
+    std::set<uint32_t> mod_function_entry_funcs;
+
     // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
     // addresses (MotK VLC leaves, etc.). Host locality hint only.
     std::set<uint32_t> hot_funcs;
+
+    // [recompiler] load_charge_batch(_funcs): install a function-local
+    // cycle accumulator so load charges skip deadline probes until IRQ/MMIO
+    // / function exit. Guest totals at those barriers are unchanged.
+    std::set<uint32_t> load_charge_batch_funcs;
 
     // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
     // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
@@ -103,6 +112,9 @@ struct CodeGenConfig {
     // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
     // the auto-detector cannot qualify (X-only test, no height compare).
     std::set<uint32_t> ws_cull_slti_sites;
+    // Signed lower-bound counterpart: `slti rt,sx,-W` compares against
+    // `-W-x_margin`, preserving the original result at 4:3.
+    std::set<uint32_t> ws_cull_slti_lower_sites;
 
     // `bltz rs, reject` emitted through psx_ws_cull_bltz — the explicit
     // LEFT-edge counterpart to ws_cull_slti_sites ([widescreen.cull]
@@ -133,6 +145,18 @@ struct CodeGenConfig {
     // xclip_load_sites). The configured lw routes through the runtime helper
     // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
     std::set<uint32_t> ws_cull_xclip_load_sites;
+
+    // Exact `bltz MAC0, reject`-style NCLIP/backface rejects to suppress while
+    // widescreen reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_nclip_keep_sites;
+
+    // Exact `bltz MAC0, reject`-style NCLIP/backface sites that consume the
+    // validated precise sign while wide, without changing guest-visible MAC0.
+    std::set<uint32_t> ws_cull_nclip_exact_sites;
+
+    // Exact branch PCs whose reject target is suppressed while widescreen
+    // reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_branch_keep_sites;
 
     // Exact, full-word-guarded comparison sites whose result is forced only
     // while widescreen reveals extra world. 4:3 evaluates the original compare.
@@ -459,6 +483,35 @@ private:
     std::string translate_lhu(uint32_t instr);
     std::string translate_lwl(uint32_t instr);
     std::string translate_lwr(uint32_t instr);
+    //
+    // LWL/LWR take their destination register as BOTH input (the merge base)
+    // and output. Unlike every other load, they read that input late enough to
+    // receive the forwarded result of an immediately preceding load, so they
+    // are NOT subject to the load delay: after
+    //
+    //     lw   $t0, 12($a3)
+    //     lwr  $t0, 10($a3)
+    //
+    // the LWR merges into the value the LW just fetched, not the stale $t0.
+    // When the pair emitter defers a load's writeback into psx_ldd_<addr>, it
+    // sets these so the LWL/LWR merge operand names that temporary instead of
+    // cpu->gpr[rt]. Empty temp = no forwarding in effect.
+    //
+    // (The mirror case -- LWL/LWR as the PRODUCER -- needs nothing: those never
+    // defer, so their writeback is already immediate.)
+    void set_lwlr_merge_forward(uint32_t rt, const std::string& temp) {
+        lwlr_merge_reg_ = rt;
+        lwlr_merge_temp_ = temp;
+    }
+    void clear_lwlr_merge_forward() { lwlr_merge_temp_.clear(); }
+    // Name to use for an LWL/LWR merge operand on register rt.
+    std::string lwlr_merge_operand(uint32_t rt) {
+        if (!lwlr_merge_temp_.empty() && rt == lwlr_merge_reg_)
+            return lwlr_merge_temp_;
+        return reg_name(rt);
+    }
+    uint32_t    lwlr_merge_reg_ = 0xFFFFFFFFu;
+    std::string lwlr_merge_temp_;
     std::string translate_swl(uint32_t instr);
     std::string translate_swr(uint32_t instr);
     std::string translate_sb(uint32_t instr);

@@ -260,3 +260,8 @@ void psx_vsync_query_hle_stats_json(char* buf, int cap) {
              (unsigned long long)s_extra_horizon_hits,
              (unsigned long long)s_extra_horizon_cycles);
 }
+
+void psx_vsync_query_hle_horizon_totals(uint64_t *hits, uint64_t *cycles) {
+    if (hits) *hits = s_horizon_hits + s_extra_horizon_hits;
+    if (cycles) *cycles = s_horizon_cycles + s_extra_horizon_cycles;
+}

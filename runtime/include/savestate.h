@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /*
- * User save states (Shift+F1-F12 save, F1-F12 load; 12 slots).
+ * User save states (F7 save-state menu by default; 12 slots).
  *
  * A thin wrapper over boot_state.c's complete full-machine serializer
  * (boot_state_save / boot_state_load — CPU/RAM/scratchpad/VRAM/SPU/CDROM/DMA/SIO/
@@ -23,14 +23,50 @@ extern "C" {
  */
 
 #define SAVESTATE_SLOTS 12
+#define SAVESTATE_THUMB_W 128
+#define SAVESTATE_THUMB_H 96
 
 /* Configure the slot directory + integrity key (from main, after config load).
- * dir = the per-game memcard/save dir; files land at
- * <dir>/state_<entry_pc>_slotNN.pst. */
-void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry_pc);
+ *
+ * When bios_token is non-empty (e.g. "openbios" / "scph1001"):
+ *   dir is the per-game memcard/save ROOT; slots land at
+ *   <dir>/<bios_token>/state_<entry_pc>_slotNN.pst.
+ *   Loose legacy <dir>/state_*.pst files are migrated once by .pst header
+ *   bios_checksum (openbios_wordsum → openbios/; else → scph1001/).
+ *
+ * When bios_token is NULL/empty: dir is used as-is (netplay guest sandbox /
+ * leave restore of an already-scoped path). */
+void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry_pc,
+                         const char* bios_token, uint32_t openbios_wordsum);
+
+/* Scope savestates to one disc of a multi-image set. The disc appears as a
+ * token in the slot FILENAME inside the existing BIOS directory:
+ * <saves>/<bios>/state_<entry>_disc<N>_slot<NN>.pst. Call before
+ * savestate_configure().
+ *
+ * A savestate is whole-machine state, so restoring one taken on disc 2 while
+ * disc 1 is mounted resumes a guest that believes it is reading disc 2 -- the
+ * slot list gives no hint, because every disc of a set shares one entry_pc and
+ * the existing key is entry_pc. The BIOS stays a directory because a state is
+ * invalid across BIOS images whatever disc it came from; the disc only has to
+ * not collide within one, which a filename token does without another level to
+ * browse, back up and migrate.
+ *
+ * disc_number is 1-based; 0 disables scoping. Single-disc titles must pass 0
+ * so their existing paths are untouched. */
+void savestate_set_disc_scope(int disc_number);
 
 /* Current slot directory (empty if not configured). */
 const char* savestate_dir(void);
+
+/* Memcard/save root remembered from the last bios-scoped configure
+ * (empty until a non-empty bios_token was passed). */
+const char* savestate_root_dir(void);
+
+/* Last bios_token / openbios_wordsum from a bios-scoped configure
+ * (token empty when never scoped; used to restore after netplay sandbox). */
+const char* savestate_bios_token(void);
+uint32_t savestate_openbios_wordsum(void);
 
 /* Integrity key last passed to savestate_configure (for sandbox rebind). */
 void savestate_get_integrity(uint32_t* bios_checksum, uint32_t* entry_pc);
@@ -45,6 +81,19 @@ int savestate_write_slot(int slot, const void* data, size_t size);
 /* 1 if the slot file exists and is non-empty. */
 int savestate_slot_exists(int slot);
 
+/* Slot file modified time, seconds since the Unix epoch. */
+int savestate_slot_mtime(int slot, int64_t* out_time);
+
+/* Per-slot screenshot thumbnails captured after a successful save. */
+int savestate_capture_thumb(int slot);
+int savestate_read_thumb(int slot, uint32_t* out_argb,
+                         int out_w, int out_h);
+
+/* 1 if the slot .pst header matches this build's integrity key (BIOS/entry/
+ * codegen). 0 + optional reason when missing or stale — use before netplay
+ * load probe so incompatible saves never enter the post-load barrier. */
+int savestate_slot_compatible(int slot, char* reason, size_t reason_cap);
+
 /* Stage a save/load of slot [0..SAVESTATE_SLOTS-1]. Executed at the next safe
  * boundary by savestate_poll (called every block from psx_check_interrupts).
  * Safe to call from the SDL key handler or a debug-server command.
@@ -58,14 +107,39 @@ int savestate_request_load(int slot);
 int savestate_request_save_protocol(int slot);
 int savestate_request_load_protocol(int slot);
 
+/* Netplay LOAD transfer: stage an in-memory .pst (no disk write). Copied
+ * internally; applied by savestate_poll like a normal slot load. */
+int savestate_request_load_blob_protocol(const void* data, size_t size);
+
 /* 1 while a staged save/load has not yet been consumed by savestate_poll. */
 int savestate_pending(void);
+
+/* Machine-readable lifecycle receipt for deterministic debug harnesses. */
+void savestate_status_json(char* buf, size_t cap);
 
 /* 1 once after a successful load restore (before scheduler longjmp). Clears. */
 int savestate_take_load_completed(void);
 
+/* 1 once after a staged load failed in savestate_poll (missing/mismatched).
+ * Clears. Netplay uses this to abort the load barrier instead of hanging. */
+int savestate_take_load_failed(void);
+
+/* 1 once after a staged save failed in savestate_poll (no safe resume PC,
+ * I/O error, etc.). Clears. Netplay aborts SAVE coord instead of transferring
+ * a stale/null-PC .pst. */
+int savestate_take_save_failed(void);
+
+/* Resume PC stamped into the last successful slot save (0 if none / failed). */
+uint32_t savestate_last_save_pc(void);
+
 /* Frontend hook (main.cpp): restage VRAM present path after a successful load. */
 void psx_frontend_on_savestate_loaded(void);
+/* Rollback snap apply: depth24 hold clear + restage without FMV cutover thrash. */
+void psx_frontend_on_rb_snap_loaded(void);
+
+/* Frontend hook (main.cpp): host OSD toast after a user save/load settles.
+ * is_load: 0 = save, 1 = load. slot is 0-based. ok: 1 on success. */
+void psx_frontend_on_savestate_notify(int is_load, int slot, int ok);
 
 /* Called every block from psx_check_interrupts (in_exception == 0). If a save is
  * pending, serialize with cpu->pc = resume_pc; if a load is pending, restore and

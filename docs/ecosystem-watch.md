@@ -5,6 +5,11 @@ exact external state that was inspected, separates reusable framework work from
 title-specific work, and prevents an old fork from silently replacing newer
 framework fixes.
 
+> Note: entries evaluated on or before 2026-07-13 predate the removal of the
+> sljit Tier-2 backend (`5b7e69b4`, 2026-07-15). Where an entry describes an
+> external branch touching "SLJIT", that surface no longer exists here; the
+> equivalent path today is the bundled tcc tier plus the dirty interpreter.
+
 ## Audit baseline and rules
 
 - Evaluated through `2026-07-13T21:25:28-07:00` (America/Los_Angeles), against `mstan/psxrecomp`
