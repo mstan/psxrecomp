@@ -2891,7 +2891,19 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * not a new entry. Anything else arrived from native code (a call or
      * a fresh dispatch) and is real interior-entry evidence for alias
      * seeding. */
-    if (pc_entry && addr != g_dirty_interp_chain_target) pc_entry->entry_hits++;
+    if (pc_entry && addr != g_dirty_interp_chain_target) {
+        pc_entry->entry_hits++;
+        /* Enrichment, external entries only (this is a real native/dispatch
+         * arrival, not interp block chaining). occ_crc names which overlay is
+         * resident in this band; last_ext_ra names the caller that reached
+         * this interior. Both durable in the per_pc snapshot — no ring window,
+         * no offline join. See DirtyRamPcEntry. */
+        extern uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid);
+        int occ_ok = 0;
+        pc_entry->occ_crc = psx_overlay_resident_crc_at(phys, &occ_ok);
+        pc_entry->occ_ok = (uint8_t)occ_ok;
+        pc_entry->last_ext_ra = cpu->gpr[31];
+    }
     g_dirty_interp_chain_target = 0;
 
     /* Block-entry ring buffer — answers "who tried to JALR into this RAM

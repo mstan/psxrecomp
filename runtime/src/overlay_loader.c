@@ -504,6 +504,10 @@ static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  
                                         /* interp because their candidate is    */
                                         /* still inside the diff verify budget  */
 static uint32_t s_last_crc       = 0;
+/* psx_overlay_resident_crc_at(phys, &valid) -- the occupant fingerprint the dirty
+ * interpreter stamps on each interpreted PC (DirtyRamPcEntry.occ_crc) -- is
+ * defined with the static-match cache below; s_last_crc is its DLL-path
+ * fallback. */
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint64_t s_cand_overflow  = 0;   /* registrations dropped at CAND_CAP  */
 static uint64_t s_pair_aliases   = 0;   /* validated complete pairs deduped    */
@@ -565,6 +569,8 @@ typedef struct {
     uint32_t expected_crc;
     uint32_t gen_sum;
     int      matches;
+    uint32_t lo_min;      /* span of the variant's code ranges (phys), for */
+    uint32_t hi_max;      /* psx_overlay_resident_crc_at()                 */
 } StaticMatchCache;
 
 static StaticMatchCache s_static_match_cache[STATIC_MATCH_CACHE_CAP];
@@ -647,8 +653,60 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
         entry->expected_crc = expected_crc;
         entry->gen_sum = gen_sum;
         entry->matches = matches;
+        uint32_t lo_min = 0xFFFFFFFFu, hi_max = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+            uint32_t hi = lo + lo_len_pairs[i * 2u + 1u];
+            if (lo < lo_min) lo_min = lo;
+            if (hi > hi_max) hi_max = hi;
+        }
+        entry->lo_min = lo_min;
+        entry->hi_max = hi_max;
     }
     return matches;
+}
+
+/* Occupant fingerprint for an interpreted PC (tier-1 enrichment,
+ * DirtyRamPcEntry.occ_crc / occ_ok). Scans the static-match cache for the
+ * variant whose code ranges span `phys`:
+ *   - one that matched and whose pages are unchanged since (same
+ *     page-generation test the dispatch fast path uses) -> its manifest CRC,
+ *     *valid = 1. An interior the static walk missed, interpreted inside a
+ *     validating variant: the normal Axis B seed.
+ *   - otherwise the spanning variant most recently consulted -> its manifest
+ *     CRC, *valid = 0. "Compiled for this band, resident, but NOT validating"
+ *     -- a CRC-miss occupant (data inside the code range rewritten at run
+ *     time, or a section that differs from the one compiled). This is the
+ *     case a plain 0 would hide, and it is the one that explains a band that
+ *     is compiled yet fully interpreted (SCENA16 at the title screen,
+ *     2026-09-05).
+ *   - no spanning variant at all -> 0 / *valid = 0 (BIOS, kernel, boot EXE,
+ *     or a band nothing was compiled for); DLL-path titles get the last
+ *     residency hash as a hint instead.
+ * The CRC is the one the variant was compiled from, so it maps straight back
+ * to a capture / .EMI section offline. Called only on EXTERNAL interp
+ * entries, so a 4096-slot scan is fine. */
+uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid) {
+    phys &= 0x1FFFFFFFu;
+    uint32_t stale = 0;
+    for (uint32_t i = 0; i < STATIC_MATCH_CACHE_CAP; i++) {
+        const StaticMatchCache *e = &s_static_match_cache[i];
+        if (!e->ranges || phys < e->lo_min || phys >= e->hi_max)
+            continue;
+        if (e->matches) {
+            uint32_t gen_sum = 0;
+            for (uint32_t k = 0; k < e->count; k++)
+                gen_sum += overlay_watch_pagegen_sum(e->ranges[k * 2u] & 0x1FFFFFFFu,
+                                                    e->ranges[k * 2u + 1u]);
+            if (gen_sum == e->gen_sum) {
+                if (valid) *valid = 1;
+                return e->expected_crc;
+            }
+        }
+        if (!stale) stale = e->expected_crc;
+    }
+    if (valid) *valid = 0;
+    return stale ? stale : s_last_crc;
 }
 
 void overlay_loader_static_match_stats(uint64_t *rehashes,
@@ -658,6 +716,8 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
     if (crc_misses) *crc_misses = s_static_match_crc_misses;
     if (gen_fastpath) *gen_fastpath = s_static_match_gen_fastpath;
 }
+#else
+uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid) { (void)phys; if (valid) *valid = 0; return s_last_crc; }
 #endif
 
 /* ---- Per-DLL code-range manifest --------------------------------------- */

@@ -224,6 +224,30 @@ typedef struct {
                           * below the local-flow floor every taken branch
                           * re-dispatches, so chain blocks dominate. entry_hits
                           * is the evidence stream for interior-alias seeds. */
+    /* Enrichment (2026-09-05, BoF3): make a bare interpreted PC explainable
+     * from a session-long per_pc snapshot alone, with no offline join and no
+     * live-ring window. Stamped only on EXTERNAL entries (arrived from native
+     * dispatch, addr != chain target), which is where the value is. */
+    uint32_t occ_crc;    /* tier 1: psx_overlay_resident_crc_at(pc) at the last
+                          * external entry -- the manifest CRC of the static
+                          * variant whose code ranges span this PC (DLL path:
+                          * last hash taken). Disambiguates a mixed band
+                          * (0x801D0C00 carries BATTLE/ETC/SCENARIO/WORLD
+                          * occupants) to the one actually loaded, which the
+                          * offline enrich_pcs join cannot. 0 = nothing compiled
+                          * spans this PC (BIOS / kernel / boot EXE). */
+    uint8_t  occ_ok;     /* 1 = that variant validated at the time (interior
+                          * gap inside live native code: an Axis B seed);
+                          * 0 = it is resident but CRC-missing (data inside the
+                          * code range rewritten, or a different section than
+                          * the one compiled) -- the whole band runs
+                          * interpreted and no seed will fix it. */
+    uint32_t last_ext_ra;/* tier 2: gpr[31] (caller RA) at the most recent
+                          * external entry — names the call site that reaches a
+                          * function-pointer-table interior. This is the §9 (LOGO
+                          * effect-handler tables) diagnosis made durable and
+                          * session-long instead of ring-bounded; the full
+                          * call/jalr/jr transfer split stays in the fp-log ring. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 /* Every aligned main-RAM word is a possible instruction PC.  Execution
