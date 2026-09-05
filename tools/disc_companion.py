@@ -19,6 +19,7 @@ REQUIRED_SBI = {
     (712491360, "b3ec6631e1c9ed3b0f554b3a5f61166bac8ebb9d"): {
         "title": "Resident Evil 3: Nemesis",
         "serial": "SLES-02529",
+        "data_sha256": "dc3f29d7f7046fbdc85e8c376721a8880567f0cda309a52ee5da875ae9e40157",
         "revision": "Europe, data-track SHA-1 b3ec6631e1c9ed3b0f554b3a5f61166bac8ebb9d",
         "sbi_sha256": "ada8877a2a964eff2743d53cc043be0b7b148469b60de82fd1069f32700670eb",
         "evidence": "RE3 same-executable operator acceptance, 2026-09-05; docs/DISC_COMPANIONS.md",

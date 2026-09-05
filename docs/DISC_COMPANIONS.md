@@ -61,9 +61,30 @@ The existing `RESULT_CUE=` output remains unchanged.
 CLI disc results add the same `subchannel` record.
 The legacy `verified` field describes only the existing main-track check; it never proves complete subchannels.
 Missing required companions return preparation exit code 1 or CLI verification exit code 3.
-No configuration keys or graphical file selectors changed.
+No configuration keys changed.
 Existing setup hosts need the updated Python tools, including `tools/disc_companion.py`, to receive this gate.
-Direct runtime launches and older installed setup kits retain their existing behavior.
+Older installed setup kits retain their existing behavior.
+
+## Native launcher
+
+The native launcher also checks the exact data-track SHA-256 before Play.
+With the matching recomp-ui update, the verification card shows `SBI File`:
+`Missing` for a required missing or mismatched companion, `OK` for a match,
+and `N/A` when the registry has no requirement for this disc.
+`N/A` is not proof that an unknown revision has complete subchannels.
+
+Select the disc first. Use **Browse For Disc / SBI** to select its matching SBI.
+The native host checks the SBI hash before staging a private CUE and SBI under
+`sbi-input` beside the executable. CUE track references become absolute paths;
+the original tracks and companions remain untouched. The launcher selects the
+staged CUE and uses its normal settings persistence. A rejected SBI leaves the
+disc selection intact and shows an error below the button.
+
+This importer supports registered CUE/BIN inputs. It does not infer a match for
+unknown revisions. Build the UI and host together after changing the launcher C
+structures. `RECOMP_LAUNCHER_HAS_SBI_STATUS` enables the status and import callback.
+Regenerate `runtime/include/sbi_registry.h` with `tools/generate_sbi_registry.py`
+after changing the metadata registry; it contains identities, not companion data.
 
 ## Provenance and validation
 
@@ -79,12 +100,14 @@ Primary format reference: [PSX-SPX CDROM format](https://psx-spx.consoledev.net/
 The existing runtime reader supplies the type-1 parsing contract in `ISOReader::LoadSBICompanion`.
 Runtime support came from `cebe738fd17cc4c37a76729462e093ff16ee457a`.
 Upstream `17f49ad3b20dc30917a881a02baaa25374c13d18` already contains that commit, but lacks the setup gate and copy step.
-This change starts from that upstream identity and changes no runtime code.
+This change starts from that upstream identity. Native setup changes affect
+launcher validation and input staging; guest execution and the SBI reader are unchanged.
 
 Run the source-owned setup tests from the framework root:
 
 ```sh
 python tools/tests/test_disc_companion.py -v
+python tools/tests/test_sbi_registry.py -v
 ```
 
 The fixtures create synthetic ISO directory records, an inert executable header, audio bytes, and SBI records.

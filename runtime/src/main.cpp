@@ -79,6 +79,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "mod_runtime.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "sbi_setup.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
@@ -2368,6 +2369,12 @@ static bool validate_disc_for_launch(const std::filesystem::path& path,
     if (!v.has_header || !v.id_matches) {
         launcher_warning("Disc Image Warning",
             v.detail + "\n\nThis may be the wrong game or a corrupt image. The runtime will try to run it anyway.");
+    }
+    const auto resolved = PSXRecompV4::resolve_disc_path(path);
+    const auto companion = PSXRecompV4::check_sbi_setup(resolved.data, resolved.mount);
+    if (!companion.ready) {
+        launcher_warning("SBI file required", companion.message);
+        return false;
     }
     return true;
 }
@@ -7813,6 +7820,23 @@ namespace {
         return 1;
     }
 
+#if defined(RECOMP_LAUNCHER_HAS_SBI_STATUS)
+    int ae_import_sbi(const char* disc, const char* sbi, char* out_disc,
+                      size_t out_cap, char* error, size_t error_cap) {
+        try {
+            const auto resolved = PSXRecompV4::resolve_disc_path(disc);
+            const auto root = exe_dir_from_argv(g_lnch_argv0 ? g_lnch_argv0 : "") / "sbi-input";
+            const auto imported = PSXRecompV4::import_sbi_setup(resolved.data, resolved.mount, sbi, root).string();
+            if (imported.size() >= out_cap) throw std::runtime_error("The imported disc path is too long.");
+            std::snprintf(out_disc, out_cap, "%s", imported.c_str());
+            return 1;
+        } catch (const std::exception& e) {
+            if (error && error_cap) std::snprintf(error, error_cap, "%s", e.what());
+            return 0;
+        }
+    }
+#endif
+
     int ae_disc_verify(const char* disc_path, RecompLauncherCDiscVerify* out) {
         if (!disc_path || !disc_path[0] || !out) return 0;
         std::memset(out, 0, sizeof(*out));
@@ -7860,6 +7884,22 @@ namespace {
         else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) out->verdict = 2; // warn
         else if (g_lnch_netplay_available && !id.netplay_ok)         out->verdict = 2; // TOC/cue
         else                                                          out->verdict = 1; // ok
+        const auto resolved = PSXRecompV4::resolve_disc_path(disc_path);
+        const auto companion = PSXRecompV4::check_sbi_setup(resolved.data, resolved.mount);
+#if defined(RECOMP_LAUNCHER_HAS_SBI_STATUS)
+        out->sbi_status = !companion.required ? RECOMP_SBI_NA :
+                         companion.ready ? RECOMP_SBI_OK : RECOMP_SBI_MISSING;
+#endif
+        static std::string last_companion_warning;
+        if (!companion.ready) {
+            out->verdict = 3; // Block Play/Finish through the existing disc gate.
+            if (last_companion_warning != companion.message) {
+                last_companion_warning = companion.message;
+                launcher_warning("SBI file required", companion.message);
+            }
+        } else {
+            last_companion_warning.clear();
+        }
         return 1;
     }
 
@@ -10968,6 +11008,9 @@ namespace {
             gi->num_languages = 0;
         }
         gi->disc_verify = ae_disc_verify;
+#if defined(RECOMP_LAUNCHER_HAS_SBI_STATUS)
+        gi->import_sbi = ae_import_sbi;
+#endif
         gi->memcard_inspect = ae_memcard_inspect;
         gi->mods = PSXRecompV4::mod_runtime_launcher_provider();
         gi->bios_verify = ae_bios_verify;
