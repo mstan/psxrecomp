@@ -487,6 +487,23 @@ Composite actions (from the game repo after checkout):
 
 ## CI workflow template
 
+For an existing project, `tools/generate_ci` writes the filled workflow and
+nothing else (no commit, no push, no migration plan):
+
+```sh
+sh psxrecomp/tools/generate_ci.sh            # in the project; --check, --force, --dry-run
+```
+
+```powershell
+powershell -File psxrecomp\tools\generate_ci.ps1
+```
+
+It is the single-purpose face of Project Studio's `emit_ci_workflow`: the
+template comes from the project's own psxrecomp submodule, the zip prefix from
+`scripts/package_setup_release.sh` so CI uploads the zips the packager built,
+and an installed workflow is compared by step name -- `--check` exits 1 when
+it is missing or stale, and only `--force` overwrites one.
+
 The New Project Layout scaffold **copies and fills** this for you after
 submodules land:
 
