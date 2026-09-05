@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG // Keep test checks active in Release builds too.
+#endif
 #include "sbi_setup.h"
 #include <cassert>
 #include <fstream>

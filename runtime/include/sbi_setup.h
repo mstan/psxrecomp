@@ -2,6 +2,7 @@
 #pragma once
 #include "psx_sha256.h"
 #include <array>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <string>
