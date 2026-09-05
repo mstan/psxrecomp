@@ -384,6 +384,13 @@ if(BUILD_TESTING)
     target_include_directories(frame_pacing_test PRIVATE include)
     add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 
+    # Same family of bug as frame_pacing: the starvation watchdog's staleness
+    # gap must not wrap when the (cross-thread) heartbeat is newer than the
+    # clock sample taken by the emu thread.
+    add_executable(starvation_watchdog_test tests/test_starvation_watchdog.c)
+    target_include_directories(starvation_watchdog_test PRIVATE include)
+    add_test(NAME starvation_watchdog_test COMMAND starvation_watchdog_test)
+
     add_executable(freeze_dump_policy_test
         tests/test_freeze_dump_policy.c
         src/freeze_dump_policy.c)
