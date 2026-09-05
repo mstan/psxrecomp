@@ -3230,7 +3230,8 @@ def _interior_fail_key(phys_addr: int, interior: int, data: bytes,
 
 def interior_failure_is_deterministic(reason: str) -> bool:
     """Only guest-byte/codegen audit verdicts belong in the persistent memo."""
-    return reason.startswith(('generated-c-audit:', 'requested-entry-audit:'))
+    return reason.startswith(('generated-c-audit:', 'requested-entry-audit:',
+                              'guest-walk-audit:'))
 
 
 def optional_static_fragment_rejection(entry: int, job: dict,
@@ -3287,11 +3288,66 @@ def append_interior_fail_memo(cache_dir: str, key: str, reason: str) -> None:
         pass   # best-effort; a memo write failure must never break the compile
 
 
+def served_static_variant_keys(parts) -> set:
+    """(entry, image_crc) pairs the built static parts can dispatch.
+
+    Coverage is per byte-variant: a part serves an address only for the image
+    it was compiled from, because the dispatcher's CRC gate rejects that
+    identity against any other resident bytes."""
+    return {(variant['addr'], part['image_crc'])
+            for part in parts for variant in part['variants']}
+
+
+def select_static_fragment_demands(requested_keys, parts) -> list:
+    """Requested (entry, image_crc) demands no built part serves, sorted.
+
+    Keyed by (entry, image crc) and NEVER by the bare address. With address
+    keys, the first variant at an address -- from any capture of the band --
+    marked that address served for every other capture, and the per-entry
+    source map kept only the last capture's bytes, so in a band with N
+    occupants exactly one occupant ever received isolated fragments
+    (BoF3 SCENARIO band, 2026-09-05: 20 sections, SCENA16 resident, all 53 of
+    its observed entries interpreted while every spanning piece had been
+    compiled from SCENA19/04/06 bytes and could never validate)."""
+    return sorted(set(requested_keys) - served_static_variant_keys(parts))
+
+
+_STATIC_IMAGE_SOURCES: dict = {}
+
+
+def _init_static_fragment_worker(image_sources: dict) -> None:
+    """Pool initializer: the image table travels to each worker ONCE.
+
+    A demand is (entry, image); thousands of demands share a few hundred
+    images, so pickling the bytes per job would move the whole capture set
+    through the pipe once per demand. Workers look images up by key."""
+    global _STATIC_IMAGE_SOURCES
+    _STATIC_IMAGE_SOURCES = image_sources
+
+
+def static_fragment_job(entry: int, image_key, args):
+    """Worker for the static isolated-fragment pass: one (entry, image).
+
+    Module-level and self-contained so it runs in a ProcessPoolExecutor.
+    Returns (part or None, reason)."""
+    data, load_addr, size, phys_addr, guard_bytes = \
+        _STATIC_IMAGE_SOURCES[image_key]
+    return generate_interior_fragment_static(
+        entry, data, load_addr, size, phys_addr, args,
+        guard_bytes=guard_bytes)
+
+
 def generate_interior_fragment_static(interior: int, data: bytes,
                                       load_addr: int, size: int,
                                       phys_addr: int, args, *,
                                       guard_bytes: int):
-    """Generate one isolated, exact-range-gated static interior shard."""
+    """Generate one isolated, exact-range-gated static interior shard.
+
+    Returns (part, reason): part is None on failure and reason then says
+    why. Reasons starting with 'generated-c-audit:', 'requested-entry-audit:'
+    or 'guest-walk-audit:' are deterministic verdicts on these exact bytes
+    (the interior is data in this image) and are safe to memoize; anything
+    else (recompiler exit, missing output) is not."""
     with tempfile.TemporaryDirectory() as tmp:
         psx = os.path.join(tmp, 'frag.psx')
         with open(psx, 'wb') as f:
@@ -3313,7 +3369,18 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             cmd, capture_output=True, text=True,
             cwd=os.path.dirname(os.path.abspath(args.game_toml)), env=sub_env)
         if result.returncode != 0:
-            return None
+            # A walk from this interior that runs off the image (a branch at
+            # the last word, its delay slot past the end) is the recompiler's
+            # own verdict that these bytes are not code from here: it throws
+            # rather than auditing. Deterministic for the image, so memoizable
+            # alongside the audit rejections.
+            text = (result.stderr or '') + (result.stdout or '')
+            walk = [ln.strip() for ln in text.splitlines()
+                    if 'outside the input image' in ln or
+                    'cannot emit control flow' in ln]
+            if walk:
+                return None, 'guest-walk-audit: ' + walk[0][:160]
+            return None, f'recompiler: exit {result.returncode}'
 
         full_c = ranges_src = None
         for filename in os.listdir(out_dir_tmp):
@@ -3322,7 +3389,7 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             elif filename.endswith('_full.ranges'):
                 ranges_src = os.path.join(out_dir_tmp, filename)
         if not full_c or not ranges_src:
-            return None
+            return None, 'no-output: recompiler emitted no _full.c/_full.ranges'
 
         with open(full_c) as f:
             src, func_addrs = patch_generated_c_static(
@@ -3330,17 +3397,19 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         image_crc = binascii.crc32(data) & 0xFFFFFFFF
         audit = audit_generated_c(src, load_addr, size, image_crc, {})
         if audit['unknown_bad'] or audit['unsupported_todo_addrs']:
-            return None
+            return None, (f'generated-c-audit: {len(audit["unknown_bad"])} '
+                          f'unknown_bad, '
+                          f'{len(audit["unsupported_todo_addrs"])} unsupported')
         func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         ids_by_addr = {}
         for ev, code_crc, ranges in func_ids:
             ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
         if set(func_addrs) - set(ids_by_addr):
-            return None
+            return None, 'static-ranges: dispatchable function(s) lack exact ranges'
 
         entry = (interior & 0x1FFFFFFF) | 0x80000000
         if entry not in ids_by_addr or entry not in set(func_addrs):
-            return None
+            return None, 'requested-entry-audit: fragment omitted its own entry'
         namespace = (f'ov_frag_{phys_addr:08X}_{image_crc:08X}_'
                      f'{entry:08X}')
         continuation_owners = parse_cps_continuation_owners(src)
@@ -3358,11 +3427,12 @@ def generate_interior_fragment_static(interior: int, data: bytes,
             'src': src,
             'variants': variants,
             'namespace': namespace,
+            'image_crc': image_crc,
             'func_addrs': set(func_addrs),
             'symbols': symbols,
             'ids_by_addr': ids_by_addr,
             'continuation_owners': continuation_owners,
-        }
+        }, 'ok'
 
 
 def validate_overlay_func_ids(func_ids: list,
@@ -5581,8 +5651,16 @@ def static_capture_job(cap: dict, args, toml: dict, forced_interiors: set,
     parallel workers never interleave.
 
     result: label, outcome ('ok' | 'skip' | 'fail'), fail=(class, detail),
-            part (the static_parts entry, or None), requested_entries (set),
-            entry_sources ({entry: (data, load_addr, size, phys_addr)}), log.
+            part (the static_parts entry, or None),
+            requested_entries (set of (entry, image_crc)),
+            entry_sources ({(entry, image_crc): (data, load_addr, size,
+            phys_addr, guard_bytes)}), log.
+
+    Requested entries are keyed by (entry, image crc), never by the bare
+    address: the dispatcher validates every variant against the exact bytes
+    it was compiled from, so a demand is only served by a variant built from
+    THIS capture's bytes. Two captures of one band that both observed an
+    address are two demands (see the isolated-fragment pass in main()).
     """
     result = {'label': None, 'outcome': None, 'fail': None, 'part': None,
               'requested_entries': set(), 'entry_sources': {}, 'log': ''}
@@ -5615,8 +5693,9 @@ def _static_capture_job(cap, args, toml, forced_interiors, static_out, result):
 
     for captured_entry in _parse_addr_list(cap.get('dispatch_entry_pcs', [])):
         entry = ((captured_entry & 0x1FFFFFFF) | 0x80000000)
-        result['requested_entries'].add(entry)
-        result['entry_sources'][entry] = (
+        key = (entry, crc32)
+        result['requested_entries'].add(key)
+        result['entry_sources'][key] = (
             data, load_addr, size, phys_addr, guard_bytes)
     # --force-interior is an explicit operator assertion that a live dispatch
     # entry was observed even if the retained capture lost its classifier
@@ -5627,8 +5706,9 @@ def _static_capture_job(cap, args, toml, forced_interiors, static_out, result):
         forced_phys = forced_entry & 0x1FFFFFFF
         if phys_addr <= forced_phys < region_hi:
             entry = forced_phys | 0x80000000
-            result['requested_entries'].add(entry)
-            result['entry_sources'][entry] = (
+            key = (entry, crc32)
+            result['requested_entries'].add(key)
+            result['entry_sources'][key] = (
                 data, load_addr, size, phys_addr, guard_bytes)
 
     seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
@@ -5748,6 +5828,7 @@ def _static_capture_job(cap, args, toml, forced_interiors, static_out, result):
             'src': src,
             'variants': variants,
             'namespace': namespace,
+            'image_crc': crc32,
             'func_addrs': set(func_addrs),
             'symbols': symbols,
             'ids_by_addr': ids_by_addr,
@@ -5820,14 +5901,32 @@ def write_static_outputs(static_out: str, parts: list, variants: list,
 
     d = os.path.dirname(static_out) or '.'
     stem = os.path.splitext(os.path.basename(static_out))[0]
+    # One unit per region part, plus one unit per IMAGE for its isolated
+    # fragments. Fragments are per (entry, image) and a band with many
+    # occupants carries thousands of them (BoF3: 20k), so a unit per fragment
+    # would mean 20k files for the glob and 20k compiler launches. Fragment
+    # parts are privately namespaced, so concatenating an image's fragments
+    # is safe; keeping them apart from the region unit means a new fragment
+    # rewrites only its image's fragment unit, never the region.
+    units = []      # (label, [parts])
+    frag_units = {}
+    for part in parts:
+        if part['namespace'].startswith('ov_frag_'):
+            key = part['namespace'].rsplit('_', 1)[0]   # ov_frag_<phys>_<crc>
+            if key not in frag_units:
+                frag_units[key] = [key + '_fragments', []]
+                units.append(frag_units[key])
+            frag_units[key][1].append(part)
+        else:
+            units.append([part['namespace'], [part]])
     written = []
-    for index, part in enumerate(parts):
+    for index, (label, unit_parts) in enumerate(units):
         path = os.path.join(d, f'{stem}_{index:04d}.c')
         # No part COUNT in the header: adding or dropping an overlay must leave
         # every unchanged unit byte-identical (and therefore not rebuilt).
         text = (STATIC_HEADER +
-                f'/* Static overlay translation unit {index}: '
-                f'{part["namespace"]} */\n' + part['src'])
+                f'/* Static overlay translation unit {index}: {label} */\n' +
+                ''.join(part['src'] for part in unit_parts))
         _write_if_changed(path, text)
         written.append(path)
     keep = set(written)
@@ -5838,7 +5937,7 @@ def write_static_outputs(static_out: str, parts: list, variants: list,
     symbols = sorted({variant['symbol'] for variant in variants})
     main = STATIC_HEADER
     main += '#include "psx_runtime.h"\n\n'
-    main += (f'/* Dispatcher for {len(parts)} overlay translation unit(s) '
+    main += (f'/* Dispatcher for {len(written)} overlay translation unit(s) '
              f'({stem}_0000.c ...). Every compiled entry has external linkage '
              f'in its own unit; declare them here. */\n')
     main += ''.join(f'void {sym}(CPUState *cpu);\n' for sym in symbols)
@@ -7277,56 +7376,132 @@ def main():
                 part['src'] += ''.join(wrappers)
 
         synthesize_all_resume_wrappers(static_parts)
-        existing_entries = {
-            variant['addr']
-            for part in static_parts
-            for variant in part['variants']
-        }
 
         # Captured entries not owned by any compiled host are genuine orphan
         # interiors. Compile each as an isolated dispatch-root shard, then give
         # every block in those fragments the same universal resume treatment.
-        unresolved = sorted(static_requested_entries - existing_entries)
+        #
+        # Demands are (entry, image crc), one per capture that observed the
+        # address, and a demand is served only by a part built from that
+        # capture's bytes (select_static_fragment_demands). A band with many
+        # occupants therefore gets one fragment per occupant that observed the
+        # address -- the dispatcher's CRC gate picks the resident one.
+        unresolved = select_static_fragment_demands(
+            static_requested_entries, static_parts)
         # PSX_STATIC_NO_ISOLATED=1: A/B guard -- skip the isolated-fragment pass
         # entirely while testing the universal-resume machinery.
         if os.environ.get('PSX_STATIC_NO_ISOLATED'):
             unresolved = []
-        fragment_built = 0
-        new_fragment_parts = []
-        for entry in unresolved:
-            if entry in existing_entries:
-                continue
-            source = static_entry_sources.get(entry)
+
+        # Persistent doomed-fragment memo, as in the DLL path: an interior
+        # that is data in THIS image fails the generated-C audit every time,
+        # after a full recompiler walk. Band-attributed captures (an observed
+        # PC attached to every occupant of its band) make that the common
+        # case, so remember the verdict per (image bytes, interior, toml,
+        # cps, guard) next to the static output. --force cannot be the retry
+        # switch here (static mode needs it just to overwrite the output);
+        # --force-interior PC retries that entry, deleting the memo file
+        # retries everything.
+        fail_memo = load_interior_fail_memo(args.out_dir)
+        expected_abi = overlay_abi_tag(args.runtime_include, args.flavor)
+        forced_phys = {entry & 0x1FFFFFFF for entry in forced_interiors}
+        fragment_jobs = []      # (demand key, memo key, image key)
+        image_sources = {}      # image key -> (data, load, size, phys, guard)
+        fragment_memo_skipped = 0
+        for key in unresolved:
+            source = static_entry_sources.get(key)
             if source is None:
                 continue
+            entry, image_crc = key
             data, load_addr, size, phys_addr, guard_bytes = source
-            part = generate_interior_fragment_static(
-                entry, data, load_addr, size, phys_addr, args,
-                guard_bytes=guard_bytes)
+            memo_key = _interior_fail_key(
+                phys_addr, entry, data, load_addr, size, [], [],
+                expected_abi, bool(args.cps), toml, guard_bytes=guard_bytes)
+            if (memo_key in fail_memo and
+                    (entry & 0x1FFFFFFF) not in forced_phys):
+                fragment_memo_skipped += 1
+                continue
+            image_key = (image_crc, phys_addr, size)
+            image_sources.setdefault(image_key, source)
+            fragment_jobs.append((key, memo_key, image_key))
+
+        # Fragments are independent recompiler subprocesses; run them on the
+        # same pool as the regions. Results are merged in demand order and a
+        # result whose entry an earlier-merged part already serves for the
+        # same image is discarded, so the output is byte-identical to the
+        # sequential loop (which skipped such entries before compiling).
+        if fragment_jobs:
+            print(f'Static isolated interior fragments: {len(fragment_jobs)} '
+                  f'(entry, image) demand(s) over {len(image_sources)} '
+                  f'image(s) to compile'
+                  + (f', {fragment_memo_skipped} known-doomed skipped'
+                     if fragment_memo_skipped else ''))
+        if args.jobs > 1 and len(fragment_jobs) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(
+                    max_workers=args.jobs,
+                    initializer=_init_static_fragment_worker,
+                    initargs=(image_sources,)) as pool:
+                fragment_results = list(pool.map(
+                    static_fragment_job,
+                    [job[0][0] for job in fragment_jobs],
+                    [job[2] for job in fragment_jobs],
+                    itertools.repeat(args),
+                    chunksize=8))
+        else:
+            _init_static_fragment_worker(image_sources)
+            fragment_results = [static_fragment_job(key[0], image_key, args)
+                                for key, _memo_key, image_key in fragment_jobs]
+
+        fragment_built = 0
+        fragment_rejected = 0
+        fragment_failed = []
+        new_fragment_parts = []
+        existing_keys = served_static_variant_keys(static_parts)
+        for (key, memo_key, _image_key), (part, reason) in zip(
+                fragment_jobs, fragment_results):
+            if key in existing_keys:
+                continue
             if part is None:
+                if interior_failure_is_deterministic(reason):
+                    fragment_rejected += 1
+                    append_interior_fail_memo(args.out_dir, memo_key, reason)
+                else:
+                    fragment_failed.append((key, reason))
                 continue
             static_parts.append(part)
             new_fragment_parts.append(part)
-            existing_entries.update(
-                variant['addr'] for variant in part['variants'])
+            existing_keys.update(
+                (variant['addr'], part['image_crc'])
+                for variant in part['variants'])
             fragment_built += 1
 
         synthesize_all_resume_wrappers(new_fragment_parts)
-        existing_entries = {
-            variant['addr']
-            for part in static_parts
-            for variant in part['variants']
-        }
-        unresolved = sorted(static_requested_entries - existing_entries)
+        unresolved = select_static_fragment_demands(
+            static_requested_entries, static_parts)
         print(f'Static universal CPS resume wrappers: {synthesized}')
         print(f'Static isolated interior shards: {fragment_built}')
-        if unresolved:
-            sample = ', '.join(f'0x{entry:08X}' for entry in unresolved[:12])
-            print(f'STATIC COVERAGE WARNING: {len(unresolved)} captured dispatch '
-                  f'entry(s) have no compiled body/owner: {sample}')
-            for entry in unresolved:
-                stats.add_fail(f'static entry 0x{entry:08X}', 'static_unresolved',
-                               'captured dispatch entry with no compiled body/owner')
+        if fragment_rejected or fragment_memo_skipped:
+            # Data-as-code in that capture's bytes. Expected whenever a
+            # dispatch entry is attributed to more occupants of a band than
+            # actually ran it: safe coverage loss, never a shard failure --
+            # the resident occupant's own fragment is what serves the entry.
+            print(f'Static fragments rejected as data in their image: '
+                  f'{fragment_rejected} this run (memoized), '
+                  f'{fragment_memo_skipped} skipped from the memo')
+            stats.add_skip(fragment_rejected + fragment_memo_skipped)
+        hard = [(key, reason) for key, reason in fragment_failed]
+        if hard:
+            sample = ', '.join(f'0x{key[0]:08X}/{key[1]:08X}'
+                               for key, _reason in hard[:12])
+            print(f'STATIC COVERAGE WARNING: {len(hard)} captured dispatch '
+                  f'entry(s) have no compiled body/owner (entry/image): '
+                  f'{sample}')
+            for key, reason in hard:
+                stats.add_fail(f'static entry 0x{key[0]:08X} image {key[1]:08X}',
+                               'static_unresolved',
+                               f'captured dispatch entry with no compiled '
+                               f'body/owner: {reason}')
 
         all_variants = []
         for part in static_parts:
