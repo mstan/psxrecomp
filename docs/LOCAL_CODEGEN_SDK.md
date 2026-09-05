@@ -83,6 +83,10 @@ python psxrecomp/psxrecomp_cli.py pgo-train \
   [--disc …] [--train-secs 120] [--train-runs 3] [--json-progress]
 ```
 
+Disc verification and preparation also check and retain user-supplied
+[SBI companions](DISC_COMPANIONS.md). Main-track hashes alone do not prove
+complete subchannel input.
+
 `generate` normalizes the dump via `tools/prepare_disc.py` when needed, then
 runs `psxrecomp-game --config game.toml` into `[recompiler] out_dir`.
 

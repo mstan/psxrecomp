@@ -60,6 +60,11 @@ How the two configs relate:
 [audit]
 ```
 
+`[prepare_disc]` digests identify the main track only. See
+[disc companions](DISC_COMPANIONS.md) for the separate SBI input gate,
+exact revision coverage, and preparation receipts. No SBI configuration key
+is required.
+
 ## Netplay disc mount (`[netplay]`)
 
 Optional. Online play needs the same CD geometry on every peer — data-track
