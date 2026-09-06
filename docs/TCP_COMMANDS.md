@@ -243,6 +243,43 @@ vector observation there.
 
 ---
 
+## `dirty_ram_stats` `per_pc` — interpreted-PC table
+
+Snapshot of the open-addressed per-entry-PC table
+(`g_dirty_ram_pc_table`, `dirty_ram_interp.c`): one object per interpreted
+entry PC. Read-only; safe to poll while the game runs.
+
+- `pc` — physical entry PC.
+- `hits` — dispatches here (interp block chaining conflated in).
+- `insns` — instructions executed across those hits.
+- `entries` — dispatches that arrived from NATIVE code (a call or a fresh
+  dispatch), not interp block-to-block chaining. `entries > 0` marks a real
+  interior entry point — the seed stream for overlay-capture aliasing.
+- `occ_crc` / `occ_ok` — enrichment (2026-09-05): at the last external
+  entry, the manifest CRC of the static overlay variant whose code ranges
+  span this PC (`psx_overlay_resident_crc_at`; DLL-path titles get the last
+  residency hash instead), and whether it validated then. The CRC is the one
+  the variant was compiled from, so it maps straight back to a capture /
+  `.EMI` section offline. Read the pair as: `occ_ok = 1` — an interior gap
+  inside live native code, an alias seed will make it native; `occ_ok = 0`
+  with a CRC — the band's compiled occupant is resident but CRC-missing (data
+  inside the code range is rewritten at run time, or the section differs from
+  the compiled one), so the whole band runs interpreted and no seed helps;
+  `0x00000000` — nothing compiled spans this PC (BIOS / kernel / boot EXE).
+- `ext_ra` — enrichment: `$ra` at the most recent external entry, i.e. the
+  caller that reached this interior. A PC reached only through a
+  function-pointer table shows the dispatcher's `ra` here, so the table's
+  call site is recoverable from the snapshot alone (the LOGO effect-handler
+  case) without a live `overlay_fp_log` window. `ext_ra == pc` means the
+  entry was a `jr ra` *return* from native code into an interpreted
+  continuation, not a call.
+
+The array is emitted inline and truncates before the trailing bitmap
+diagnostics when the response buffer fills; a partial list is still valid JSON
+(the cut lands between rows). Poll periodically to accumulate coverage.
+
+---
+
 ## Rule when the server can't answer your question
 
 If an inspection need isn't covered by the existing commands, **do not fall back to printf or log files**. Instead:

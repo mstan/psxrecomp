@@ -2906,7 +2906,11 @@ static void handle_dirty_ram_stats(int id, const char *json)
                                                      uint32_t out[5]);
     (void)json;
 
-    char buf[32 * 1024];
+    /* 64 KiB (was 32): the per_pc array is emitted inline and each row grew by
+     * the occ_crc / ext_ra enrichment fields (2026-09-05). The tail reserve
+     * below still truncates the row list before the fixed diagnostics, so a
+     * larger buffer only means more per_pc rows fit before that cut. */
+    char buf[64 * 1024];
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
@@ -2926,12 +2930,16 @@ static void handle_dirty_ram_stats(int id, const char *json)
         if (e->pc == 0 || e->hits == 0) continue;
         n += snprintf(buf + n, sizeof(buf) - n,
                       "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu,"
-                      "\"entries\":%llu}",
+                      "\"entries\":%llu,\"occ_crc\":\"0x%08X\","
+                      "\"occ_ok\":%u,\"ext_ra\":\"0x%08X\"}",
                       first ? "" : ",",
                       (unsigned)e->pc,
                       (unsigned long long)e->hits,
                       (unsigned long long)e->insns,
-                      (unsigned long long)e->entry_hits);
+                      (unsigned long long)e->entry_hits,
+                      (unsigned)e->occ_crc,
+                      (unsigned)e->occ_ok,
+                      (unsigned)e->last_ext_ra);
         first = 0;
         /* Reserve enough tail room for all bitmap/guard diagnostics below. */
         if (n >= (int)sizeof(buf) - 2048) break;
