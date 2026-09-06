@@ -107,6 +107,43 @@ setup-host zip never opens first-run / Generate & rebuild. The zip ships
 emitters + OpenBIOS.toml; end users Generate (OpenBIOS always; SCPH1001 if
 they have a dump) via the wizard, then rebuild.
 
+## Windows code signing
+
+Windows 11 **Smart App Control** (on by default on new installs) allows an
+executable only if it carries a valid Authenticode signature or its exact
+hash already has reputation. Every CI build is a new hash, so an unsigned
+release is blocked outright, with no "run anyway".
+
+`package_setup_host.sh` therefore runs `tools/ci/sign_windows.sh` over the
+staged tree before zipping. It signs the host exe, every DLL, and the
+emitters (an embedded `toolchain/` is left alone) with SHA-256 and an RFC 3161
+timestamp, then verifies each file.
+
+| Secret / variable | Meaning |
+|---|---|
+| `WINDOWS_SIGN_PFX_BASE64` | the PKCS#12 certificate, base64 (`base64 -w0 cert.pfx`) |
+| `WINDOWS_SIGN_PFX_PASSWORD` | its password (omit for a passwordless .pfx) |
+| `WINDOWS_SIGN_TIMESTAMP_URL` | optional; default `http://timestamp.digicert.com` |
+| `WINDOWS_SIGN_DESCRIPTION` | optional; text shown in the file's properties / UAC |
+
+**No certificate = no signing, and the build still succeeds** (a notice is
+printed). A certificate that is present but fails to sign is fatal. The
+workflow template passes the two secrets to the *Package setup zip* step;
+forks without them package unsigned exactly as before.
+
+Certificate choice: an OV certificate satisfies Smart App Control at once,
+while SmartScreen reputation still builds over downloads. An EV certificate
+or Azure Trusted Signing is trusted by both immediately. Trusted Signing
+does not hand out a .pfx; wiring it means a different signing step, not
+this script.
+
+What signing cannot cover: a setup-host title is **rebuilt on the player's
+machine** after Generate. That locally built game exe is a new, unsigned
+binary and Smart App Control judges it on its own. Signing covers the
+shipped host/wizard, emitters and DLLs; a machine with Smart App Control
+*On* will still refuse the locally built game until the policy is turned
+off (Windows Security → App & browser control), which is permanent.
+
 ## Release checklist
 
 See [`../GAME_PROJECT_SETUP.md`](../GAME_PROJECT_SETUP.md#bundled-release-checklist).

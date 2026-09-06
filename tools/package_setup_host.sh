@@ -581,6 +581,23 @@ if (( ${#missing_incs[@]} )); then
   exit 1
 fi
 
+# --- Windows: Authenticode-sign what the player will run -------------------
+# The host exe, its DLLs, and the emitters. A no-op without a certificate in
+# the environment (see tools/ci/sign_windows.sh); fatal if one is configured
+# and signing fails. Note the limit of what signing can do for a setup-host
+# title: the game exe the player's own machine builds after Generate is not
+# this file and carries no signature -- Smart App Control judges that build
+# on its own, and only the host/wizard, emitters and DLLs shipped here are
+# covered.
+if [[ "${EXE_BASENAME}" == *.exe ]]; then
+  SIGN_SH="${SCRIPT_DIR}/ci/sign_windows.sh"
+  if [[ -f "${SIGN_SH}" ]]; then
+    bash "${SIGN_SH}" "${STAGE}"
+  else
+    echo "note: ${SIGN_SH} missing; Windows binaries ship unsigned" >&2
+  fi
+fi
+
 find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {} +
 
 (

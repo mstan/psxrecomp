@@ -538,6 +538,14 @@ jobs:
           echo "lobby pin ok: ${BUILT} (${STAMP})"
 
       - name: Package setup zip
+        # Windows code signing (Smart App Control / SmartScreen): the packager
+        # signs the host exe, DLLs and emitters when these secrets exist and
+        # skips signing, with a notice, when they do not. Put the .pfx in the
+        # repo's Actions secrets base64-encoded (`base64 -w0 cert.pfx`).
+        # See psxrecomp/docs/ci/README.md, "Windows code signing".
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
         run: |
           set -euo pipefail
           chmod +x scripts/package_setup_release.sh
