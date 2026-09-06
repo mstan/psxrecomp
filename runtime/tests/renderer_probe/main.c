@@ -11,6 +11,7 @@
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
+#include "gpu_ng_renderer.h"
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -25,6 +26,8 @@ typedef struct Options {
     int iters;
     int scale;
     int skip_wide;
+    int contracts;
+    int present;
 } Options;
 
 typedef struct BackendRuntime {
@@ -258,6 +261,108 @@ static int dump_raw(const char *out_dir, const char *backend, int repeat, const 
     return (wrote == VRAM_PIXELS && close_ok == 0) ? 0 : -1;
 }
 
+/* Small analytical contracts run outside timing. They catch an inert backend,
+ * ignored masks, wrong CLUT decoding and broken wrapped/odd-width transfers
+ * without treating another renderer's rasterization as a hardware oracle. */
+static int expect_pixel(int x, int y, uint16_t expected, const char *operation)
+{
+    uint16_t actual = gr_vram_read(x, y);
+    if (actual == expected) return 0;
+    fprintf(stderr, "%s at (%d,%d): expected %04x, got %04x\n", operation, x, y, expected, actual);
+    return -1;
+}
+
+static int pixel_contract_check(void)
+{
+    const uint16_t red = rgb555(31, 0, 0), green = rgb555(0, 31, 0);
+    const uint16_t odd[] = {1, 2, 3, 4, 5, 6};
+    uint16_t copy[6] = {0};
+    uint16_t palette[16] = {0};
+    uint16_t indices = 0x0010;
+    reset_render_state();
+    gr_fill_rect(0, 0, VRAM_W, VRAM_H, 0);
+    gr_vram_transfer_in(1023, 511, 3, 2, odd);
+    gr_vram_transfer_out(1023, 511, 3, 2, copy);
+    if (memcmp(odd, copy, sizeof(odd))) {
+        fprintf(stderr, "wrapped odd-width transfer regression\n");
+        return -1;
+    }
+    gr_copy_rect(1023,511,110,110,3,2);
+    gr_vram_transfer_out(110,110,3,2,copy);
+    if (memcmp(odd,copy,sizeof(odd))) {
+        fprintf(stderr, "wrapped source VRAM copy regression\n");
+        return -1;
+    }
+    gr_draw_flat_rect(20, 20, 3, 2, red);
+    if (expect_pixel(20,20,red,"flat rect") || expect_pixel(22,21,red,"flat rect extent") ||
+        expect_pixel(23,21,0,"flat rect exclusive edge")) return -1;
+    gr_set_mask_bits(1, 0);
+    gr_draw_flat_rect(20, 20, 1, 1, green);
+    gr_set_mask_bits(0, 1);
+    gr_draw_flat_rect(20, 20, 1, 1, red);
+    if (expect_pixel(20,20,(uint16_t)(green | 0x8000),"mask protection")) return -1;
+    gr_set_mask_bits(0, 0);
+    gr_set_draw_area(31,31,32,32);
+    gr_set_draw_offset(10,10);
+    /* gpu.c applies GP0 drawing offsets before calling this facade. */
+    gr_draw_flat_rect(30,30,4,4,red);
+    if (expect_pixel(30,30,0,"draw area clipping") || expect_pixel(31,31,red,"offset not applied twice")) return -1;
+    reset_render_state();
+    palette[1] = green;
+    gr_vram_transfer_in(0,480,16,1,palette);
+    gr_vram_transfer_in(768,0,1,1,&indices);
+    gr_draw_flat_rect(40,40,2,1,red);
+    gr_draw_textured_rect(40,40,2,1,0,0,0,480,12); /* 4-bit page x=768 */
+    if (expect_pixel(40,40,red,"transparent CLUT entry") || expect_pixel(41,40,green,"4-bit CLUT")) return -1;
+    gr_copy_rect(40,40,60,60,2,1);
+    if (expect_pixel(60,60,red,"VRAM copy") || expect_pixel(61,60,green,"VRAM copy extent")) return -1;
+    {
+        const uint16_t back = rgb555(12,12,12), front = rgb555(8,8,8);
+        const int expected[] = {10,20,4,14};
+        for (int mode = 0; mode < 4; ++mode) {
+            gr_set_semi_transparency(0,0);
+            gr_draw_flat_rect(80,80,4,4,back);
+            gr_set_semi_transparency(1,mode);
+            gr_draw_flat_rect(80,80,4,4,front);
+            for (int y = 80; y < 84; ++y)
+                for (int x = 80; x < 84; ++x)
+                    if (expect_pixel(x,y,rgb555(expected[mode],expected[mode],expected[mode]),"semi-transparent rectangle")) return -1;
+        }
+        gr_set_semi_transparency(0,0);
+        gr_draw_flat_rect(80,80,4,4,back);
+        gr_set_semi_transparency(1,1);
+        gr_draw_flat_triangle(80,80,84,80,80,84,front);
+        gr_draw_flat_triangle(84,80,84,84,80,84,front);
+        for (int y = 80; y < 84; ++y)
+            for (int x = 80; x < 84; ++x)
+                if (expect_pixel(x,y,rgb555(20,20,20),"shared triangle edge blends once")) return -1;
+    }
+    reset_render_state();
+    {
+        uint16_t texel = (uint16_t)(green | 0x8000);
+        gr_vram_transfer_in(768,0,1,1,&texel);
+        gr_draw_textured_rect(90,90,1,1,0,0,0,0,texpage_16bpp(768,0,0));
+        /* Existing software drops texture STP on write; the new backend's
+         * contract preserves it, as native Vulkan's texture shader does. */
+        uint16_t stored = gr_backend() == GR_BACKEND_SOFTWARE ? green : texel;
+        if (expect_pixel(90,90,stored,"textured mask bit")) return -1;
+        gr_draw_flat_rect(92,92,1,1,red);
+        gr_set_semi_transparency(1,0);
+        gr_draw_textured_rect(92,92,1,1,0,0,0,0,texpage_16bpp(768,0,0));
+        uint16_t blended = rgb555(15,15,0);
+        if (gr_backend() != GR_BACKEND_SOFTWARE) blended |= 0x8000;
+        if (expect_pixel(92,92,blended,"textured blending preserves STP")) return -1;
+        gr_set_semi_transparency(0,0);
+        /* A following partial fill must not discard pending GPU writes from
+         * the CPU mirror, which is consumed by savestates and debug tools. */
+        gr_draw_flat_rect(91,91,1,1,green);
+        gr_fill_rect(100,100,1,1,red);
+        if (expect_pixel(91,91,green,"partial fill retains prior GPU writes")) return -1;
+    }
+    reset_render_state();
+    return 0;
+}
+
 static int init_backend(const Options *opt, BackendRuntime *rt)
 {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
@@ -278,7 +383,7 @@ static int init_backend(const Options *opt, BackendRuntime *rt)
     SDL_WindowFlags flags = SDL_WINDOW_HIDDEN;
     if (opt->backend == GR_BACKEND_OPENGL) {
         flags |= SDL_WINDOW_OPENGL;
-    } else if (opt->backend == GR_BACKEND_VULKAN) {
+    } else if (opt->backend == GR_BACKEND_VULKAN || opt->backend == GR_BACKEND_NOGRAPHICS) {
         flags |= SDL_WINDOW_VULKAN;
     }
     rt->window = SDL_CreateWindow("psx-renderer-probe", 640, 480, flags);
@@ -299,6 +404,19 @@ static int init_backend(const Options *opt, BackendRuntime *rt)
             fprintf(stderr, "vk_renderer_init_context failed\n");
             return -1;
         }
+    } else if (opt->backend == GR_BACKEND_NOGRAPHICS) {
+        ng_renderer_set_present_mode(0);
+        if (!ng_renderer_init_context(rt->window)) {
+            fprintf(stderr, "ng_renderer_init_context failed\n");
+            return -1;
+        }
+        gr_set_backend(GR_BACKEND_NOGRAPHICS);
+        gr_init(g_vram);
+        gr_set_scale(opt->scale);
+    }
+    if (gr_backend() != opt->backend) {
+        fprintf(stderr, "Unexpected backend fallback\n");
+        return -1;
     }
     return 0;
 }
@@ -309,6 +427,9 @@ static void shutdown_backend(const Options *opt, BackendRuntime *rt)
         gl_renderer_shutdown();
     } else if (opt->backend == GR_BACKEND_VULKAN) {
         vk_renderer_shutdown();
+    } else if (opt->backend == GR_BACKEND_NOGRAPHICS) {
+        gr_set_backend(GR_BACKEND_SOFTWARE);
+        ng_renderer_shutdown();
     }
     if (rt->window) SDL_DestroyWindow(rt->window);
     SDL_Quit();
@@ -329,6 +450,10 @@ static int run_probe(const Options *opt)
 
     if (gr_scale() != opt->scale) {
         fprintf(stderr, "Requested scale %d, effective scale %d\n", opt->scale, gr_scale());
+        shutdown_backend(opt, &rt);
+        return 5;
+    }
+    if (opt->contracts && pixel_contract_check() != 0) {
         shutdown_backend(opt, &rt);
         return 5;
     }
@@ -365,6 +490,29 @@ static int run_probe(const Options *opt)
     }
     printf("]}\n");
 
+    if (opt->present) {
+        int presented = 0;
+        if (opt->backend == GR_BACKEND_NOGRAPHICS) {
+            uint32_t *cpu_frame = malloc(320u * 240u * sizeof(uint32_t));
+            if (!cpu_frame) { shutdown_backend(opt, &rt); return 6; }
+            for (int i = 0; i < 320 * 240; ++i) cpu_frame[i] = 0xff204080u;
+            presented = ng_renderer_present_vram(0,0,320,240,0,1);
+            SDL_SetWindowSize(rt.window, 800, 600);
+            SDL_PumpEvents();
+            presented &= ng_renderer_present_vram(0,0,320,240,1,1);
+            ng_renderer_present_cpu(cpu_frame,320,240,0,1);
+            free(cpu_frame);
+            ng_renderer_present_blank();
+        } else if (opt->backend == GR_BACKEND_VULKAN) {
+            presented = vk_renderer_present_vram(0,0,320,240,0,1);
+        }
+        if (!presented) {
+            fprintf(stderr, "Presentation smoke failed/unsupported\n");
+            shutdown_backend(opt, &rt);
+            return 6;
+        }
+    }
+
     shutdown_backend(opt, &rt);
     return 0;
 }
@@ -374,12 +522,13 @@ static int parse_backend(const char *s, GrBackend *out)
     if (strcmp(s, "software") == 0 || strcmp(s, "sw") == 0) { *out = GR_BACKEND_SOFTWARE; return 0; }
     if (strcmp(s, "opengl") == 0 || strcmp(s, "gl") == 0) { *out = GR_BACKEND_OPENGL; return 0; }
     if (strcmp(s, "vulkan") == 0 || strcmp(s, "vk") == 0) { *out = GR_BACKEND_VULKAN; return 0; }
+    if (strcmp(s, "vulkan_nographics") == 0 || strcmp(s, "ng") == 0) { *out = GR_BACKEND_NOGRAPHICS; return 0; }
     return -1;
 }
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s --backend software|opengl|vulkan [--out DIR] [--warmup N] [--repeat N] [--iters N] [--scale N] [--skip-wide]\n", argv0);
+    fprintf(stderr, "usage: %s --backend software|opengl|vulkan|vulkan_nographics [--out DIR] [--warmup N] [--repeat N] [--iters N] [--scale N] [--skip-wide] [--contracts] [--present]\n", argv0);
 }
 
 int main(int argc, char **argv)
@@ -403,6 +552,7 @@ int main(int argc, char **argv)
             }
             if (opt.backend == GR_BACKEND_SOFTWARE) opt.backend_name = "software";
             else if (opt.backend == GR_BACKEND_OPENGL) opt.backend_name = "opengl";
+            else if (opt.backend == GR_BACKEND_NOGRAPHICS) opt.backend_name = "vulkan_nographics";
             else opt.backend_name = "vulkan";
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             opt.out_dir = argv[++i];
@@ -416,6 +566,10 @@ int main(int argc, char **argv)
             opt.scale = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--skip-wide") == 0) {
             opt.skip_wide = 1;
+        } else if (strcmp(argv[i], "--contracts") == 0) {
+            opt.contracts = 1;
+        } else if (strcmp(argv[i], "--present") == 0) {
+            opt.present = 1;
         } else {
             usage(argv[0]);
             return 64;

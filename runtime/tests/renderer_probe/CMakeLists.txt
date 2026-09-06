@@ -3,6 +3,7 @@ project(psx_renderer_probe C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(PSX_NOGRAPHICS_DLL "" CACHE FILEPATH "Optional NoGraphicsAPI renderer DLL to exercise")
 
 set(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." CACHE PATH "psxrecomp checkout root")
 set(PSX_RENDERER_PROBE_VULKAN_SOURCE "${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c" CACHE FILEPATH "Vulkan renderer source for A/B harness runs")
@@ -40,12 +41,23 @@ set(PSX_RENDERER_PROBE_SOURCES
   "${PSXRECOMP_ROOT}/runtime/src/gpu_render.c"
   "${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c"
   "${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c"
+  "${PSXRECOMP_ROOT}/runtime/src/gpu_ng_renderer.c"
   "${PSX_RENDERER_PROBE_VULKAN_SOURCE}"
   "${PSXRECOMP_ROOT}/runtime/src/gpu_vram_dirty.c"
 )
 
 add_executable(renderer_probe ${PSX_RENDERER_PROBE_SOURCES} "${PSX_RENDERER_PROBE_VK_HEADER}")
 add_dependencies(renderer_probe psx_renderer_probe_vkgen)
+if(PSX_NOGRAPHICS_DLL)
+  if(NOT WIN32 OR NOT EXISTS "${PSX_NOGRAPHICS_DLL}")
+    message(FATAL_ERROR "PSX_NOGRAPHICS_DLL must name an existing Windows renderer DLL")
+  endif()
+  target_compile_definitions(renderer_probe PRIVATE PSX_HAVE_NOGRAPHICS=1)
+  add_custom_target(renderer_probe_stage_nographics
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PSX_NOGRAPHICS_DLL}"
+      "$<TARGET_FILE_DIR:renderer_probe>/psx_nographics.dll" VERBATIM)
+  add_dependencies(renderer_probe renderer_probe_stage_nographics)
+endif()
 
 target_include_directories(renderer_probe PRIVATE
   "${PSXRECOMP_ROOT}/runtime/include"

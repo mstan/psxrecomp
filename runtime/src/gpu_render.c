@@ -61,6 +61,11 @@ extern const GpuRenderBackend *gl_backend_get(void);
 /* Supplied by gpu_vk_renderer.c; returns NULL until the Vulkan backend is
  * ready (init succeeded). When Vulkan isn't compiled in it returns NULL. */
 extern const GpuRenderBackend *vk_backend_get(void);
+#if defined(PSX_HAVE_NOGRAPHICS)
+/* Supplied by the NoGraphicsAPI Vulkan bridge; returns NULL until the backend
+ * is initialized. */
+extern const GpuRenderBackend *ng_backend_get(void);
+#endif
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
@@ -87,6 +92,20 @@ void gr_set_backend(GrBackend backend) {
         fprintf(stdout, "psxrecomp: renderer = vulkan requested but unavailable "
                         "— falling back to software\n");
     }
+#if defined(PSX_HAVE_NOGRAPHICS)
+    else if (backend == GR_BACKEND_NOGRAPHICS) {
+        const GpuRenderBackend *ng = ng_backend_get();
+        if (ng) {
+            g_b = ng;
+            g_effective = GR_BACKEND_NOGRAPHICS;
+            fprintf(stdout, "psxrecomp: renderer = vulkan_nographics (%s)\n",
+                    ng->name);
+            return;
+        }
+        fprintf(stdout, "psxrecomp: renderer = vulkan_nographics requested but "
+                        "unavailable - falling back to software\n");
+    }
+#endif
     g_b = &SW_BACKEND;
     g_effective = GR_BACKEND_SOFTWARE;
 }

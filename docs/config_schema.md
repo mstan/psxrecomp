@@ -420,16 +420,21 @@ Runtime video defaults live in `[video]`:
 
 ```toml
 [video]
-renderer = "opengl"       # "software", "opengl", or "vulkan"
+renderer = "opengl"       # "software", "opengl", "vulkan", or "vulkan_nographics"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
+offer_vulkan_nographics = true # with offer_vulkan, show NoGraphicsAPI Vulkan when available
 auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
 ```
 
-`renderer = "vulkan"` remains an experimental runtime choice and still requires
-a build compiled with Vulkan support. `offer_vulkan` controls launcher
-visibility only; it defaults to false so game projects must explicitly expose
-Vulkan after validating their visuals and stability.
+`renderer = "vulkan"` remains the native experimental Vulkan runtime choice and
+still requires a build compiled with Vulkan support. `renderer =
+"vulkan_nographics"` selects the separate experimental NoGraphicsAPI Vulkan
+backend when its bridge is present and initializes successfully. `offer_vulkan`
+controls launcher visibility only; it defaults to false so game projects must
+explicitly expose Vulkan after validating their visuals and stability. The
+NoGraphicsAPI option is shown beside it only when the bridge probe succeeds and
+`offer_vulkan_nographics` is not set false.
 
 `offer_skip_fmv` defaults to true for compatibility with the shared PSX
 Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets

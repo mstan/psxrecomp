@@ -63,4 +63,17 @@ timed runs remove the runner's validation environment overrides.
 Not covered: GP0 packet decoding, BIOS/game execution, 24-bit FMV, presentation
 and swapchain recreation, screenshots through the debug server, netplay,
 rewind, interpolation, perspective corrections, or every PSX edge case.
-NoGraphicsAPI is a separate probe in `tools/nographics_probe`.
+The experimental NoGraphicsAPI runtime backend is opt-in via
+`-DPSX_NOGRAPHICS_DLL=<absolute path to psx_nographics.dll>` when configuring this
+probe. See [its build instructions](../../nographics/README.md). Use
+`--backend vulkan_nographics --scale 1 --contracts --present` for extra pixel
+contracts and presentation/resize calls outside timing. `--contracts` also
+exposes known differences/limitations in other backends (native Vulkan currently
+fails the wrapped-transfer case; software drops texture STP on write).
+
+For a four-backend measurement, add `--nographics --scales 1` to `benchmark.py`.
+Use a Release DLL for timing. For Debug validation, select the local 1.4.357
+layer documented by the NoGraphicsAPI device probe; SDK 1.4.341 cannot validate
+the device-address command extension. The runner rejects NoGraphicsAPI validation
+diagnostics as failures. The separate resource-only probe remains in
+`tools/nographics_probe`.

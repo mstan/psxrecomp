@@ -45,6 +45,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_ng_renderer.h"
 #include "lockstep.h"
 
 #include <stdio.h>
@@ -8746,6 +8747,10 @@ static void handle_screenshot_file(int id, const char *json)
         gl_renderer_sync_cpu();
         extern void vk_renderer_sync_cpu(void);
         vk_renderer_sync_cpu();
+#if defined(PSX_HAVE_NOGRAPHICS)
+        extern void ng_renderer_sync_cpu(void);
+        ng_renderer_sync_cpu();
+#endif
     }
 
     uint32_t w = di.width;  if (w > 640) w = 640;
@@ -8898,7 +8903,7 @@ static void handle_present_shot(int id, const char *json)
         strncpy(path, "psx_present_shot.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
     if (!present_shot_request(path)) {
-        send_err(id, "present_shot unavailable (headless, or the Vulkan backend "
+        send_err(id, "present_shot unavailable (headless, or a Vulkan backend "
                      "which has no present readback)");
         return;
     }
@@ -8929,6 +8934,10 @@ static void handle_dump_buffer(int id, const char *json)
     gl_renderer_sync_cpu();
     extern void vk_renderer_sync_cpu(void);
     vk_renderer_sync_cpu();
+#if defined(PSX_HAVE_NOGRAPHICS)
+    extern void ng_renderer_sync_cpu(void);
+    ng_renderer_sync_cpu();
+#endif
 
     int y0 = json_get_int(json, "y", 0);
     char path[512];
@@ -13194,6 +13203,19 @@ static void handle_vk_perf(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"vk_perf\":%s}", id, buf);
 }
 
+static void handle_ng_perf(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 60);
+    static char buf[49152];
+#if defined(PSX_HAVE_NOGRAPHICS)
+    ng_perf_json(buf, (int)sizeof(buf), count);
+#else
+    (void)count;
+    snprintf(buf, sizeof(buf), "[]");
+#endif
+    send_fmt("{\"id\":%d,\"ok\":true,\"ng_perf\":%s}", id, buf);
+}
+
 static void handle_lockstep(int id, const char *json) {
     /* #2 lockstep comparator. {"lo":N,"hi":M} arms the frame window; the reply
      * reports the first compiled-vs-interp block divergence (if any) so far. */
@@ -13582,6 +13604,7 @@ static const CmdEntry s_commands[] = {
     { "devtrace_ctl",      handle_devtrace_ctl },
     { "latency",           handle_latency },
     { "vk_perf",           handle_vk_perf },
+    { "ng_perf",           handle_ng_perf },
     { "game_options",      handle_game_options },
     { "stack_profile",     handle_stack_profile },
     { "xprobe",            handle_xprobe },

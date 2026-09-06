@@ -601,14 +601,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("renderer")) {
             const auto mode = toml::find<std::string>(video, "renderer");
-            if (mode == "software")     rt.video_renderer = 0;
-            else if (mode == "opengl")  rt.video_renderer = 1;
-            else if (mode == "vulkan")  rt.video_renderer = 2;
-            else throw std::runtime_error(fmt::format(
-                "[video] renderer must be \"software\", \"opengl\" or \"vulkan\": {}", mode));
+            if (!video_renderer_parse(mode, &rt.video_renderer)) {
+                throw std::runtime_error(fmt::format(
+                    "[video] renderer must be \"software\", \"opengl\", "
+                    "\"vulkan\" or \"vulkan_nographics\": {}", mode));
+            }
         }
         if (video.contains("offer_vulkan")) {
             rt.video_offer_vulkan = toml::find<bool>(video, "offer_vulkan");
+        }
+        if (video.contains("offer_vulkan_nographics")) {
+            rt.video_offer_vulkan_nographics =
+                toml::find<bool>(video, "offer_vulkan_nographics");
         }
         if (video.contains("geometry_correction")) {
             rt.video_geometry_correction =
@@ -1443,12 +1447,16 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
     bool vulkan_offered = false;
+    bool vulkan_nographics_offered = true;
     bool ws_adaptive_view = false;
     bool ws_ultrawide_offered = false;
     if (cfg.contains("video")) {
         const toml::value& video = toml::find(cfg, "video");
         if (video.contains("offer_vulkan"))
             vulkan_offered = toml::find<bool>(video, "offer_vulkan");
+        if (video.contains("offer_vulkan_nographics"))
+            vulkan_nographics_offered =
+                toml::find<bool>(video, "offer_vulkan_nographics");
     }
     // Optional [data_shards] block — memoized pure-function replay hooks.
     std::vector<uint32_t> data_shard_funcs;
@@ -2179,6 +2187,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
         /*vulkan_offered*/        vulkan_offered,
+        /*vulkan_nographics_offered*/ vulkan_nographics_offered,
         /*ws_adaptive_view*/      ws_adaptive_view,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
@@ -2266,9 +2275,8 @@ UserSettings load_user_settings(const fs::path& path) {
         const toml::value& v = toml::find(doc, "video");
         if (v.contains("renderer")) try_get([&]{
             const auto m = toml::find<std::string>(v, "renderer");
-            if (m == "software") { s.renderer = 0; s.has_renderer = true; }
-            else if (m == "opengl") { s.renderer = 1; s.has_renderer = true; }
-            else if (m == "vulkan") { s.renderer = 2; s.has_renderer = true; }
+            if (video_renderer_parse(m, &s.renderer))
+                s.has_renderer = true;
         });
         if (v.contains("supersampling")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "supersampling");
@@ -2623,7 +2631,7 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     f << "[video]\n";
     if (s.has_renderer)
         f << "renderer          = \""
-          << (s.renderer == 2 ? "vulkan" : s.renderer == 1 ? "opengl" : "software")
+          << video_renderer_name(s.renderer)
           << "\"\n";
     if (s.has_supersampling)
         f << "supersampling     = " << s.supersampling << "\n";

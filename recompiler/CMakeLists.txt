@@ -443,6 +443,22 @@ if(BUILD_TESTING)
     add_test(NAME video_enhancement_settings_test
              COMMAND video_enhancement_settings_test)
 
+    # [video] renderer compatibility for native Vulkan and NoGraphics Vulkan.
+    add_executable(renderer_nographics_settings_test
+        tests/renderer_nographics_settings_test.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(renderer_nographics_settings_test PRIVATE
+        include
+        src
+        lib/fmt/include
+        lib/toml11
+    )
+    target_link_libraries(renderer_nographics_settings_test PRIVATE fmt)
+    add_test(NAME renderer_nographics_settings_test
+             COMMAND renderer_nographics_settings_test)
+
     # [video] rewind opt-in plumbing (default off + settings round trip).
     add_executable(rewind_settings_test
         tests/rewind_settings_test.cpp

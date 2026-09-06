@@ -29,14 +29,15 @@ def run(exe, backend, label, scale, args, validation=False):
     result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=120, encoding="utf-8", errors="replace")
     (out / "run.log").write_text(result.stdout, encoding="utf-8")
-    if result.returncode or "Validation Error" in result.stdout or "SYNC-HAZARD" in result.stdout:
+    if result.returncode or any(message in result.stdout for message in
+                               ("Validation Error", "SYNC-HAZARD", "NoGraphicsAPI validation:")):
         raise RuntimeError(f"{label} failed ({result.returncode}); see {out / 'run.log'}")
     reports = [json.loads(line) for line in result.stdout.splitlines()
                if line.startswith('{"backend":')]
     if len(reports) != 1:
         raise RuntimeError(f"Missing/unparseable measurement from {label}")
     report = reports[0]
-    expected = {"software": 0, "opengl": 1, "vulkan": 2}[backend]
+    expected = {"software": 0, "opengl": 1, "vulkan": 2, "vulkan_nographics": 3}[backend]
     if report["effective_backend"] != expected or report["scale"] != scale:
         raise RuntimeError(f"Unexpected renderer fallback: {report}")
     samples = [r["wall_ms"] / report["iters"] for r in report["repeats"]]
@@ -69,6 +70,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", type=Path, required=True)
     p.add_argument("--baseline", type=Path)
+    p.add_argument("--nographics", action="store_true", help="Include the separately built NoGraphicsAPI DLL backend")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--scales", type=int, nargs="+", default=[1])
     p.add_argument("--warmup", type=int, default=20)
@@ -87,17 +89,24 @@ def main():
     for scale in args.scales:
         if args.validate:
             validations.append(run(args.exe, "vulkan", "vulkan", scale, args, True))
+            if args.nographics:
+                validations.append(run(args.exe, "vulkan_nographics", "vulkan_nographics", scale, args, True))
         current = [run(args.exe, name, name, scale, args)
                    for name in ("software", "opengl", "vulkan")]
         if args.baseline:
             current.append(run(args.baseline, "vulkan", "vulkan-baseline", scale, args))
+        if args.nographics:
+            current.append(run(args.exe, "vulkan_nographics", "vulkan_nographics", scale, args))
         results.extend(current)
         for a, b in ((0, 1), (0, 2), (1, 2)):
             comparisons.append(compare(current[a], current[b]))
         if args.baseline:
             comparisons.append(compare(current[3], current[2]))
+        if args.nographics:
+            for reference in current[:3]:
+                comparisons.append(compare(reference, current[-1]))
     report = {"kind": "renderer-microbenchmark", "timed_work": "fixed draws/uploads plus full 1MiB VRAM readback per iteration",
-              "excludes": "game CPU emulation, presentation, vsync; not NoGraphicsAPI",
+              "excludes": "game CPU emulation, presentation, vsync",
               "results": results, "comparisons": comparisons, "validation_runs": validations}
     (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     for r in results:

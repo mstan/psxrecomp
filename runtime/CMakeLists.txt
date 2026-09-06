@@ -446,6 +446,15 @@ if(BUILD_TESTING)
     add_test(NAME gpu_vk_upload_alignment_test
              COMMAND gpu_vk_upload_alignment_test)
 
+    add_executable(gpu_render_nographics_facade_test
+        tests/test_gpu_render_nographics_facade.c
+        src/gpu_render.c)
+    target_include_directories(gpu_render_nographics_facade_test PRIVATE include)
+    target_compile_definitions(gpu_render_nographics_facade_test PRIVATE
+        PSX_HAVE_NOGRAPHICS=1)
+    add_test(NAME gpu_render_nographics_facade_test
+             COMMAND gpu_render_nographics_facade_test)
+
     # Portable rollback helpers (retcomm-rbengine) — required for MotK netplay
     # unit tests that use the netplay_* compatibility shims.
     set(_RBE_ROOT "${PSXRECOMP_ROOT}/lib/retcomm-rbengine")

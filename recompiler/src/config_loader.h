@@ -42,7 +42,39 @@ enum PadMode { PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 inline constexpr int VIDEO_RENDERER_SOFTWARE = 0;
 inline constexpr int VIDEO_RENDERER_OPENGL = 1;
 inline constexpr int VIDEO_RENDERER_VULKAN = 2;
+inline constexpr int VIDEO_RENDERER_NOGRAPHICS = 3;
 inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
+
+inline const char* video_renderer_name(int v) {
+    switch (v) {
+        case VIDEO_RENDERER_SOFTWARE:   return "software";
+        case VIDEO_RENDERER_OPENGL:     return "opengl";
+        case VIDEO_RENDERER_VULKAN:     return "vulkan";
+        case VIDEO_RENDERER_NOGRAPHICS: return "vulkan_nographics";
+        default:                        return "opengl";
+    }
+}
+
+inline bool video_renderer_parse(const std::string& s, int* out) {
+    if (!out) return false;
+    if (s == "software") {
+        *out = VIDEO_RENDERER_SOFTWARE;
+        return true;
+    }
+    if (s == "opengl") {
+        *out = VIDEO_RENDERER_OPENGL;
+        return true;
+    }
+    if (s == "vulkan") {
+        *out = VIDEO_RENDERER_VULKAN;
+        return true;
+    }
+    if (s == "vulkan_nographics") {
+        *out = VIDEO_RENDERER_NOGRAPHICS;
+        return true;
+    }
+    return false;
+}
 
 // Controller-hotkey bind encoding, mirroring recomp-ui's RECOMP_LAUNCHER_PAD_*
 // (recomp_launcher.h): 0 = unbound, 1..99 = button (1 + SDL button code),
@@ -401,9 +433,10 @@ struct RuntimeConfig {
     //               overall sharpness at the nearest level
     int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
 
-    // renderer: "software" | "opengl" (default) | "vulkan". Selects the
-    // rasterizer/present backend. The software rasterizer remains the explicit
-    // fallback. Stored as VIDEO_RENDERER_*.
+    // renderer: "software" | "opengl" (default) | "vulkan" |
+    // "vulkan_nographics". Selects the rasterizer/present backend. The
+    // software rasterizer remains the explicit fallback. Stored as
+    // VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
 
     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
@@ -465,6 +498,10 @@ struct RuntimeConfig {
     // Defaults false even for Vulkan-enabled builds; developers must opt in per
     // game once visuals are validated.
     bool                  video_offer_vulkan = false;
+    // offer_vulkan_nographics: explicit per-title opt-out for the experimental
+    // NoGraphicsAPI Vulkan renderer. The launcher offers it when native Vulkan
+    // is offered and the runtime bridge probe succeeds, unless this is false.
+    bool                  video_offer_vulkan_nographics = true;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of
@@ -1114,6 +1151,7 @@ struct GameConfig {
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
     bool vulkan_offered = false;
+    bool vulkan_nographics_offered = false;
 
     // [widescreen] adaptive_view — let the user opt into a live, resize-driven
     // aspect instead of selecting only fixed 4:3/16:9/21:9 modes. The fixed
@@ -1188,7 +1226,7 @@ struct UserSettings {
     bool parse_error = false;
 
     // [video]
-    bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
+    bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // VIDEO_RENDERER_*
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4
     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
     // both the launcher and the emulator window so they boot at the same size.

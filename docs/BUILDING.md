@@ -158,8 +158,57 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 | `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL + libgcc/libstdc++) |
 | `PSX_RECOMP_UI` | ON | Wire a downstream game's pinned recomp-ui launcher; set OFF for headless/generated builds |
 | `PSX_ENABLE_VULKAN` | **ON** | Build the experimental Vulkan renderer when the SDK tools are present (skipped if not). Pass `OFF` to exclude it outright. |
+| `PSX_ENABLE_NOGRAPHICS` | OFF | Opt in to the supplemental NoGraphicsAPI renderer bridge. Requires a C ABI DLL; the normal runtime never links NoGraphicsAPI C++ objects directly. |
 | `PSX_NETPLAY` | OFF | Link recomp-net + lobby; advertise full netplay UI (multiplayer titles) |
 | `PSX_SETUP_WIZARD` | OFF | Advertise first-run setup wizard + Generate & rebuild in recomp-ui |
+
+### Supplemental NoGraphicsAPI DLL
+
+NoGraphicsAPI is built as a separate Windows x64 DLL because the normal runtime
+uses the RetComM Clang/MinGW toolchain and upstream NoGraphicsAPI rejects MinGW.
+The runtime side is a C bridge loaded at run time, guarded by
+`PSX_HAVE_NOGRAPHICS`. With `PSX_ENABLE_NOGRAPHICS=OFF`, that bridge must compile
+as a stub and no DLL is required.
+
+Use either a prebuilt bridge DLL:
+
+```sh
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DPSX_ENABLE_NOGRAPHICS=ON \
+  -DPSX_NOGRAPHICS_DLL=F:/path/to/psx_nographics.dll
+```
+
+or point the runtime build at the standalone MSVC CMake project that produces
+the DLL:
+
+```sh
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DPSX_ENABLE_NOGRAPHICS=ON \
+  -DPSX_NOGRAPHICS_PROJECT_DIR=F:/Projects/psxrecomp/_wt-nographics-vulkan/runtime/nographics \
+  -DPSX_NOGRAPHICS_API_ROOT=F:/Projects/psxrecomp/_probe-nographics/NoGraphicsAPI \
+  -DPSX_NOGRAPHICS_VULKAN_HEADERS_ROOT=F:/Projects/psxrecomp/_probe-nographics/Vulkan-Headers-1.4.357 \
+  -DPSX_NOGRAPHICS_VULKAN_LIBRARY=C:/VulkanSDK/1.4.341.1/Lib/vulkan-1.lib \
+  -DPSX_NOGRAPHICS_SLANGC=F:/Projects/psxrecomp/_probe-nographics/slang-2026.14.1/bin/slangc.exe \
+  -DPSX_NOGRAPHICS_SPIRV_VAL=F:/Projects/psxrecomp/_probe-nographics/build-spirv-tools-v2026.3/tools/spirv-val.exe \
+  -DPSX_NOGRAPHICS_CMAKE="C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+```
+
+The helper builds `PSX_NOGRAPHICS_TARGET` (`psx_nographics_runtime` by default) with
+Visual Studio 2022 x64, expects `psx_nographics.dll` under the standalone
+build's `bin/<config>/` directory, then copies it beside the runtime
+executable through an always-run staging target. Rebuilding the runtime target
+therefore refreshes a changed prebuilt DLL even when the exe itself does not
+relink. The standalone configure/build is launched with the Visual
+Studio-bundled CMake and a minimal native PATH containing that CMake, native
+Git, and Windows system directories, so MSYS CMake/compiler shims cannot be
+selected accidentally.
+`PSX_NOGRAPHICS_BUILD_DIR` optionally overrides the parent directory; each
+runtime target receives its own `<target>_nographics_runtime` subdirectory to
+avoid duplicate output rules when building the runtime and oracle together.
+
+NoGraphicsAPI shaders belong inside that DLL, so game/runtime installs do not
+gain extra shader-file staging. Extra standalone configure switches can be
+passed with `PSX_NOGRAPHICS_CMAKE_ARGS`.
 
 See [SDL backends](SDL_BACKENDS.md) for the fallback command and the initial
 SDL3/SDL2 game A/B results.

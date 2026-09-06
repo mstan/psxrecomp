@@ -1,0 +1,222 @@
+{
+  "kind": "renderer-microbenchmark",
+  "timed_work": "fixed draws/uploads plus full 1MiB VRAM readback per iteration",
+  "excludes": "game CPU emulation, presentation, vsync",
+  "results": [
+    {
+      "backend": "software",
+      "effective_backend": 0,
+      "scale": 1,
+      "warmup": 5,
+      "iters": 10,
+      "repeats": [
+        {
+          "repeat": 0,
+          "wall_ms": 1.9091,
+          "hash64": "cda555170bb8ec5e"
+        },
+        {
+          "repeat": 1,
+          "wall_ms": 2.0358,
+          "hash64": "cda555170bb8ec5e"
+        },
+        {
+          "repeat": 2,
+          "wall_ms": 1.8994,
+          "hash64": "cda555170bb8ec5e"
+        },
+        {
+          "repeat": 3,
+          "wall_ms": 1.9142,
+          "hash64": "cda555170bb8ec5e"
+        },
+        {
+          "repeat": 4,
+          "wall_ms": 1.9408,
+          "hash64": "cda555170bb8ec5e"
+        }
+      ],
+      "label": "software",
+      "median_ms_per_iteration": 0.19141999999999998,
+      "min_ms_per_iteration": 0.18994,
+      "max_ms_per_iteration": 0.20358,
+      "stable_sha256": "cd59da1af7f01d438ee66c24e238db23ab6e0664bebc50dc04dfbc4275667c83",
+      "validation": false
+    },
+    {
+      "backend": "opengl",
+      "effective_backend": 1,
+      "scale": 1,
+      "warmup": 5,
+      "iters": 10,
+      "repeats": [
+        {
+          "repeat": 0,
+          "wall_ms": 9.3685,
+          "hash64": "f1799a4b03510e17"
+        },
+        {
+          "repeat": 1,
+          "wall_ms": 8.3707,
+          "hash64": "f1799a4b03510e17"
+        },
+        {
+          "repeat": 2,
+          "wall_ms": 7.2538,
+          "hash64": "f1799a4b03510e17"
+        },
+        {
+          "repeat": 3,
+          "wall_ms": 7.6284,
+          "hash64": "f1799a4b03510e17"
+        },
+        {
+          "repeat": 4,
+          "wall_ms": 6.9219,
+          "hash64": "f1799a4b03510e17"
+        }
+      ],
+      "label": "opengl",
+      "median_ms_per_iteration": 0.76284,
+      "min_ms_per_iteration": 0.69219,
+      "max_ms_per_iteration": 0.93685,
+      "stable_sha256": "c92755fdda73c104c173cf94dea10ffacf55c65ea5a880f55a6e1ce68e113927",
+      "validation": false
+    },
+    {
+      "backend": "vulkan",
+      "effective_backend": 2,
+      "scale": 1,
+      "warmup": 5,
+      "iters": 10,
+      "repeats": [
+        {
+          "repeat": 0,
+          "wall_ms": 48.859,
+          "hash64": "adde00b9e296ea10"
+        },
+        {
+          "repeat": 1,
+          "wall_ms": 49.5907,
+          "hash64": "adde00b9e296ea10"
+        },
+        {
+          "repeat": 2,
+          "wall_ms": 49.2075,
+          "hash64": "adde00b9e296ea10"
+        },
+        {
+          "repeat": 3,
+          "wall_ms": 50.3813,
+          "hash64": "adde00b9e296ea10"
+        },
+        {
+          "repeat": 4,
+          "wall_ms": 51.4035,
+          "hash64": "adde00b9e296ea10"
+        }
+      ],
+      "label": "vulkan",
+      "median_ms_per_iteration": 4.95907,
+      "min_ms_per_iteration": 4.8859,
+      "max_ms_per_iteration": 5.14035,
+      "stable_sha256": "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+      "validation": false
+    },
+    {
+      "backend": "vulkan_nographics",
+      "effective_backend": 3,
+      "scale": 1,
+      "warmup": 5,
+      "iters": 10,
+      "repeats": [
+        {
+          "repeat": 0,
+          "wall_ms": 689.2865,
+          "hash64": "b25244fdea2c19b4"
+        },
+        {
+          "repeat": 1,
+          "wall_ms": 692.6547,
+          "hash64": "b25244fdea2c19b4"
+        },
+        {
+          "repeat": 2,
+          "wall_ms": 695.2465,
+          "hash64": "b25244fdea2c19b4"
+        },
+        {
+          "repeat": 3,
+          "wall_ms": 1269.1302,
+          "hash64": "b25244fdea2c19b4"
+        },
+        {
+          "repeat": 4,
+          "wall_ms": 1992.1271,
+          "hash64": "b25244fdea2c19b4"
+        }
+      ],
+      "label": "vulkan_nographics",
+      "median_ms_per_iteration": 69.52465,
+      "min_ms_per_iteration": 68.92865,
+      "max_ms_per_iteration": 199.21271,
+      "stable_sha256": "02c0339e43b5415dcc67e64d619b445c24a20351b4bfe23669445dc2b0cddedd",
+      "validation": false
+    }
+  ],
+  "comparisons": [
+    {
+      "left": "software",
+      "right": "opengl",
+      "scale": 1,
+      "different_pixels": 19723,
+      "total_pixels": 524288,
+      "exact_match": false
+    },
+    {
+      "left": "software",
+      "right": "vulkan",
+      "scale": 1,
+      "different_pixels": 18849,
+      "total_pixels": 524288,
+      "exact_match": false
+    },
+    {
+      "left": "opengl",
+      "right": "vulkan",
+      "scale": 1,
+      "different_pixels": 6141,
+      "total_pixels": 524288,
+      "exact_match": false
+    },
+    {
+      "left": "software",
+      "right": "vulkan_nographics",
+      "scale": 1,
+      "different_pixels": 18745,
+      "total_pixels": 524288,
+      "exact_match": false
+    },
+    {
+      "left": "opengl",
+      "right": "vulkan_nographics",
+      "scale": 1,
+      "different_pixels": 12822,
+      "total_pixels": 524288,
+      "exact_match": false
+    },
+    {
+      "left": "vulkan",
+      "right": "vulkan_nographics",
+      "scale": 1,
+      "different_pixels": 10942,
+      "total_pixels": 524288,
+      "exact_match": false
+    }
+  ],
+  "validation_runs": [],
+  "driver": "NVIDIA 616.86, RTX 3080 Ti",
+  "status": "provisional: installer-requested reboot pending; synthetic workload, no game FPS claim",
+  "toolchain": "Release MSVC 19.41 NoGraphicsAPI DLL; Release Clang 22.1.8 runtime probe; Slang 2026.14.1",
+  "nographics_revision": "469ebba558ee46f93c73a9f285979aa00fce7500"
+}

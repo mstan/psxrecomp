@@ -1,11 +1,12 @@
 # NoGraphicsAPI / Vulkan investigation — 2026-09-06
 
-**Status: NoGraphicsAPI device creation and resource transfers now run; the full
-PSX renderer port is not delivered.** The user-approved NVIDIA 616.86 hotfix
-removed the extension blocker. RGBA8 color and R16_UINT raw VRAM resource
-round trips pass. The installer requests a reboot before further performance
-testing. Existing Vulkan fixes and prior-driver measurements remain saved;
-no NoGraphicsAPI performance gain has been measured.
+**Status: a separate experimental NoGraphicsAPI renderer is now integrated at
+native resolution. Full feature parity and game validation are not delivered.**
+Native Vulkan remains selectable and retains its existing setting. The approved
+616.86 hotfix removed the device blocker. The new backend executes real GPU
+primitives and presentation, with passing targeted pixel/validation tests, but
+it is slower than native Vulkan in the measured synthetic workload. The
+installer-requested reboot is still pending, so new measurements are provisional.
 
 Worktree: `F:/Projects/psxrecomp/_wt-nographics-vulkan`, branch
 `feat/nographics-vulkan`, created from freshly fetched `origin/master`
@@ -13,6 +14,72 @@ Worktree: `F:/Projects/psxrecomp/_wt-nographics-vulkan`, branch
 Three GPT-5.5 subagents audited compatibility, renderer coverage and benchmarking;
 the orchestrator reviewed their changes and independently built and ran the
 probes. Initial benchmark assumptions and test defects were rejected/corrected.
+
+## Separate runtime backend
+
+The launcher labels native ID 2 as **Vulkan (Native)** and new ID 3 as
+**Vulkan (NoGraphicsAPI, Experimental)**. Serialized `renderer = "vulkan"`
+keeps its old meaning; `"vulkan_nographics"` selects the new implementation.
+Games offering Vulkan inherit the experimental option when its build/DLL is
+available, unless `offer_vulkan_nographics = false`. Failed initialization falls
+back to software and reports that result. OpenGL remains the default.
+
+The [runtime backend](../../runtime/nographics/README.md) is a separate MSVC
+C++20 DLL loaded by a versioned C interface from the MinGW runtime. It uses
+NoGraphicsAPI compute shaders for canonical R16_UINT VRAM and an RGBA8 color
+mirror, plus a graphics shader for Win32 presentation. Shaders are embedded.
+Transfers handle wrapping and masks; texture feedback and copies use snapshots.
+The orchestrator corrected agent defects involving per-pixel upload submissions,
+mask writes, triangle edges, stale CPU mirrors, scratch bounds, presentation
+sampling/color format, and DLL lifetime. Primitive commands and uploads are batched.
+
+Current limits: **1x only**, no raster bilinear filtering, SSAA, PGXP/perspective
+correction, native-wide compositor, OSD overlays or selectable present modes.
+Runtime startup reports the effective feature limits. Netplay retains the
+software-authoritative fallback. NoGraphicsAPI does not replace PSX raster rules;
+pixel differences and actual-game behavior still require further work.
+
+Standalone Debug/Release DLL, both prebuilt-DLL and nested-project staging, and
+enabled runtime builds passed, including the
+launcher with compatible recomp-ui revision
+`4c9ad9042eadbc7f7b695bb445661769fb947389`. The ordinary local recomp-ui checkout
+and its fetched master lack netplay ABI fields expected by psxrecomp master;
+the compatible revision was built in a separate probe worktree. Settings tests
+exercise legacy/new serialization, invalid values and game offer flags; facade
+tests exercise unavailable/available/fallback routing with assertions enabled
+in Release. The production renderer probe passes wrapped/odd transfers, wrapped
+GPU copies, masks, CLUT transparency, all four blend modes, shared triangle edges,
+textured STP preservation and partial-fill CPU coherence. Its Debug DLL runs the
+full synthetic workload, VRAM/CPU presentation and resize calls with no reported
+core or synchronization errors using VVL 1.4.357. These presentation calls are
+not a pixel-perfect swapchain capture or a game/FMV validation.
+
+### Provisional runtime measurements on 616.86
+
+Release builds; all four backends run serially on the same driver. Five warmups,
+five batches of ten identical iterations, native scale. Each iteration includes
+draws/uploads and a complete 1 MiB VRAM readback. Initialization, file output,
+validation, presentation and game emulation are outside timing. A larger
+experimental run exceeded the harness timeout; the completed shorter run is
+reported without substituting partial samples.
+
+| Backend | Median ms/iteration | Batch min–max |
+|---|---:|---:|
+| Software | 0.191 | 0.190–0.204 |
+| OpenGL | 0.763 | 0.692–0.937 |
+| Vulkan (Native) | 4.959 | 4.886–5.140 |
+| Vulkan (NoGraphicsAPI) | 69.525 | 68.929–199.213 |
+
+There is **no measured speedup**: NoGraphicsAPI takes about 14 times native
+Vulkan's time here, with a substantial slow batch. Every repeated capture is
+stable per backend. NoGraphicsAPI differs from native Vulkan at 10,942 of
+524,288 pixels, OpenGL at 12,822, and software at 18,745. These figures do not
+establish hardware accuracy or game FPS. Complete the required reboot before
+treating driver/performance conclusions as final.
+
+[Portable samples and hashes](nographics-runtime-results.json) accompany this
+report. Local run logs are under `_probe-nographics/ng-runtime-benchmark-final`
+and `_probe-nographics/ng-runtime-debug.log`.
 
 ## NoGraphicsAPI feasibility
 
@@ -28,8 +95,8 @@ actual upstream CMake target. Native VS2022/MSVC x64 build passed using
 Vulkan-Headers v1.4.357 (`e3b1eec08173d6b825cd3ac88c885a63b621504a`) and the
 installed Vulkan SDK 1.4.341.1 import library. The older installed headers lack
 the required declarations. Upstream rejects the MinGW compiler used by the
-current psxrecomp runtime toolchain; a supported C++ build/ABI boundary would
-also need integration before adding it to that runtime.
+current psxrecomp runtime toolchain; the new renderer uses the separate MSVC
+DLL and C ABI boundary described above.
 
 Initial extension enumeration, before the approved hotfix:
 
@@ -149,7 +216,8 @@ supersampling and wide composition already had implementations. This change:
 
 The latter fixes follow Vulkan's [copy destination usage requirement](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImageToBuffer.html)
 and [combined depth/stencil barrier rules](https://docs.vulkan.org/refpages/latest/refpages/source/VkImageMemoryBarrier.html).
-NoGraphicsAPI is not selected by the runtime; these are fixes to classic Vulkan.
+These earlier fixes apply to classic Vulkan. The new NoGraphicsAPI renderer is
+an additional implementation, selected independently through the runtime.
 
 ## Validation
 
@@ -208,8 +276,9 @@ is in `_build-nographics-vtable/root-baseline-validation.log` and
 1. Complete the installer-requested reboot and repeat device/resource tests.
    Device creation, both raw resource roles and all seven upstream tests already
    pass on the active 616.86 driver with the updated validation layer before reboot.
-2. Integrate a supported C++ toolchain boundary and port the PSX renderer and
-   shaders to NoGraphicsAPI, including VRAM synchronization and Win32 presentation.
+2. Complete the experimental renderer's missing features and optimize its
+   transfer/synchronization and shader costs. The supported C++ DLL boundary,
+   canonical GPU renderer and Win32 presentation are now implemented.
 3. Resolve pixel discrepancies with focused/reference captures; validate FMV,
    mask/feedback edge cases, swapchain changes, wide presentation, netplay and
    other runtime features using actual game workloads.
