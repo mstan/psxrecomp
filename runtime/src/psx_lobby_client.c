@@ -1858,6 +1858,9 @@ static void handle_server_json(const char *json)
                      "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
                      g_lc.display_name, g_lc.filter_game_name);
             queue_send(msg);
+            fprintf(stderr, "psx_lobby: hello as \"%s\" for game \"%s\"\n",
+                    g_lc.display_name,
+                    g_lc.filter_game_name[0] ? g_lc.filter_game_name : "(none)");
         }
         queue_list_request();
         /* Prefetch Coturn creds for ICE (no-op reply if server lacks COTURN_*). */
