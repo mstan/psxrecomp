@@ -101,6 +101,8 @@ repositories with **`psxrecomp/` and `recomp-ui/` as root-level submodules**
 and game code (`game.toml`, seeds, CMake) at the repo root. See
 [`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md).
 
+## Getting Started
+
 ### Build requirements
 
 Every platform needs **Git**, **Python 3**, **CMake 3.20+**, **Ninja**, and a
