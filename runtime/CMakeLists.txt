@@ -183,6 +183,27 @@ if(BUILD_TESTING)
     add_test(NAME mod_gpu_dma_aperture_test
              COMMAND mod_gpu_dma_aperture_test)
 
+    # The real-handler fixture relies on LTO pruning its unused syscall paths.
+    # Enable only the toolchain on which that link contract is verified; keep
+    # the coverage gap visible in CTest for every other compiler/platform.
+    if(WIN32 AND MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 8
+       AND CMAKE_C_COMPILER_ID STREQUAL "GNU"
+       AND CMAKE_C_COMPILER_VERSION VERSION_EQUAL "16.1.0")
+        add_executable(exit_critical_section_test
+            tests/test_exit_critical_section.c src/traps.c)
+        target_include_directories(exit_critical_section_test PRIVATE include)
+        target_compile_definitions(exit_critical_section_test PRIVATE PSX_NO_DEBUG_TOOLS=1)
+        target_compile_options(exit_critical_section_test PRIVATE -O3 -flto -ffunction-sections)
+        target_link_options(exit_critical_section_test PRIVATE -flto -Wl,--gc-sections)
+        add_test(NAME exit_critical_section_test COMMAND exit_critical_section_test)
+    else()
+        add_test(NAME exit_critical_section_test
+            COMMAND "${CMAKE_COMMAND}" -E echo
+                "SKIP: real-handler LTO fixture is verified only on Windows x64 MinGW GCC 16.1.0; current compiler is ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+        set_tests_properties(exit_critical_section_test PROPERTIES
+            SKIP_REGULAR_EXPRESSION "^SKIP:")
+    endif()
+
     add_executable(dma_gpu_linked_list_timing_test
         tests/test_dma_gpu_linked_list_timing.c
         src/dma_gpu_ll.c)

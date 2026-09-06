@@ -924,7 +924,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
     /*
      * PS1 BIOS SYSCALL convention:
      *   $a0 = 1: EnterCriticalSection — disable interrupts, return old SR
-     *   $a0 = 2: ExitCriticalSection  — enable interrupts, return old SR
+     *   $a0 = 2: ExitCriticalSection  — enable interrupts, preserve GPRs
      *   $a0 = 3: ReturnFromException  — restore full TCB state + RFE
      *
      * Syscalls 1 and 2 are always handled directly — they only touch IEc
@@ -953,7 +953,9 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
 
         case 2: /* ExitCriticalSection: enable interrupts */
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
-            cpu->gpr[2] = 0;
+            /* SYS(02h) has no return value: it preserves the caller's v0.
+             * SDK wrappers can return an earlier BIOS result through this
+             * call, so assigning zero here changes their guest contract. */
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
             cpu->pc = 0;
             return 0;
