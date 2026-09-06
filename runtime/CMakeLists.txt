@@ -26,19 +26,27 @@ if(BUILD_TESTING)
     # Optional real-hardware regression. Configure its dependencies explicitly;
     # absence must remain visible, never counted as a passing GPU test.
     set(PSX_GL_READBACK_SDL_ROOT "" CACHE PATH "SDL3 static build root for GL readback test")
-    if(MINGW AND PSX_GL_READBACK_SDL_ROOT)
+    get_filename_component(_gl_test_default_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+    set(PSX_GL_READBACK_COMPILER_BIN "${_gl_test_default_bin}" CACHE PATH "GCC/MinGW bin for GL fixture")
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME gl_readback_runner_test COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_runner.py")
+    endif()
+    if(MINGW AND PSX_GL_READBACK_SDL_ROOT
+            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/gcc.exe"
+            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/g++.exe")
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        get_filename_component(_gl_test_compiler_bin "${CMAKE_C_COMPILER}" DIRECTORY)
         add_test(NAME gl_readback_region_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_readback_region.py"
                 --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_region.c"
-                --compiler-bin "${_gl_test_compiler_bin}"
+                --compiler-bin "${PSX_GL_READBACK_COMPILER_BIN}"
                 --sdl-root "${PSX_GL_READBACK_SDL_ROOT}"
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-readback-results")
         set_tests_properties(gl_readback_region_test PROPERTIES LABELS "gpu;opengl;hardware" TIMEOUT 180)
     else()
-        message(STATUS "gl_readback_region_test: not registered (requires MinGW and PSX_GL_READBACK_SDL_ROOT)")
+        message(STATUS "gl_readback_region_test: not registered (requires MinGW, PSX_GL_READBACK_SDL_ROOT and gcc.exe/g++.exe in PSX_GL_READBACK_COMPILER_BIN)")
     endif()
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)

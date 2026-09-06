@@ -42,3 +42,9 @@ DuckStation's software readback path was consulted as an alternative. This corre
 authority and needs no title hook or controller policy change. Future work can
 reduce row submissions or use a more precise dirty set if measured demand
 justifies it.
+
+For Clang/MinGW builds, set `PSX_GL_READBACK_COMPILER_BIN` to a GCC/MinGW
+bin directory containing both gcc.exe and g++.exe. CMake checks these files
+before registering the hardware test. `gl_readback_runner_test` separately
+checks strict result parsing without a GPU or compiler. A negative run passes
+only for exactly one failure named single-pixel bounded transfer.
