@@ -7918,8 +7918,8 @@ namespace {
     std::filesystem::path g_lnch_settings_path;
     std::string g_lnch_lobby_url;
     RecompLauncherCNetplayLaunch g_lnch_pending_direct_launch{};
-    int g_lnch_lobby_input_delay = 2;
-    int g_lnch_lobby_input_prediction = 4;
+    int g_lnch_lobby_input_delay = 6;
+    int g_lnch_lobby_input_prediction = 10;
     /* §108: online lobbies always SFU; force_input_relay is set from launch
      * relay_endpoint. force_turn is a rollback delay-floor hint only. */
     int g_lnch_force_input_relay = 0;
@@ -7932,14 +7932,65 @@ namespace {
     /* Delay-sync READY/START waits for every seat in slot_count. Use seated
      * players (not lobby max_slots) so a 3/5 room can start. Sparse seats
      * (moved) still need width covering the highest occupied index. */
+    /* Session slot plan. The lobby host is ALWAYS session slot 0 -- the sim
+     * authority every host-only path keys on -- whatever lobby seat it holds
+     * after a swap or a move to the gallery; the other players follow in
+     * lobby-seat order. Each drives the controller port of its LOBBY seat, so
+     * the game sees players where the lobby seated them; a host in the
+     * gallery drives no port. Every peer builds this from the same seat table
+     * the start delivered, so they agree.
+     *   seats[]  : occupied player seats, any order; host_seat among them or
+     *              -1 when the host is in the gallery
+     *   my_seat  : this peer's player seat, or -1 (spectator) */
+    struct AeSlotPlan {
+        int      local_slot = -1;   /* -1: not a player (spectator) */
+        int      slot_count = 0;
+        uint32_t occupied = 0;
+        int      port[RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS + 1];
+    };
+    static bool ae_np_plan_session_slots(const int* seats, int n, int host_seat,
+                                         int my_seat, bool i_am_host,
+                                         AeSlotPlan* out) {
+        if (!out) return false;
+        *out = AeSlotPlan{};
+        for (int& p : out->port) p = -1;
+        const int cap = RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS + 1;
+        /* Slot 0: the host, with its seat's port (or none from the gallery). */
+        out->port[0] = host_seat;
+        out->slot_count = 1;
+        if (i_am_host) out->local_slot = 0;
+        /* Then the others, by ascending seat. */
+        int sorted[RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS];
+        int m = 0;
+        for (int i = 0; i < n && m < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS; ++i) {
+            if (seats[i] < 0 || seats[i] == host_seat) continue;
+            bool dup = false;
+            for (int j = 0; j < m; ++j) if (sorted[j] == seats[i]) dup = true;
+            if (!dup) sorted[m++] = seats[i];
+        }
+        for (int i = 1; i < m; ++i)
+            for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; --j)
+                std::swap(sorted[j - 1], sorted[j]);
+        for (int i = 0; i < m && out->slot_count < cap; ++i) {
+            const int s = out->slot_count++;
+            out->port[s] = sorted[i];
+            if (!i_am_host && my_seat == sorted[i]) out->local_slot = s;
+        }
+        if (out->slot_count < 2) out->slot_count = 2;
+        out->occupied = (out->slot_count >= 32) ? 0xffffffffu
+                                               : ((1u << out->slot_count) - 1u);
+        return true;
+    }
+
     static int ae_np_session_slot_count(int player_count, int max_slots,
-                                       int local_slot, int game_fallback) {
+                                       int local_slot, int game_fallback,
+                                       int slot_cap) {
         int slots = player_count >= 2 ? player_count
                     : (max_slots >= 2 ? max_slots
                        : (game_fallback >= 2 ? game_fallback : 2));
         if (local_slot + 1 > slots) slots = local_slot + 1;
         if (slots < 2) slots = 2;
-        if (slots > PSX_MAX_PLAYERS) slots = PSX_MAX_PLAYERS;
+        if (slots > slot_cap) slots = slot_cap;
         return slots;
     }
     bool g_lnch_hosting_lan = false;
@@ -8050,6 +8101,15 @@ namespace {
     }
     static void ae_np_lan_send_chat_to_peers(const char* player_id, const char* from,
                                             const char* text);
+    /* Host: "<name> <what>" as a system line, into its own ring and to every
+     * peer. Empty sender fields are what mark it as system on the wire. */
+    static void ae_np_lan_chat_announce(const char* name, const char* what) {
+        char line[224];
+        if (!name || !name[0]) return;
+        std::snprintf(line, sizeof(line), "%s %s", name, what);
+        ae_np_lan_chat_push("", "", line, 1);
+        ae_np_lan_send_chat_to_peers("", "", line);
+    }
 
     static int ae_np_lan_occupied(const AeLanLobbyState& state);
     static int ae_np_lan_endpoint_port(const std::string& endpoint);
@@ -8096,8 +8156,8 @@ namespace {
         int max_slots = 2;
         int has_password = 0;
         int latency_ms = -1;
-        int input_delay = 2;
-        int input_prediction = 4;
+        int input_delay = 6;
+        int input_prediction = 10;
         int rollback = 1;
         uint32_t session_id = 1;
         uint32_t last_seen_ms = 0;
@@ -8106,8 +8166,14 @@ namespace {
     static int g_lnch_lan_discovered_n = 0;
     static uint32_t g_lnch_lan_beacon_announce_ms = 0;
 
+    /* The LAN room is a file. Two instances of one build only see the same
+     * room if they read the same file, and the working directory is whatever
+     * each was launched from, so the registry is anchored to the executable's
+     * directory rather than to the cwd. */
     std::filesystem::path ae_np_lan_file() {
-        return std::filesystem::current_path() / "netplay_lan_lobby.txt";
+        const auto exe = exe_dir_from_argv(g_lnch_argv0 ? g_lnch_argv0 : "");
+        if (exe.empty()) return std::filesystem::current_path() / "netplay_lan_lobby.txt";
+        return exe / "netplay_lan_lobby.txt";
     }
 
     static void ae_np_lan_sock_set_broadcast(AeLanSock s) {
@@ -8229,8 +8295,8 @@ namespace {
         d.session_id = lines[6]
             ? (uint32_t)std::strtoul(lines[6], nullptr, 10) : 1u;
         if (!d.session_id) d.session_id = 1u;
-        d.input_delay = lines[7] ? std::atoi(lines[7]) : 2;
-        d.input_prediction = lines[8] ? std::atoi(lines[8]) : 4;
+        d.input_delay = lines[7] ? std::atoi(lines[7]) : 6;
+        d.input_prediction = lines[8] ? std::atoi(lines[8]) : 10;
         d.rollback = lines[9] ? (std::atoi(lines[9]) != 0) : 1;
         if (d.input_delay < 2) d.input_delay = 2;
         if (d.input_delay > 20) d.input_delay = 20;
@@ -9464,6 +9530,111 @@ namespace {
         ae_np_lan_udp_sendto(to, msg);
     }
 
+    /* ---- LAN seat self-service (MOTK5 SEATMOVE / SWAPASK / SWAPANS / SWAPRES)
+     * The host is the room: a guest asks it to move (SEATMOVE); a free seat
+     * is taken outright, an occupied one turns into an ask relayed to the
+     * occupant (SWAPASK), whose answer (SWAPANS) the host applies and
+     * reports back (SWAPRES). The host's own moves apply directly, and the
+     * host's own asks / answers use the same state the UI reads. */
+    struct AeLanSwap {
+        bool incoming = false;
+        char asker_id[48] = {0};
+        char asker_name[64] = {0};
+        int  from_slot = -1;
+        int  outgoing = 0; /* 0 idle, 1 waiting, 2 accepted, -1 declined */
+    };
+    AeLanSwap g_lnch_lan_swap;
+
+    static bool ae_np_lan_send_to_host(const char* msg) {
+        if (!g_lnch_joined_lan || !g_lnch_remote_lan) return false;
+        if (g_lnch_lan_udp == kAeLanSockInvalid) return false;
+        char host[64];
+        if (!ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host))) return false;
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons((uint16_t)ae_np_lan_endpoint_port(g_lnch_lan_endpoint));
+        if (inet_pton(AF_INET, host, &to.sin_addr) != 1) return false;
+        ae_np_lan_udp_sendto(to, msg);
+        return true;
+    }
+
+    /* Host: trade two player seats (either may be empty) and tell the room. */
+    static bool ae_np_lan_swap_seats(int a, int b) {
+        AeLanLobbyState state;
+        if (!ae_np_read_lan_state(&state)) return false;
+        if (a < 0 || b < 0 || a >= state.max_slots || b >= state.max_slots || a == b)
+            return false;
+        std::swap(state.slot_name[a], state.slot_name[b]);
+        std::swap(state.slot_id[a], state.slot_id[b]);
+        if (state.host_slot == a) state.host_slot = b;
+        else if (state.host_slot == b) state.host_slot = a;
+        if (a < kAeLanMaxSlots && b < kAeLanMaxSlots) {
+            std::swap(g_lnch_lan_peers[a], g_lnch_lan_peers[b]);
+            std::swap(g_lnch_lan_peer_ok[a], g_lnch_lan_peer_ok[b]);
+            std::swap(g_lnch_lan_slot_bios[a], g_lnch_lan_slot_bios[b]);
+            std::swap(g_lnch_lan_slot_memcard[a], g_lnch_lan_slot_memcard[b]);
+        }
+        state.started = false;
+        ae_np_lan_sync_legacy_names(state);
+        if (!ae_np_write_lan_state(state)) return false;
+        ae_np_lan_send_update_to_peers(state);
+        return true;
+    }
+
+    /* Host: a seat request from `asker_id` for seat `to`. */
+    static void ae_np_lan_host_seat_request(const char* asker_id, int to) {
+        AeLanLobbyState st;
+        if (!ae_np_read_lan_state(&st)) return;
+        const int from = ae_np_lan_find_slot_by_id(st, asker_id);
+        if (from < 0 || to < 0 || to >= st.max_slots || to == from) return;
+        if (st.slot_name[to].empty()) {
+            (void)ae_np_lan_swap_seats(from, to);
+            return;
+        }
+        if (to == st.host_slot) {
+            /* Asking the host: the host's own prompt. */
+            g_lnch_lan_swap.incoming = true;
+            std::snprintf(g_lnch_lan_swap.asker_id, sizeof(g_lnch_lan_swap.asker_id),
+                          "%s", asker_id);
+            std::snprintf(g_lnch_lan_swap.asker_name,
+                          sizeof(g_lnch_lan_swap.asker_name), "%s",
+                          st.slot_name[from].c_str());
+            g_lnch_lan_swap.from_slot = from;
+            return;
+        }
+        if (to < kAeLanMaxSlots && g_lnch_lan_peer_ok[to]) {
+            char msg[224];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SWAPASK\n%s\n%s\n%d\n", asker_id,
+                          st.slot_name[from].c_str(), from);
+            ae_np_lan_udp_sendto(g_lnch_lan_peers[to], msg);
+        }
+    }
+
+    /* Host: an answer from the occupant `responder_id` to `asker_id`. */
+    static void ae_np_lan_host_seat_answer(const char* responder_id,
+                                           const char* asker_id, int accept) {
+        AeLanLobbyState st;
+        if (!ae_np_read_lan_state(&st)) return;
+        const int mine = ae_np_lan_find_slot_by_id(st, responder_id);
+        const int theirs = ae_np_lan_find_slot_by_id(st, asker_id);
+        int swapped = 0;
+        if (mine >= 0 && theirs >= 0 && accept)
+            swapped = ae_np_lan_swap_seats(mine, theirs) ? 1 : 0;
+        if (std::strcmp(asker_id, ae_np_lan_local_player_id()) == 0) {
+            g_lnch_lan_swap.outgoing = swapped ? 2 : -1;
+            return;
+        }
+        /* The asker's peer binding moved with its seat. */
+        AeLanLobbyState now;
+        if (!ae_np_read_lan_state(&now)) return;
+        const int asker_slot = ae_np_lan_find_slot_by_id(now, asker_id);
+        if (asker_slot >= 0 && asker_slot < kAeLanMaxSlots && g_lnch_lan_peer_ok[asker_slot]) {
+            char msg[48];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SWAPRES\n%d\n", swapped);
+            ae_np_lan_udp_sendto(g_lnch_lan_peers[asker_slot], msg);
+        }
+    }
+
     /* Seat 1's offer && host allow — the value the match launches with. */
     static int ae_np_lan_guest_memcard_effective(const AeLanLobbyState& st) {
         if (!g_lnch_guest_memcard) return 0;
@@ -9695,6 +9866,98 @@ namespace {
         }
         return g_lnch_guest_memcard ? 1 : 0;
     }
+    /* ---- seat self-service callbacks (see recomp_launcher.h) ---- */
+    int ae_np_seat_move_self(void*, int to_slot) {
+        if (g_lnch_hosting_lan) {
+            AeLanLobbyState st;
+            if (!ae_np_read_lan_state(&st)) return -1;
+            if (to_slot < 0 || to_slot >= st.max_slots || to_slot == st.host_slot) return -1;
+            if (!st.slot_name[to_slot].empty()) return -1; /* occupied: ask instead */
+            return ae_np_lan_swap_seats(st.host_slot, to_slot) ? 0 : -1;
+        }
+        if (g_lnch_joined_lan) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SEATMOVE\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), to_slot);
+            return ae_np_lan_send_to_host(msg) ? 0 : -1;
+        }
+        return psx_lobby_seat_move_self(to_slot);
+    }
+    int ae_np_seat_swap_request(void*, int target_slot) {
+        if (g_lnch_hosting_lan) {
+            AeLanLobbyState st;
+            if (!ae_np_read_lan_state(&st)) return -1;
+            if (target_slot < 0 || target_slot >= st.max_slots ||
+                target_slot == st.host_slot || st.slot_name[target_slot].empty())
+                return -1;
+            if (g_lnch_lan_swap.outgoing == 1) return -1;
+            if (target_slot >= kAeLanMaxSlots || !g_lnch_lan_peer_ok[target_slot]) return -1;
+            char msg[224];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SWAPASK\n%s\n%s\n%d\n",
+                          ae_np_lan_local_player_id(),
+                          st.slot_name[st.host_slot].c_str(), st.host_slot);
+            ae_np_lan_udp_sendto(g_lnch_lan_peers[target_slot], msg);
+            g_lnch_lan_swap.outgoing = 1;
+            return 0;
+        }
+        if (g_lnch_joined_lan) {
+            if (g_lnch_lan_swap.outgoing == 1) return -1;
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SEATMOVE\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), target_slot);
+            if (!ae_np_lan_send_to_host(msg)) return -1;
+            g_lnch_lan_swap.outgoing = 1;
+            return 0;
+        }
+        return psx_lobby_seat_swap_request(target_slot);
+    }
+    int ae_np_seat_swap_incoming(void*, char* who, size_t who_cap, int* from_slot) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) {
+            if (!g_lnch_lan_swap.incoming) return 0;
+            if (who && who_cap) std::snprintf(who, who_cap, "%s", g_lnch_lan_swap.asker_name);
+            if (from_slot) *from_slot = g_lnch_lan_swap.from_slot;
+            return 1;
+        }
+        return psx_lobby_seat_swap_incoming(who, who_cap, from_slot);
+    }
+    int ae_np_seat_swap_respond(void*, int accept) {
+        if (g_lnch_hosting_lan) {
+            if (!g_lnch_lan_swap.incoming) return -1;
+            g_lnch_lan_swap.incoming = false;
+            ae_np_lan_host_seat_answer(ae_np_lan_local_player_id(),
+                                       g_lnch_lan_swap.asker_id, accept);
+            return 0;
+        }
+        if (g_lnch_joined_lan) {
+            if (!g_lnch_lan_swap.incoming) return -1;
+            g_lnch_lan_swap.incoming = false;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "MOTK5 SWAPANS\n%s\n%s\n%d\n",
+                          ae_np_lan_local_player_id(), g_lnch_lan_swap.asker_id,
+                          accept ? 1 : 0);
+            return ae_np_lan_send_to_host(msg) ? 0 : -1;
+        }
+        return psx_lobby_seat_swap_respond(accept);
+    }
+    int ae_np_seat_swap_outgoing(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return g_lnch_lan_swap.outgoing;
+        return psx_lobby_seat_swap_outgoing();
+    }
+    void ae_np_seat_swap_clear(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) {
+            if (g_lnch_lan_swap.outgoing != 1) g_lnch_lan_swap.outgoing = 0;
+            return;
+        }
+        psx_lobby_seat_swap_clear();
+    }
+
+    /* Host-from-the-gallery is an online (server) feature: the LAN room has
+     * no gallery, and it is the server that sizes the relay for it. */
+    int ae_np_host_can_spectate(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return 0;
+        return (psx_lobby_in_lobby() && psx_lobby_is_host()) ? 1 : 0;
+    }
+
     /* Lobby chat callbacks (see recomp_launcher.h). */
     static bool g_lnch_chat_was_seated = false;
     static void ae_np_chat_track_room(void) {
@@ -10073,6 +10336,7 @@ namespace {
                 if (!ae_np_write_lan_state(st)) continue;
                 ae_np_lan_set_peer_slot(slot, from);
                 ae_np_lan_send_update_to_peers(st);
+                ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
                 continue;
             }
 
@@ -10110,6 +10374,37 @@ namespace {
                 if (!ae_np_write_lan_state(st)) continue;
                 ae_np_lan_set_peer_slot(slot, from);
                 ae_np_lan_send_update_to_peers(st);
+                ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
+                continue;
+            }
+
+            if (std::strncmp(buf, "MOTK5 SEATMOVE\n", 15) == 0 && g_lnch_hosting_lan) {
+                /* MOTK5 SEATMOVE\n<player_id>\n<to_slot>\n */
+                char* p = buf + 15;
+                char* nl = std::strchr(p, '\n');
+                if (!nl) continue;
+                *nl = '\0';
+                const char* who = p;
+                p = nl + 1;
+                nl = std::strchr(p, '\n');
+                if (nl) *nl = '\0';
+                ae_np_lan_host_seat_request(who, std::atoi(p));
+                continue;
+            }
+
+            if (std::strncmp(buf, "MOTK5 SWAPANS\n", 14) == 0 && g_lnch_hosting_lan) {
+                /* MOTK5 SWAPANS\n<responder_id>\n<asker_id>\n<accept>\n */
+                char* p = buf + 14;
+                char* lines[3] = {};
+                for (int i = 0; i < 3; ++i) {
+                    lines[i] = p;
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) { if (i < 2) lines[i] = nullptr; break; }
+                    *nl = '\0';
+                    p = nl + 1;
+                }
+                if (!lines[0] || !lines[1] || !lines[2]) continue;
+                ae_np_lan_host_seat_answer(lines[0], lines[1], std::atoi(lines[2]) != 0);
                 continue;
             }
 
@@ -10173,6 +10468,7 @@ namespace {
                 AeLanLobbyState st;
                 if (!ae_np_read_lan_state(&st)) continue;
                 int cleared = -1;
+                std::string left_name;
                 if (leave_key) {
                     if (by_id) {
                         cleared = ae_np_lan_find_slot_by_id(st, leave_key);
@@ -10187,6 +10483,7 @@ namespace {
                         }
                     }
                     if (cleared >= 0) {
+                        left_name = st.slot_name[cleared];
                         st.slot_name[cleared].clear();
                         st.slot_id[cleared].clear();
                         ae_np_lan_clear_slot_bios(cleared);
@@ -10196,6 +10493,7 @@ namespace {
                     for (int i = 0; i < st.max_slots; ++i) {
                         if (i == st.host_slot) continue;
                         if (!st.slot_name[i].empty()) {
+                            left_name = st.slot_name[i];
                             st.slot_name[i].clear();
                             st.slot_id[i].clear();
                             ae_np_lan_clear_slot_bios(i);
@@ -10209,10 +10507,38 @@ namespace {
                 ae_np_write_lan_state(st);
                 if (cleared >= 0) ae_np_lan_clear_peer_slot(cleared);
                 ae_np_lan_send_update_to_peers(st);
+                if (cleared >= 0 && !left_name.empty())
+                    ae_np_lan_chat_announce(left_name.c_str(), "has left.");
                 continue;
             }
 
             if (!g_lnch_remote_lan) continue;
+
+            if (std::strncmp(buf, "MOTK5 SWAPASK\n", 14) == 0) {
+                /* MOTK5 SWAPASK\n<asker_id>\n<asker_name>\n<from_slot>\n */
+                char* p = buf + 14;
+                char* lines[3] = {};
+                for (int i = 0; i < 3; ++i) {
+                    lines[i] = p;
+                    char* nl = std::strchr(p, '\n');
+                    if (!nl) { if (i < 2) lines[i] = nullptr; break; }
+                    *nl = '\0';
+                    p = nl + 1;
+                }
+                if (!lines[0] || !lines[1] || !lines[2]) continue;
+                g_lnch_lan_swap.incoming = true;
+                std::snprintf(g_lnch_lan_swap.asker_id, sizeof(g_lnch_lan_swap.asker_id),
+                              "%s", lines[0]);
+                std::snprintf(g_lnch_lan_swap.asker_name,
+                              sizeof(g_lnch_lan_swap.asker_name), "%s", lines[1]);
+                g_lnch_lan_swap.from_slot = std::atoi(lines[2]);
+                continue;
+            }
+
+            if (std::strncmp(buf, "MOTK5 SWAPRES\n", 14) == 0) {
+                g_lnch_lan_swap.outgoing = std::atoi(buf + 14) != 0 ? 2 : -1;
+                continue;
+            }
 
             if (std::strncmp(buf, "MOTK5 CHAT\n", 11) == 0) {
                 /* MOTK5 CHAT\n<player_id>\n<name>\n<text>\n from the host. */
@@ -10226,7 +10552,8 @@ namespace {
                     p = nl + 1;
                 }
                 if (!lines[0] || !lines[1] || !lines[2]) continue;
-                ae_np_lan_chat_push(lines[0], lines[1], lines[2], 0);
+                /* No sender name = a system line ("X has joined."). */
+                ae_np_lan_chat_push(lines[0], lines[1], lines[2], lines[1][0] == '\0');
                 continue;
             }
 
@@ -10502,6 +10829,8 @@ namespace {
         out->max_slots = row.max_slots;
         out->has_password = row.has_password;
         out->latency_ms = row.latency_ms;
+        std::snprintf(out->host_country, sizeof(out->host_country), "%s",
+                      row.host_country);
         return 1;
     }
 
@@ -11051,6 +11380,7 @@ namespace {
             out->memcard_offer_valid = mem.memcard_offer_valid;
             out->memcard_has_card = mem.memcard_has_card;
             out->memcard_share = mem.memcard_share;
+            std::snprintf(out->country, sizeof(out->country), "%s", mem.country);
             return 1;
         }
         if (ae_np_use_lan_members()) {
@@ -11111,13 +11441,30 @@ namespace {
         out->memcard_offer_valid = mem.memcard_offer_valid;
         out->memcard_has_card = mem.memcard_has_card;
         out->memcard_share = mem.memcard_share;
+        std::snprintf(out->country, sizeof(out->country), "%s", mem.country);
         return 1;
+    }
+
+    /* The lobby seat the host currently holds (player or gallery), or -1. */
+    static int ae_np_ws_host_seat(void) {
+        const char* host_id = psx_lobby_host_player_id();
+        if (!host_id || !host_id[0]) return -1;
+        const int mc = psx_lobby_member_count();
+        for (int i = 0; i < mc; ++i) {
+            PsxLobbyMember mem{};
+            if (!psx_lobby_member_get(i, &mem)) continue;
+            if (std::strcmp(mem.player_id, host_id) == 0) return mem.slot;
+        }
+        return -1;
     }
 
     int ae_np_move_member(void*, int from_slot, int to_slot) {
         if (from_slot < 0 || to_slot < 0 || from_slot == to_slot) return -1;
-        /* Slot 0 = session host / sim authority; guests rearrange only. */
-        if (from_slot == 0 || to_slot == 0) return -1;
+        /* Any seat may trade with any other, the host's included: the lobby
+         * host is identified by id, and at launch it is always session slot
+         * 0 whatever seat it holds (ae_np_plan_session_slots), so a guest in
+         * lobby seat 0 is just a player on port 0, not the authority. */
+        (void)ae_np_ws_host_seat;
         if (g_lnch_hosting_lan) {
             AeLanLobbyState state;
             if (!ae_np_read_lan_state(&state)) return -1;
@@ -11151,6 +11498,7 @@ namespace {
             if (slot < 0 || slot >= state.max_slots || slot == state.host_slot)
                 return -1;
             if (state.slot_name[slot].empty()) return -1;
+            const std::string kicked_name = state.slot_name[slot];
             state.slot_name[slot].clear();
             state.slot_id[slot].clear();
             ae_np_lan_clear_slot_bios(slot);
@@ -11162,6 +11510,7 @@ namespace {
                 ae_np_lan_clear_peer_slot(slot);
             }
             ae_np_lan_send_update_to_peers(state);
+            ae_np_lan_chat_announce(kicked_name.c_str(), "was kicked.");
             return 0;
         }
         if (ae_np_use_ws_members() && psx_lobby_is_host())
@@ -11258,11 +11607,25 @@ namespace {
                 g_lnch_lan_session_id = state.session_id ? state.session_id : 1u;
                 g_lnch_pending_direct_launch = {};
                 g_lnch_pending_direct_launch.enabled = 1;
+                AeSlotPlan lan_plan;
                 {
-                    int local_slot = g_lnch_hosting_lan ? state.host_slot : g_lnch_lan_my_slot;
-                    if (local_slot < 0)
-                        local_slot = g_lnch_hosting_lan ? state.host_slot : 1;
-                    g_lnch_pending_direct_launch.local_slot = local_slot;
+                    int seats[kAeLanMaxSlots];
+                    int n = 0;
+                    for (int i = 0; i < state.max_slots && i < kAeLanMaxSlots; ++i) {
+                        if (state.slot_name[i].empty() && state.slot_id[i].empty())
+                            continue;
+                        seats[n++] = i;
+                    }
+                    int my_seat = g_lnch_hosting_lan ? state.host_slot : g_lnch_lan_my_slot;
+                    if (my_seat < 0) my_seat = g_lnch_hosting_lan ? state.host_slot : 1;
+                    ae_np_plan_session_slots(seats, n, state.host_slot, my_seat,
+                                             g_lnch_hosting_lan, &lan_plan);
+                    g_lnch_pending_direct_launch.local_slot =
+                        lan_plan.local_slot >= 0 ? lan_plan.local_slot
+                                                 : (g_lnch_hosting_lan ? 0 : 1);
+                    g_lnch_pending_direct_launch.slot_port_valid = 1;
+                    for (int i = 0; i < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS + 1; ++i)
+                        g_lnch_pending_direct_launch.slot_port[i] = lan_plan.port[i];
                 }
                 /* -1 => resolve at netplay start (prefer NETPLAY/P1 card). */
                 g_lnch_pending_direct_launch.input_player = -1;
@@ -11283,24 +11646,10 @@ namespace {
                 g_lnch_pending_direct_launch.rollback = g_lnch_rollback ? 1 : 0;
                 g_lnch_pending_direct_launch.guest_memcard =
                     g_lnch_lan_guest_memcard_active ? 1 : 0;
-                g_lnch_pending_direct_launch.player_count = ae_np_lan_occupied(state);
-                {
-                    uint32_t occ = 0;
-                    int high = g_lnch_pending_direct_launch.local_slot;
-                    for (int i = 0; i < state.max_slots && i < kAeLanMaxSlots; ++i) {
-                        if (state.slot_name[i].empty() && state.slot_id[i].empty())
-                            continue;
-                        occ |= (1u << (unsigned)i);
-                        if (i > high) high = i;
-                    }
-                    if (high + 1 > g_lnch_pending_direct_launch.player_count)
-                        g_lnch_pending_direct_launch.player_count = high + 1;
-                    if (occ == 0u) {
-                        const int n = g_lnch_pending_direct_launch.player_count;
-                        occ = (n >= 32) ? 0xffffffffu : ((1u << n) - 1u);
-                    }
-                    g_lnch_pending_direct_launch.occupied_mask = occ;
-                }
+                /* Compact session slots (host first, then seat order): the
+                 * plan's count and mask, not the lobby's seat indices. */
+                g_lnch_pending_direct_launch.player_count = lan_plan.slot_count;
+                g_lnch_pending_direct_launch.occupied_mask = lan_plan.occupied;
                 if (g_lnch_hosting_lan) {
                     const size_t colon = state.endpoint.rfind(':');
                     const char* port = colon == std::string::npos
@@ -11372,6 +11721,16 @@ namespace {
         out->local_slot = ji->local_slot;
         out->is_spectator = ji->local_is_spectator ? 1 : 0;
         out->spectator_wire_slot = 0;
+        /* Host in the gallery: it keeps session slot 0 with a muted pad (the
+         * seat every host-only path keys on), so it is NOT a spectator to the
+         * engine, and every player seat sits one session slot higher. The
+         * server said so once at start; every peer applies the same rule. */
+        const int host_spectates = ji->host_spectates ? 1 : 0;
+        out->host_spectates = host_spectates;
+        if (host_spectates && psx_lobby_is_host()) {
+            out->local_slot = 0;
+            out->is_spectator = 0;
+        }
         if (out->is_spectator) {
             const int wire = psx_lobby_local_wire_slot();
             if (wire <= 0) {
@@ -11401,34 +11760,47 @@ namespace {
         out->max_slots = ji->max_slots >= 2 ? ji->max_slots
                          : (g_lnch_game_players >= 2 ? g_lnch_game_players : 2);
         if (out->max_slots > PSX_MAX_PLAYERS) out->max_slots = PSX_MAX_PLAYERS;
-        /* Seated width for delay-sync (not lobby ceiling). Bump for sparse
-         * seat indices so a moved player at slot N still fits. */
+        out->max_slots += host_spectates; /* the host's silent slot 0 */
+        /* Session slots from the seat table the start delivered: host first,
+         * then the players by seat; ports by lobby seat. */
         {
-            int seated = ji->player_count > 0 ? ji->player_count : 0;
-            int high = ji->local_slot;
-            uint32_t occ = 0;
+            int seats[RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS];
+            int n = 0;
+            int host_seat = -1;
+            int my_seat = out->is_spectator ? -1 : ji->local_slot;
+            const char* host_id = psx_lobby_host_player_id();
+            const char* self_id = psx_lobby_player_id();
             const int mc = psx_lobby_member_count();
             for (int i = 0; i < mc; ++i) {
                 PsxLobbyMember mem{};
                 if (!psx_lobby_member_get(i, &mem)) continue;
-                if (mem.slot > high) high = mem.slot;
-                if (mem.slot >= 0 && mem.slot < 32)
-                    occ |= (1u << (unsigned)mem.slot);
+                if (mem.is_spectator) continue; /* gallery seats are not session slots */
+                if (mem.slot < 0 || mem.slot >= RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS) continue;
+                if (n < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS) seats[n++] = mem.slot;
+                if (host_id && host_id[0] && std::strcmp(mem.player_id, host_id) == 0)
+                    host_seat = mem.slot;
+                if (self_id && self_id[0] && std::strcmp(mem.player_id, self_id) == 0)
+                    my_seat = mem.slot;
             }
-            if (ji->local_slot >= 0 && ji->local_slot < 32)
-                occ |= (1u << (unsigned)ji->local_slot);
-            if (high + 1 > seated) seated = high + 1;
-            if (seated < 2) seated = out->max_slots;
-            if (seated > out->max_slots) seated = out->max_slots;
-            out->player_count = seated;
-            /* Sparse rooms leave holes in 0..seated-1; tell netplay which
-             * seats are real so READY/admit do not wait on phantoms. */
-            if (occ == 0u) {
-                occ = (seated >= 32) ? 0xffffffffu : ((1u << seated) - 1u);
-            } else if (seated < 32) {
-                occ &= (1u << seated) - 1u;
+            AeSlotPlan plan;
+            ae_np_plan_session_slots(seats, n, host_seat, my_seat,
+                                     psx_lobby_is_host(), &plan);
+            if (!out->is_spectator) {
+                if (plan.local_slot < 0) {
+                    std::fprintf(stderr,
+                                 "netplay: this peer (seat %d) is not in the "
+                                 "start's seat table - refusing to launch\n",
+                                 ji->local_slot);
+                    return 0;
+                }
+                out->local_slot = plan.local_slot;
             }
-            out->occupied_mask = occ;
+            out->player_count = plan.slot_count;
+            if (out->player_count > out->max_slots) out->max_slots = out->player_count;
+            out->occupied_mask = plan.occupied;
+            out->slot_port_valid = 1;
+            for (int i = 0; i < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS + 1; ++i)
+                out->slot_port[i] = plan.port[i];
         }
         /* §108: online launch always SFU. Prefer caps.force_input_relay from
          * relay_endpoint rewrite; also infer when host==guest advertise. */
@@ -11613,6 +11985,13 @@ namespace {
         g_lnch_netplay_callbacks.chat_send = ae_np_chat_send;
         g_lnch_netplay_callbacks.chat_count = ae_np_chat_count;
         g_lnch_netplay_callbacks.chat_get = ae_np_chat_get;
+        g_lnch_netplay_callbacks.host_can_spectate = ae_np_host_can_spectate;
+        g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
+        g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
+        g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;
+        g_lnch_netplay_callbacks.seat_swap_respond = ae_np_seat_swap_respond;
+        g_lnch_netplay_callbacks.seat_swap_outgoing = ae_np_seat_swap_outgoing;
+        g_lnch_netplay_callbacks.seat_swap_clear = ae_np_seat_swap_clear;
         g_lnch_netplay_callbacks.allow_spectators_get = ae_np_allow_spectators_get;
         g_lnch_netplay_callbacks.allow_spectators_set = ae_np_allow_spectators_set;
         g_lnch_netplay_callbacks.lobby_allow_spectators = ae_np_lobby_allow_spectators;
@@ -13650,9 +14029,16 @@ int main(int argc, char** argv) {
                     net_cfg.rollback = ls.netplay_launch.rollback ? 1 : 0;
                     net_cfg.guest_memcard = ls.netplay_launch.guest_memcard ? 1 : 0;
                     net_cfg.player_count = ls.netplay_launch.player_count;
+                    net_cfg.host_spectates = ls.netplay_launch.host_spectates ? 1 : 0;
+                    net_cfg.port_map_valid = ls.netplay_launch.slot_port_valid ? 1 : 0;
+                    for (int i = 0; i < 9; ++i)
+                        net_cfg.port_of_slot[i] =
+                            (net_cfg.port_map_valid && i <= RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS)
+                                ? ls.netplay_launch.slot_port[i] : -1;
                     net_cfg.slot_count = ae_np_session_slot_count(
                         ls.netplay_launch.player_count, ls.netplay_launch.max_slots,
-                        ls.netplay_launch.local_slot, game_players);
+                        ls.netplay_launch.local_slot, game_players,
+                        PSX_MAX_PLAYERS + (net_cfg.host_spectates ? 1 : 0));
                     if (net_cfg.player_count <= 0)
                         net_cfg.player_count = net_cfg.slot_count;
                     net_cfg.occupied_mask = ls.netplay_launch.occupied_mask;
@@ -15341,6 +15727,10 @@ soft_return_lobby:
 #endif
 
         if (rui_rc == 0) {
+            /* The rematch launcher can rebind keys just like the first-boot
+             * one; the first-boot path re-reads keybinds.ini after the
+             * launcher returns, and so must this one. */
+            psx_keybinds_init(argv[0]);
             host_volume_set(ls.volume);
             if (rui_out_disc[0]) {
                 resolved_disc = normalize_disc_path_for_launch(rui_out_disc);
@@ -15369,10 +15759,22 @@ soft_return_lobby:
                 net_cfg.force_input_relay = ls.netplay_launch.force_input_relay ? 1 : 0;
                 net_cfg.force_turn = ls.netplay_launch.force_turn ? 1 : 0;
                 net_cfg.rollback = ls.netplay_launch.rollback ? 1 : 0;
+                /* Same fold as the first-boot path: rematch must not lose
+                 * the seat rules the lobby settled. */
+                net_cfg.spectator = ls.netplay_launch.is_spectator ? 1 : 0;
+                net_cfg.spectator_wire_slot = ls.netplay_launch.spectator_wire_slot;
+                net_cfg.guest_memcard = ls.netplay_launch.guest_memcard ? 1 : 0;
+                net_cfg.host_spectates = ls.netplay_launch.host_spectates ? 1 : 0;
+                net_cfg.port_map_valid = ls.netplay_launch.slot_port_valid ? 1 : 0;
+                for (int i = 0; i < 9; ++i)
+                    net_cfg.port_of_slot[i] =
+                        (net_cfg.port_map_valid && i <= RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS)
+                            ? ls.netplay_launch.slot_port[i] : -1;
                 net_cfg.player_count = ls.netplay_launch.player_count;
                 net_cfg.slot_count = ae_np_session_slot_count(
                     ls.netplay_launch.player_count, ls.netplay_launch.max_slots,
-                    ls.netplay_launch.local_slot, game_players);
+                    ls.netplay_launch.local_slot, game_players,
+                    PSX_MAX_PLAYERS + (net_cfg.host_spectates ? 1 : 0));
                 if (net_cfg.player_count <= 0)
                     net_cfg.player_count = net_cfg.slot_count;
                 net_cfg.occupied_mask = ls.netplay_launch.occupied_mask;

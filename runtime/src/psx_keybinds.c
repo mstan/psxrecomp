@@ -420,9 +420,23 @@ SDL_Scancode psx_keybinds_get_button(int player, int button) {
     return *(SDL_Scancode *)((char *)player_binds(player) + s_buttons[button].offset);
 }
 
+/* A key drives ONE input per player: clear it from every other primary and
+ * alternate slot before it lands, or one press asserts two buttons. */
+static void take_key(int player, int button, int alt, SDL_Scancode sc) {
+    if (sc == SDL_SCANCODE_UNKNOWN) return;
+    if (player < 1 || player > PSXKB_MAX_PLAYERS) return;
+    for (int i = 0; i < PSXKB_N; i++) {
+        SDL_Scancode *p = (SDL_Scancode *)((char *)&s_binds.player[player - 1] + s_buttons[i].offset);
+        SDL_Scancode *a = (SDL_Scancode *)((char *)&s_alt_binds.player[player - 1] + s_buttons[i].offset);
+        if (*p == sc && !(i == button && !alt)) *p = SDL_SCANCODE_UNKNOWN;
+        if (*a == sc && !(i == button && alt))  *a = SDL_SCANCODE_UNKNOWN;
+    }
+}
+
 void psx_keybinds_set_button(int player, int button, SDL_Scancode sc) {
     if (button < 0 || button >= PSXKB_N) return;
     if (player < 1 || player > PSXKB_MAX_PLAYERS) return;
+    take_key(player, button, 0, sc);
     *(SDL_Scancode *)((char *)player_binds(player) + s_buttons[button].offset) = sc;
 }
 
@@ -439,6 +453,7 @@ SDL_Scancode psx_keybinds_get_button_alt(int player, int button) {
 
 void psx_keybinds_set_button_alt(int player, int button, SDL_Scancode sc) {
     if (button < 0 || button >= PSXKB_N) return;
+    take_key(player, button, 1, sc);
     *(SDL_Scancode *)((char *)player_alt_binds(player) + s_buttons[button].offset) = sc;
 }
 

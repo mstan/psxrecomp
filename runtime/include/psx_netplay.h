@@ -56,7 +56,19 @@ typedef struct PsxNetplayConfig {
      * relay's player count. Required when spectator is set; it is what makes
      * the relay refuse to forward anything this peer sends. */
     int         spectator_wire_slot;
-    int         slot_count;    /* 2 .. PSX_MAX_PLAYERS (session pad count) */
+    /* 1 = the host watches from the gallery: it is still session slot 0
+     * (the seat every host-only path keys on) but its pad is muted and no
+     * controller port is mapped to it; session slot s >= 1 drives pad
+     * port s - 1. slot_count then includes the host's silent slot, so it
+     * may reach PSX_MAX_PLAYERS + 1. Env PSX_NET_HOST_SPECTATES=1. */
+    int         host_spectates;
+    /* Session slot -> controller port (-1 = none), when port_map_valid. The
+     * lobby host is always session slot 0 whatever seat it holds; the other
+     * players follow in seat order and drive the port of their lobby seat.
+     * Without it: identity, or slot - 1 with host_spectates. */
+    int         port_map_valid;
+    int         port_of_slot[9];
+    int         slot_count;    /* 2 .. PSX_MAX_PLAYERS (+1 with host_spectates) */
     int         player_count;  /* seated players at launch (0 = use slot_count) */
     /* Bit i = lobby seat i occupied. 0 = all seats occupied (legacy). Sparse
      * rooms (moved seats leaving a hole) must set this so recomp-net does not
@@ -101,6 +113,8 @@ void psx_netplay_diag_tick(void);
 int  psx_netplay_local_slot(void);
 /* 1 while this build is watching rather than playing. */
 int  psx_netplay_is_spectator(void);
+/* 1 when the local peer is the host running the match from the gallery. */
+int  psx_netplay_host_spectates(void);
 /* Resolved host player index used for local capture. */
 int  psx_netplay_input_player(void);
 uint32_t psx_netplay_sim_tick(void);

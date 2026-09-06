@@ -55,6 +55,46 @@
 
 /* Session pad count mirrored for release_pads (available without recomp-net). */
 static int g_np_slot_count = 2;
+/* Session slots may exceed the pad count by one: with host_spectates the
+ * host holds slot 0 silently and pads sit at slot - 1. Mirrored here (like
+ * g_np_slot_count) for the pad helpers that sit above g_np's definition. */
+#define NP_SLOT_CAP (PSX_MAX_PLAYERS + 1)
+static int g_np_host_spectates = 0;
+static int g_np_port_map_valid = 0;
+static int g_np_port_of_slot[NP_SLOT_CAP];
+
+/* Session slot -> controller port (-1 = none). The lobby's map when it sent
+ * one (host always slot 0, ports by lobby seat); else identity, or slot - 1
+ * with a host in the gallery. */
+static int np_slot_to_port(int slot)
+{
+    if (slot < 0 || slot >= NP_SLOT_CAP) return -1;
+    if (g_np_port_map_valid) return g_np_port_of_slot[slot];
+    if (!g_np_host_spectates) return slot;
+    return slot - 1; /* -1 for the host: no port */
+}
+
+/* Ports the session drives: one past the highest mapped port, so a sparse
+ * room (seats 0 and 3) still counts as four ports for the multitap rule. */
+static int np_pad_count(int slot_count)
+{
+    int i, hi = -1;
+    if (slot_count > NP_SLOT_CAP) slot_count = NP_SLOT_CAP;
+    for (i = 0; i < slot_count; ++i) {
+        const int p = np_slot_to_port(i);
+        if (p > hi) hi = p;
+    }
+    return hi + 1;
+}
+
+/* Lobby seat 1 ("P2") as a session slot: the slot that drives port 1. */
+static int np_guest_card_slot(void)
+{
+    int i;
+    for (i = 0; i < NP_SLOT_CAP; ++i)
+        if (np_slot_to_port(i) == 1) return i;
+    return 1;
+}
 
 /* Persists across shutdown so starvation dumps still see last session topology. */
 static char g_np_diag_arch[24] = "off";
@@ -87,6 +127,7 @@ void psx_netplay_config_defaults(PsxNetplayConfig *cfg)
     cfg->force_turn = 0;
     cfg->transport = 0;
     cfg->guest_memcard = 0;
+    cfg->host_spectates = 0;
     cfg->session_id = 1;
     strncpy(cfg->bind_hostport, "0.0.0.0:7777", sizeof(cfg->bind_hostport) - 1);
     cfg->peer_hostport[0] = '\0';
@@ -146,6 +187,9 @@ void psx_netplay_apply_env(PsxNetplayConfig *cfg)
     v = getenv("PSX_NET_GUEST_MEMCARD");
     if (v && v[0])
         cfg->guest_memcard = (v[0] != '0') ? 1 : 0;
+    v = getenv("PSX_NET_HOST_SPECTATES");
+    if (v && v[0])
+        cfg->host_spectates = (v[0] != '0') ? 1 : 0;
 }
 
 void psx_netplay_normalize_pad(PsxNetPad *pad)
@@ -165,12 +209,15 @@ void psx_netplay_normalize_pad(PsxNetPad *pad)
 static void force_session_pads_connected(int slot_count)
 {
     int i;
+    slot_count = np_pad_count(slot_count);
     if (slot_count < 2) slot_count = 2;
     if (slot_count > PSX_MAX_PLAYERS) slot_count = PSX_MAX_PLAYERS;
     if (slot_count >= 3)
         sio_set_multitap(1);
     else
         sio_set_multitap(0);
+    /* Ports 0..count-1 are connected as before; an unmapped port inside the
+     * range (a hole in a sparse room) is a pad nobody drives, same as today. */
     for (i = 0; i < slot_count; ++i) {
         sio_connect_pad(i);
         /* Tap seats are digital unless multitap_analog hack is armed. */
@@ -347,9 +394,9 @@ uint32_t psx_start_consumer_offline_frame(void)
 void psx_start_consumer_note(int slot, uint32_t sim, uint16_t buttons)
 {
     static uint32_t s_n;
-    static uint32_t s_last_sim[PSX_MAX_PLAYERS];
-    static uint8_t s_last_start[PSX_MAX_PLAYERS];
-    static uint8_t s_have[PSX_MAX_PLAYERS];
+    static uint32_t s_last_sim[NP_SLOT_CAP];
+    static uint8_t s_last_start[NP_SLOT_CAP];
+    static uint8_t s_have[NP_SLOT_CAP];
     int start;
     const char *edge;
     const char *mode;
@@ -357,7 +404,7 @@ void psx_start_consumer_note(int slot, uint32_t sim, uint16_t buttons)
 
     if (!psx_start_consumer_enabled())
         return;
-    if (slot < 0 || slot >= PSX_MAX_PLAYERS)
+    if (slot < 0 || slot >= NP_SLOT_CAP)
         return;
 
     /* PSX digital Start = bit 3, active-low. */
@@ -396,6 +443,7 @@ const char *psx_netplay_transport_name(void) { return "none"; }
 int  psx_netplay_ice_failed(void) { return 0; }
 void psx_netplay_diag_tick(void) {}
 int  psx_netplay_is_spectator(void) { return 0; }
+int  psx_netplay_host_spectates(void) { return 0; }
 int  psx_netplay_local_slot(void) { return -1; }
 int  psx_netplay_input_player(void) { return 0; }
 uint32_t psx_netplay_sim_tick(void) { return 0; }
@@ -518,6 +566,7 @@ typedef struct {
     int          slot_count;
     int          local_slot;
     int          spectator;
+    int          host_spectates; /* slot 0 is the host with a muted pad; pads at slot-1 */
     int          input_player; /* resolved host PlayerInput index */
     int          needs_advance;
     int          latched_for_tick; /* 1 if staged pad frozen for current sim_tick */
@@ -1321,7 +1370,7 @@ static void np_apply_ready_state(void)
             /* Host: install seat 1's card as the match slot-2 card. Only a
              * transfer from seat 1 counts, and only when the lobby agreed —
              * anything else is a peer/version mismatch, dropped loudly. */
-            if (!g_np.guest_memcard || slot != 1u) {
+            if (!g_np.guest_memcard || slot != (rnet_u8)np_guest_card_slot()) {
                 printf("psxrecomp: netplay ignoring MEMCARD upload from seat %u "
                        "(guest_memcard=%d)\n", (unsigned)slot, g_np.guest_memcard);
                 fflush(stdout);
@@ -1920,7 +1969,8 @@ static void np_maybe_upload_guest_card(void)
 {
     uint8_t *blob;
     size_t sz = 0;
-    if (!g_np.guest_memcard || g_np.local_slot != 1 || g_np.mc_guest_sent)
+    if (!g_np.guest_memcard || g_np.local_slot != np_guest_card_slot() ||
+        g_np.mc_guest_sent)
         return;
     if (!rnet_session_is_running(g_np.session)) return;
     if (np_xfer_busy()) return;
@@ -2144,10 +2194,10 @@ static void np_pad_log_edge(const char *tag, int slot, uint32_t sim, uint16_t pr
  * edge trackers and the local tip pipeline must preserve *logical* held
  * buttons across Replay/skip-snap — never synthesize idle→held for a button
  * the player kept down through the transition. */
-static uint16_t g_sio_pad_prev[PSX_MAX_PLAYERS];
-static uint8_t g_sio_pad_have[PSX_MAX_PLAYERS];
-static uint16_t g_inv_pad_prev[PSX_MAX_PLAYERS];
-static uint8_t g_inv_pad_have[PSX_MAX_PLAYERS];
+static uint16_t g_sio_pad_prev[NP_SLOT_CAP];
+static uint8_t g_sio_pad_have[NP_SLOT_CAP];
+static uint16_t g_inv_pad_prev[NP_SLOT_CAP];
+static uint8_t g_inv_pad_have[NP_SLOT_CAP];
 static uint16_t g_local_pad_prev = 0xFFFFu;
 static int g_local_pad_have;
 static uint16_t g_live_trace_prev = 0xFFFFu;
@@ -2156,10 +2206,10 @@ static uint16_t g_dev_trace_prev = 0xFFFFu;
 static int g_dev_trace_have;
 static uint16_t g_tip_trace_prev = 0xFFFFu;
 static int g_tip_trace_have;
-static uint32_t g_sio_apply_sim[PSX_MAX_PLAYERS];
-static uint16_t g_sio_apply_btn[PSX_MAX_PLAYERS];
-static uint8_t g_sio_apply_n[PSX_MAX_PLAYERS];
-static uint8_t g_sio_apply_have[PSX_MAX_PLAYERS];
+static uint32_t g_sio_apply_sim[NP_SLOT_CAP];
+static uint16_t g_sio_apply_btn[NP_SLOT_CAP];
+static uint8_t g_sio_apply_n[NP_SLOT_CAP];
+static uint8_t g_sio_apply_have[NP_SLOT_CAP];
 
 void psx_netplay_on_rb_snap_loaded(void)
 {
@@ -2275,8 +2325,12 @@ void psx_netplay_pad_trace_dev(int card, int fallback, int sdl_start,
 
 static void apply_pad_slot(int slot, const PsxNetPad *pad)
 {
-    if (slot < 0 || slot >= g_np.slot_count || slot >= PSX_MAX_PLAYERS || !pad) return;
-    const int on_tap = sio_pad_on_multitap(slot);
+    if (slot < 0 || slot >= g_np.slot_count || slot >= NP_SLOT_CAP || !pad) return;
+    /* The host in the gallery holds slot 0 and no port: its row is applied
+     * nowhere, which is what "cannot send inputs" means at this layer. */
+    const int port = np_slot_to_port(slot);
+    if (port < 0 || port >= PSX_MAX_PLAYERS) return;
+    const int on_tap = sio_pad_on_multitap(port);
     if (psx_start_bisect_enabled() && slot == g_np.local_slot) {
         uint32_t sim = g_np.session ? rnet_session_sim_tick(g_np.session) : 0u;
         psx_start_bisect_log("sio", sim, -1, -1, -1,
@@ -2340,14 +2394,14 @@ static void apply_pad_slot(int slot, const PsxNetPad *pad)
         g_sio_pad_have[slot] = 1u;
     }
     const int force_dig = on_tap && !sio_get_multitap_analog();
-    sio_set_pad_connected(slot, 1);
-    sio_set_pad_config_capable(slot, force_dig ? 0 : 1);
-    sio_set_pad_state_slot(slot, pad->buttons);
+    sio_set_pad_connected(port, 1);
+    sio_set_pad_config_capable(port, force_dig ? 0 : 1);
+    sio_set_pad_state_slot(port, pad->buttons);
     if (force_dig)
-        sio_set_pad_sticks(slot, 0x80, 0x80, 0x80, 0x80);
+        sio_set_pad_sticks(port, 0x80, 0x80, 0x80, 0x80);
     else
-        sio_set_pad_sticks(slot, pad->lx, pad->ly, pad->rx, pad->ry);
-    sio_request_pad_type(slot, (!force_dig && pad->analog) ? 1 : 0);
+        sio_set_pad_sticks(port, pad->lx, pad->ly, pad->rx, pad->ry);
+    sio_request_pad_type(port, (!force_dig && pad->analog) ? 1 : 0);
     if (psx_start_consumer_enabled()) {
         uint32_t sim = g_np.session ? rnet_session_sim_tick(g_np.session) : 0u;
         psx_start_consumer_note(slot, sim, pad->buttons);
@@ -2377,7 +2431,7 @@ static void host_publish(rnet_u32 tick, const RNetInputSample *by_slot, int slot
     if (!by_slot || slots <= 0) return;
     n = g_np.slot_count;
     if (n > slots) n = slots;
-    if (n > PSX_MAX_PLAYERS) n = PSX_MAX_PLAYERS;
+    if (n > NP_SLOT_CAP) n = NP_SLOT_CAP;
     force_session_pads_connected(n);
     for (i = 0; i < n; ++i) {
         PsxNetPad pad;
@@ -2402,7 +2456,7 @@ static void np_publish_hist_sio(uint32_t tick)
 {
     int i;
     force_session_pads_connected(g_np.slot_count);
-    for (i = 0; i < g_np.slot_count && i < PSX_MAX_PLAYERS; ++i) {
+    for (i = 0; i < g_np.slot_count && i < NP_SLOT_CAP; ++i) {
         RNetRbFrame row;
         PsxNetPad pad;
         if (!netplay_ih_get(&g_np.ih, i, tick, &row))
@@ -3248,6 +3302,11 @@ int psx_netplay_is_spectator(void)
     return (g_np.session && g_np.spectator) ? 1 : 0;
 }
 
+int psx_netplay_host_spectates(void)
+{
+    return (g_np.session && g_np.host_spectates) ? 1 : 0;
+}
+
 int psx_netplay_local_slot(void)
 {
     return psx_netplay_active() ? g_np.local_slot : -1;
@@ -3266,6 +3325,12 @@ uint32_t psx_netplay_sim_tick(void)
 
 void psx_netplay_stage_local(const PsxNetPad *pad)
 {
+    /* Host in the gallery: its seat still publishes a row every tick (the
+     * lockstep needs one), but the row is always "no controller" -- the
+     * local pads never reach it, and slot 0 maps to no port anyway. */
+    static const PsxNetPad k_quiet_pad = { 0xFFFFu, 0x80, 0x80, 0x80, 0x80, 0u, 0u };
+    if (pad && g_np.host_spectates)
+        pad = &k_quiet_pad;
     if (!pad) {
         g_np.staged_valid = 0;
         g_np.live_valid = 0;
@@ -3564,8 +3629,26 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
 
     slots = cfg->slot_count;
     if (slots < 2) slots = 2;
-    if (slots > PSX_MAX_PLAYERS) slots = PSX_MAX_PLAYERS;
+    if (slots > PSX_MAX_PLAYERS + (cfg->host_spectates ? 1 : 0))
+        slots = PSX_MAX_PLAYERS + (cfg->host_spectates ? 1 : 0);
     if (slots > RNET_MAX_SLOTS) slots = RNET_MAX_SLOTS;
+    /* Must be live before any pad-count / port mapping below. */
+    g_np.host_spectates = cfg->host_spectates ? 1 : 0;
+    g_np_host_spectates = g_np.host_spectates;
+    g_np_port_map_valid = cfg->port_map_valid ? 1 : 0;
+    {
+        int i;
+        for (i = 0; i < NP_SLOT_CAP; ++i)
+            g_np_port_of_slot[i] = g_np_port_map_valid ? cfg->port_of_slot[i] : -1;
+    }
+    if (g_np_port_map_valid) {
+        int i;
+        fprintf(stderr, "psxrecomp: netplay slot->port map:");
+        for (i = 0; i < slots && i < NP_SLOT_CAP; ++i)
+            fprintf(stderr, " %d->%d", i, g_np_port_of_slot[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
     local = cfg->local_slot;
     if (local < 0) local = 0;
@@ -3858,6 +3941,13 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
     g_np_slot_count = g_np.slot_count;
     g_np.local_slot = (int)rcfg.local_slot;
     g_np.spectator = cfg->spectator ? 1 : 0;
+    if (g_np.host_spectates) {
+        fprintf(stderr,
+                "psxrecomp: HOST SPECTATES - slot 0 runs the match with a "
+                "muted pad; %d pad port(s) at session slot - 1\n",
+                np_pad_count(slots));
+        fflush(stderr);
+    }
     if (g_np.spectator) {
         fprintf(stderr,
                 "psxrecomp: SPECTATING - simulating %d seat(s) from the wire, "
@@ -3939,7 +4029,7 @@ int psx_netplay_start(const PsxNetplayConfig *cfg)
         }
         fflush(stdout);
     }
-    if (g_np.slot_count >= 3)
+    if (np_pad_count(g_np.slot_count) >= 3)
         sio_set_multitap(1);
     else
         sio_set_multitap(0);
@@ -4146,6 +4236,8 @@ void psx_netplay_shutdown(void)
     np_sched_bind(NULL);
     np_leave_guest_sandbox();
     np_leave_host_card_sandbox();
+    g_np_host_spectates = 0;
+    g_np_port_map_valid = 0;
     {
         CPUState *saved_cpu = g_np.cpu;
         memset(&g_np, 0, sizeof(g_np));

@@ -49,6 +49,8 @@ typedef struct PsxLobbyRow {
     int      lan_count;
     /* Round-trip ms to a reachable candidate; -1 unknown / timed out. */
     int      latency_ms;
+    /* Host's country (alpha-2) from the server's GeoIP; "" unknown. */
+    char     host_country[4];
 } PsxLobbyRow;
 
 typedef struct PsxLobbyMember {
@@ -70,6 +72,8 @@ typedef struct PsxLobbyMember {
     int  memcard_offer_valid;
     int  memcard_has_card;    /* a slot-1 card is enabled locally */
     int  memcard_share;       /* peer opted in to bring it to the match */
+    /* Country (alpha-2) from the server's GeoIP; "" unknown. */
+    char country[4];
 } PsxLobbyMember;
 
 /*
@@ -165,6 +169,9 @@ typedef struct PsxLobbyJoinInfo {
      * The relay forwards nothing from a slot at or beyond its player count, so
      * this is the number that makes a spectator unable to send. */
     int      spectator_relay_base;
+    /* Launch: the host watches from the gallery but runs the match from
+     * session slot 0 (pad muted); player seats sit at lobby seat + 1. */
+    int      host_spectates;
     char     last_error[64]; /* need_password | bad_password | … */
 } PsxLobbyJoinInfo;
 
@@ -350,6 +357,22 @@ const PsxLobbyBiosOffer *psx_lobby_bios_offer(void);
 /* Local memory-card offer (attached to set_ready alongside bios_offer). */
 void psx_lobby_set_memcard_offer(const PsxLobbyMemcardOffer *offer);
 const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void);
+
+/* Seat self-service (server ops seat_move / seat_swap_request /
+ * seat_swap_answer). A player may move itself to a FREE player seat; taking
+ * an occupied one asks its occupant, who answers from the prompt.
+ *   seat_move_self(to)    : 0 queued; a refusal comes back as a lobby error
+ *   seat_swap_request(to) : 0 queued; outgoing() then reports the answer
+ *   seat_swap_incoming    : 1 while somebody is asking THIS player
+ *   seat_swap_respond(ok) : answer (and drop) the incoming ask
+ *   seat_swap_outgoing    : 0 idle, 1 waiting, 2 accepted, -1 declined
+ *   seat_swap_clear       : back to idle after showing a finished result */
+int  psx_lobby_seat_move_self(int to_slot);
+int  psx_lobby_seat_swap_request(int target_slot);
+int  psx_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot);
+int  psx_lobby_seat_swap_respond(int accept);
+int  psx_lobby_seat_swap_outgoing(void);
+void psx_lobby_seat_swap_clear(void);
 
 /* Lobby chat. send: 0 when queued (the line appears via the server echo).
  * count/get read the ring, oldest first; cleared on create/join/leave. */

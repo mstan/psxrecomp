@@ -40,6 +40,32 @@ remains useful for debugging and for hosts that prefer fixed lag.
 
 ---
 
+## Seats vs session slots
+
+Players can move themselves in the lobby and ask to swap seats (online via
+the server's `seat_move` / `seat_swap_request` / `seat_swap_answer`; on LAN
+via `MOTK5 SEATMOVE` / `SWAPASK` / `SWAPANS` / `SWAPRES` relayed by the host),
+so the lobby host can hold any seat. The session is planned at launch
+(`ae_np_plan_session_slots`): the host is always **session slot 0** — the
+seat every host-only path keys on — and the other players follow in lobby-seat
+order; each session slot drives the controller port of its lobby seat
+(`PsxNetplayConfig.port_of_slot`), so the game sees a player where the lobby
+seated them. Session slots are therefore compact (no holes) even when the
+lobby is sparse; the sparse ports are what the game sees.
+
+## Host in the spectator table
+
+Online rooms let the host watch from the gallery and still run the match. The
+host keeps session slot 0 — the seat every host-only path keys on (save
+states, card sync, the start barrier, overlay host controls) — but its pad is
+muted (`psx_netplay_stage_local` substitutes "no controller") and slot 0 maps
+to no controller port; player seats sit at lobby seat + 1 and drive port
+slot − 1. The server publishes `host_spectates` with the launch and sizes the
+input relay for the extra forwarded slot; every peer derives its session slot
+from that one flag. The session can therefore hold `PSX_MAX_PLAYERS + 1`
+slots. LAN rooms have no gallery, so this is online-only.
+Env for command-line sessions: `PSX_NET_HOST_SPECTATES=1` on every peer.
+
 ## Bring your own memory card (seat 2)
 
 By default a match runs on the **host's** memory-card choices: at launch the
@@ -70,7 +96,8 @@ Memories duels load each duelist's deck from a separate card. For that, seat 2
 
 The room page also carries a lobby chat. Online it is the server's `chat` op,
 echoed to everyone seated; on LAN the host relays it (`MOTK5 CHATREQ` from a
-guest, `MOTK5 CHAT` to everyone).
+guest, `MOTK5 CHAT` to everyone). Join, leave and kick are announced as system
+lines the same way (empty sender fields on the wire mark them as system).
 
 Env override for command-line sessions: `PSX_NET_GUEST_MEMCARD=1` on **every**
 peer (a host that expects a card from a seat that never sends one waits at the

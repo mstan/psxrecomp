@@ -119,6 +119,13 @@ const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void)
     return &z;
 }
 int  psx_lobby_send_chat(const char *text) { (void)text; return -1; }
+int  psx_lobby_seat_move_self(int to_slot) { (void)to_slot; return -1; }
+int  psx_lobby_seat_swap_request(int target_slot) { (void)target_slot; return -1; }
+int  psx_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot)
+{ (void)who; (void)who_cap; (void)from_slot; return 0; }
+int  psx_lobby_seat_swap_respond(int accept) { (void)accept; return -1; }
+int  psx_lobby_seat_swap_outgoing(void) { return 0; }
+void psx_lobby_seat_swap_clear(void) {}
 int  psx_lobby_chat_count(void) { return 0; }
 int  psx_lobby_chat_get(int index, PsxLobbyChatMsg *out) { (void)index; (void)out; return 0; }
 void psx_lobby_chat_clear(void) {}
@@ -206,6 +213,12 @@ typedef struct {
     PsxLobbyMatchCaps match_caps;
     PsxLobbyBiosOffer bios_offer;
     PsxLobbyMemcardOffer memcard_offer;
+    /* Seat swap: one pending ask aimed at us, one outgoing result. */
+    int  swap_in_valid;
+    char swap_in_asker_id[PSX_LOBBY_ID_LEN];
+    char swap_in_asker_name[PSX_LOBBY_NAME_LEN];
+    int  swap_in_from_slot;
+    int  swap_out; /* 0 idle, 1 waiting, 2 accepted, -1 declined */
     /* Lobby chat ring (oldest at chat_head). */
     PsxLobbyChatMsg chat[PSX_LOBBY_CHAT_RING];
     int chat_head;
@@ -998,8 +1011,8 @@ static void match_caps_clear(PsxLobbyMatchCaps *c)
     memset(c, 0, sizeof(*c));
     c->aspect_num = 4;
     c->aspect_den = 3;
-    c->input_delay = 2;
-    c->input_prediction = 4;
+    c->input_delay = 6;
+    c->input_prediction = 10;
     c->guest_memcard = 1;
 }
 
@@ -1310,10 +1323,10 @@ static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out)
     out->bios_hle = json_get_bool(obj, "bios_hle", 1);
     out->fast_boot = json_get_bool(obj, "fast_boot", 0);
     out->auto_skip_fmv = json_get_bool(obj, "auto_skip_fmv", 0);
-    out->input_delay = json_get_int(obj, "input_delay", 2);
+    out->input_delay = json_get_int(obj, "input_delay", 6);
     if (out->input_delay < 0) out->input_delay = 0;
     if (out->input_delay > 20) out->input_delay = 20;
-    out->input_prediction = json_get_int(obj, "input_prediction", 4);
+    out->input_prediction = json_get_int(obj, "input_prediction", 10);
     if (out->input_prediction < 2) out->input_prediction = 2;
     if (out->input_prediction > 16) out->input_prediction = 16;
     out->force_input_relay = json_get_bool(obj, "force_input_relay", 0);
@@ -1563,6 +1576,8 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
                     g_lc.members[n].bios_prefer_openbios =
                         (strcmp(prefer, "openbios") == 0) ? 1 : 0;
                 }
+                json_get_str(chunk, "country", g_lc.members[n].country,
+                             sizeof(g_lc.members[n].country));
                 if (json_extract_object(chunk, "memcard_offer", offer, sizeof(offer))) {
                     g_lc.members[n].memcard_offer_valid = 1;
                     g_lc.members[n].memcard_has_card =
@@ -1607,6 +1622,7 @@ static void parse_slots_array(const char *json)
     g_lc.join.spectator_relay_base =
         json_get_int(json, "spectator_relay_base",
                      g_lc.join.spectator_relay_base);
+    g_lc.join.host_spectates = json_get_bool(json, "host_spectates", 0);
     g_lc.join.spectator_slot_base =
         json_get_int(json, "spectator_slot_base",
                      g_lc.join.spectator_slot_base > 0
@@ -1867,6 +1883,8 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].player_count = json_get_int(chunk, "player_count", 0);
                     g_lc.list[n].max_slots = json_get_int(chunk, "max_slots", 2);
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
+                    json_get_str(chunk, "host_country", g_lc.list[n].host_country,
+                                 sizeof(g_lc.list[n].host_country));
                     json_get_str(chunk, "host_endpoint", g_lc.list[n].host_endpoint,
                                  sizeof(g_lc.list[n].host_endpoint));
                     g_lc.list[n].lan_count = json_parse_str_array(
@@ -2084,6 +2102,19 @@ static void handle_server_json(const char *json)
         lobby_host_advertise_reset();
         return;
     }
+    if (strcmp(op, "seat_swap_ask") == 0) {
+        g_lc.swap_in_valid = 1;
+        json_get_str(json, "asker_player_id", g_lc.swap_in_asker_id,
+                     sizeof(g_lc.swap_in_asker_id));
+        json_get_str(json, "asker_name", g_lc.swap_in_asker_name,
+                     sizeof(g_lc.swap_in_asker_name));
+        g_lc.swap_in_from_slot = json_get_int(json, "from_slot", -1);
+        return;
+    }
+    if (strcmp(op, "seat_swap_result") == 0) {
+        g_lc.swap_out = json_get_bool(json, "accept", 0) ? 2 : -1;
+        return;
+    }
     if (strcmp(op, "chat") == 0) {
         char text[PSX_LOBBY_CHAT_TEXT_LEN];
         char from_id[PSX_LOBBY_ID_LEN];
@@ -2151,6 +2182,8 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
         strcmp(op, "kicked") == 0) {
         psx_lobby_chat_clear();
+        g_lc.swap_in_valid = 0;
+        g_lc.swap_out = 0;
         g_lc.ice_rtt_suspended = 0;
         lobby_ice_rtt_close();
         lobby_rtt_close();
@@ -3376,6 +3409,66 @@ void psx_lobby_set_memcard_offer(const PsxLobbyMemcardOffer *offer)
 const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void)
 {
     return &g_lc.memcard_offer;
+}
+
+int psx_lobby_seat_move_self(int to_slot)
+{
+    char msg[80];
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    /* A player seat or a gallery seat: the server takes either, empty only. */
+    if (!psx_lobby_seat_valid(to_slot)) return -1;
+    snprintf(msg, sizeof(msg), "{\"op\":\"seat_move\",\"to_slot\":%d}", to_slot);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int psx_lobby_seat_swap_request(int target_slot)
+{
+    char msg[96];
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    /* A player seat or a gallery seat: the occupant of either can be asked. */
+    if (!psx_lobby_seat_valid(target_slot)) return -1;
+    if (g_lc.swap_out == 1) return -1; /* one ask at a time */
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_request\",\"target_slot\":%d}", target_slot);
+    queue_send(msg);
+    flush_pending();
+    g_lc.swap_out = 1;
+    return 0;
+}
+
+int psx_lobby_seat_swap_incoming(char *who, size_t who_cap, int *from_slot)
+{
+    if (!g_lc.swap_in_valid) return 0;
+    if (who && who_cap) snprintf(who, who_cap, "%s", g_lc.swap_in_asker_name);
+    if (from_slot) *from_slot = g_lc.swap_in_from_slot;
+    return 1;
+}
+
+int psx_lobby_seat_swap_respond(int accept)
+{
+    char msg[160];
+    if (!g_lc.swap_in_valid) return -1;
+    g_lc.swap_in_valid = 0;
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    snprintf(msg, sizeof(msg),
+             "{\"op\":\"seat_swap_answer\",\"accept\":%s,"
+             "\"asker_player_id\":\"%s\"}",
+             accept ? "true" : "false", g_lc.swap_in_asker_id);
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int psx_lobby_seat_swap_outgoing(void)
+{
+    return g_lc.swap_out;
+}
+
+void psx_lobby_seat_swap_clear(void)
+{
+    if (g_lc.swap_out != 1) g_lc.swap_out = 0;
 }
 
 int psx_lobby_send_chat(const char *text)
