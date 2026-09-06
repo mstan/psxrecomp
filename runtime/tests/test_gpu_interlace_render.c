@@ -5,7 +5,8 @@
 #include <string.h>
 
 static uint16_t vram[1024 * 512];
-static uint32_t hires[32*4*32*4];
+static uint32_t hires[32*4*32*4], reference_hires[32*4*32*4];
+static uint16_t reference_vram[32*32];
 static int skipped_row;
 static int failures;
 static int mock_enabled, mock_pc, mock_pq, mock_submissions, mock_bad;
@@ -85,6 +86,28 @@ int main(void) {
                 }
             }
         }
+        /* Enhanced vertices can lie above/below integer fallback vertices.
+         * Compare each masked surface with its own unmasked pixel oracle. */
+        for (int shift = -10; shift <= 10; shift += 20) {
+            reset_canvas();
+            gr_set_precise_triangle(1,2*65536,(8+shift)*65536+16384,
+                10*65536,(8+shift)*65536+16384,2*65536,(16+shift)*65536+16384);
+            gr_draw_flat_triangle(2,8,10,8,2,16,0x7FFF);
+            for (int y=0; y<32; ++y)
+                memcpy(reference_vram+y*32,vram+y*1024,32*sizeof(uint16_t));
+            gr_render_display_hires(reference_hires,32*scale*4,0,0,32,32);
+            for (int skip=0; skip<=1; ++skip) {
+                reset_canvas(); skipped_row=skip;
+                gr_set_precise_triangle(1,2*65536,(8+shift)*65536+16384,
+                    10*65536,(8+shift)*65536+16384,2*65536,(16+shift)*65536+16384);
+                gr_draw_flat_triangle(2,8,10,8,2,16,0x7FFF);
+                for (int y=0; y<32; ++y) for (int x=0; x<32; ++x)
+                    CHECK(vram[y*1024+x] == ((y&1)==skip ? 0 : reference_vram[y*32+x]));
+                gr_render_display_hires(hires,32*scale*4,0,0,32,32);
+                for (int y=0; y<32*scale; ++y) for (int x=0; x<32*scale; ++x)
+                    CHECK((hires[y*32*scale+x]&0xFFFFFF) == (((y/scale)&1)==skip ? 0 : (reference_hires[y*32*scale+x]&0xFFFFFF)));
+            }
+        }
         reset_canvas(); skipped_row=1;
         gr_set_draw_area(3,3,8,8); gr_draw_flat_rect(0,0,10,10,0x7FFF);
         CHECK(vram[4*1024+3]==0x7FFF && vram[3*1024+3]==0 && vram[4*1024+2]==0);
@@ -120,7 +143,13 @@ int main(void) {
     gr_set_precise_triangle(1,0,0,10*65536,0,0,10*65536);
     gr_set_perspective_triangle(1,1.0f,0.5f,0.25f);
     gr_draw_flat_triangle(0,0,10,0,0,10,0x7FFF);
-    CHECK(mock_submissions==16 && mock_bad==0 && !mock_pc && !mock_pq);
+    CHECK(mock_submissions==6 && mock_bad==0 && !mock_pc && !mock_pq);
+    mock_submissions=0;
+    gr_set_draw_area(0,0,1023,511);
+    gr_set_precise_triangle(1,0,8*65536+16384,65536,8*65536+16384,0,9*65536+16384);
+    gr_set_perspective_triangle(1,1.0f,1.0f,1.0f);
+    gr_draw_flat_triangle(0,8,1,8,0,9,0x7FFF);
+    CHECK(mock_submissions==3 && mock_bad==0 && !mock_pc && !mock_pq);
     gr_set_backend(GR_BACKEND_SOFTWARE);
     if (failures) return 1;
     puts("PASS: field predicate, all raster primitives, clipping, transfers, mode switch, scales 1/4");

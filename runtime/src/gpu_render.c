@@ -141,10 +141,22 @@ static void gr_rearm_triangle(void) {
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(g_pq_enabled,g_pq[0],g_pq[1],g_pq[2]);
 }
+/* Keep both integer fallback rows and enhanced fixed-point rows. The one-row
+ * margin covers edge rounding without submitting a full VRAM-height strip. */
+static void gr_precise_row_bounds(int *lo, int *hi) {
+    for (int i = 1; i < 6; i += 2) {
+        int y = g_pc[i] / 65536;
+        int rem = g_pc[i] % 65536;
+        int floor_y = y - (rem < 0);
+        int ceil_y = y + (rem > 0);
+        *lo = gr_min(*lo, floor_y - 1);
+        *hi = gr_max(*hi, ceil_y + 1);
+    }
+}
 #define GR_TRIANGLE_ROWS(ylo, yhi, draw_call) do { \
     /* Precise positions can cross the integer primitive bounds. */ \
     int lo = (ylo), hi = (yhi); \
-    if (g_pc_enabled) { lo = 0; hi = 511; } \
+    if (g_pc_enabled) gr_precise_row_bounds(&lo, &hi); \
     GR_RASTER_ROWS(lo, hi, (gr_rearm_triangle(), draw_call)); \
     g_pc_enabled = g_pq_enabled = 0; \
     gr_rearm_triangle(); \

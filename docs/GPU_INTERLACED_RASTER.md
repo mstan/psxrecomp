@@ -42,3 +42,9 @@ same row-preservation assertions.
 These sources supplied behavioral evidence. The implementation and regression
 fixture were written independently. Exact title run receipts and route limits
 are maintained by the Timeshock correction project.
+
+Precise vertices use signed 16.16 positions. Row dispatch covers the union of
+integer fallback bounds and precise vertex bounds, with one row for rounding.
+Tests compare native and enhanced masked pixels with unmasked images when
+precise positions cross the integer bounds, including negative coordinates.
+A tiny precise triangle must submit three row clips rather than 256.
