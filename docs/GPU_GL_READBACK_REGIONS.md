@@ -34,7 +34,7 @@ Run `python runtime/tests/run_gl_readback_region.py --compiler-bin <mingw-bin>
 --sdl-root <deps> --output <new-directory>`. The SDL dependency root must contain
 `sdl3-src/include` and `sdl3-build/libSDL3.a`. The Windows runner uses hidden
 windows. It tests
-native and4x scales. `--gl-source <old-gpu_gl_renderer.c> --expect-unbounded`
+native and 4x scales. `--gl-source <old-gpu_gl_renderer.c> --expect-unbounded`
 accepts an unbounded implementation only when pixel comparisons pass and
 exactly the small-transfer assertion fails. An older implementation with a
 coherence defect (including the depth24 clear) is correctly rejected too. Each command/result is saved in `receipt.json` under a fresh run directory inside the output root. Configure `runtime/` with `BUILD_TESTING=ON` and `PSX_GL_READBACK_SDL_ROOT=<deps>` on MinGW to register `gl_readback_region_test`; run it with `ctest --test-dir <build> -R gl_readback_region_test --output-on-failure`. Missing dependencies print a configure-time message and do not count as a hardware pass.
@@ -49,6 +49,7 @@ justifies it.
 
 For Clang/MinGW builds, set `PSX_GL_READBACK_COMPILER_BIN` to a GCC/MinGW
 bin directory containing both gcc.exe and g++.exe. CMake checks these files
-before registering the hardware test. `gl_readback_runner_test` separately
+before registering the hardware test. Both the configure step and the runner
+also validate the SDL3 include directory and static library. `gl_readback_runner_test` separately
 checks strict result parsing without a GPU or compiler. A negative run passes
 only for exactly one failure named single-pixel bounded transfer.

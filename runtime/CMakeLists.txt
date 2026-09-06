@@ -35,7 +35,9 @@ if(BUILD_TESTING)
     endif()
     if(MINGW AND PSX_GL_READBACK_SDL_ROOT
             AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/gcc.exe"
-            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/g++.exe")
+            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/g++.exe"
+            AND IS_DIRECTORY "${PSX_GL_READBACK_SDL_ROOT}/sdl3-src/include"
+            AND EXISTS "${PSX_GL_READBACK_SDL_ROOT}/sdl3-build/libSDL3.a")
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_test(NAME gl_readback_region_test
             COMMAND "${Python3_EXECUTABLE}"
@@ -46,7 +48,7 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-readback-results")
         set_tests_properties(gl_readback_region_test PROPERTIES LABELS "gpu;opengl;hardware" TIMEOUT 180)
     else()
-        message(STATUS "gl_readback_region_test: not registered (requires MinGW, PSX_GL_READBACK_SDL_ROOT and gcc.exe/g++.exe in PSX_GL_READBACK_COMPILER_BIN)")
+        message(STATUS "gl_readback_region_test: not registered (requires MinGW, SDL3 headers/static library in PSX_GL_READBACK_SDL_ROOT and gcc.exe/g++.exe in PSX_GL_READBACK_COMPILER_BIN)")
     endif()
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)

@@ -36,11 +36,15 @@ def main():
     for name in ("gcc.exe", "g++.exe"):
         if not (compiler / name).is_file():
             parser.error(f"--compiler-bin must contain {name}: {compiler}")
+    sdl = pathlib.Path(args.sdl_root).resolve()
+    if not (sdl / "sdl3-src/include").is_dir():
+        parser.error(f"--sdl-root must contain the sdl3-src/include directory: {sdl}")
+    if not (sdl / "sdl3-build/libSDL3.a").is_file():
+        parser.error(f"--sdl-root must contain sdl3-build/libSDL3.a: {sdl}")
     output = pathlib.Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     dest = pathlib.Path(tempfile.mkdtemp(prefix="readback-", dir=output))
     print("Evidence directory:", dest)
-    sdl = pathlib.Path(args.sdl_root).resolve()
     env = os.environ.copy()
     env["PATH"] = str(compiler) + os.pathsep + env.get("PATH", "")
     if args.gl_source:
