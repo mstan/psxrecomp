@@ -23,6 +23,23 @@ psxrecomp_add_runtime_target(psx-runtime
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    # Optional real-hardware regression. Configure its dependencies explicitly;
+    # absence must remain visible, never counted as a passing GPU test.
+    set(PSX_GL_READBACK_SDL_ROOT "" CACHE PATH "SDL3 static build root for GL readback test")
+    if(MINGW AND PSX_GL_READBACK_SDL_ROOT)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        get_filename_component(_gl_test_compiler_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+        add_test(NAME gl_readback_region_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_readback_region.py"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_region.c"
+                --compiler-bin "${_gl_test_compiler_bin}"
+                --sdl-root "${PSX_GL_READBACK_SDL_ROOT}"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-readback-results")
+        set_tests_properties(gl_readback_region_test PROPERTIES LABELS "gpu;opengl;hardware" TIMEOUT 180)
+    else()
+        message(STATUS "gl_readback_region_test: not registered (requires MinGW and PSX_GL_READBACK_SDL_ROOT)")
+    endif()
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)
     target_include_directories(launcher_device_roundtrip_test PRIVATE include)
