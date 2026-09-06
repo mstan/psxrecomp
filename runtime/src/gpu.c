@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gpu_interlace.h"
 #include "display_scanout.h"
 #include "pgxp.h"
 #include "mod_memory.h"
@@ -2731,6 +2732,14 @@ void gpu_init(void) {
 }
 
 /* ---- GPUSTAT read (0x1F801814) ---- */
+
+/* Primitive rasterization must leave the active display field untouched in
+ * 480-line interlaced mode unless GP0(E1h).10 permits drawing to it.
+ * Transfers, fills, and copies are not raster primitives. */
+int gpu_raster_skipped_row(void) {
+    return psx_gpu_raster_skipped_row(vertical_interlace, vres,
+                                    draw_to_display, display_area_y, lcf);
+}
 
 uint32_t gpu_read_gpustat(void) {
     /* Advance vblank when polled enough times from within a single function.
