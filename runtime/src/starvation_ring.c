@@ -13,6 +13,8 @@
 #include "psx_bss.h"
 #include "psx_cycles.h"
 #include "psx_netplay.h"
+#include "crash_trace.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +48,15 @@ extern int psx_get_in_exception(void);
 
 static PSX_BSS StarvationEntry s_ring[STARVATION_RING_CAP];
 static uint64_t        s_seq = 0;
-static uint64_t        s_last_heartbeat_us = 0;
+/* Written by the emu thread AND the debug-server IO thread
+ * (send_all_blocking); read by the emu thread's watchdog. Atomic so the
+ * cross-thread store/load is single-copy atomic on every target. */
+static _Atomic uint64_t s_last_heartbeat_us = 0;
 static int             s_dump_done = 0;
+
+static uint64_t heartbeat_load(void) {
+    return atomic_load_explicit(&s_last_heartbeat_us, memory_order_relaxed);
+}
 
 /* Watchdog threshold: 4 seconds of wall-clock without a heartbeat is
  * "TCP died, BIOS still running" territory. Real BIOS pad polling
@@ -70,13 +79,14 @@ static uint64_t starvation_timeout_us(void) {
 }
 
 void starvation_watchdog_heartbeat(void) {
-    s_last_heartbeat_us = host_us_now();
+    atomic_store_explicit(&s_last_heartbeat_us, host_us_now(),
+                          memory_order_relaxed);
 }
 
 void starvation_ring_reset(void) {
     memset(s_ring, 0, sizeof(s_ring));
     s_seq = 0;
-    s_last_heartbeat_us = 0;
+    atomic_store_explicit(&s_last_heartbeat_us, 0, memory_order_relaxed);
     s_dump_done = 0;
 }
 
@@ -204,7 +214,7 @@ void starvation_ring_dump(const char *path) {
                 "\"in_exception\":%u,\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
                 "\"net_arch\":\"%s\",\"max_players\":%d,\"player_count\":%d}}\n",
                 (unsigned long long)total, (unsigned long long)avail,
-                (unsigned long long)s_last_heartbeat_us,
+                (unsigned long long)heartbeat_load(),
                 (unsigned long long)host_us_now(),
                 (unsigned long long)psx_get_cycle_count(),
                 g_debug_current_func_addr, g_debug_last_store_pc,
@@ -244,18 +254,25 @@ void starvation_ring_dump(const char *path) {
 
 void starvation_watchdog_check(void) {
     if (s_dump_done) return;
-    if (s_last_heartbeat_us == 0) return;  /* not initialized yet */
+    /* Load the heartbeat BEFORE sampling the clock. The IO thread stamps it
+     * concurrently; with the reads in the other order a stamp landing in
+     * between made now < last and the unsigned gap wrapped past any
+     * threshold (see starvation_watchdog_stale). */
+    uint64_t last = heartbeat_load();
+    if (last == 0) return;                 /* not initialized yet */
     uint64_t timeout = starvation_timeout_us();
     if (timeout == 0) return;              /* watchdog disabled (renderer bring-up) */
     uint64_t now = host_us_now();
-    if (now - s_last_heartbeat_us > timeout) {
+    if (starvation_watchdog_stale(last, now, timeout)) {
         starvation_ring_dump(NULL);
         /* Abort cleanly so the dump file is preserved and the user knows
-         * the runtime starved. */
+         * the runtime starved. Tag the exit so psx_last_run_report.json
+         * says "starvation_watchdog" instead of atexit/unknown. */
         fprintf(stderr, "starvation_watchdog: %llu us without heartbeat — "
                 "ring dumped to starvation_dump.jsonl, aborting\n",
-                (unsigned long long)(now - s_last_heartbeat_us));
+                (unsigned long long)(now - last));
         fflush(stderr);
+        psx_crash_trace_set_exit_origin("starvation_watchdog");
         exit(2);
     }
 }

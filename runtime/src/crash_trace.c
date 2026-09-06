@@ -878,7 +878,11 @@ static void psx_signal_handler(int sig) {
  * exit(0) so __gcov_exit / instr-profile writers run. Not async-signal-safe;
  * acceptable for intentional train/Ctrl+C stop. */
 static void psx_soft_exit_handler(int sig) {
-    (void)sig;
+    /* Tag the origin so the report distinguishes a train-script kill or
+     * Ctrl+C from an untagged exit() (which stays "unknown" on purpose). */
+    psx_crash_trace_set_exit_origin(sig == SIGINT  ? "signal_sigint" :
+                                    sig == SIGTERM ? "signal_sigterm" :
+                                                     "signal_soft");
     exit(0);
 }
 
@@ -894,6 +898,12 @@ static LONG WINAPI psx_seh_handler(EXCEPTION_POINTERS *info) {
 static BOOL WINAPI psx_console_ctrl_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
         type == CTRL_CLOSE_EVENT) {
+        /* A console torn down under the game (terminal crash, window X)
+         * used to report as atexit/unknown — indistinguishable from an
+         * SDL window close. Name the event. */
+        psx_crash_trace_set_exit_origin(type == CTRL_CLOSE_EVENT ? "console_close" :
+                                        type == CTRL_BREAK_EVENT ? "console_ctrl_break" :
+                                                                   "console_ctrl_c");
         exit(0);
         return TRUE;
     }

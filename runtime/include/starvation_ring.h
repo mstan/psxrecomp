@@ -99,6 +99,25 @@ void starvation_watchdog_heartbeat(void);
 /* Run watchdog check from a hot path (e.g. psx_advance_cycles). */
 void starvation_watchdog_check(void);
 
+/* Pure staleness decision behind starvation_watchdog_check(), exposed so a
+ * unit test can pin it without linking the ring.
+ *
+ * The heartbeat is stamped from two threads (emu thread per vblank, and the
+ * debug-server IO thread on every send() chunk), while the check runs on the
+ * emu thread. A stamp landing between the check's clock sample and its
+ * heartbeat load makes `last > now`; the old open-coded `now - last` wrapped
+ * to ~1.8e19, beat any threshold, and exited a healthy runtime (BoF3
+ * 2026-09-02: 402 us of real staleness tripped a 4 s watchdog). Callers must
+ * therefore load `last` BEFORE sampling `now`, and this function refuses a
+ * negative gap by construction. Returns 1 when the watchdog should fire.
+ * `timeout == 0` disables it; `last == 0` means "no heartbeat yet". */
+static inline int starvation_watchdog_stale(uint64_t last, uint64_t now,
+                                            uint64_t timeout) {
+    if (last == 0 || timeout == 0) return 0;
+    if (now <= last) return 0;
+    return (now - last) > timeout;
+}
+
 /* Manual dump-to-file (for testing / TCP probe). Filename can be NULL. */
 void starvation_ring_dump(const char *path);
 
