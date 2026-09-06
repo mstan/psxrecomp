@@ -7,10 +7,11 @@
  * gl_backend_get(); if that returns NULL (GL unavailable / init failed) we
  * stay on software so a misconfigured [video] renderer never bricks boot.
  *
- * The software backend table points straight at the existing sw_* functions,
- * so the software path is byte-for-byte unchanged. */
+ * Primitive dispatch also applies the GPU's interlaced field mask through
+ * the backend clip, at native VRAM row granularity. */
 
 #include "gpu_render.h"
+#include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include <stdio.h>
 
@@ -64,6 +65,11 @@ extern const GpuRenderBackend *vk_backend_get(void);
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
+/* Backends consume triangle metadata on submission. Re-arm it for each
+ * clipped row belonging to the same interlaced primitive. */
+static int g_pc_enabled, g_pq_enabled;
+static int32_t g_pc[6];
+static float g_pq[3];
 
 void gr_set_backend(GrBackend backend) {
     if (backend == GR_BACKEND_OPENGL) {
@@ -105,48 +111,121 @@ void gr_set_texture_window(uint32_t raw)             { g_b->set_texture_window(r
 void gr_set_color_modulation(int r, int g, int b, int raw) { g_b->set_color_modulation(r, g, b, raw); }
 void gr_set_precise_triangle(int enabled, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
                              int32_t x2, int32_t y2) {
+    g_pc_enabled = enabled;
+    g_pc[0]=x0; g_pc[1]=y0; g_pc[2]=x1; g_pc[3]=y1; g_pc[4]=x2; g_pc[5]=y2;
     if (g_b->set_precise_triangle)
         g_b->set_precise_triangle(enabled, x0, y0, x1, y1, x2, y2);
 }
+static uint32_t g_perspective_triangles;
+uint32_t gr_perspective_triangle_count(void) { return g_perspective_triangles; }
 void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+    /* Count the original triangle, not per-row backend metadata re-arms. */
+    if (g_b->set_perspective_triangle && enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f)
+        ++g_perspective_triangles;
+    g_pq_enabled=enabled; g_pq[0]=q0; g_pq[1]=q1; g_pq[2]=q2;
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(enabled, q0, q1, q2);
 }
 void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
 void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
+/* Apply field masking through each backend's native-coordinate clip. This
+ * preserves the same rows in canonical VRAM and supersampled surfaces, and
+ * leaves non-raster transfers untouched. Bounds are already offset by gpu.c.
+ * Query live GPU state per primitive so reset/restore/mode changes cannot
+ * leave a stale renderer-side field latch. */
+static int gr_min(int a, int b) { return a < b ? a : b; }
+static int gr_max(int a, int b) { return a > b ? a : b; }
+static void gr_rearm_triangle(void) {
+    if (g_b->set_precise_triangle)
+        g_b->set_precise_triangle(g_pc_enabled,g_pc[0],g_pc[1],g_pc[2],g_pc[3],g_pc[4],g_pc[5]);
+    if (g_b->set_perspective_triangle)
+        g_b->set_perspective_triangle(g_pq_enabled,g_pq[0],g_pq[1],g_pq[2]);
+}
+/* Keep both integer fallback rows and enhanced fixed-point rows. The one-row
+ * margin covers edge rounding without submitting a full VRAM-height strip. */
+static void gr_precise_row_bounds(int *lo, int *hi) {
+    for (int i = 1; i < 6; i += 2) {
+        int y = g_pc[i] / 65536;
+        int rem = g_pc[i] % 65536;
+        int floor_y = y - (rem < 0);
+        int ceil_y = y + (rem > 0);
+        *lo = gr_min(*lo, floor_y - 1);
+        *hi = gr_max(*hi, ceil_y + 1);
+    }
+}
+#define GR_TRIANGLE_ROWS(ylo, yhi, draw_call) do { \
+    /* Precise positions can cross the integer primitive bounds. */ \
+    int lo = (ylo), hi = (yhi); \
+    if (g_pc_enabled) gr_precise_row_bounds(&lo, &hi); \
+    GR_RASTER_ROWS(lo, hi, (gr_rearm_triangle(), draw_call)); \
+    g_pc_enabled = g_pq_enabled = 0; \
+    gr_rearm_triangle(); \
+} while (0)
+#define GR_RASTER_ROWS(ylo, yhi, draw_call) do { \
+    int skip = gpu_raster_skipped_row(); \
+    if (skip < 0) { draw_call; } else { \
+        int cx1, cy1, cx2, cy2; \
+        g_b->get_draw_area(&cx1, &cy1, &cx2, &cy2); \
+        int first = gr_max(gr_max((ylo), cy1), 0); \
+        int last = gr_min(gr_min((yhi), cy2), 511); \
+        for (int row = first; row <= last; ++row) { \
+            if ((row & 1) == skip) continue; \
+            g_b->set_draw_area(cx1, row, cx2, row); \
+            draw_call; \
+        } \
+        g_b->set_draw_area(cx1, cy1, cx2, cy2); \
+    } \
+} while (0)
+
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
-    g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
+    GR_TRIANGLE_ROWS(gr_min(y0, gr_min(y1, y2)), gr_max(y0, gr_max(y1, y2)), g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c));
 }
 void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1,
                               int x2, int y2, uint16_t c2) {
-    g_b->draw_gouraud_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
+    GR_TRIANGLE_ROWS(gr_min(y0, gr_min(y1, y2)), gr_max(y0, gr_max(y1, y2)), g_b->draw_gouraud_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2));
 }
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
-                                clut_x, clut_y, texpage);
+    GR_TRIANGLE_ROWS(gr_min(y0, gr_min(y1, y2)), gr_max(y0, gr_max(y1, y2)), g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
+                                clut_x, clut_y, texpage));
 }
 void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c0,
                                       int x1, int y1, int u1, int v1, uint32_t c1,
                                       int x2, int y2, int u2, int v2, uint32_t c2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw) {
-    g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
-                                       x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
+    GR_TRIANGLE_ROWS(gr_min(y0, gr_min(y1, y2)), gr_max(y0, gr_max(y1, y2)), g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
+                                       x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw));
 }
-void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
+/* Wide flat-overlay backends intentionally replace the clip with a full
+ * surface scissor. Submit row-height geometry too, so the field mask survives
+ * that path while ordinary full-screen overlays keep their existing policy. */
+static void gr_draw_flat_rect_row(int x, int w, uint16_t c) {
+    int x1, y1, x2, y2;
+    g_b->get_draw_area(&x1, &y1, &x2, &y2);
+    g_b->draw_flat_rect(x, y1, w, 1, c);
+}
+void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) {
+    if (gpu_raster_skipped_row() < 0) {
+        g_b->draw_flat_rect(x, y, w, h, c);
+        return;
+    }
+    GR_RASTER_ROWS(y, y + h - 1, gr_draw_flat_rect_row(x, w, c));
+}
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
+    GR_RASTER_ROWS(y, y + h - 1, g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage));
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);
+    GR_RASTER_ROWS(y, y + h - 1, g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage));
 }
-void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) { g_b->draw_line(x0, y0, x1, y1, c); }
+void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) {
+    GR_RASTER_ROWS(gr_min(y0, y1), gr_max(y0, y1), g_b->draw_line(x0, y0, x1, y1, c));
+}
 void gr_draw_shaded_line(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1) {
-    g_b->draw_shaded_line(x0, y0, c0, x1, y1, c1);
+    GR_RASTER_ROWS(gr_min(y0, y1), gr_max(y0, y1), g_b->draw_shaded_line(x0, y0, c0, x1, y1, c1));
 }
 int gr_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
     return g_b->render_display(o, p, dx, dy, dw, dh);

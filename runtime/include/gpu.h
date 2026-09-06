@@ -17,6 +17,7 @@ extern "C" {
 
 void     gpu_init(void);
 uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
+int gpu_raster_skipped_row(void); /* -1: all rows; otherwise preserved field parity */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */

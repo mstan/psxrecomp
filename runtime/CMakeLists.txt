@@ -440,6 +440,15 @@ if(BUILD_TESTING)
     target_include_directories(gpu_sw_edges_test PRIVATE src)
     add_test(NAME gpu_sw_edges_test COMMAND gpu_sw_edges_test)
 
+    add_executable(gpu_interlace_render_test
+        tests/test_gpu_interlace_render.c src/gpu_render.c
+        src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
+    target_include_directories(gpu_interlace_render_test PRIVATE include)
+    if(NOT MSVC)
+        target_link_libraries(gpu_interlace_render_test PRIVATE m)
+    endif()
+    add_test(NAME gpu_interlace_render_test COMMAND gpu_interlace_render_test)
+
     add_executable(gpu_vk_upload_alignment_test
         tests/test_gpu_vk_upload_alignment.c)
     target_include_directories(gpu_vk_upload_alignment_test PRIVATE src)

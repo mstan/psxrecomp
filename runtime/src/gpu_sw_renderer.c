@@ -56,7 +56,6 @@ static int       g_precise_valid = 0;
 static int32_t   g_precise_x16[3], g_precise_y16[3];
 static int       g_perspective_valid = 0;
 static float     g_perspective_q[3];
-static uint32_t  g_perspective_triangles = 0;
 
 /* ---- Native-wide compositor (separate present surfaces) ------------------
  * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
@@ -522,11 +521,6 @@ void sw_set_perspective_triangle(int enabled,
     g_perspective_q[0] = q0;
     g_perspective_q[1] = q1;
     g_perspective_q[2] = q2;
-    if (g_perspective_valid) g_perspective_triangles++;
-}
-
-uint32_t sw_perspective_triangle_count(void) {
-    return g_perspective_triangles;
 }
 
 static inline int precise_scaled(int axis, int vertex, int fallback, int scale) {

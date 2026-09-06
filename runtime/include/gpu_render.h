@@ -54,6 +54,8 @@ void gr_set_precise_triangle(int enabled,
  * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
  * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
 void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+/* Original perspective-qualified triangles since process startup. */
+uint32_t gr_perspective_triangle_count(void);
 
 /* Primitives */
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
