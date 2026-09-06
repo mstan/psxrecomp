@@ -40,6 +40,44 @@ remains useful for debugging and for hosts that prefer fixed lag.
 
 ---
 
+## Bring your own memory card (seat 2)
+
+By default a match runs on the **host's** memory-card choices: at launch the
+host hashes / sends both of its cards to every guest (the `SRAM` state op), and
+guests play from a sandbox copy so their own cards are never written.
+
+Some games need each player's *own* card in the machine — Yu-Gi-Oh! Forbidden
+Memories duels load each duelist's deck from a separate card. For that, seat 2
+(P2) can **bring its card**:
+
+- In the lobby a memory-card glyph sits beside P2's name. P2 clicks it to
+  offer its **local slot-1** card; the host can click it to disallow / allow
+  guest cards. It lights up only when both agree, and every peer sees the same
+  state. Default is off (host cards only).
+- At launch, before the host's card broadcast, P2 uploads that card to the host
+  over the session (`MEMCARD` state op, the one guest→host transfer). The host
+  installs it as the match's **slot-2** card and the normal broadcast then
+  carries it to everyone, P2 included.
+- The host's real slot-2 card is neither read by the match nor written: the
+  host rebinds slot 2 to `<memcard_dir>/netplay/guest_card2.mcd` for the
+  session and restores its own file on shutdown. P2's real cards stay untouched
+  too (guests already sandbox both slots); what the match writes to slot 2
+  lands in P2's sandbox copy, not in P2's personal card.
+- The value is **settled once by the host at start** and delivered with the
+  launch caps (`guest_memcard_active`, or the trailing `MOTK1 START` line on
+  LAN), so a toggle racing the start cannot leave peers disagreeing about
+  whether a card is coming.
+
+The room page also carries a lobby chat. Online it is the server's `chat` op,
+echoed to everyone seated; on LAN the host relays it (`MOTK5 CHATREQ` from a
+guest, `MOTK5 CHAT` to everyone).
+
+Env override for command-line sessions: `PSX_NET_GUEST_MEMCARD=1` on **every**
+peer (a host that expects a card from a seat that never sends one waits at the
+`mc_guest_wait` barrier — the stall phase names it).
+
+---
+
 ## Hybrid graphics (determinism + present quality)
 
 Netplay must keep **guest simulation identical** across peers. Present quality

@@ -13,7 +13,20 @@ extern "C" {
 #define PSX_LOBBY_VERSION_LEN 32
 #define PSX_LOBBY_ENDPOINT_LEN 64
 #define PSX_LOBBY_MAX_LIST 32
-#define PSX_LOBBY_MAX_MEMBERS 8
+/* Player seats this framework can seat. Was what PSX_LOBBY_MAX_MEMBERS meant
+ * before a lobby held anything that was not a player. */
+#define PSX_LOBBY_MAX_PLAYERS 8
+/* Spectator seats a host may open, a separate pool on top of the players --
+ * so a full eight-player room can still be watched. */
+#define PSX_LOBBY_MAX_SPECTATORS 4
+/* Rows in the membership table: both tables land in it, tagged by role. */
+#define PSX_LOBBY_MAX_MEMBERS (PSX_LOBBY_MAX_PLAYERS + PSX_LOBBY_MAX_SPECTATORS)
+
+/* Seat indices are one namespace, matching the server: below the base is a
+ * player seat, at or above it is `index - base` in the gallery. The server
+ * republishes its own base in every lobby_update; this is the compiled-in
+ * default for an update that arrives without one. */
+#define PSX_LOBBY_SPECTATOR_SLOT_BASE 64
 #define PSX_LOBBY_MAX_LAN_EPS 4
 #define PSX_LOBBY_LANG_LEN 16
 
@@ -39,15 +52,24 @@ typedef struct PsxLobbyRow {
 } PsxLobbyRow;
 
 typedef struct PsxLobbyMember {
+    /* Seat index in the shared namespace: a player seat, or
+     * spectator_slot_base + gallery index. Pass it back to kick / move as-is. */
     int  slot;
     char player_id[PSX_LOBBY_ID_LEN];
     char display_name[PSX_LOBBY_NAME_LEN];
     int  ready;
+    /* 1 when this row is in the gallery. Read this rather than comparing
+     * `slot` against a base: the base is the server's to choose. */
+    int  is_spectator;
     /* Peer BIOS capability from set_ready bios_offer (0 if legacy/missing). */
     int  bios_offer_valid;
     int  bios_can_openbios;   /* linked OpenBIOS backend */
     int  bios_can_scph1001;   /* linked retail + validated dump available */
     int  bios_prefer_openbios; /* explicit OpenBIOS pick (not retail) */
+    /* Peer memory-card offer from set_ready memcard_offer (0 if legacy). */
+    int  memcard_offer_valid;
+    int  memcard_has_card;    /* a slot-1 card is enabled locally */
+    int  memcard_share;       /* peer opted in to bring it to the match */
 } PsxLobbyMember;
 
 /*
@@ -60,6 +82,31 @@ typedef struct PsxLobbyBiosOffer {
     int  can_scph1001;
     int  prefer_openbios; /* 1 = OpenBIOS selected; 0 = retail / willing SCPH */
 } PsxLobbyBiosOffer;
+
+/*
+ * Local memory-card offer advertised on set_ready. `has_card` says whether a
+ * slot-1 card is enabled here; `share` is the player's opt-in to bring it.
+ * Meaningful for seat 1 (whose card becomes the match's slot-2 card); other
+ * seats may advertise it harmlessly.
+ */
+typedef struct PsxLobbyMemcardOffer {
+    int  valid;
+    int  has_card;
+    int  share;
+} PsxLobbyMemcardOffer;
+
+/* One lobby chat line (WS op:chat, echoed by the server to everyone seated,
+ * sender included — so the ring is the room's order, not ours). */
+#define PSX_LOBBY_CHAT_TEXT_LEN 256
+#define PSX_LOBBY_CHAT_RING 64
+typedef struct PsxLobbyChatMsg {
+    char     player_id[PSX_LOBBY_ID_LEN];
+    char     from[PSX_LOBBY_NAME_LEN];
+    char     text[PSX_LOBBY_CHAT_TEXT_LEN];
+    int      is_local;
+    int      is_system;
+    uint32_t seq;
+} PsxLobbyChatMsg;
 
 /*
  * Host-authoritative sim settings negotiated over the lobby.
@@ -80,6 +127,14 @@ typedef struct PsxLobbyMatchCaps {
     int  rollback;         /* 0/1 — invent/rollback netplay (default on) */
     /* DualShock-on-multitap-tap hack (0/1). Host-authoritative for the match. */
     int  multitap_analog;
+    /* Host allows seat 1 to bring its own memory card (default 1; absent
+     * field = 1). The lobby icon is lit only when this AND seat 1's offer
+     * (has_card && share) hold. */
+    int  guest_memcard;
+    /* Settled at start by the host: 1 = seat 1's card IS used this match.
+     * Peers launch from this, never from their own view of the seat table,
+     * so a toggle racing the start cannot split the room. */
+    int  guest_memcard_active;
     char language[PSX_LOBBY_LANG_LEN];
     /* Settled match BIOS: "openbios" | "scph1001" | "" (unset / legacy). */
     char session_bios[16];
@@ -96,6 +151,20 @@ typedef struct PsxLobbyJoinInfo {
     char     peer_hostport[PSX_LOBBY_ENDPOINT_LEN];
     int      player_count;
     int      max_slots;
+    /* 1 when this client holds a gallery seat: it runs the match and shows it,
+     * and contributes no input to anybody. */
+    int      local_is_spectator;
+    /* Host opt-in, echoed by the server. 0 when the server predates
+     * spectators, which is why every spectator control is gated on it. */
+    int      allow_spectators;
+    int      max_spectators;
+    int      spectator_count;
+    int      spectator_slot_base;
+    /* Where the gallery starts in the RELAY's slot space -- a different
+     * namespace from the lobby seat index above, and the one the engine needs.
+     * The relay forwards nothing from a slot at or beyond its player count, so
+     * this is the number that makes a spectator unable to send. */
+    int      spectator_relay_base;
     char     last_error[64]; /* need_password | bad_password | … */
 } PsxLobbyJoinInfo;
 
@@ -160,6 +229,42 @@ int  psx_lobby_join(const char *lobby_id, const char *password,
                     const char *guest_bind);
 
 int  psx_lobby_leave(void);
+
+/* ---- spectators --------------------------------------------------------
+ *
+ * A gallery seat runs the match locally, in sync, and contributes nothing.
+ * The lobby server enforces the "contributes nothing" half at its UDP relay;
+ * this side enforces the rest -- no Ready vote, no controller reaching the sim.
+ *
+ * Every one of these reads 0 against a server that predates spectators, so a
+ * caller that gates its UI on allow_spectators degrades to the old lobby. */
+
+/* Host: open a gallery on the NEXT create. Sticky, like the max_slots
+ * default -- create carries whatever this was last set to. */
+void psx_lobby_set_allow_spectators(int allow);
+/* What the toggle is set to, for the UI to render: what the host ASKED for. */
+int  psx_lobby_allow_spectators_pref(void);
+/* What the current lobby actually has (server-echoed), not what was asked.
+ * These disagree whenever the server predates spectators -- exactly the case
+ * the UI must not offer a gallery in. */
+int  psx_lobby_allow_spectators(void);
+int  psx_lobby_max_spectators(void);
+int  psx_lobby_spectator_count(void);
+/* 1 when THIS client is in the gallery. The one call the engine needs. */
+int  psx_lobby_local_is_spectator(void);
+/* Base of the gallery half of the seat namespace, as the server reports it. */
+int  psx_lobby_spectator_slot_base(void);
+/* Seat index for gallery position `index`, for move / kick; <0 out of range. */
+int  psx_lobby_spectator_slot(int index);
+/* This client's slot in the RELAY's namespace, for RNetConfig.wire_slot.
+ * -1 when not a spectator or the server published no relay base -- and a
+ * spectator without one must not launch, because sending as a player slot is
+ * exactly what it must not do. */
+int  psx_lobby_local_wire_slot(void);
+/* 1 when `slot` addresses a seat in either table -- the shared guard the
+ * kick / move entry points use, so a gallery index is not rejected as if it
+ * were out of range. */
+int  psx_lobby_seat_valid(int slot);
 
 /* Host-only: remove the player in `slot` (not the host / self). */
 int  psx_lobby_kick(int slot);
@@ -242,6 +347,16 @@ int  psx_lobby_set_ready(int ready);
 /* Local BIOS offer used on the next set_ready (and included in settle). */
 void psx_lobby_set_bios_offer(const PsxLobbyBiosOffer *offer);
 const PsxLobbyBiosOffer *psx_lobby_bios_offer(void);
+/* Local memory-card offer (attached to set_ready alongside bios_offer). */
+void psx_lobby_set_memcard_offer(const PsxLobbyMemcardOffer *offer);
+const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void);
+
+/* Lobby chat. send: 0 when queued (the line appears via the server echo).
+ * count/get read the ring, oldest first; cleared on create/join/leave. */
+int  psx_lobby_send_chat(const char *text);
+int  psx_lobby_chat_count(void);
+int  psx_lobby_chat_get(int index, PsxLobbyChatMsg *out);
+void psx_lobby_chat_clear(void);
 
 /*
  * Settle session BIOS from seated peers' bios_offer (+ local offer):

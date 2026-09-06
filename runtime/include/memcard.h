@@ -82,6 +82,11 @@ int memcard_rebind_dir(const char *dir);
 /* Restore explicit per-slot filepaths (from a prior snapshot). NULL path skips. */
 int memcard_rebind_paths(const char *path0, const char *path1);
 
+/* Rebind ONE slot's on-disk path without touching RAM. An empty/NULL path
+ * unbinds the slot (no file, not present) — the way to put back a slot the
+ * player had disabled after a sandbox bound it. Returns 0, -1 on bad slot. */
+int memcard_rebind_path(int card, const char *path);
+
 /* Reload in-memory images from the currently bound filepaths (0 = ok). */
 int memcard_reload_bound(void);
 

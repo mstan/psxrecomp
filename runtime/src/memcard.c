@@ -335,6 +335,31 @@ int memcard_rebind_paths(const char *path0, const char *path1) {
     return 0;
 }
 
+int memcard_rebind_path(int card, const char *path) {
+    if (card < 0 || card >= MAX_CARDS) return -1;
+    if (path && path[0]) {
+        snprintf(cards[card].filepath, sizeof(cards[card].filepath), "%s", path);
+        /* The first flush must not fail on a missing directory (the host's
+         * netplay/ dir does not exist until a guest card is bound there). */
+        {
+            char dir[sizeof(cards[card].filepath)];
+            size_t n;
+            snprintf(dir, sizeof(dir), "%s", path);
+            n = strlen(dir);
+            while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') --n;
+            if (n > 1) {
+                dir[n - 1] = '\0';
+                memcard_ensure_dir(dir);
+            }
+        }
+    } else {
+        cards[card].filepath[0] = '\0';
+        cards[card].present = 0;
+        cards[card].dirty = 0;
+    }
+    return 0;
+}
+
 int memcard_reload_bound(void) {
     int i;
     for (i = 0; i < MAX_CARDS; i++) {

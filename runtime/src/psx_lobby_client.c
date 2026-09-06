@@ -44,6 +44,17 @@ int  psx_lobby_join(const char *a, const char *b, const char *c)
 { (void)a; (void)b; (void)c; return -1; }
 int  psx_lobby_leave(void) { return -1; }
 int  psx_lobby_kick(int slot) { (void)slot; return -1; }
+void psx_lobby_set_allow_spectators(int allow) { (void)allow; }
+int  psx_lobby_allow_spectators_pref(void) { return 0; }
+int  psx_lobby_allow_spectators(void) { return 0; }
+int  psx_lobby_max_spectators(void) { return 0; }
+int  psx_lobby_spectator_count(void) { return 0; }
+int  psx_lobby_local_is_spectator(void) { return 0; }
+int  psx_lobby_spectator_slot_base(void) { return PSX_LOBBY_SPECTATOR_SLOT_BASE; }
+int  psx_lobby_spectator_slot(int index) { (void)index; return -1; }
+int  psx_lobby_local_wire_slot(void) { return -1; }
+int  psx_lobby_seat_valid(int slot)
+{ return slot >= 0 && slot < PSX_LOBBY_MAX_PLAYERS; }
 int  psx_lobby_move_member(int from_slot, int to_slot)
 { (void)from_slot; (void)to_slot; return -1; }
 int  psx_lobby_in_lobby(void) { return 0; }
@@ -101,6 +112,16 @@ const PsxLobbyBiosOffer *psx_lobby_bios_offer(void)
     static PsxLobbyBiosOffer z;
     return &z;
 }
+void psx_lobby_set_memcard_offer(const PsxLobbyMemcardOffer *offer) { (void)offer; }
+const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void)
+{
+    static PsxLobbyMemcardOffer z;
+    return &z;
+}
+int  psx_lobby_send_chat(const char *text) { (void)text; return -1; }
+int  psx_lobby_chat_count(void) { return 0; }
+int  psx_lobby_chat_get(int index, PsxLobbyChatMsg *out) { (void)index; (void)out; return 0; }
+void psx_lobby_chat_clear(void) {}
 int  psx_lobby_settle_session_bios(char *out, size_t out_cap)
 {
     if (!out || out_cap < 9) return -1;
@@ -184,6 +205,12 @@ typedef struct {
     int launch_pending;
     PsxLobbyMatchCaps match_caps;
     PsxLobbyBiosOffer bios_offer;
+    PsxLobbyMemcardOffer memcard_offer;
+    /* Lobby chat ring (oldest at chat_head). */
+    PsxLobbyChatMsg chat[PSX_LOBBY_CHAT_RING];
+    int chat_head;
+    int chat_count;
+    uint32_t chat_seq;
     char pending_tx[8][2048];
     int pending_n;
     /* Inbound ICE signals (WS op:signal). */
@@ -895,6 +922,10 @@ static int local_member_slot(void)
 
 /* Default max_slots for create (clamped 2..8). */
 static int g_lobby_max_slots = 2;
+/* Host preference for the next create, beside the seat ceiling it travels
+ * with. File scope so a setting made before a reconnect is still there when
+ * the create goes out. */
+static int g_allow_spectators_pref;
 
 void psx_lobby_set_max_slots(int max_slots)
 {
@@ -969,6 +1000,7 @@ static void match_caps_clear(PsxLobbyMatchCaps *c)
     c->aspect_den = 3;
     c->input_delay = 2;
     c->input_prediction = 4;
+    c->guest_memcard = 1;
 }
 
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
@@ -1289,6 +1321,9 @@ static void parse_match_caps_object(const char *obj, PsxLobbyMatchCaps *out)
     /* Absent field → delay-sync (older hosts). New hosts always publish explicit. */
     out->rollback = json_get_bool(obj, "rollback", 0);
     out->multitap_analog = json_get_bool(obj, "multitap_analog", 0);
+    /* Absent (older host) = allowed; the seat-1 offer still gates it. */
+    out->guest_memcard = json_get_bool(obj, "guest_memcard", 1);
+    out->guest_memcard_active = json_get_bool(obj, "guest_memcard_active", 0);
     json_get_str(obj, "language", out->language, sizeof(out->language));
     json_get_str(obj, "session_bios", out->session_bios, sizeof(out->session_bios));
     /* Normalize settled BIOS id. */
@@ -1329,7 +1364,9 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         "\"turbo_loads\":%s,\"bios_hle\":%s,\"fast_boot\":%s,"
                         "\"auto_skip_fmv\":%s,\"input_delay\":%d,\"input_prediction\":%d,"
                         "\"force_input_relay\":%s,\"force_turn\":%s,\"rollback\":%s,"
-                        "\"multitap_analog\":%s,\"language\":\"%s\",\"session_bios\":\"%s\"}",
+                        "\"multitap_analog\":%s,\"guest_memcard\":%s,"
+                        "\"guest_memcard_active\":%s,"
+                        "\"language\":\"%s\",\"session_bios\":\"%s\"}",
                         caps->aspect_num, caps->aspect_den,
                         caps->turbo_loads ? "true" : "false",
                         caps->bios_hle ? "true" : "false",
@@ -1341,6 +1378,8 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const PsxLobbyMatch
                         caps->force_turn ? "true" : "false",
                         caps->rollback ? "true" : "false",
                         caps->multitap_analog ? "true" : "false",
+                        caps->guest_memcard ? "true" : "false",
+                        caps->guest_memcard_active ? "true" : "false",
                         lang, sb);
     }
 }
@@ -1448,26 +1487,35 @@ static void fill_peer_bind_from_join(void)
     j->peer_hostport[sizeof(j->peer_hostport) - 1] = '\0';
 }
 
-static void parse_slots_array(const char *json)
+/* Read one seat array into the membership table, appending from `n`.
+ *
+ * Players and spectators arrive as two arrays of identical rows and land in
+ * one table tagged by role, because every consumer -- the UI's two tables
+ * included -- wants "who is here and what are they" rather than two parallel
+ * lists to keep in step. Returns the new row count.
+ *
+ * `key` absent is not an error: a server that predates spectators sends no
+ * "spectators", and the right result there is a lobby with an empty gallery. */
+static int parse_seat_array(const char *json, const char *key, int is_spectator,
+                            int n)
 {
-    const char *p = strstr(json, "\"slots\"");
-    int n = 0;
-    g_lc.member_count = 0;
-    g_lc.local_ready = 0;
+    char keybuf[32];
+    const char *p;
+    snprintf(keybuf, sizeof(keybuf), "\"%s\"", key);
+    p = strstr(json, keybuf);
     if (!p) {
-        return;
+        return n;
     }
     p = strchr(p, '[');
     if (!p) {
-        return;
+        return n;
     }
     ++p;
     while (*p && n < PSX_LOBBY_MAX_MEMBERS) {
         const char *obj;
         while (*p && *p != '{') {
             if (*p == ']') {
-                g_lc.member_count = n;
-                return;
+                return n;
             }
             ++p;
         }
@@ -1502,6 +1550,7 @@ static void parse_slots_array(const char *json)
                 json_get_str(chunk, "display_name", g_lc.members[n].display_name,
                              sizeof(g_lc.members[n].display_name));
                 g_lc.members[n].ready = json_get_bool(chunk, "ready", 0);
+                g_lc.members[n].is_spectator = is_spectator;
                 if (json_extract_object(chunk, "bios_offer", offer, sizeof(offer))) {
                     char prefer[24];
                     prefer[0] = '\0';
@@ -1514,16 +1563,57 @@ static void parse_slots_array(const char *json)
                     g_lc.members[n].bios_prefer_openbios =
                         (strcmp(prefer, "openbios") == 0) ? 1 : 0;
                 }
+                if (json_extract_object(chunk, "memcard_offer", offer, sizeof(offer))) {
+                    g_lc.members[n].memcard_offer_valid = 1;
+                    g_lc.members[n].memcard_has_card =
+                        json_get_bool(offer, "has_card", 0);
+                    g_lc.members[n].memcard_share =
+                        json_get_bool(offer, "share", 0);
+                }
                 if (g_lc.player_id[0] &&
                     strcmp(g_lc.members[n].player_id, g_lc.player_id) == 0) {
                     g_lc.local_ready = g_lc.members[n].ready;
                     g_lc.join.local_slot = g_lc.members[n].slot;
+                    /* And the role, which a host move can change under us at
+                     * any moment. Everything downstream -- whether this build
+                     * contributes input at all -- reads it, so it has to be
+                     * refreshed from the same update that moved the seat. */
+                    g_lc.join.local_is_spectator = is_spectator;
                 }
                 ++n;
                 p = end;
             }
         }
     }
+    return n;
+}
+
+static void parse_slots_array(const char *json)
+{
+    int n;
+    g_lc.member_count = 0;
+    g_lc.local_ready = 0;
+    g_lc.join.local_is_spectator = 0;
+    /* Default to what we already knew, not to zero. This also runs for
+     * `launch`, which carries no allow_spectators -- it has no reason to --
+     * and zeroing there would erase the gallery at the exact moment the client
+     * decides whether it is in it. */
+    g_lc.join.allow_spectators =
+        json_get_bool(json, "allow_spectators", g_lc.join.allow_spectators);
+    g_lc.join.max_spectators =
+        json_get_int(json, "max_spectators", g_lc.join.max_spectators);
+    g_lc.join.spectator_count =
+        json_get_int(json, "spectator_count", g_lc.join.spectator_count);
+    g_lc.join.spectator_relay_base =
+        json_get_int(json, "spectator_relay_base",
+                     g_lc.join.spectator_relay_base);
+    g_lc.join.spectator_slot_base =
+        json_get_int(json, "spectator_slot_base",
+                     g_lc.join.spectator_slot_base > 0
+                         ? g_lc.join.spectator_slot_base
+                         : PSX_LOBBY_SPECTATOR_SLOT_BASE);
+    n = parse_seat_array(json, "slots", 0, 0);
+    n = parse_seat_array(json, "spectators", 1, n);
     g_lc.member_count = n;
 }
 
@@ -1581,6 +1671,38 @@ static void drain_ws_pending(void)
             return;
         }
     }
+}
+
+static void chat_push(const char *player_id, const char *from, const char *text,
+                      int is_system)
+{
+    PsxLobbyChatMsg *m;
+    int idx;
+    if (!text || !text[0]) return;
+    if (g_lc.chat_count < PSX_LOBBY_CHAT_RING) {
+        idx = (g_lc.chat_head + g_lc.chat_count) % PSX_LOBBY_CHAT_RING;
+        g_lc.chat_count++;
+    } else {
+        idx = g_lc.chat_head;
+        g_lc.chat_head = (g_lc.chat_head + 1) % PSX_LOBBY_CHAT_RING;
+    }
+    m = &g_lc.chat[idx];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+    snprintf(m->text, sizeof(m->text), "%s", text);
+    m->is_system = is_system ? 1 : 0;
+    m->is_local = (!is_system && g_lc.player_id[0] && player_id &&
+                   strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
+    m->seq = ++g_lc.chat_seq;
+}
+
+void psx_lobby_chat_clear(void)
+{
+    g_lc.chat_head = 0;
+    g_lc.chat_count = 0;
+    /* seq keeps counting: a UI comparing "newest seen" must not mistake the
+     * first line of a new room for one it already scrolled to. */
 }
 
 static void handle_server_json(const char *json)
@@ -1787,6 +1909,7 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "created") == 0) {
+        psx_lobby_chat_clear();
         g_lc.in_lobby = 1;
         g_lc.is_host = 1;
         g_lc.join.ok = 1;
@@ -1828,6 +1951,7 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "joined") == 0) {
+        psx_lobby_chat_clear();
         g_lc.in_lobby = 1;
         g_lc.is_host = 0;
         g_lc.join.ok = 1;
@@ -1960,6 +2084,19 @@ static void handle_server_json(const char *json)
         lobby_host_advertise_reset();
         return;
     }
+    if (strcmp(op, "chat") == 0) {
+        char text[PSX_LOBBY_CHAT_TEXT_LEN];
+        char from_id[PSX_LOBBY_ID_LEN];
+        char from[PSX_LOBBY_NAME_LEN];
+        text[0] = '\0';
+        from_id[0] = '\0';
+        from[0] = '\0';
+        json_get_str(json, "text", text, sizeof(text));
+        json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from", from, sizeof(from));
+        chat_push(from_id, from, text, json_get_bool(json, "system", 0));
+        return;
+    }
     if (strcmp(op, "signal") == 0) {
         char text_buf[2048];
         char from[PSX_LOBBY_ID_LEN];
@@ -2013,6 +2150,7 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "lobby_closed") == 0 || strcmp(op, "left") == 0 ||
         strcmp(op, "kicked") == 0) {
+        psx_lobby_chat_clear();
         g_lc.ice_rtt_suspended = 0;
         lobby_ice_rtt_close();
         lobby_rtt_close();
@@ -2960,10 +3098,12 @@ int psx_lobby_create(const char *name, const char *game_name, const char *game_v
     }
     n = snprintf(msg, sizeof(msg),
                  "{\"op\":\"create\",\"name\":\"%s\",\"game_name\":\"%s\",\"game_version\":\"%s\","
-                 "\"password\":\"%s\",\"max_slots\":%d,\"host_bind\":\"%s\",\"display_name\":\"%s\","
+                 "\"password\":\"%s\",\"max_slots\":%d,\"allow_spectators\":%s,"
+                 "\"host_bind\":\"%s\",\"display_name\":\"%s\","
                  "\"disc_fp\":\"%s\"%s}",
                  name && name[0] ? name : "Lobby", gn, gv,
-                 password ? password : "", g_lobby_max_slots, g_lc.my_bind,
+                 password ? password : "", g_lobby_max_slots,
+                 g_allow_spectators_pref ? "true" : "false", g_lc.my_bind,
                  g_lc.display_name[0] ? g_lc.display_name : "Host",
                  g_lc.disc_fp, caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
@@ -3019,13 +3159,77 @@ int psx_lobby_leave(void)
     return 0;
 }
 
+void psx_lobby_set_allow_spectators(int allow)
+{
+    g_allow_spectators_pref = allow ? 1 : 0;
+}
+
+int psx_lobby_allow_spectators_pref(void)
+{
+    return g_allow_spectators_pref;
+}
+
+int psx_lobby_allow_spectators(void)
+{
+    return g_lc.join.allow_spectators ? 1 : 0;
+}
+
+int psx_lobby_max_spectators(void)
+{
+    return g_lc.join.max_spectators;
+}
+
+int psx_lobby_spectator_count(void)
+{
+    return g_lc.join.spectator_count;
+}
+
+int psx_lobby_local_is_spectator(void)
+{
+    return g_lc.join.local_is_spectator ? 1 : 0;
+}
+
+int psx_lobby_spectator_slot_base(void)
+{
+    /* The server republishes its base in every update, and the namespace is
+     * the server's to define. The compiled-in value is only a fallback for an
+     * update that arrives without it, so `move` stays addressable. */
+    return g_lc.join.spectator_slot_base > 0 ? g_lc.join.spectator_slot_base
+                                             : PSX_LOBBY_SPECTATOR_SLOT_BASE;
+}
+
+int psx_lobby_spectator_slot(int index)
+{
+    if (index < 0 || index >= PSX_LOBBY_MAX_SPECTATORS) return -1;
+    return psx_lobby_spectator_slot_base() + index;
+}
+
+int psx_lobby_local_wire_slot(void)
+{
+    int gallery_index;
+    if (!g_lc.join.local_is_spectator) return -1;
+    if (g_lc.join.spectator_relay_base <= 0) return -1;
+    gallery_index = g_lc.join.local_slot - psx_lobby_spectator_slot_base();
+    if (gallery_index < 0 || gallery_index >= PSX_LOBBY_MAX_SPECTATORS)
+        return -1;
+    return g_lc.join.spectator_relay_base + gallery_index;
+}
+
+int psx_lobby_seat_valid(int slot)
+{
+    const int base = psx_lobby_spectator_slot_base();
+    if (slot < 0) return 0;
+    if (slot < PSX_LOBBY_MAX_PLAYERS) return 1;
+    return slot >= base && slot < base + PSX_LOBBY_MAX_SPECTATORS;
+}
+
 int psx_lobby_kick(int slot)
 {
     char msg[64];
     if (!psx_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host) {
         return -1;
     }
-    if (slot < 0 || slot >= PSX_LOBBY_MAX_MEMBERS) {
+    if (!psx_lobby_seat_valid(slot)) {
         return -1;
     }
     snprintf(msg, sizeof(msg), "{\"op\":\"kick\",\"slot\":%d}", slot);
@@ -3040,8 +3244,9 @@ int psx_lobby_move_member(int from_slot, int to_slot)
     if (!psx_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host) {
         return -1;
     }
-    if (from_slot < 0 || from_slot >= PSX_LOBBY_MAX_MEMBERS ||
-        to_slot < 0 || to_slot >= PSX_LOBBY_MAX_MEMBERS ||
+    /* Either seat may be in the gallery: this is the call that promotes and
+     * demotes, and it is the same call that reorders within one table. */
+    if (!psx_lobby_seat_valid(from_slot) || !psx_lobby_seat_valid(to_slot) ||
         from_slot == to_slot) {
         return -1;
     }
@@ -3159,6 +3364,47 @@ const PsxLobbyBiosOffer *psx_lobby_bios_offer(void)
     return &g_lc.bios_offer;
 }
 
+void psx_lobby_set_memcard_offer(const PsxLobbyMemcardOffer *offer)
+{
+    if (!offer) {
+        memset(&g_lc.memcard_offer, 0, sizeof(g_lc.memcard_offer));
+        return;
+    }
+    g_lc.memcard_offer = *offer;
+}
+
+const PsxLobbyMemcardOffer *psx_lobby_memcard_offer(void)
+{
+    return &g_lc.memcard_offer;
+}
+
+int psx_lobby_send_chat(const char *text)
+{
+    char esc[PSX_LOBBY_CHAT_TEXT_LEN * 2 + 8];
+    char msg[PSX_LOBBY_CHAT_TEXT_LEN * 2 + 64];
+    int n;
+    if (!psx_lobby_connected() || !g_lc.in_lobby) return -1;
+    if (!text || !text[0]) return -1;
+    json_escape(text, esc, sizeof(esc));
+    n = snprintf(msg, sizeof(msg), "{\"op\":\"chat\",\"text\":\"%s\"}", esc);
+    if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int psx_lobby_chat_count(void)
+{
+    return g_lc.chat_count;
+}
+
+int psx_lobby_chat_get(int index, PsxLobbyChatMsg *out)
+{
+    if (!out || index < 0 || index >= g_lc.chat_count) return 0;
+    *out = g_lc.chat[(g_lc.chat_head + index) % PSX_LOBBY_CHAT_RING];
+    return 1;
+}
+
 int psx_lobby_settle_session_bios(char *out, size_t out_cap)
 {
     int i;
@@ -3215,23 +3461,32 @@ int psx_lobby_settle_session_bios(char *out, size_t out_cap)
 
 int psx_lobby_set_ready(int ready)
 {
-    char msg[384];
+    char msg[512];
+    char memcard[96];
     int n;
     if (!psx_lobby_connected() || !g_lc.in_lobby) {
         return -1;
+    }
+    memcard[0] = '\0';
+    if (g_lc.memcard_offer.valid) {
+        snprintf(memcard, sizeof(memcard),
+                 ",\"memcard_offer\":{\"v\":1,\"has_card\":%s,\"share\":%s}",
+                 g_lc.memcard_offer.has_card ? "true" : "false",
+                 g_lc.memcard_offer.share ? "true" : "false");
     }
     if (g_lc.bios_offer.valid) {
         n = snprintf(msg, sizeof(msg),
                      "{\"op\":\"set_ready\",\"ready\":%s,"
                      "\"bios_offer\":{\"v\":1,\"prefer\":\"%s\","
-                     "\"can_openbios\":%s,\"can_scph1001\":%s}}",
+                     "\"can_openbios\":%s,\"can_scph1001\":%s}%s}",
                      ready ? "true" : "false",
                      g_lc.bios_offer.prefer_openbios ? "openbios" : "scph1001",
                      g_lc.bios_offer.can_openbios ? "true" : "false",
-                     g_lc.bios_offer.can_scph1001 ? "true" : "false");
+                     g_lc.bios_offer.can_scph1001 ? "true" : "false",
+                     memcard);
     } else {
-        n = snprintf(msg, sizeof(msg), "{\"op\":\"set_ready\",\"ready\":%s}",
-                     ready ? "true" : "false");
+        n = snprintf(msg, sizeof(msg), "{\"op\":\"set_ready\",\"ready\":%s%s}",
+                     ready ? "true" : "false", memcard);
     }
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
     queue_send(msg);
