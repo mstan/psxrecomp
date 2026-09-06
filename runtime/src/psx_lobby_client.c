@@ -74,6 +74,9 @@ int  psx_lobby_set_match_caps(const PsxLobbyMatchCaps *c) { (void)c; return -1; 
 int  psx_lobby_member_count(void) { return 0; }
 int  psx_lobby_member_get(int index, PsxLobbyMember *out) { (void)index; (void)out; return 0; }
 int  psx_lobby_member_latency_ms(int slot) { (void)slot; return -1; }
+int  psx_lobby_send_server_chat(const char *text) { (void)text; return -1; }
+int  psx_lobby_server_chat_count(void) { return 0; }
+int  psx_lobby_server_chat_get(int index, PsxLobbyChatMsg *out) { (void)index; (void)out; return 0; }
 void psx_lobby_resume_waiting_room_rtt(void) {}
 int  psx_lobby_member_is_host(const PsxLobbyMember *member)
 {
@@ -149,6 +152,7 @@ void psx_lobby_clear_launch_pending(void) {}
 #include "recomp_net/ice_rtt.h"
 #include "recomp_net/lan_beacon.h"
 #include "recomp_net/rtt_probe.h"
+#include "recomp_net/chat_filter.h"
 #include "host_time.h"
 
 #if defined(_WIN32)
@@ -226,6 +230,11 @@ typedef struct {
     int chat_head;
     int chat_count;
     uint32_t chat_seq;
+    /* Server (per-game) chat: a second ring with its own sequence. */
+    PsxLobbyChatMsg schat[PSX_LOBBY_CHAT_RING];
+    int schat_head;
+    int schat_count;
+    uint32_t schat_seq;
     char pending_tx[8][2048];
     int pending_n;
     /* Inbound ICE signals (WS op:signal). */
@@ -1319,6 +1328,13 @@ static void lobby_list_parse_players(const char *json)
                      sizeof(g_lc.online[n].lobby_name));
         g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
         json_get_str(chunk, "tag", g_lc.online[n].tag, sizeof(g_lc.online[n].tag));
+        json_get_str(chunk, "game_name", g_lc.online[n].game_name,
+                     sizeof(g_lc.online[n].game_name));
+        /* Players of another title are not "online" for this one. A row
+         * with no title yet (a client that has not listed) is kept. */
+        if (g_lc.filter_game_name[0] && g_lc.online[n].game_name[0] &&
+            strcmp(g_lc.online[n].game_name, g_lc.filter_game_name) != 0)
+            { p = end; continue; }
         if (g_lc.online[n].display_name[0]) ++n;
         p = end;
     }
@@ -1785,10 +1801,37 @@ static void chat_push(const char *player_id, const char *from, const char *text,
     snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
     snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
     snprintf(m->text, sizeof(m->text), "%s", text);
+    /* Masked on arrival, whatever relayed it: the server already did this,
+     * an older server did not, and the rule is that nothing unmasked is
+     * ever shown. */
+    if (!is_system) (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
     m->is_system = is_system ? 1 : 0;
     m->is_local = (!is_system && g_lc.player_id[0] && player_id &&
                    strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
     m->seq = ++g_lc.chat_seq;
+}
+
+static void schat_push(const char *player_id, const char *from, const char *text)
+{
+    PsxLobbyChatMsg *m;
+    int idx;
+    if (!text || !text[0]) return;
+    if (g_lc.schat_count < PSX_LOBBY_CHAT_RING) {
+        idx = (g_lc.schat_head + g_lc.schat_count) % PSX_LOBBY_CHAT_RING;
+        g_lc.schat_count++;
+    } else {
+        idx = g_lc.schat_head;
+        g_lc.schat_head = (g_lc.schat_head + 1) % PSX_LOBBY_CHAT_RING;
+    }
+    m = &g_lc.schat[idx];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+    snprintf(m->text, sizeof(m->text), "%s", text);
+    (void)rnet_chat_filter_apply(m->text, sizeof(m->text));
+    m->is_local = (g_lc.player_id[0] && player_id &&
+                   strcmp(player_id, g_lc.player_id) == 0) ? 1 : 0;
+    m->seq = ++g_lc.schat_seq;
 }
 
 void psx_lobby_chat_clear(void)
@@ -1805,9 +1848,15 @@ static void handle_server_json(const char *json)
     json_get_str(json, "op", op, sizeof(op));
     if (strcmp(op, "welcome") == 0) {
         json_get_str(json, "player_id", g_lc.player_id, sizeof(g_lc.player_id));
-        if (g_lc.display_name[0]) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "{\"op\":\"hello\",\"display_name\":\"%s\"}", g_lc.display_name);
+        {
+            /* Say who we are AND what we are playing in the first message:
+             * the server scopes players-online and server chat by title, and
+             * waiting for a `list` to tell it left a client that chatted
+             * first with no title at all. Title only -- never the version. */
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
+                     g_lc.display_name, g_lc.filter_game_name);
             queue_send(msg);
         }
         queue_list_request();
@@ -2195,6 +2244,19 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "seat_swap_result") == 0) {
         g_lc.swap_out = json_get_bool(json, "accept", 0) ? 2 : -1;
+        return;
+    }
+    if (strcmp(op, "server_chat") == 0) {
+        char text[PSX_LOBBY_CHAT_TEXT_LEN];
+        char from_id[PSX_LOBBY_ID_LEN];
+        char from[PSX_LOBBY_NAME_LEN];
+        text[0] = '\0';
+        from_id[0] = '\0';
+        from[0] = '\0';
+        json_get_str(json, "text", text, sizeof(text));
+        json_get_str(json, "from_player_id", from_id, sizeof(from_id));
+        json_get_str(json, "from", from, sizeof(from));
+        schat_push(from_id, from, text);
         return;
     }
     if (strcmp(op, "chat") == 0) {
@@ -3571,6 +3633,37 @@ int psx_lobby_send_chat(const char *text)
 int psx_lobby_chat_count(void)
 {
     return g_lc.chat_count;
+}
+
+int psx_lobby_send_server_chat(const char *text)
+{
+    char esc[PSX_LOBBY_CHAT_TEXT_LEN * 2 + 8];
+    char msg[PSX_LOBBY_CHAT_TEXT_LEN * 2 + 256];
+    int n;
+    if (!psx_lobby_connected()) return -1;
+    if (!text || !text[0]) return -1;
+    json_escape(text, esc, sizeof(esc));
+    /* Carry the title on the line itself: the server scopes by it, and this
+     * works even against a server that has not seen our `list` yet. */
+    n = snprintf(msg, sizeof(msg),
+                 "{\"op\":\"server_chat\",\"game_name\":\"%s\",\"text\":\"%s\"}",
+                 g_lc.filter_game_name, esc);
+    if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
+    queue_send(msg);
+    flush_pending();
+    return 0;
+}
+
+int psx_lobby_server_chat_count(void)
+{
+    return g_lc.schat_count;
+}
+
+int psx_lobby_server_chat_get(int index, PsxLobbyChatMsg *out)
+{
+    if (!out || index < 0 || index >= g_lc.schat_count) return 0;
+    *out = g_lc.schat[(g_lc.schat_head + index) % PSX_LOBBY_CHAT_RING];
+    return 1;
 }
 
 int psx_lobby_chat_get(int index, PsxLobbyChatMsg *out)

@@ -42,6 +42,18 @@ remains useful for debugging and for hosts that prefer fixed lag.
 
 ## Seats vs session slots
 
+Lobby chat is masked for profanity and slurs on every path: the server
+filters relayed lines, and every client runs recomp-net's
+`rnet_chat_filter_apply` on each line it puts in its ring -- so LAN rooms
+(host-relayed `MOTK5 CHAT`) are filtered without a server. The list is
+`lib/recomp-net/data/chat_filter_words.txt`; `RNET_CHAT_FILTER=0` disables
+the client pass.
+
+The lobby browser also carries a per-game server chat (server op
+`server_chat`, relayed to every client listed for the same title) and lists
+only the players online for this title; both are online-only, since a LAN
+room has no server. The same emoji and profanity handling applies.
+
 Players can move themselves in the lobby and ask to swap seats (online via
 the server's `seat_move` / `seat_swap_request` / `seat_swap_answer`; on LAN
 via `MOTK5 SEATMOVE` / `SWAPASK` / `SWAPANS` / `SWAPRES` relayed by the host),

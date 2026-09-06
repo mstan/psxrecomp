@@ -56,6 +56,9 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "psx_netplay_rb.h"
 #include "psx_selfcheck.h"
 #include "psx_lobby_client.h"
+#if defined(PSX_HAS_RECOMP_NET)
+#include "recomp_net/chat_filter.h" /* chat profanity mask, LAN rooms too */
+#endif
 #include "spu.h"
 #include "audio_trace.h"
 #include "spu_shadow.h"
@@ -8084,6 +8087,11 @@ namespace {
         std::snprintf(m.player_id, sizeof(m.player_id), "%s", player_id ? player_id : "");
         std::snprintf(m.from, sizeof(m.from), "%s", from ? from : "");
         std::snprintf(m.text, sizeof(m.text), "%s", text);
+        /* A LAN room has no server to mask for it: every peer masks the
+         * line as it lands in the ring, the host included. */
+#if defined(PSX_HAS_RECOMP_NET)
+        if (!is_system) (void)rnet_chat_filter_apply(m.text, sizeof(m.text));
+#endif
         m.is_system = is_system ? 1 : 0;
         ++g_lnch_lan_chat_seq;
     }
@@ -10025,6 +10033,31 @@ namespace {
         }
         PsxLobbyChatMsg msg{};
         if (!psx_lobby_chat_get(index, &msg)) return 0;
+        std::snprintf(out->from, sizeof(out->from), "%s", msg.from);
+        std::snprintf(out->text, sizeof(out->text), "%s", msg.text);
+        out->is_local = msg.is_local;
+        out->is_system = msg.is_system;
+        out->seq = msg.seq;
+        return 1;
+    }
+    /* Server chat: per-game, online only. A LAN room has no server and no
+     * wider audience, so the panel is hidden there (send refuses, count 0). */
+    int ae_np_server_chat_send(void*, const char* text) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan || !psx_lobby_connected()) return -1;
+        char line[256];
+        ae_np_chat_sanitize(text, line, sizeof(line));
+        if (!line[0]) return -1;
+        return psx_lobby_send_server_chat(line);
+    }
+    int ae_np_server_chat_count(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return 0;
+        return psx_lobby_server_chat_count();
+    }
+    int ae_np_server_chat_get(void*, int index, RecompLauncherCNetplayChatMessage* out) {
+        if (!out) return 0;
+        std::memset(out, 0, sizeof(*out));
+        PsxLobbyChatMsg msg{};
+        if (!psx_lobby_server_chat_get(index, &msg)) return 0;
         std::snprintf(out->from, sizeof(out->from), "%s", msg.from);
         std::snprintf(out->text, sizeof(out->text), "%s", msg.text);
         out->is_local = msg.is_local;
@@ -12014,6 +12047,9 @@ namespace {
         g_lnch_netplay_callbacks.host_can_spectate = ae_np_host_can_spectate;
         g_lnch_netplay_callbacks.online_count = ae_np_online_count;
         g_lnch_netplay_callbacks.online_get = ae_np_online_get;
+        g_lnch_netplay_callbacks.server_chat_send = ae_np_server_chat_send;
+        g_lnch_netplay_callbacks.server_chat_count = ae_np_server_chat_count;
+        g_lnch_netplay_callbacks.server_chat_get = ae_np_server_chat_get;
         g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
         g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
         g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;

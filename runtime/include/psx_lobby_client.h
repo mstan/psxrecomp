@@ -68,6 +68,9 @@ typedef struct PsxLobbyOnlinePlayer {
     /* First 8 characters of the player's connection id: enough to tell
      * "which row is me" without publishing whole ids to browsers. */
     char tag[12];
+    /* The title that player is browsing for; rows of other titles are
+     * dropped at parse time when this client has a game identity. */
+    char game_name[PSX_LOBBY_NAME_LEN];
 } PsxLobbyOnlinePlayer;
 #define PSX_LOBBY_MAX_ONLINE 64
 
@@ -398,6 +401,12 @@ void psx_lobby_seat_swap_clear(void);
 /* Lobby chat. send: 0 when queued (the line appears via the server echo).
  * count/get read the ring, oldest first; cleared on create/join/leave. */
 int  psx_lobby_send_chat(const char *text);
+
+/* Server chat: per-game, outside any room (op server_chat). Its own ring,
+ * cleared on disconnect; lines are masked on arrival like lobby chat. */
+int  psx_lobby_send_server_chat(const char *text);
+int  psx_lobby_server_chat_count(void);
+int  psx_lobby_server_chat_get(int index, PsxLobbyChatMsg *out);
 int  psx_lobby_chat_count(void);
 int  psx_lobby_chat_get(int index, PsxLobbyChatMsg *out);
 void psx_lobby_chat_clear(void);
