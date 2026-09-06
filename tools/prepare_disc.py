@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from disc_companion import CompanionError, check_destination, inspect_companion, stage_companion
 
 DST_SEC = 2352
 SRC_2448 = 2448
@@ -549,8 +552,7 @@ def main() -> int:
         print(f"source not found: {src}", file=sys.stderr)
         return 1
 
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-
+    selected_image = src
     cue_src: Path | None = None
     cue_bins: list[Path] = []
     if src.suffix.lower() == ".cue":
@@ -570,6 +572,14 @@ def main() -> int:
 
     kind = detect_kind(src, src_size)
 
+    # Bind the selected CUE basename, not its first track's basename.
+    try:
+        companion, companion_data = inspect_companion(selected_image, src_size, src_sha1)
+        check_destination(cfg.out_dir / cfg.cue_name, companion_data)
+    except CompanionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     known_hit = matches_known(cfg, src_size, src_md5, src_sha1)
     if cfg.known and not cfg.skip_hash_check:
         if known_hit:
@@ -588,6 +598,22 @@ def main() -> int:
             )
     elif not cfg.known and not cfg.skip_hash_check and kind == "bin2352":
         print("  no prepare_disc.known_* configured - verifying boot EXE only")
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def finish(cue_path: Path) -> None:
+        report = stage_companion(cue_path, companion, companion_data)
+        receipt = {
+            "schema": "psxrecomp-disc-preparation-v1",
+            "source_image": str(selected_image),
+            "source_data_track": {"path": str(src), "size": src_size, "sha1": src_sha1, "md5": src_md5},
+            "output_cue": str(cue_path.resolve()),
+            "subchannel": report,
+        }
+        cue_path.with_suffix(".disc-receipt.json").write_text(
+            json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(f"subchannel: {report['status']}")
+        print(f"RESULT_CUE={cue_path.resolve()}")
 
     # Multi-track Redump: keep the cue + every track bin so CDDA works.
     if cue_src is not None and len(cue_bins) > 1 and kind == "bin2352":
@@ -609,7 +635,7 @@ def main() -> int:
         print(f"  size  {out_size}")
         print(f"  md5   {out_md5}")
         print(f"  sha1  {out_sha1}")
-        print(f"RESULT_CUE={cue_path}")
+        finish(cue_path)
         return 0
 
     if kind == "bin2352":
@@ -664,7 +690,7 @@ def main() -> int:
     elif kind == "raw2448":
         print("  trimmed from 2448-byte/sector dump")
 
-    print(f"RESULT_CUE={cue_path.resolve()}")
+    finish(cue_path)
     return 0
 
 

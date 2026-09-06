@@ -28,6 +28,7 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "tools"))
 from sdk_progress import ProgressReporter  # noqa: E402
+from disc_companion import CompanionError, inspect_companion  # noqa: E402
 from toolchain_pack import (  # noqa: E402
     ensure_toolchain as _ensure_toolchain_pack,
     resolve_toolchain_bin,
@@ -845,12 +846,17 @@ def verify_disc_path(
     if path.suffix.lower() == ".cue":
         path = resolve_cue_bin(path)
     md5, sha1, size = file_hashes(path)
+    try:
+        subchannel, _ = inspect_companion(disc, size, sha1)
+    except CompanionError as exc:
+        raise DiscVerifyError(str(exc)) from exc
     identity = {
         "path": str(path),
         "md5": md5,
         "sha1": sha1,
         "size": size,
         "verified": False,
+        "subchannel": subchannel,
     }
     progress.event("disc", **identity)
     sizes = [int(s) for s in (prep.get("known_sizes") or [])]
@@ -906,7 +912,8 @@ def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
-    progress.phase("done", pct=1.0, message="Disc OK")
+    progress.phase("done", pct=1.0,
+                   message=f"Main track accepted; subchannel status: {identity['subchannel']['status']}")
     progress.result(ok=True, **identity)
     return EXIT_OK
 
