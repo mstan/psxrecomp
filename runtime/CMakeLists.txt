@@ -81,6 +81,11 @@ if(BUILD_TESTING)
                  COMMAND psx_memory_geometry_${_ram_geometry}_test)
     endforeach()
 
+    add_executable(psx_ram_runtime_map_test
+        tests/test_psx_ram_runtime_map.c)
+    target_include_directories(psx_ram_runtime_map_test PRIVATE include)
+    add_test(NAME psx_ram_runtime_map_test COMMAND psx_ram_runtime_map_test)
+
     add_executable(host_keymap_test
         tests/test_host_keymap.c
         src/host_keymap.c)

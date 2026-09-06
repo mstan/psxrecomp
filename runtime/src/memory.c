@@ -23,13 +23,14 @@
 #include "data_shards.h"
 #include "dirty_ram_interp.h"
 #include "psx_cycles.h"
+#include "psx_ram.h"
 #include "starvation_ring.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define RAM_SIZE        (2 * 1024 * 1024)
+#define RAM_SIZE        PSX_RAM_CAPACITY
 #define SCRATCHPAD_SIZE 1024
 #define BIOS_ROM_SIZE   (512 * 1024)
 #define MOD_MEMORY_BASE 0x1F000000u
@@ -42,6 +43,66 @@ static uint8_t mod_memory[MOD_MEMORY_SIZE];
 static uint32_t mod_memory_used;
 static uint8_t mod_gpu_dma_memory[PSX_MOD_GPU_DMA_APERTURE_SIZE];
 static uint32_t mod_gpu_dma_memory_used;
+static int s_ram_8mb_requested;
+
+uint32_t g_psx_ram_size = PSX_RAM_2MB;
+uint32_t g_psx_ram_mask = PSX_RAM_2MB - 1u;
+static uint32_t s_ram_high_registered[PSX_RAM_HIGH_BITWORDS];
+uint32_t g_psx_ram_high_unique[PSX_RAM_HIGH_BITWORDS];
+
+static inline void psx_ram_high_page_mark(uint32_t page) {
+    uint32_t i, bit;
+    if (page < PSX_RAM_HIGH_PAGE0 || page >= (PSX_RAM_8MB >> 12))
+        return;
+    i = page - PSX_RAM_HIGH_PAGE0;
+    bit = 1u << (i & 31u);
+    g_psx_ram_high_unique[i >> 5] |= bit;
+    s_ram_high_registered[i >> 5] |= bit;
+}
+
+static void psx_ram_apply_registered_bitmap(void) {
+    memcpy(g_psx_ram_high_unique, s_ram_high_registered,
+           sizeof(g_psx_ram_high_unique));
+}
+
+void psx_ram_register_unique(uint32_t addr, uint32_t len) {
+    uint32_t phys, end, page, last;
+    if (len == 0u)
+        return;
+    phys = addr & 0x1FFFFFFFu;
+    if (phys >= PSX_RAM_WINDOW)
+        return;
+    end = phys + len;
+    if (end < phys || end > PSX_RAM_WINDOW)
+        end = PSX_RAM_WINDOW;
+    if (end <= PSX_RAM_2MB)
+        return;
+    if (phys < PSX_RAM_2MB)
+        phys = PSX_RAM_2MB;
+    page = phys >> 12;
+    last = (end - 1u) >> 12;
+    for (; page <= last; page++)
+        psx_ram_high_page_mark(page);
+}
+
+uint32_t psx_ram_canon_code_addr(uint32_t addr) {
+    return psx_ram_canon_code_addr_inline(addr);
+}
+
+void psx_ram_resync_high_after_restore(void) {
+    uint32_t page;
+    psx_ram_apply_registered_bitmap();
+    if (g_psx_ram_size <= PSX_RAM_2MB)
+        return;
+    for (page = PSX_RAM_HIGH_PAGE0; page < (PSX_RAM_8MB >> 12); page++) {
+        uint32_t dst = page << 12;
+        uint32_t src = dst & (PSX_RAM_2MB - 1u);
+        if (psx_ram_high_page_unique(page))
+            continue;
+        if (memcmp(ram + dst, ram + src, 4096u) != 0)
+            psx_ram_high_page_mark(page);
+    }
+}
 
 /*
  * Trusted mods may opt into host-backed guest memory in Expansion 1. Before
@@ -98,22 +159,63 @@ uint8_t *g_psx_ram = ram;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
-/* Physical address translation for guest accesses. The 2 MB main RAM is
- * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
- * register, default 0x0B88) and games rely on it — Kula World's crt0
- * parks $sp in the 4th mirror (0x807FFFF8). Fold the mirrors here so the
- * RAM bounds checks below see canonical offsets; without this, mirror
- * writes fell into the open-bus no-op and mirror reads returned 0 (the
- * guest's stack silently vanished and $ra came back as 0). */
+/* Physical address translation for guest accesses. Retail 2 MB DRAM is
+ * mirrored across the first 8 MB of each segment; the opt-in 8 MB mode maps
+ * registered high pages uniquely and keeps unregistered high pages aliased. */
 static inline uint32_t psx_phys_addr(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys < 0x00800000u) phys &= (uint32_t)(RAM_SIZE - 1);
+    if (phys < PSX_RAM_WINDOW) phys = psx_ram_map_read(phys);
+    return phys;
+}
+
+static inline uint32_t psx_phys_addr_store(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys < PSX_RAM_WINDOW) phys = psx_ram_map_write(phys);
     return phys;
 }
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
+uint32_t memory_get_ram_bytes(void) { return g_psx_ram_size; }
+int psx_ram_8mb_active(void) { return g_psx_ram_size > PSX_RAM_2MB; }
+
+void psx_ram_reset_size_request(void) {
+    s_ram_8mb_requested = 0;
+    memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
+    memset(g_psx_ram_high_unique, 0, sizeof(g_psx_ram_high_unique));
+}
+
+int psx_mod_set_main_ram_8mb(int enabled) {
+    s_ram_8mb_requested = enabled ? 1 : 0;
+    memset(s_ram_high_registered, 0, sizeof(s_ram_high_registered));
+    memset(g_psx_ram_high_unique, 0, sizeof(g_psx_ram_high_unique));
+    if (enabled)
+        psx_ram_register_unique(PSX_RAM_2MB, PSX_RAM_8MB - PSX_RAM_2MB);
+    return 1;
+}
+
+static int psx_ram_any_high_registered(void) {
+    uint32_t i;
+    for (i = 0; i < PSX_RAM_HIGH_BITWORDS; i++) {
+        if (s_ram_high_registered[i] != 0u)
+            return 1;
+    }
+    return 0;
+}
+
+static void psx_ram_apply_size_request(void) {
+    if (s_ram_8mb_requested) {
+        g_psx_ram_size = PSX_RAM_8MB;
+        g_psx_ram_mask = PSX_RAM_8MB - 1u;
+        if (!psx_ram_any_high_registered())
+            psx_ram_register_unique(PSX_RAM_2MB, PSX_RAM_8MB - PSX_RAM_2MB);
+    } else {
+        g_psx_ram_size = PSX_RAM_2MB;
+        g_psx_ram_mask = PSX_RAM_2MB - 1u;
+        memset(g_psx_ram_high_unique, 0, sizeof(g_psx_ram_high_unique));
+    }
+}
 
 void memory_clear_low_boot_scratch(void) {
     memset(ram, 0, 0x10u);
@@ -680,6 +782,7 @@ uint32_t dirty_ram_get_bitmap_word_count(void) {
 }
 
 void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
+    memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     if (count > DIRTY_RAM_BITMAP_WORDS) count = DIRTY_RAM_BITMAP_WORDS;
     for (uint32_t i = 0; i < count; i++)
         dirty_ram_bitmap[i] = words[i];
@@ -1002,6 +1105,7 @@ static uint32_t s_bios_checksum = 0;
 uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 
 void memory_init(const char* bios_path) {
+    psx_ram_apply_size_request();
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
     /* Rematch re-enters without process exit — wipe sticky I/O regs that
@@ -1611,7 +1715,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
      * We have no cache model, so silently discard RAM/scratchpad writes. */
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = psx_phys_addr(addr);
+    uint32_t phys = psx_phys_addr_store(addr);
 
     /* The generated BIOS mirrors its exception trampoline to 0x80000000 during
      * boot. On hardware this mirror copy is not visible in RAM; only the real
@@ -1805,7 +1909,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = psx_phys_addr(addr);
+    uint32_t phys = psx_phys_addr_store(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
@@ -2065,10 +2169,10 @@ static inline int psx_cyc_main_ram_fast_addr(uint32_t addr, uint32_t width,
         return 0;
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys >= 0x00800000u) return 0;
-    phys &= (uint32_t)(RAM_SIZE - 1);
+    phys = psx_ram_map_read(phys);
     /* Aligned guest loads cannot cross this boundary, but fail closed for a
      * malformed/unaligned caller instead of introducing a host OOB read. */
-    if (phys > (uint32_t)RAM_SIZE - width) return 0;
+    if (phys > g_psx_ram_size - width) return 0;
     *phys_out = phys;
     return 1;
 }
@@ -2140,7 +2244,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = psx_phys_addr(addr);
+    uint32_t phys = psx_phys_addr_store(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
