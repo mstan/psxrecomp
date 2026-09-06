@@ -51,7 +51,25 @@ typedef struct PsxLobbyRow {
     int      latency_ms;
     /* Host's country (alpha-2) from the server's GeoIP; "" unknown. */
     char     host_country[4];
+    /* Gallery: 0 = none; else how many watch out of how many seats. */
+    int      allow_spectators;
+    int      max_spectators;
+    int      spectator_count;
 } PsxLobbyRow;
+
+/* One player connected to the hub (the lobby_list `players` array). */
+typedef struct PsxLobbyOnlinePlayer {
+    char player_id[PSX_LOBBY_ID_LEN];
+    char display_name[PSX_LOBBY_NAME_LEN];
+    char country[4];
+    char lobby_id[PSX_LOBBY_ID_LEN];
+    char lobby_name[PSX_LOBBY_NAME_LEN];
+    int  hosting;
+    /* First 8 characters of the player's connection id: enough to tell
+     * "which row is me" without publishing whole ids to browsers. */
+    char tag[12];
+} PsxLobbyOnlinePlayer;
+#define PSX_LOBBY_MAX_ONLINE 64
 
 typedef struct PsxLobbyMember {
     /* Seat index in the shared namespace: a player seat, or
@@ -219,6 +237,9 @@ void psx_lobby_set_max_slots(int max_slots);
 void psx_lobby_request_list(void);
 int  psx_lobby_list_count(void);
 int  psx_lobby_list_get(int index, PsxLobbyRow *out);
+/* Players connected to the hub, refreshed with every lobby_list. */
+int  psx_lobby_online_count(void);
+int  psx_lobby_online_get(int index, PsxLobbyOnlinePlayer *out);
 
 /*
  * Create lobby. host_bind e.g. "0.0.0.0:7777". password may be NULL/empty.

@@ -197,6 +197,8 @@ typedef struct {
     size_t ws_pending_len;
     PsxLobbyRow list[PSX_LOBBY_MAX_LIST];
     int list_count;
+    PsxLobbyOnlinePlayer online[PSX_LOBBY_MAX_ONLINE];
+    int online_count;
     int in_lobby;
     int is_host;
     char host_player_id[PSX_LOBBY_ID_LEN];
@@ -916,6 +918,22 @@ static void member_rtt_clear(void)
     g_lc.rtt_next_ping_ms = 0;
 }
 
+/* member_rtt_ms has a cell per seat in BOTH tables, but a gallery seat is
+ * numbered from the server's spectator base (64+), not from the array. Map
+ * a seat to its cell; -1 for a seat neither table has. Without this every
+ * spectator's report was dropped as out of range and the gallery showed no
+ * latency at all. */
+static int rtt_index_for_slot(int slot)
+{
+    int base;
+    if (slot < 0) return -1;
+    if (slot < PSX_LOBBY_MAX_PLAYERS) return slot;
+    base = psx_lobby_spectator_slot_base();
+    if (base > 0 && slot >= base && slot < base + PSX_LOBBY_MAX_SPECTATORS)
+        return PSX_LOBBY_MAX_PLAYERS + (slot - base);
+    return -1;
+}
+
 static int member_slot_for_player(const char *player_id)
 {
     int i;
@@ -1257,6 +1275,66 @@ static int json_get_int(const char *json, const char *key, int def)
         return def;
     }
     return (int)strtol(p + 1, NULL, 10);
+}
+
+static int json_get_bool(const char *json, const char *key, int def);
+
+/* The `players` array of a lobby_list: everyone on the hub. Flat objects,
+ * so each one is cut out by brace depth and read with the key getters. An
+ * older server has no such array and the count simply goes to zero. */
+static void lobby_list_parse_players(const char *json)
+{
+    const char *p = strstr(json, "\"players\"");
+    int n = 0;
+    g_lc.online_count = 0;
+    if (!p) return;
+    p = strchr(p, '[');
+    if (!p) return;
+    ++p;
+    while (*p && n < PSX_LOBBY_MAX_ONLINE) {
+        const char *obj, *end;
+        int depth = 0;
+        char chunk[512];
+        size_t len;
+        while (*p && *p != '{' && *p != ']') ++p;
+        if (*p != '{') break;
+        obj = end = p;
+        do {
+            if (*end == '{') ++depth;
+            else if (*end == '}') --depth;
+            ++end;
+        } while (*end && depth > 0);
+        len = (size_t)(end - obj);
+        if (len >= sizeof(chunk)) len = sizeof(chunk) - 1;
+        memcpy(chunk, obj, len);
+        chunk[len] = '\0';
+        memset(&g_lc.online[n], 0, sizeof(g_lc.online[n]));
+        json_get_str(chunk, "display_name", g_lc.online[n].display_name,
+                     sizeof(g_lc.online[n].display_name));
+        json_get_str(chunk, "country", g_lc.online[n].country,
+                     sizeof(g_lc.online[n].country));
+        json_get_str(chunk, "lobby_id", g_lc.online[n].lobby_id,
+                     sizeof(g_lc.online[n].lobby_id));
+        json_get_str(chunk, "lobby_name", g_lc.online[n].lobby_name,
+                     sizeof(g_lc.online[n].lobby_name));
+        g_lc.online[n].hosting = json_get_bool(chunk, "hosting", 0);
+        json_get_str(chunk, "tag", g_lc.online[n].tag, sizeof(g_lc.online[n].tag));
+        if (g_lc.online[n].display_name[0]) ++n;
+        p = end;
+    }
+    g_lc.online_count = n;
+}
+
+int psx_lobby_online_count(void)
+{
+    return g_lc.online_count;
+}
+
+int psx_lobby_online_get(int index, PsxLobbyOnlinePlayer *out)
+{
+    if (!out || index < 0 || index >= g_lc.online_count) return 0;
+    *out = g_lc.online[index];
+    return 1;
 }
 
 static int json_get_bool(const char *json, const char *key, int def)
@@ -1783,6 +1861,7 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "lobby_list") == 0) {
         const char *p = strstr(json, "\"lobbies\"");
         int n = 0;
+        lobby_list_parse_players(json);
         /* Keep prior RTTs across server list pushes; Refresh re-probes.
          * Invalidate when host_endpoint or lan_endpoints change. */
         char prev_ids[PSX_LOBBY_MAX_LIST][PSX_LOBBY_ID_LEN];
@@ -1885,6 +1964,9 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].has_password = json_get_bool(chunk, "has_password", 0);
                     json_get_str(chunk, "host_country", g_lc.list[n].host_country,
                                  sizeof(g_lc.list[n].host_country));
+                    g_lc.list[n].allow_spectators = json_get_bool(chunk, "allow_spectators", 0);
+                    g_lc.list[n].max_spectators = json_get_int(chunk, "max_spectators", 0);
+                    g_lc.list[n].spectator_count = json_get_int(chunk, "spectator_count", 0);
                     json_get_str(chunk, "host_endpoint", g_lc.list[n].host_endpoint,
                                  sizeof(g_lc.list[n].host_endpoint));
                     g_lc.list[n].lan_count = json_parse_str_array(
@@ -2142,12 +2224,11 @@ static void handle_server_json(const char *json)
         if (type == PSX_LOBBY_SIG_RTT_PING || type == PSX_LOBBY_SIG_RTT_PONG)
             return;
         if (type == PSX_LOBBY_SIG_RTT_REPORT) {
-            int slot = member_slot_for_player(from);
+            int slot = rtt_index_for_slot(member_slot_for_player(from));
             int ms = (int)strtol(text_buf, NULL, 10);
             /* Max with local measure — never let an optimistic peer REPORT
              * undercut delay provisioning (Force TURN / asymmetric ICE). */
-            if (slot >= 0 && slot < PSX_LOBBY_MAX_MEMBERS && ms >= 0 &&
-                ms <= 60000) {
+            if (slot >= 0 && ms >= 0 && ms <= 60000) {
                 if (g_lc.member_rtt_ms[slot] < 0 ||
                     ms > g_lc.member_rtt_ms[slot])
                     g_lc.member_rtt_ms[slot] = ms;
@@ -2743,8 +2824,8 @@ static void lobby_rtt_store_for_peer(const char *peer_id, int ms)
     int slot;
     if (ms < 0 || !peer_id || !peer_id[0])
         return;
-    slot = member_slot_for_player(peer_id);
-    if (slot < 0 || slot >= PSX_LOBBY_MAX_MEMBERS)
+    slot = rtt_index_for_slot(member_slot_for_player(peer_id));
+    if (slot < 0)
         return;
     if (g_lc.member_rtt_ms[slot] < 0 || ms > g_lc.member_rtt_ms[slot])
         g_lc.member_rtt_ms[slot] = ms;
@@ -3350,13 +3431,14 @@ int psx_lobby_member_get(int index, PsxLobbyMember *out)
 
 int psx_lobby_member_latency_ms(int slot)
 {
-    int local;
-    if (slot < 0 || slot >= PSX_LOBBY_MAX_MEMBERS)
+    int local, idx;
+    idx = rtt_index_for_slot(slot);
+    if (idx < 0)
         return -1;
     local = local_member_slot();
     if (local >= 0 && slot == local)
         return -1; /* never show self-RTT */
-    return g_lc.member_rtt_ms[slot];
+    return g_lc.member_rtt_ms[idx];
 }
 
 int psx_lobby_member_is_host(const PsxLobbyMember *member)

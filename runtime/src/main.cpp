@@ -10831,6 +10831,32 @@ namespace {
         out->latency_ms = row.latency_ms;
         std::snprintf(out->host_country, sizeof(out->host_country), "%s",
                       row.host_country);
+        out->allow_spectators = row.allow_spectators;
+        out->max_spectators = row.max_spectators;
+        out->spectator_count = row.spectator_count;
+        return 1;
+    }
+
+    /* Players online: the hub's `players` list. LAN rooms have no hub, so
+     * a LAN-only session reports nobody rather than guessing. */
+    int ae_np_online_count(void*) {
+        return psx_lobby_connected() ? psx_lobby_online_count() : 0;
+    }
+    int ae_np_online_get(void*, int index, RecompLauncherCNetplayOnlinePlayer* out) {
+        if (!out) return 0;
+        PsxLobbyOnlinePlayer p{};
+        if (!psx_lobby_online_get(index, &p)) return 0;
+        std::memset(out, 0, sizeof(*out));
+        std::snprintf(out->display_name, sizeof(out->display_name), "%s", p.display_name);
+        std::snprintf(out->country, sizeof(out->country), "%s", p.country);
+        std::snprintf(out->lobby_name, sizeof(out->lobby_name), "%s", p.lobby_name);
+        out->in_lobby = p.lobby_id[0] != '\0';
+        out->hosting = p.hosting;
+        /* Which row is us: the hub tags each row with the first characters
+         * of its connection id. A name match would mark every namesake. */
+        const char* me = psx_lobby_player_id();
+        out->is_local = me && me[0] && p.tag[0] &&
+                        std::strncmp(me, p.tag, std::strlen(p.tag)) == 0;
         return 1;
     }
 
@@ -11986,6 +12012,8 @@ namespace {
         g_lnch_netplay_callbacks.chat_count = ae_np_chat_count;
         g_lnch_netplay_callbacks.chat_get = ae_np_chat_get;
         g_lnch_netplay_callbacks.host_can_spectate = ae_np_host_can_spectate;
+        g_lnch_netplay_callbacks.online_count = ae_np_online_count;
+        g_lnch_netplay_callbacks.online_get = ae_np_online_get;
         g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
         g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
         g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;
