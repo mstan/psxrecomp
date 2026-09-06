@@ -11,10 +11,8 @@
  * back to software when no ICD is present.
  *
  * BUILD STATUS: instance/device/swapchain + VRAM image + fills + CPU<->VRAM
- * transfers + present are implemented; geometry pipelines (triangles/rects/
- * lines), texturing/CLUT, mask-bit, semi-transparency, SSAA and the native-wide
- * compositor are added in later phases — those vtable entries currently abort
- * via psx_fatal_halt rather than silently no-op (no stubs).
+ * transfers + present + geometry pipelines, texturing/CLUT, mask-bit,
+ * semi-transparency, SSAA and the native-wide compositor are implemented.
  */
 
 #include "gpu.h"
@@ -1048,8 +1046,12 @@ static int create_render_targets(void) {
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &s_raw_img, &s_raw_mem, &s_raw_view)) return 0;
     s_ds_format = choose_ds_format();
+    /* Initial stencil clear is a transfer. Both candidate formats contain
+     * depth and stencil, so barriers below transition both aspects together
+     * (the device does not enable separateDepthStencilLayouts). */
     if (!make_image(s_ds_format, VRAM_W * S, VRAM_H * S,
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_STENCIL_BIT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_STENCIL_BIT,
                     &s_ds_img, &s_ds_mem, &s_ds_view)) return 0;
     if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, VRAM_W * S, VRAM_H * S,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1071,7 +1073,7 @@ static int create_render_targets(void) {
         db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         db.image = s_ds_img; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
         db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
         p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, 0, NULL, 0, NULL, 1, &db);
@@ -1671,6 +1673,39 @@ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
     off[1].x = x + tw;  off[1].y = y + th;  off[1].z = 1;
 }
 
+/* Uploads and VRAM copies update the canonical image, while mirrored geometry
+ * supplies the reveal margins. Refresh the centre before reading/presenting
+ * a wide surface, including both vertical double-buffer bands. */
+static void wide_blit_center(int surf_i, int base_x) {
+    if (surf_i < 0 || s_wide_w <= 0) return;
+    int S = s_scale;
+    int native_w = s_wide_w - 2 * s_wide_offset;
+    if (native_w <= 0 || s_wide_offset < 0 || base_x < 0 ||
+        base_x > VRAM_W - native_w) return;
+    VkCommandBuffer cb = begin_oneshot();
+    vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    img_to(cb, s_wide_img[surf_i], &s_wide_layout[surf_i],
+           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy copy = {0};
+    copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.dstSubresource.layerCount = 1;
+    copy.srcOffset.x = base_x * S;
+    copy.srcOffset.y = 0;
+    copy.dstOffset.x = s_wide_offset * S;
+    copy.dstOffset.y = 0;
+    copy.extent.width = (uint32_t)(native_w * S);
+    copy.extent.height = (uint32_t)(VRAM_H * S);
+    copy.extent.depth = 1;
+    p_vkCmdCopyImage(cb, s_vram_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     s_wide_img[surf_i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &copy);
+    img_to(cb, s_wide_img[surf_i], &s_wide_layout[surf_i],
+           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    end_oneshot(cb);
+}
+
 int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
                              int linear, int force_4_3) {
     if (!s_ctx_ok) return 0;
@@ -1837,7 +1872,9 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
         if (s_wide_img[k] && s_wide_base[k] == disp_x) { i = k; break; }
     if (i < 0) return 0;
     flush_cpu_upload();
-    flush_tex_batch(); flush_geometry(); gpu_sync();
+    flush_tex_batch(); flush_geometry();
+    wide_blit_center(i, disp_x);
+    gpu_sync();
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
 
@@ -1965,7 +2002,7 @@ static void begin_geo_pass(VkCommandBuffer cb) {
     db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     db.image = s_ds_img;
-    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     db.subresourceRange.levelCount = 1;
     db.subresourceRange.layerCount = 1;
     db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -1999,7 +2036,8 @@ static void bind_masked_stencil_only(VkCommandBuffer cb, int prog, int topo, int
     p_vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, check ? 0u : (uint32_t)write_val);
 }
 
-/* Host-visible staging buffer (TRANSFER_SRC). */
+/* Shared host-visible upload/readback cache. Every entry can be reused for
+ * either direction, including wide-surface vkCmdCopyImageToBuffer readback. */
 static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map) {
     int best = -1;
     for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
@@ -2018,7 +2056,8 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
     }
 
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (p_vkCreateBuffer(s_dev, &bci, NULL, buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req; p_vkGetBufferMemoryRequirements(s_dev, *buf, &req);
@@ -2582,7 +2621,7 @@ static int wide_surf_for(int base_x) {
         db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         db.image = s_wide_ds_img[i]; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
         db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
         p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, 0, NULL, 0, NULL, 1, &db);
@@ -2618,7 +2657,7 @@ static void wide_pass_begin(VkCommandBuffer cb) {
     db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     db.image = s_wide_ds_img[i];
-    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
     db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
@@ -3236,6 +3275,7 @@ static int vkb_render_wide_display(uint32_t *out, int pitch, int base_x,
         if (s_wide_img[k] && s_wide_base[k] == base_x) { i = k; break; }
     if (i < 0) return 0;
     flush_cpu_upload(); flush_tex_batch(); flush_geometry();
+    wide_blit_center(i, base_x);
     int S = s_scale, W = s_wide_w * S, H = VRAM_H * S;
     int out_h = disp_h * S, ry0 = disp_y * S;
     if (ry0 < 0) ry0 = 0;
@@ -3267,6 +3307,52 @@ static int vkb_render_wide_display(uint32_t *out, int pitch, int base_x,
         }
     }
     free_staging(buf, mem);
+    return count;
+}
+
+/* Dump the ENTIRE wide compositor surface for base_x, mirroring
+ * sw_wide_dump_full/glb_wide_dump_full for the debug-server wide_full command.
+ * Top-down RGBA8 -> 0xAARRGGBB with alpha forced to FF. */
+static int vkb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
+                              int base_x) {
+    if (!s_ready || s_wide_w <= 0 || !out || cap_pixels <= 0) return 0;
+    int S = s_scale, W = s_wide_w * S, H = VRAM_H * S;
+    /* This entry point promises the whole surface. Never silently truncate
+     * rows or treat a zero capacity as an unbounded caller allocation. */
+    if ((int64_t)W * H > cap_pixels) return 0;
+    int i = -1;
+    for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
+        if (s_wide_img[k] && s_wide_base[k] == base_x) { i = k; break; }
+    if (i < 0) return 0;
+    flush_cpu_upload(); flush_tex_batch(); flush_geometry();
+    wide_blit_center(i, base_x);
+    VkBuffer buf; VkDeviceMemory mem; void *map;
+    if (!make_staging((VkDeviceSize)W * H * 4, &buf, &mem, &map)) return 0;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rc = {0};
+    rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rc.imageSubresource.layerCount = 1;
+    rc.imageExtent.width = (uint32_t)W;
+    rc.imageExtent.height = (uint32_t)H;
+    rc.imageExtent.depth = 1;
+    p_vkCmdCopyImageToBuffer(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             buf, 1, &rc);
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    end_oneshot(cb);
+    gpu_sync();
+
+    const uint8_t *src = (const uint8_t *)map;
+    int count = 0;
+    for (int px = 0; px < W * H; px++) {
+        const uint8_t *s8 = src + (size_t)px * 4;
+        out[px] = 0xFF000000u | ((uint32_t)s8[0] << 16)
+                | ((uint32_t)s8[1] << 8) | s8[2];
+        count++;
+    }
+    free_staging(buf, mem);
+    if (ow) *ow = W;
+    if (oh) *oh = H;
     return count;
 }
 
@@ -3309,6 +3395,7 @@ static const GpuRenderBackend VK_BACKEND = {
     .wide_clear                    = vkb_wide_clear,
     .wide_clear_margins            = vkb_wide_clear_margins,
     .render_wide_display           = vkb_render_wide_display,
+    .wide_dump_full                = vkb_wide_dump_full,
 };
 
 /* Returned unconditionally (like gl_backend_get): the table is selected before

@@ -1,0 +1,771 @@
+{
+    "kind":  "renderer-microbenchmark",
+    "timed_work":  "fixed draws/uploads plus full 1MiB VRAM readback per iteration",
+    "excludes":  "game CPU emulation, presentation, vsync; not NoGraphicsAPI",
+    "results":  [
+                    {
+                        "backend":  "software",
+                        "effective_backend":  0,
+                        "scale":  1,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  19.1145,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  19.1724,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  19.425,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  19.2763,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  19.9693,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  19.2624,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  21.6913,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        }
+                                    ],
+                        "label":  "software",
+                        "median_ms_per_iteration":  0.192763,
+                        "min_ms_per_iteration":  0.191145,
+                        "max_ms_per_iteration":  0.216913,
+                        "stable_sha256":  "cd59da1af7f01d438ee66c24e238db23ab6e0664bebc50dc04dfbc4275667c83",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "opengl",
+                        "effective_backend":  1,
+                        "scale":  1,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  76.5992,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  70.5803,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  55.4374,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  56.7354,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  57.618,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  54.9174,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  58.4362,
+                                            "hash64":  "f1799a4b03510e17"
+                                        }
+                                    ],
+                        "label":  "opengl",
+                        "median_ms_per_iteration":  0.57618,
+                        "min_ms_per_iteration":  0.549174,
+                        "max_ms_per_iteration":  0.765992,
+                        "stable_sha256":  "c92755fdda73c104c173cf94dea10ffacf55c65ea5a880f55a6e1ce68e113927",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  1,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  420.6276,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  441.6912,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  445.9101,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  439.4892,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  420.1801,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  513.2432,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  563.3759,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan",
+                        "median_ms_per_iteration":  4.416912,
+                        "min_ms_per_iteration":  4.201801,
+                        "max_ms_per_iteration":  5.633759,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  1,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  452.0164,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  453.1813,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  459.4131,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  434.1773,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  443.2307,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  454.2978,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  494.8735,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan-baseline",
+                        "median_ms_per_iteration":  4.5318130000000005,
+                        "min_ms_per_iteration":  4.341773,
+                        "max_ms_per_iteration":  4.948735,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "software",
+                        "effective_backend":  0,
+                        "scale":  2,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  362.4232,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  341.2994,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  342.9222,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  343.0687,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  342.4176,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  343.7386,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  338.4822,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        }
+                                    ],
+                        "label":  "software",
+                        "median_ms_per_iteration":  3.4292219999999998,
+                        "min_ms_per_iteration":  3.3848219999999998,
+                        "max_ms_per_iteration":  3.624232,
+                        "stable_sha256":  "cd59da1af7f01d438ee66c24e238db23ab6e0664bebc50dc04dfbc4275667c83",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "opengl",
+                        "effective_backend":  1,
+                        "scale":  2,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  72.543,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  74.0482,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  70.8771,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  72.2272,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  69.8198,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  71.2881,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  74.2934,
+                                            "hash64":  "f1799a4b03510e17"
+                                        }
+                                    ],
+                        "label":  "opengl",
+                        "median_ms_per_iteration":  0.7222719999999999,
+                        "min_ms_per_iteration":  0.698198,
+                        "max_ms_per_iteration":  0.7429340000000001,
+                        "stable_sha256":  "c92755fdda73c104c173cf94dea10ffacf55c65ea5a880f55a6e1ce68e113927",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  2,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  448.3344,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  476.1086,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  455.8096,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  484.6039,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  557.634,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  594.402,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  600.5258,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan",
+                        "median_ms_per_iteration":  4.846039,
+                        "min_ms_per_iteration":  4.483344,
+                        "max_ms_per_iteration":  6.005258,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  2,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  472.5807,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  453.2078,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  474.7873,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  447.6101,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  436.9,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  476.8254,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  461.0356,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan-baseline",
+                        "median_ms_per_iteration":  4.6103559999999995,
+                        "min_ms_per_iteration":  4.369,
+                        "max_ms_per_iteration":  4.768254,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "software",
+                        "effective_backend":  0,
+                        "scale":  4,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  1305.661,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  1298.0934,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  1306.9472,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  1308.8,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  1297.7784,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  1314.6518,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  1315.0429,
+                                            "hash64":  "cda555170bb8ec5e"
+                                        }
+                                    ],
+                        "label":  "software",
+                        "median_ms_per_iteration":  13.069472000000001,
+                        "min_ms_per_iteration":  12.977784,
+                        "max_ms_per_iteration":  13.150428999999999,
+                        "stable_sha256":  "cd59da1af7f01d438ee66c24e238db23ab6e0664bebc50dc04dfbc4275667c83",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "opengl",
+                        "effective_backend":  1,
+                        "scale":  4,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  102.8738,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  98.2027,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  92.4099,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  94.9486,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  90.9199,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  90.2143,
+                                            "hash64":  "f1799a4b03510e17"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  94.0882,
+                                            "hash64":  "f1799a4b03510e17"
+                                        }
+                                    ],
+                        "label":  "opengl",
+                        "median_ms_per_iteration":  0.940882,
+                        "min_ms_per_iteration":  0.9021429999999999,
+                        "max_ms_per_iteration":  1.028738,
+                        "stable_sha256":  "c92755fdda73c104c173cf94dea10ffacf55c65ea5a880f55a6e1ce68e113927",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  4,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  440.87,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  446.3003,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  445.5938,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  453.5388,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  525.4391,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  501.2659,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  604.847,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan",
+                        "median_ms_per_iteration":  4.535388,
+                        "min_ms_per_iteration":  4.4087,
+                        "max_ms_per_iteration":  6.04847,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    },
+                    {
+                        "backend":  "vulkan",
+                        "effective_backend":  2,
+                        "scale":  4,
+                        "warmup":  20,
+                        "iters":  100,
+                        "repeats":  [
+                                        {
+                                            "repeat":  0,
+                                            "wall_ms":  440.518,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  1,
+                                            "wall_ms":  440.4865,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  2,
+                                            "wall_ms":  438.5825,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  3,
+                                            "wall_ms":  443.6873,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  4,
+                                            "wall_ms":  499.1095,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  5,
+                                            "wall_ms":  507.2299,
+                                            "hash64":  "adde00b9e296ea10"
+                                        },
+                                        {
+                                            "repeat":  6,
+                                            "wall_ms":  522.507,
+                                            "hash64":  "adde00b9e296ea10"
+                                        }
+                                    ],
+                        "label":  "vulkan-baseline",
+                        "median_ms_per_iteration":  4.436873,
+                        "min_ms_per_iteration":  4.385825,
+                        "max_ms_per_iteration":  5.22507,
+                        "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                        "validation":  false
+                    }
+                ],
+    "comparisons":  [
+                        {
+                            "left":  "software",
+                            "right":  "opengl",
+                            "scale":  1,
+                            "different_pixels":  19723,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "software",
+                            "right":  "vulkan",
+                            "scale":  1,
+                            "different_pixels":  18849,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "opengl",
+                            "right":  "vulkan",
+                            "scale":  1,
+                            "different_pixels":  6141,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "vulkan-baseline",
+                            "right":  "vulkan",
+                            "scale":  1,
+                            "different_pixels":  0,
+                            "total_pixels":  524288,
+                            "exact_match":  true
+                        },
+                        {
+                            "left":  "software",
+                            "right":  "opengl",
+                            "scale":  2,
+                            "different_pixels":  19723,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "software",
+                            "right":  "vulkan",
+                            "scale":  2,
+                            "different_pixels":  18849,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "opengl",
+                            "right":  "vulkan",
+                            "scale":  2,
+                            "different_pixels":  6141,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "vulkan-baseline",
+                            "right":  "vulkan",
+                            "scale":  2,
+                            "different_pixels":  0,
+                            "total_pixels":  524288,
+                            "exact_match":  true
+                        },
+                        {
+                            "left":  "software",
+                            "right":  "opengl",
+                            "scale":  4,
+                            "different_pixels":  19723,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "software",
+                            "right":  "vulkan",
+                            "scale":  4,
+                            "different_pixels":  18849,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "opengl",
+                            "right":  "vulkan",
+                            "scale":  4,
+                            "different_pixels":  6141,
+                            "total_pixels":  524288,
+                            "exact_match":  false
+                        },
+                        {
+                            "left":  "vulkan-baseline",
+                            "right":  "vulkan",
+                            "scale":  4,
+                            "different_pixels":  0,
+                            "total_pixels":  524288,
+                            "exact_match":  true
+                        }
+                    ],
+    "validation_runs":  [
+                            {
+                                "backend":  "vulkan",
+                                "effective_backend":  2,
+                                "scale":  1,
+                                "warmup":  1,
+                                "iters":  2,
+                                "repeats":  [
+                                                {
+                                                    "repeat":  0,
+                                                    "wall_ms":  10.801,
+                                                    "hash64":  "adde00b9e296ea10"
+                                                }
+                                            ],
+                                "label":  "vulkan",
+                                "median_ms_per_iteration":  5.4005,
+                                "min_ms_per_iteration":  5.4005,
+                                "max_ms_per_iteration":  5.4005,
+                                "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                                "validation":  true
+                            },
+                            {
+                                "backend":  "vulkan",
+                                "effective_backend":  2,
+                                "scale":  2,
+                                "warmup":  1,
+                                "iters":  2,
+                                "repeats":  [
+                                                {
+                                                    "repeat":  0,
+                                                    "wall_ms":  14.684,
+                                                    "hash64":  "adde00b9e296ea10"
+                                                }
+                                            ],
+                                "label":  "vulkan",
+                                "median_ms_per_iteration":  7.342,
+                                "min_ms_per_iteration":  7.342,
+                                "max_ms_per_iteration":  7.342,
+                                "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                                "validation":  true
+                            },
+                            {
+                                "backend":  "vulkan",
+                                "effective_backend":  2,
+                                "scale":  4,
+                                "warmup":  1,
+                                "iters":  2,
+                                "repeats":  [
+                                                {
+                                                    "repeat":  0,
+                                                    "wall_ms":  15.1443,
+                                                    "hash64":  "adde00b9e296ea10"
+                                                }
+                                            ],
+                                "label":  "vulkan",
+                                "median_ms_per_iteration":  7.57215,
+                                "min_ms_per_iteration":  7.57215,
+                                "max_ms_per_iteration":  7.57215,
+                                "stable_sha256":  "9b652566d4fb4bdaa01f014edce77f7bd7d0202b5aecd3b1b6924c81d0b55700",
+                                "validation":  true
+                            }
+                        ],
+    "base_commit":  "b213858c4cd286f15bbe80bfbc36cf90764b442f",
+    "captured_date":  "2026-09-06",
+    "gpu":  "NVIDIA GeForce RTX 3080 Ti / driver 610.74",
+    "cpu":  "AMD Ryzen 7 9800X3D"
+}
