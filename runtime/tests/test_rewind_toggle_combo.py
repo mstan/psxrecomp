@@ -75,5 +75,11 @@ KEYMAP_C = (ROOT / "runtime" / "src" / "host_keymap.c").read_text(encoding="utf-
 assert "HOST_KEYMAP_TURBO_TOGGLE," in KEYMAP_H
 assert 'ieq(name, "TurboToggle")' in KEYMAP_C
 assert "add_bind(HOST_KEYMAP_TURBO_TOGGLE, (int)SDLK_F9" in KEYMAP_C
+# A present-but-empty / "None" [KeyMap] line is an explicit unbind: no
+# built-in default is re-applied for that action (launcher Backspace-to-clear).
+assert "int explicit_unbound;" in KEYMAP_C
+assert "static int want_default(HostKeymapAction action)" in KEYMAP_C
+assert "s_actions[HOST_KEYMAP_TURBO].count == 0" not in KEYMAP_C
+assert "if (want_default(HOST_KEYMAP_TURBO))" in KEYMAP_C
 
 print("host shortcut guard passed")

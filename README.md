@@ -746,6 +746,10 @@ acceleration is **opt-in**, per game, so the accurate path is never compromised:
   speed until pressed again. Controller host shortcuts bound to a single
   button or trigger are chords with Select — the launcher shows them as
   `select + …`; only a two-button capture replaces the implicit Select.
+  Backspace while the launcher is listening clears a shortcut; in the files
+  that is `0` for a `[hotkeys]` pad value and `None` for a `[KeyMap]` key (a
+  present-but-empty or `None` line is an explicit unbind, a missing line
+  keeps the built-in default).
 - **The "Fast Loading (host pacing)" and "CD Speed" mods** — automatic
   acceleration during load waits, shipped with every title and **off by
   default**, with `turbo_audio_sink` keeping the SPU timeline coherent through

@@ -18,6 +18,7 @@ static int mod_alt(void) { return (int)KMOD_ALT; }
 
 int main(int argc, char **argv) {
     uint8_t keys[SDL_NUM_SCANCODES];
+    char label[32];
     const char *cfg = "host_keymap_test.ini";
     FILE *f;
     (void)argc;
@@ -85,6 +86,26 @@ int main(int argc, char **argv) {
                                   (int)SDLK_UNKNOWN,
                                   (int)SDL_SCANCODE_F10, 0),
           "display perf rebind accepts the F10 scancode");
+
+    f = fopen(cfg, "wb");
+    check(f != NULL, "create temporary explicit-unbind config.ini");
+    if (!f) return 1;
+    fputs("[KeyMap]\n"
+          "SaveStateMenu = None\n",
+          f);
+    fclose(f);
+
+    host_keymap_load(cfg);
+    check(!host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU,
+                                   (int)SDLK_UNKNOWN,
+                                   (int)SDL_SCANCODE_F7, 0),
+          "explicit save-state-menu unbind disables F7");
+    check(host_keymap_label(HOST_KEYMAP_SAVE_STATE_MENU, label,
+                            sizeof(label))[0] == 0,
+          "explicit save-state-menu unbind has no fallback label");
+    check(host_keymap_match(HOST_KEYMAP_FULLSCREEN, (int)SDLK_RETURN,
+                            mod_alt()),
+          "missing fullscreen line still keeps default after explicit unbind");
 
     remove(cfg);
     if (failures) {
