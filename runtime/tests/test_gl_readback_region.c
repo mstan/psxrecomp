@@ -7,8 +7,9 @@ void gpu_vram_dirty_mark_row_impl(uint32_t y){}
 void gpu_vram_dirty_mark_rect(int x,int y,int w,int h){}
 void gpu_vram_dirty_mark_all(void){}
 int psx_netplay_active(void){return 0;}
-int gpu_display_is_depth24(void){return 0;}
-void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));}
+static int test_depth24;
+int gpu_display_is_depth24(void){return test_depth24;}
+void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->display_x=32;out->display_y=32;out->width=320;out->height=16;}
 int psx_ws_prim_in_backdrop(void){return 0;}
 int g_ws_tex_edge_pct=0;
 int psx_ws_prim_is_tagged(void){return 0;}
@@ -60,7 +61,17 @@ int main(int argc,char **argv){
  glb_set_draw_area(0,0,1023,511);glb_draw_flat_rect(320,320,8,8,0x4444);
  for(int i=0;i<1024*512;i++)image[i]=(uint16_t)((i*23)&0x7fff);
  gl_renderer_restage_vram_after_savestate();verify("state restage with pending draw");
- check(image[511*1024+1020]==oracle[511*1024+1020],"edge preserved");
+ /* Existing depth24 policy clears the skipped movie band on return to15-bit.
+  * That GPU write must become visible without waiting for another primitive. */
+ static uint16_t movie[480*16], texture[4]={0x3210,0x3210,0x3210,0x3210};
+ for(int i=0;i<480*16;i++)movie[i]=0x1234;
+ test_depth24=1;depth24_upload_policy();
+ glb_vram_transfer_in(32,32,480,16,movie);
+ glb_vram_transfer_in(33,33,2,2,texture);
+ test_depth24=0;depth24_upload_policy();
+ check(glb_vram_read(40,40)==0,"depth24 cleared band immediate CPU read");
+ check(glb_vram_read(33,33)==0x3210,"newer overlapping texture survives clear");
+ verify("depth24 leave coherence without subsequent primitive");
  printf("checks=%d failures=%d\n",checks,failures);
  gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();return failures?1:0;
 }

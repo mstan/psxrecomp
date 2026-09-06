@@ -2544,7 +2544,10 @@ static void depth24_clear_skipped_fb(void) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
-    if (!s_cpu_auth_dual) rect_add(&s_cpu_dirty, x0, y0, x1, y1);
+    if (!s_cpu_auth_dual) {
+        rect_add(&s_cpu_dirty, x0, y0, x1, y1);
+        s_gpu_dirty = 1; /* The clear must reach an immediate CPU read too. */
+    }
     present_dirty_rect(x0, y0, x1, y1, 1);
     rect_clear(&s_d24_skip_fb);
 }

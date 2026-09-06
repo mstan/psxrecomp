@@ -23,7 +23,10 @@ CPU-authority mode retains its existing no-readback behavior.
 context. It checks the complete native CPU image against full hardware readback
 after ordered synthetic workloads. It covers single pixels, odd-width row
 stride, disjoint uploads, texture dependencies, wrapping fills, overlapping
-copies, masks, blending, clipping, precision margins and state restore.
+copies, masks, blending, clipping, precision margins and state restore. A depth24 exit followed by an immediate
+CPU read verifies that cleared movie pixels are visible and newer overlapping
+texture uploads survive. It tests this existing clear policy, not full movie
+playback or depth24 raster accuracy.
 The hardware rasterizer is shared by the comparison; this proves coherence,
 not independent raster accuracy. No retail assets are required.
 
@@ -32,8 +35,9 @@ Run `python runtime/tests/run_gl_readback_region.py --compiler-bin <mingw-bin>
 `sdl3-src/include` and `sdl3-build/libSDL3.a`. The Windows runner uses hidden
 windows. It tests
 native and4x scales. `--gl-source <old-gpu_gl_renderer.c> --expect-unbounded`
-checks the previous implementation: pixel comparisons pass, and only the small
-transfer assertion fails. Each command/result is saved in `receipt.json` under a fresh run directory inside the output root. Configure `runtime/` with `BUILD_TESTING=ON` and `PSX_GL_READBACK_SDL_ROOT=<deps>` on MinGW to register `gl_readback_region_test`; run it with `ctest --test-dir <build> -R gl_readback_region_test --output-on-failure`. Missing dependencies print a configure-time message and do not count as a hardware pass.
+accepts an unbounded implementation only when pixel comparisons pass and
+exactly the small-transfer assertion fails. An older implementation with a
+coherence defect (including the depth24 clear) is correctly rejected too. Each command/result is saved in `receipt.json` under a fresh run directory inside the output root. Configure `runtime/` with `BUILD_TESTING=ON` and `PSX_GL_READBACK_SDL_ROOT=<deps>` on MinGW to register `gl_readback_region_test`; run it with `ctest --test-dir <build> -R gl_readback_region_test --output-on-failure`. Missing dependencies print a configure-time message and do not count as a hardware pass.
 
 ## Prior art and scope
 
