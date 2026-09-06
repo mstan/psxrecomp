@@ -34,7 +34,6 @@ void sw_set_precise_triangle(int enabled,
  * homogeneous interpolation weights associated with each screen vertex. */
 void sw_set_perspective_triangle(int enabled,
                                  float q0, float q1, float q2);
-uint32_t sw_perspective_triangle_count(void);
 
 /* Texture filtering. 0 = nearest (native PSX look, default), 1 = bilinear
  * (smooths textures/2D backgrounds; blends in RGB after the CLUT lookup,

@@ -3362,7 +3362,7 @@ int gpu_texture_correction_enabled(void) {
 }
 
 uint32_t gpu_texture_correction_hits(void) {
-    return sw_perspective_triangle_count();
+    return gr_perspective_triangle_count();
 }
 
 /* Per-vertex precise positions (PGXP, docs/ENHANCEMENTS.md G1). Each of the three

@@ -116,7 +116,12 @@ void gr_set_precise_triangle(int enabled, int32_t x0, int32_t y0, int32_t x1, in
     if (g_b->set_precise_triangle)
         g_b->set_precise_triangle(enabled, x0, y0, x1, y1, x2, y2);
 }
+static uint32_t g_perspective_triangles;
+uint32_t gr_perspective_triangle_count(void) { return g_perspective_triangles; }
 void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+    /* Count the original triangle, not per-row backend metadata re-arms. */
+    if (g_b->set_perspective_triangle && enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f)
+        ++g_perspective_triangles;
     g_pq_enabled=enabled; g_pq[0]=q0; g_pq[1]=q1; g_pq[2]=q2;
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(enabled, q0, q1, q2);

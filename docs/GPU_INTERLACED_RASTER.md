@@ -10,7 +10,9 @@ renderer facade applies the field mask with native-row clip rectangles and
 restores the original clip. This also preserves the corresponding rows in
 scaled surfaces. Each clipped triangle retains its precision and perspective
 metadata, which hardware backends otherwise consume on the first submission.
-No title address or title detection selects this behavior.
+The facade counts each original perspective triangle once; repeated backend
+metadata setup does not add diagnostic hits. No title address or title detection
+selects this behavior.
 
 Pro Pinball: Timeshock! USA SLUS-00639 repeatedly draws and reads a test pixel
 at (1020,511) during startup. Frozen source 63446a28 always returned the drawn

@@ -2763,9 +2763,7 @@ static void vkb_set_precise_triangle(int enabled,
 static void vkb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
-    /* The corrected-triangle tally lives in the software rasterizer and backs
-     * gpu_texture_correction_hits() — the "is this doing anything on this
-     * title" counter. Forward so it reads the same on every backend. */
+    /* Keep fallback software metadata in sync; the facade counts triangles. */
     sw_set_perspective_triangle(enabled, q0, q1, q2);
 }
 /* The override describes exactly one triangle; drop it once submitted so a

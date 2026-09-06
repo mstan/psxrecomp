@@ -99,6 +99,21 @@ int main(void) {
         skipped_row=-1; gr_draw_flat_rect(2,2,1,2,0x4321);
         CHECK(vram[2*1024+2]==0x4321 && vram[3*1024+2]==0x4321);
     }
+    /* One logical perspective triangle stays one hit despite row re-arms. */
+    for (int skip = -1; skip <= 1; ++skip) {
+        for (int clipped = 0; clipped <= 1; ++clipped) {
+            reset_canvas(); skipped_row = skip;
+            if (clipped) gr_set_draw_area(20,20,21,21);
+            uint32_t before = gr_perspective_triangle_count();
+            gr_set_perspective_triangle(1,1.0f,0.5f,0.25f);
+            gr_draw_textured_triangle(2,2,0,0,10,2,8,0,2,10,0,8,0,0,0x104);
+            CHECK(gr_perspective_triangle_count() == before + 1);
+            gr_set_perspective_triangle(0,1.0f,1.0f,1.0f);
+            gr_set_perspective_triangle(1,0.0f,1.0f,1.0f);
+            gr_draw_textured_triangle(2,2,0,0,10,2,8,0,2,10,0,8,0,0,0x104);
+            CHECK(gr_perspective_triangle_count() == before + 1);
+        }
+    }
     /* A single enhanced triangle keeps its metadata through all row clips. */
     mock_enabled=1;gr_set_backend(GR_BACKEND_OPENGL);skipped_row=0;
     gr_set_draw_area(0,0,31,31);
