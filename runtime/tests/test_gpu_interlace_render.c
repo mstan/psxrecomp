@@ -131,10 +131,13 @@ int main(void) {
             gr_set_perspective_triangle(1,1.0f,0.5f,0.25f);
             gr_draw_textured_triangle(2,2,0,0,10,2,8,0,2,10,0,8,0,0,0x104);
             CHECK(gr_perspective_triangle_count() == before + 1);
+            gr_set_perspective_triangle(1,0.5f,0.25f,0.125f);
+            gr_draw_textured_triangle(2,2,0,0,10,2,8,0,2,10,0,8,0,0,0x104);
+            CHECK(gr_perspective_triangle_count() == before + 2);
             gr_set_perspective_triangle(0,1.0f,1.0f,1.0f);
             gr_set_perspective_triangle(1,0.0f,1.0f,1.0f);
             gr_draw_textured_triangle(2,2,0,0,10,2,8,0,2,10,0,8,0,0,0x104);
-            CHECK(gr_perspective_triangle_count() == before + 1);
+            CHECK(gr_perspective_triangle_count() == before + 2);
         }
     }
     /* A single enhanced triangle keeps its metadata through all row clips. */

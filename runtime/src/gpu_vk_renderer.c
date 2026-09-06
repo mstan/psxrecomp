@@ -2790,8 +2790,8 @@ static void vkb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
 /* Full-screen-overlay wide pass (pause gray-filter / load fade): draw a flat
  * rect covering the FULL wide width [0, wide_w) x [y, y+h) directly into the
  * active wide surface (positions already wide-space, u_xoff = 0). Mirrors GL's
- * wide_flat_rect_direct: full-surface scissor (the overlay must dim the
- * revealed margins too). The 6 verts are consumed privately (s_vbase bumped)
+ * wide_flat_rect_direct: full-width scissor (the overlay must dim the
+ * revealed margins too), while preserving the draw-area Y band. The 6 verts are consumed privately (s_vbase bumped)
  * so they never join a canonical batch. */
 static void wide_overlay_rect(int y, int h, uint16_t c, int semi) {
     if (s_wide_cur < 0 || !s_ready) return;
@@ -2803,12 +2803,9 @@ static void wide_overlay_rect(int y, int h, uint16_t c, int semi) {
     push_vert(x0, fy0, col); push_vert(x1, fy1, col); push_vert(x0, fy1, col);
     s_vbase += s_vcount; s_vcount = 0;    /* consume privately */
     int blend = (semi < 0) ? 0 : (semi + 1);
-    int S = s_scale;
     VkCommandBuffer cb = begin_oneshot();
+    /* Keep the full width and current Y clip, including interlaced row clips. */
     wide_pass_begin(cb);
-    /* Overlay covers the whole surface: override the band scissor. */
-    VkRect2D sc = { { 0, 0 }, { (uint32_t)(s_wide_w * S), (uint32_t)(VRAM_H * S) } };
-    p_vkCmdSetScissor(cb, 0, 1, &sc);
     bind_masked(cb, 0, 0, blend, s_mask_check, s_mask_set);
     GeoPush gp = { px_shift(), 0.0f, (float)s_wide_w / 2.0f };
     p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
