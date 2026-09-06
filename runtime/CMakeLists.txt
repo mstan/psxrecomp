@@ -453,6 +453,29 @@ if(BUILD_TESTING)
         target_link_libraries(netplay_snap_ring_test PRIVATE retcomm_rbengine)
         add_test(NAME netplay_snap_ring_test COMMAND netplay_snap_ring_test)
 
+        # Lobby chat ring. #includes psx_lobby_client.c, so it needs the same
+        # guard define and include roots the runtime build uses; the two WS
+        # calls that TU makes are stubbed in the test and abort if reached.
+        if(EXISTS "${PSXRECOMP_ROOT}/runtime/src/lobby_ws/rnet_ws.c")
+            add_executable(lobby_chat_ring_test tests/test_lobby_chat_ring.c)
+            target_include_directories(lobby_chat_ring_test PRIVATE
+                include
+                src
+                "${PSXRECOMP_ROOT}/runtime/src/lobby_ws"
+                ${_RNET_ROOT}/include)
+            target_compile_definitions(lobby_chat_ring_test PRIVATE
+                PSX_HAS_LOBBY_CLIENT=1
+                PSX_HAS_RECOMP_NET=1)
+            # Links the REAL recomp_net and the real WS helpers rather than a
+            # wall of stubs. Nothing in this test reaches a socket, so no fake
+            # is needed and none can drift from what the runtime links.
+            target_sources(lobby_chat_ring_test PRIVATE
+                "${PSXRECOMP_ROOT}/runtime/src/lobby_ws/rnet_ws.c"
+                "${PSXRECOMP_ROOT}/runtime/src/lobby_ws/rnet_sha1.c")
+            target_link_libraries(lobby_chat_ring_test PRIVATE recomp_net)
+            add_test(NAME lobby_chat_ring_test COMMAND lobby_chat_ring_test)
+        endif()
+
         add_executable(rb_post_tip_filter_test tests/test_rb_post_tip_filter.c)
         target_include_directories(rb_post_tip_filter_test PRIVATE include)
         target_link_libraries(rb_post_tip_filter_test PRIVATE retcomm_rbengine)
