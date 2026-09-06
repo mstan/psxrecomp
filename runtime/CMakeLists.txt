@@ -23,6 +23,33 @@ psxrecomp_add_runtime_target(psx-runtime
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    # Optional real-hardware regression. Configure its dependencies explicitly;
+    # absence must remain visible, never counted as a passing GPU test.
+    set(PSX_GL_READBACK_SDL_ROOT "" CACHE PATH "SDL3 static build root for GL readback test")
+    get_filename_component(_gl_test_default_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+    set(PSX_GL_READBACK_COMPILER_BIN "${_gl_test_default_bin}" CACHE PATH "GCC/MinGW bin for GL fixture")
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME gl_readback_runner_test COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_runner.py")
+    endif()
+    if(MINGW AND PSX_GL_READBACK_SDL_ROOT
+            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/gcc.exe"
+            AND EXISTS "${PSX_GL_READBACK_COMPILER_BIN}/g++.exe"
+            AND IS_DIRECTORY "${PSX_GL_READBACK_SDL_ROOT}/sdl3-src/include"
+            AND EXISTS "${PSX_GL_READBACK_SDL_ROOT}/sdl3-build/libSDL3.a")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME gl_readback_region_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_readback_region.py"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_region.c"
+                --compiler-bin "${PSX_GL_READBACK_COMPILER_BIN}"
+                --sdl-root "${PSX_GL_READBACK_SDL_ROOT}"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-readback-results")
+        set_tests_properties(gl_readback_region_test PROPERTIES LABELS "gpu;opengl;hardware" TIMEOUT 180)
+    else()
+        message(STATUS "gl_readback_region_test: not registered (requires MinGW, SDL3 headers/static library in PSX_GL_READBACK_SDL_ROOT and gcc.exe/g++.exe in PSX_GL_READBACK_COMPILER_BIN)")
+    endif()
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)
     target_include_directories(launcher_device_roundtrip_test PRIVATE include)

@@ -119,6 +119,7 @@
 #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
 #define PSXGL_CONSTANT_ALPHA        0x8003
 #define PSXGL_UNPACK_ROW_LENGTH     0x0CF2
+#define PSXGL_PACK_ROW_LENGTH       0x0D02
 #define PSXGL_SRC1_ALPHA            0x8589
 
 #ifndef APIENTRY
@@ -442,6 +443,7 @@ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
+static DirtyRect s_cpu_dirty; /* conservative GPU-written area not yet read into CPU VRAM */
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
 
 /* CPU writes not yet in the FBO — an EXACT rect list, NOT a single union.
@@ -1528,6 +1530,7 @@ static void ensure_cpu(void) {
      * Never glReadPixels — that forked peer snaps/resim. */
     if (s_cpu_auth_dual || psx_netplay_active()) {
         s_gpu_dirty = 0;
+        rect_clear(&s_cpu_dirty);
         return;
     }
     flush_flat_batch();
@@ -1535,10 +1538,22 @@ static void ensure_cpu(void) {
     flush_cpu_upload();
     pack_flush();
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
-    glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
+    /* CPU uploads have already landed; raw packing preserves command order.
+     * A union is safe for readback (GPU -> CPU), unlike CPU upload unions.
+     * Do not reuse s_pack_dirty: texture sampling can consume it before CPU reads. */
+    int rx = s_cpu_dirty.set ? s_cpu_dirty.x0 : 0;
+    int ry = s_cpu_dirty.set ? s_cpu_dirty.y0 : 0;
+    int rw = s_cpu_dirty.set ? s_cpu_dirty.x1 - rx + 1 : VRAM_W;
+    int rh = s_cpu_dirty.set ? s_cpu_dirty.y1 - ry + 1 : VRAM_H;
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, VRAM_W);
+    glReadPixels(rx, ry, rw, rh, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
+                 s_vram + (size_t)ry * VRAM_W + rx);
+    glPixelStorei(PSXGL_PACK_ROW_LENGTH, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     s_gpu_dirty = 0;
-    coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+    rect_clear(&s_cpu_dirty);
+    coh_record(GL_COH_ENSURE, rx, ry, rx + rw - 1, ry + rh - 1);
+
 }
 
 /* ---- GPU primitives ------------------------------------------------------ */
@@ -1569,6 +1584,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
     if (x1 > s_area_x2) x1 = s_area_x2;
     if (y1 > s_area_y2) y1 = s_area_y2;
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
+    if (!s_cpu_auth_dual) rect_add(&s_cpu_dirty, x0, y0, x1, y1);
     /* Dual-raster keeps CPU current via SW writes — do not mark GPU-ahead. */
     if (!s_cpu_auth_dual)
         s_gpu_dirty = 1;
@@ -2205,6 +2221,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b) 
     glStencilMask(0xFF);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
+    if (!s_cpu_auth_dual) rect_add(&s_cpu_dirty, x, y, x + w - 1, y + h - 1);
 }
 
 static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
@@ -2287,6 +2304,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     hr_end();
 
     rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
+    if (!s_cpu_auth_dual) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
     if (!s_cpu_auth_dual)
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
@@ -2526,6 +2544,10 @@ static void depth24_clear_skipped_fb(void) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
+    if (!s_cpu_auth_dual) {
+        rect_add(&s_cpu_dirty, x0, y0, x1, y1);
+        s_gpu_dirty = 1; /* The clear must reach an immediate CPU read too. */
+    }
     present_dirty_rect(x0, y0, x1, y1, 1);
     rect_clear(&s_d24_skip_fb);
 }
@@ -2896,6 +2918,7 @@ static int init_gpu_raster(void) {
     s_up_nrects = 0;
     up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
     s_gpu_dirty = 0;
+    rect_clear(&s_cpu_dirty);
     s_stencil_valid = 1;
     for (int i = 0; i < PRES_ROWS; i++) s_present_dirty[i] = ~0ull;
     s_last_present_path = -1;
@@ -3181,14 +3204,18 @@ void gl_renderer_restage_vram_after_savestate(void) {
         depth24_mark_scanout_band();
     }
     /* Dual-raster: CPU is authority after snap; FBO is cosmetics only. */
-    if (s_cpu_auth_dual)
+    if (s_cpu_auth_dual) {
         s_gpu_dirty = 0;
+        rect_clear(&s_cpu_dirty);
+    }
 }
 
 void gl_renderer_set_cpu_auth_dual(int on) {
     s_cpu_auth_dual = on ? 1 : 0;
-    if (s_cpu_auth_dual)
+    if (s_cpu_auth_dual) {
         s_gpu_dirty = 0;
+        rect_clear(&s_cpu_dirty);
+    }
 }
 
 int gl_renderer_cpu_auth_dual(void) {
