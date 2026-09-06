@@ -156,32 +156,29 @@ static void print_extension_matrix()
     vkDestroyInstance(instance, nullptr);
 }
 
-/* Experimental raw-byte round trip. The packed format does not encode PSX
- * channel order or mask-bit semantics; this is not a PSX rendering test. */
-static bool run_psx_vram_resource_smoke(gpu::Device* device)
+/* Raw-byte round trip for the actual renderer's two resource roles. This
+ * validates transport, not PSX channel interpretation or rendering. */
+static bool run_texture_roundtrip(gpu::Device* device, const char* name,
+                                 gpu::Format format, uint32_t bytes_per_pixel,
+                                 gpu::TextureUsage usage)
 {
     constexpr uint32_t vram_w = 1024;
     constexpr uint32_t vram_h = 512;
-    constexpr uint64_t vram_bytes = uint64_t{vram_w} * vram_h * sizeof(uint16_t);
-
-    const gpu::TextureUsage vram_usage =
-        gpu::TextureUsage::transfer_source |
-        gpu::TextureUsage::transfer_destination |
-        gpu::TextureUsage::sampled |
-        gpu::TextureUsage::color_attachment;
+    const uint64_t vram_bytes = uint64_t{vram_w} * vram_h * bytes_per_pixel;
+    std::printf("texture_smoke.format=%s\n", name);
     const gpu::TextureDesc vram_desc{
         .type = gpu::TextureType::two_d,
         .extent = {.x = vram_w, .y = vram_h, .z = 1},
         .mip_levels = 1,
         .layer_count = 1,
-        .format = gpu::Format::r5g5b5a1_unorm,
+        .format = format,
         .mutable_format = false,
-        .usage = vram_usage,
+        .usage = usage,
     };
 
     if (!gpu::supports_texture_format(device, vram_desc.format, vram_desc.usage))
     {
-        std::printf("psx_vram_smoke=fail unsupported_r5g5b5a1_transfer_color\n");
+        std::printf("texture_smoke=fail unsupported_format_usage\n");
         return false;
     }
 
@@ -229,18 +226,9 @@ static bool run_psx_vram_resource_smoke(gpu::Device* device)
         return false;
     }
 
-    uint16_t* upload_words = reinterpret_cast<uint16_t*>(upload.range.cpu);
-    for (uint32_t y = 0; y < vram_h; ++y)
-    {
-        for (uint32_t x = 0; x < vram_w; ++x)
-        {
-            const uint16_t r = static_cast<uint16_t>(x & 31u);
-            const uint16_t g = static_cast<uint16_t>(y & 31u);
-            const uint16_t b = static_cast<uint16_t>((x ^ y) & 31u);
-            upload_words[uint64_t{y} * vram_w + x] =
-                static_cast<uint16_t>(r | (g << 5u) | (b << 10u) | 0x8000u);
-        }
-    }
+    uint8_t* upload_bytes = reinterpret_cast<uint8_t*>(upload.range.cpu);
+    for (uint64_t i = 0; i < vram_bytes; ++i)
+        upload_bytes[i] = static_cast<uint8_t>(i ^ (i >> 8u) ^ (i >> 16u));
     std::memset(readback.range.cpu, 0, static_cast<size_t>(vram_bytes));
 
     gpu::TimelineSemaphore* timeline = gpu::create_timeline_semaphore(device);
@@ -261,7 +249,7 @@ static bool run_psx_vram_resource_smoke(gpu::Device* device)
         .slice_count = 1,
         .offset = {},
         .extent = {.x = vram_w, .y = vram_h, .z = 1},
-        .row_pitch_bytes = vram_w * sizeof(uint16_t),
+        .row_pitch_bytes = vram_w * bytes_per_pixel,
         .slice_pitch_bytes = vram_bytes,
     };
     gpu::copy_memory_to_texture(commands, gpu::gpu_range(upload), vram, full_vram_copy);
@@ -279,7 +267,7 @@ static bool run_psx_vram_resource_smoke(gpu::Device* device)
 
     const bool matches = std::memcmp(upload.range.cpu, readback.range.cpu,
                                      static_cast<size_t>(vram_bytes)) == 0;
-    std::printf("psx_vram_smoke=%s\n", matches ? "pass" : "fail readback_mismatch");
+    std::printf("texture_smoke=%s\n", matches ? "pass" : "fail readback_mismatch");
 
     gpu::destroy_timeline_semaphore(timeline);
     gpu::destroy_texture(vram);
@@ -302,7 +290,16 @@ int main()
         return init.error == gpu::Error::unsupported ? 77 : 1;
     }
 
-    const bool smoke_ok = run_psx_vram_resource_smoke(init.device);
+    const gpu::TextureUsage common_usage = gpu::TextureUsage::transfer_source |
+        gpu::TextureUsage::transfer_destination | gpu::TextureUsage::sampled;
+    /* gpu_vk_renderer.c uses an RGBA8 color target and an R16_UINT sampled /
+     * storage raw mirror. A packed 5551 color target is not its contract. */
+    const bool color_ok = run_texture_roundtrip(init.device, "rgba8_color", gpu::Format::rgba8_unorm, 4,
+                                               common_usage | gpu::TextureUsage::color_attachment);
+    const bool raw_ok = run_texture_roundtrip(init.device, "r16_raw", gpu::Format::r16_uint, 2,
+                                             common_usage | gpu::TextureUsage::storage);
+    const bool smoke_ok = color_ok && raw_ok;
+    std::printf("psx_vram_smoke=%s\n", smoke_ok ? "pass" : "fail");
     const gpu::DeviceCaps& caps = gpu::get_device_caps(init.device);
     std::printf("device=%s\n", caps.device_name ? caps.device_name : "(unnamed)");
     std::printf("max_push_data_size=%llu\n", static_cast<unsigned long long>(caps.max_push_data_size));

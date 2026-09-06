@@ -1,9 +1,11 @@
 # NoGraphicsAPI / Vulkan investigation — 2026-09-06
 
-**Status: partial implementation; full NoGraphicsAPI renderer blocked and not
-delivered.** NoGraphicsAPI builds, but cannot create a device on either installed
-GPU. Existing Vulkan correctness defects were fixed and reproducible renderer
-measurements were collected. No NoGraphicsAPI performance gain was measured.
+**Status: NoGraphicsAPI device creation and resource transfers now run; the full
+PSX renderer port is not delivered.** The user-approved NVIDIA 616.86 hotfix
+removed the extension blocker. RGBA8 color and R16_UINT raw VRAM resource
+round trips pass. The installer requests a reboot before further performance
+testing. Existing Vulkan fixes and prior-driver measurements remain saved;
+no NoGraphicsAPI performance gain has been measured.
 
 Worktree: `F:/Projects/psxrecomp/_wt-nographics-vulkan`, branch
 `feat/nographics-vulkan`, created from freshly fetched `origin/master`
@@ -29,7 +31,7 @@ the required declarations. Upstream rejects the MinGW compiler used by the
 current psxrecomp runtime toolchain; a supported C++ build/ABI boundary would
 also need integration before adding it to that runtime.
 
-Actual local extension enumeration and upstream `gpu::create_device({})`:
+Initial extension enumeration, before the approved hotfix:
 
 | Requirement | RTX 3080 Ti (NVIDIA 610.74) | AMD Radeon integrated GPU |
 |---|---|---|
@@ -42,7 +44,7 @@ Actual local extension enumeration and upstream `gpu::create_device({})`:
 Loader API: 1.4.341. Result: `create_device.error=unsupported`, exit 77; CTest
 correctly reports **skipped**, not a successful device test. A separate direct
 Vulkan enumeration confirmed the same matrix. Installing newer headers does
-not add missing driver extensions. No system driver was changed.
+not add missing driver extensions. These observations preceded the hotfix.
 
 Follow-up eligibility check: the probe now prints the NVIDIA driver version
 directly from Vulkan (`610.74.0.0`) and checks coherent host-visible device-local
@@ -51,11 +53,18 @@ the AMD adapter also exposes qualifying types. This clears the memory-type
 existence check, but does not prove allocation budget, format compatibility or
 the remaining feature gates that upstream checks after extensions.
 
-The probe also compiles an experimental texture upload/readback round trip for
-a future compatible device. That path has **not executed here**. It transports
-raw packed bytes; it does not implement PSX texture interpretation or rendering.
+The resource test initially used a packed 5551 color target. After device
+creation became available, that format/usage was unsupported. The actual
+classic Vulkan renderer uses an RGBA8 color target and an R16_UINT raw mirror;
+the probe now requires both of those resource roles instead. Both complete
+upload/readback and byte comparison in the Release probe (exit 0). These checks
+do not implement PSX texture interpretation or rasterization.
+GPT-5.5 review confirmed the transfer scope: the probe does not exercise sampled
+reads, color rendering, storage-image shaders, odd/subrectangle copies, nonzero
+copy offsets or presentation. Those operations still need targeted validation
+as the renderer is ported.
 
-### Concrete driver candidate (not installed)
+### Approved hotfix installation
 
 NVIDIA's [616.64 release notes](https://us.download.nvidia.com/Windows/616.64/616.64-win11-win10-release-notes.pdf)
 list RTX 3080 Ti support. NoGraphicsAPI reports RTX 30 compatibility with that
@@ -67,8 +76,7 @@ general-release driver.
 The [616.86 hotfix](https://nvidia.custhelp.com/app/answers/detail/a_id/5906), based
 on 616.64, fixes virtual-display creation and RDP regressions after 616.56.
 This machine has Meta Virtual Monitor, making those fixes relevant. 616.86 is
-an optional beta hotfix with abbreviated QA, not a WHQL release. It is a
-candidate for testing, not a verified successful NoGraphicsAPI device.
+an optional beta hotfix with abbreviated QA, not a WHQL release.
 
 The official installer was downloaded from NVIDIA's linked URL and verified
 with Windows Authenticode: **Valid**, signer **NVIDIA Corporation**. It is saved
@@ -76,10 +84,32 @@ outside the source checkout at
 `F:/Projects/psxrecomp/_probe-nographics/drivers/616.86-desktop-notebook-win10-win11-64bit-international-dch.hf.exe`.
 Size: 984,119,224 bytes. Recorded SHA-256:
 `e14b1c806bd7d7657c612da6144a3412ed9f055a067548ea05ecd30a7d7ed7e4`.
-Installation awaits user approval because replacing the system display driver
-can interrupt displays and may require a reboot. The decisive next check is
-still the included probe reporting `create_device.error=none`, followed by a
-successful resource smoke and actual renderer validation.
+The user explicitly approved installation. The extracted, signed `setup.exe`
+ran with `-s -noreboot Display.Driver`. It completed at
+`2026-09-06T16:38:18Z` with code 1, which NVIDIA documents as
+[success, reboot required](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/windows.html).
+No machine reboot was initiated. Windows reports version `32.0.16.1686`, device
+status OK, and ConfigManager error code 0. Vulkan reports `616.86.0.0`, API
+1.4.351, all four required extensions, and `create_device.error=none`.
+Meta Virtual Monitor remains present with status OK. The former device gate
+is cleared; a reboot remains required by the installer.
+
+The old SDK 1.4.341.1 validation layer does not recognize the device-address
+command extension and its feature structure, and crashes during the transfer
+probe. It cannot validate this API. A separate local validation layer now builds
+from `vulkan-sdk-1.4.357.0`, commit
+`f4874eee15c78d7bdb2b7e60659d539f14741500`, using native VS2022/MSVC and its
+pinned dependencies. No system SDK settings were changed.
+
+With that layer selected explicitly and `VK_LAYER_VALIDATE_SYNC=1`, the Debug
+device/resource CTest passes both byte round trips with no core or synchronization
+diagnostics. The test fails on upstream's validation-message prefix even if the
+process returns zero. Release CTest also passes. Logs are saved outside Git at
+`_probe-nographics/hotfix-debug-validation.log` and
+`_probe-nographics/hotfix-upstream-validation.log`. The separate
+`_probe-nographics/hotfix-validation-loader.log` confirms the local layer DLL
+was inserted into the device call chain. Performance baselines must
+be rerun after reboot; the table below remains from driver 610.74.
 
 ### Shader toolchain prepared
 
@@ -94,9 +124,11 @@ below upstream's example requirements. Separate local tools now provide:
 
 The unmodified pinned upstream project builds all three examples (triangle,
 cube, deferred renderer), compiling and validating their vertex, fragment,
-compute and mesh shaders. CTest: five host-side tests passed, two GPU tests
-skipped because device creation is unsupported. Examples have not rendered on
-this host. Build location: `F:/Projects/psxrecomp/_build-nographics-examples-vs`.
+compute and mesh shaders. Before the hotfix, five host-side tests passed and
+two GPU tests skipped. After the hotfix, all seven Debug tests pass with the
+1.4.357 validation layer and synchronization validation enabled, without
+validation diagnostics. Examples have not rendered on this host.
+Build location: `F:/Projects/psxrecomp/_build-nographics-examples-vs`.
 Commands are in the [probe README](../../tools/nographics_probe/README.md).
 These checks prepare the actual NoGraphicsAPI path; they do not validate a PSX
 shader port. All backend baselines must be rerun after a driver change to avoid
@@ -141,7 +173,7 @@ software vs Vulkan at 18,849; OpenGL vs Vulkan at 6,141, at each tested scale.
 These differences are unresolved: no hardware-golden accuracy claim is made.
 The 1x VRAM readback also does not establish supersampled image fidelity.
 
-## Performance evidence
+## Performance evidence (driver 610.74, before hotfix)
 
 Host: Windows, AMD Ryzen 7 9800X3D, RTX 3080 Ti / NVIDIA 610.74. Release Clang
 22.1.8 build using the retcomm `cmake-clang-v1/latest` toolchain and bundled SDL3.
@@ -173,9 +205,9 @@ is in `_build-nographics-vtable/root-baseline-validation.log` and
 
 ## Work still required
 
-1. Run the real NoGraphicsAPI device/resource probe on a driver/device supplying
-   all required extensions and features. No specific replacement driver has
-   been independently validated here.
+1. Complete the installer-requested reboot and repeat device/resource tests.
+   Device creation, both raw resource roles and all seven upstream tests already
+   pass on the active 616.86 driver with the updated validation layer before reboot.
 2. Integrate a supported C++ toolchain boundary and port the PSX renderer and
    shaders to NoGraphicsAPI, including VRAM synchronization and Win32 presentation.
 3. Resolve pixel discrepancies with focused/reference captures; validate FMV,

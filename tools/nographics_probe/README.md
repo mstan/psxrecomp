@@ -2,17 +2,25 @@
 
 This opt-in probe builds upstream NoGraphicsAPI through its own CMake project,
 then runs the real headless `gpu::create_device({})` path. If device creation
-succeeds, it also attempts an experimental resource smoke test:
-a 1024x512 `r5g5b5a1_unorm` VRAM texture with transfer, sampled, and color
-attachment usage; CPU-visible upload heap; readback heap; command submission;
-timeline wait; and byte comparison after texture readback. It does not add
+succeeds, it checks the existing Vulkan renderer's two 1024x512 resource roles:
+an `rgba8_unorm` sampled color target and an `r16_uint` sampled/storage raw VRAM
+mirror, both with transfer source/destination usage. Each is uploaded from a
+CPU-visible heap, copied into a readback heap, synchronized with a timeline,
+and compared byte for byte. It does not add
 NoGraphicsAPI to the normal psxrecomp runtime build.
 
-The resource smoke is compiled but has **not run successfully on this host**:
-device creation returns `unsupported`. Its packed texture format is only a
-raw-byte transport test; it does not implement PSX channel order, mask bits,
-rasterization, or presentation. Passing this probe would be a prerequisite
-for renderer work, not a complete renderer.
+Both resource round trips pass on RTX 3080 Ti after the approved NVIDIA 616.86
+hotfix installation. The initial packed 5551 test was unsupported and did not
+match the renderer's resource contract. The revised test proves raw-byte
+transport; it does not implement PSX channel order, mask bits, rasterization,
+or presentation. It is a prerequisite for renderer work, not a full renderer.
+
+Debug builds need a validation layer new enough to recognize
+`VK_KHR_device_address_commands`. The installed SDK 1.4.341.1 layer reports
+unknown extension/structure diagnostics and crashes during transfers. The local
+1.4.357 layer described below passes the Debug probe with core and synchronization
+validation. CTest fails on upstream validation diagnostics, including when the
+executable returns zero.
 
 The probe intentionally keeps the runtime loader/library separate from the
 headers. Use `Vulkan-Headers` 1.4.357+ for compile-time declarations and the
@@ -95,10 +103,50 @@ $taskCmake = "$env:ProgramFiles/Microsoft Visual Studio/2022/Community/Common7/I
   "-DNOGRAPHICSAPI_SLANGC=$taskProbe/slang-2026.14.1/bin/slangc.exe" `
   "-DNOGRAPHICSAPI_SPIRV_VAL=$taskProbe/build-spirv-tools-v2026.3/tools/spirv-val.exe"
 & "$taskCmake/cmake.exe" --build $taskBuild --config Debug --parallel 8
-$env:VK_LAYER_PATH = 'C:/VulkanSDK/1.4.341.1/Bin'
+$env:VK_LAYER_PATH = "$taskProbe/build-vvl-root-vs/layers/Release"
+$env:VK_INSTANCE_LAYERS = 'VK_LAYER_KHRONOS_validation'
+$env:VK_LAYER_VALIDATE_SYNC = '1'
 & "$taskCmake/ctest.exe" --test-dir $taskBuild -C Debug --output-on-failure
 ```
 
-Observed: all three example binaries built, all generated shaders validated,
-five host-side tests passed, and both GPU tests skipped. A skipped GPU test is
-not evidence of successful NoGraphicsAPI execution or PSX rendering accuracy.
+Observed after the hotfix: all three example binaries built, all generated
+shaders validated, and all seven Debug tests passed without validation diagnostics.
+Before the hotfix, the two GPU tests skipped. These tests do not establish PSX
+rendering accuracy or example presentation.
+
+## Local validation layer
+
+The investigation built the unmodified `vulkan-sdk-1.4.357.0` tag of
+KhronosGroup/Vulkan-ValidationLayers at
+`f4874eee15c78d7bdb2b7e60659d539f14741500`. For a fresh build, use a native
+Windows PATH so dependency scripts cannot pick up MSYS compiler/CMake shims.
+Keep dependencies under the source's `external` directory for VS source groups.
+From a dedicated PowerShell session:
+
+```powershell
+$taskProbe = 'F:/Projects/psxrecomp/_probe-nographics'
+$taskSource = "$taskProbe/Vulkan-ValidationLayers-1.4.357.0"
+$taskCmake = "$env:ProgramFiles/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin"
+$taskPython = 'C:/Users/Matthew/AppData/Local/Programs/Python/Python312'
+$env:PATH = "$taskCmake;C:/Program Files/Git/cmd;$taskPython;C:/Windows/System32;C:/Windows"
+& 'C:/Program Files/Git/cmd/git.exe' clone --depth 1 --branch vulkan-sdk-1.4.357.0 `
+  https://github.com/KhronosGroup/Vulkan-ValidationLayers.git $taskSource
+& "$taskCmake/cmake.exe" -S $taskSource -B "$taskProbe/build-vvl-root-vs" `
+  -G 'Visual Studio 17 2022' -A x64 '-DCMAKE_BUILD_TYPE=Release' '-DBUILD_TESTS=OFF' `
+  '-DUPDATE_DEPS=ON' `
+  "-DPython3_EXECUTABLE=$taskPython/python.exe" `
+  "-DUPDATE_DEPS_DIR=$taskSource/external/root-native-deps" `
+  '-DUPDATE_DEPS_SKIP_EXISTING_INSTALL=ON'
+& "$taskCmake/cmake.exe" --build "$taskProbe/build-vvl-root-vs" `
+  --config Release --target vvl --parallel 8
+$env:VK_LAYER_PATH = "$taskProbe/build-vvl-root-vs/layers/Release"
+$env:VK_INSTANCE_LAYERS = 'VK_LAYER_KHRONOS_validation'
+$env:VK_LAYER_VALIDATE_SYNC = '1'
+& "$taskCmake/ctest.exe" --test-dir 'F:/Projects/psxrecomp/_build-nographics-create-device-vs' `
+  -C Debug -V
+```
+
+The layer manifest reports API 1.4.357. These process-local settings leave the
+installed SDK unchanged. The resource test and upstream GPU tests passed on
+driver 616.86 before the installer-requested reboot; repeat them after reboot
+before collecting new same-driver performance baselines.

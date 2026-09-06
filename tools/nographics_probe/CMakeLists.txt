@@ -78,5 +78,8 @@ target_link_libraries(nographics_create_device_probe PRIVATE "${Vulkan_LIBRARY}"
 
 if(BUILD_TESTING)
     add_test(NAME nographics_create_device_probe COMMAND nographics_create_device_probe)
-    set_tests_properties(nographics_create_device_probe PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(nographics_create_device_probe PROPERTIES
+        SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "NoGraphicsAPI validation:"
+    )
 endif()
