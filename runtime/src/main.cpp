@@ -1738,6 +1738,7 @@ static void update_adaptive_widescreen() {
     g_video_aspect_num = num;
     g_video_aspect_den = den;
     gl_renderer_set_display_aspect(num, den);
+    vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
         g_logical_w = 480 * num * g_video_scale / den;
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
@@ -13384,6 +13385,7 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
