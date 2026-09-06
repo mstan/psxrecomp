@@ -21,10 +21,17 @@ static void mock_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t c) 
     ++mock_submissions;if(!mock_pc || !mock_pq)++mock_bad;
     mock_pc=mock_pq=0; /* GPU backends consume these per submission. */
 }
+/* Wide overlay paths can deliberately ignore the draw-area scissor. */
+static unsigned overlay_rows[32];
+static void mock_flat_overlay(int x,int y,int w,int h,uint16_t c) {
+    (void)x;(void)w;(void)c;
+    for (int row=y; row<y+h && row<32; ++row)
+        if (row>=0) ++overlay_rows[row];
+}
 static const GpuRenderBackend mock_backend={
     .name="metadata fixture",.get_draw_area=sw_get_draw_area,.set_draw_area=sw_set_draw_area,
     .set_precise_triangle=mock_precise,.set_perspective_triangle=mock_perspective,
-    .draw_flat_triangle=mock_triangle
+    .draw_flat_triangle=mock_triangle,.draw_flat_rect=mock_flat_overlay
 };
 /* This fixture keeps optional widescreen presentation disabled. */
 int g_ws_bd_stretch_pct, g_ws_bd_stretch_on;
@@ -153,6 +160,17 @@ int main(void) {
     gr_set_perspective_triangle(1,1.0f,1.0f,1.0f);
     gr_draw_flat_triangle(0,8,1,8,0,9,0x7FFF);
     CHECK(mock_submissions==3 && mock_bad==0 && !mock_pc && !mock_pq);
+    for (int skip=-1; skip<=1; ++skip) {
+        memset(overlay_rows,0,sizeof overlay_rows); skipped_row=skip;
+        gr_set_draw_area(0,4,31,15);
+        gr_draw_flat_rect(0,0,32,20,0x7FFF);
+        for (int y=0; y<32; ++y) {
+            unsigned expected = skip<0 ? y<20 : (y>=4 && y<=15 && (y&1)!=skip);
+            CHECK(overlay_rows[y] == expected);
+        }
+        int x1,y1,x2,y2; gr_get_draw_area(&x1,&y1,&x2,&y2);
+        CHECK(x1==0 && y1==4 && x2==31 && y2==15);
+    }
     gr_set_backend(GR_BACKEND_SOFTWARE);
     if (failures) return 1;
     puts("PASS: field predicate, all raster primitives, clipping, transfers, mode switch, scales 1/4");

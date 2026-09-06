@@ -198,8 +198,20 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
     GR_TRIANGLE_ROWS(gr_min(y0, gr_min(y1, y2)), gr_max(y0, gr_max(y1, y2)), g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw));
 }
+/* Wide flat-overlay backends intentionally replace the clip with a full
+ * surface scissor. Submit row-height geometry too, so the field mask survives
+ * that path while ordinary full-screen overlays keep their existing policy. */
+static void gr_draw_flat_rect_row(int x, int w, uint16_t c) {
+    int x1, y1, x2, y2;
+    g_b->get_draw_area(&x1, &y1, &x2, &y2);
+    g_b->draw_flat_rect(x, y1, w, 1, c);
+}
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) {
-    GR_RASTER_ROWS(y, y + h - 1, g_b->draw_flat_rect(x, y, w, h, c));
+    if (gpu_raster_skipped_row() < 0) {
+        g_b->draw_flat_rect(x, y, w, h, c);
+        return;
+    }
+    GR_RASTER_ROWS(y, y + h - 1, gr_draw_flat_rect_row(x, w, c));
 }
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {

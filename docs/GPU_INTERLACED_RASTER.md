@@ -48,3 +48,9 @@ integer fallback bounds and precise vertex bounds, with one row for rounding.
 Tests compare native and enhanced masked pixels with unmasked images when
 precise positions cross the integer bounds, including negative coordinates.
 A tiny precise triangle must submit three row clips rather than 256.
+
+Flat overlay rectangles also submit one-row geometry while field masking is
+active. This keeps the mask when a wide backend intentionally replaces its
+scissor. Non-interlaced overlays retain the original geometry and policy.
+A backend fixture that ignores the scissor tests both field parities, original
+progressive behavior, and clip restoration. This is not Vulkan driver testing.
