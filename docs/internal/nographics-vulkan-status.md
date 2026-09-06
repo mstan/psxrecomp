@@ -44,9 +44,63 @@ correctly reports **skipped**, not a successful device test. A separate direct
 Vulkan enumeration confirmed the same matrix. Installing newer headers does
 not add missing driver extensions. No system driver was changed.
 
+Follow-up eligibility check: the probe now prints the NVIDIA driver version
+directly from Vulkan (`610.74.0.0`) and checks coherent host-visible device-local
+memory types. RTX 3080 Ti type 5 exposes a 12,670,992,384-byte device-local heap;
+the AMD adapter also exposes qualifying types. This clears the memory-type
+existence check, but does not prove allocation budget, format compatibility or
+the remaining feature gates that upstream checks after extensions.
+
 The probe also compiles an experimental texture upload/readback round trip for
 a future compatible device. That path has **not executed here**. It transports
 raw packed bytes; it does not implement PSX texture interpretation or rendering.
+
+### Concrete driver candidate (not installed)
+
+NVIDIA's [616.64 release notes](https://us.download.nvidia.com/Windows/616.64/616.64-win11-win10-release-notes.pdf)
+list RTX 3080 Ti support. NoGraphicsAPI reports RTX 30 compatibility with that
+release. NVIDIA's separate [Vulkan developer-driver history](https://developer.nvidia.com/vulkan-driver)
+also records introduction of device-address commands in beta 595.92. Branch
+version numbers alone do not establish extension support on the installed
+general-release driver.
+
+The [616.86 hotfix](https://nvidia.custhelp.com/app/answers/detail/a_id/5906), based
+on 616.64, fixes virtual-display creation and RDP regressions after 616.56.
+This machine has Meta Virtual Monitor, making those fixes relevant. 616.86 is
+an optional beta hotfix with abbreviated QA, not a WHQL release. It is a
+candidate for testing, not a verified successful NoGraphicsAPI device.
+
+The official installer was downloaded from NVIDIA's linked URL and verified
+with Windows Authenticode: **Valid**, signer **NVIDIA Corporation**. It is saved
+outside the source checkout at
+`F:/Projects/psxrecomp/_probe-nographics/drivers/616.86-desktop-notebook-win10-win11-64bit-international-dch.hf.exe`.
+Size: 984,119,224 bytes. Recorded SHA-256:
+`e14b1c806bd7d7657c612da6144a3412ed9f055a067548ea05ecd30a7d7ed7e4`.
+Installation awaits user approval because replacing the system display driver
+can interrupt displays and may require a reboot. The decisive next check is
+still the included probe reporting `create_device.error=none`, followed by a
+successful resource smoke and actual renderer validation.
+
+### Shader toolchain prepared
+
+The installed SDK's Slang `2026.1-52-gc8ddf20bb` and SPIRV-Tools 2026.1 are
+below upstream's example requirements. Separate local tools now provide:
+
+- Slang 2026.14.1, official Windows x64 release archive, SHA-256
+  `5ed0a59d650a0af0aca45d5db4e083b3d8fb5cea05748747dd95dfbe9c580658`,
+  verified against the GitHub release asset digest.
+- SPIRV-Tools v2026.3, commit `b707790a898e44038547df54580022fc1cf89c3d`,
+  built locally with SPIRV-Headers `29981f65241605e08b0ede4cfeb999fe3b723c6a`.
+
+The unmodified pinned upstream project builds all three examples (triangle,
+cube, deferred renderer), compiling and validating their vertex, fragment,
+compute and mesh shaders. CTest: five host-side tests passed, two GPU tests
+skipped because device creation is unsupported. Examples have not rendered on
+this host. Build location: `F:/Projects/psxrecomp/_build-nographics-examples-vs`.
+Commands are in the [probe README](../../tools/nographics_probe/README.md).
+These checks prepare the actual NoGraphicsAPI path; they do not validate a PSX
+shader port. All backend baselines must be rerun after a driver change to avoid
+attributing driver-only performance changes to the new renderer.
 
 ## Changes to the existing Vulkan backend
 

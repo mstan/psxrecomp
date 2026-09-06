@@ -95,6 +95,32 @@ static void print_extension_matrix()
                     VK_VERSION_MAJOR(props.apiVersion),
                     VK_VERSION_MINOR(props.apiVersion),
                     VK_VERSION_PATCH(props.apiVersion));
+        std::printf("device[%u].driver_version_raw=%u\n", device_index, props.driverVersion);
+        if (props.vendorID == 0x10de)
+            std::printf("device[%u].nvidia_driver=%u.%u.%u.%u\n", device_index,
+                        props.driverVersion >> 22, (props.driverVersion >> 14) & 0xff,
+                        (props.driverVersion >> 6) & 0xff, props.driverVersion & 0x3f);
+
+        /* Detect another prerequisite before proposing a driver change.
+         * Existence alone does not prove buffer/image memory compatibility;
+         * upstream create_device remains the authoritative eligibility test. */
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties(devices[device_index], &memory);
+        constexpr VkMemoryPropertyFlags required_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        bool mapped_device_memory = false;
+        for (uint32_t type = 0; type < memory.memoryTypeCount; ++type)
+        {
+            const uint32_t heap = memory.memoryTypes[type].heapIndex;
+            if ((memory.memoryTypes[type].propertyFlags & required_memory) == required_memory &&
+                heap < memory.memoryHeapCount && (memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            {
+                mapped_device_memory = true;
+                std::printf("device[%u].coherent_device_local_type[%u].heap_bytes=%llu\n", device_index, type,
+                            static_cast<unsigned long long>(memory.memoryHeaps[heap].size));
+            }
+        }
+        std::printf("device[%u].coherent_device_local_memory=%s\n", device_index, mapped_device_memory ? "yes" : "no");
 
         uint32_t extension_count = 0;
         result = vkEnumerateDeviceExtensionProperties(devices[device_index], nullptr, &extension_count, nullptr);
