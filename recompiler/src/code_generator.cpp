@@ -2837,11 +2837,12 @@ GeneratedFunction CodeGenerator::generate_function(
         }
 
         if (needs_fallthrough) {
-            // Emit fallthrough if the last block is reachable (has predecessors
-            // or is the entry block). Dead code after a return (e.g., padding
-            // nops) has no predecessors and should NOT get a fallthrough call.
+            // Incoming edges alone do not prove reachability: unreachable
+            // padding/loops can have predecessors too. This final safety net
+            // uses declared-entry reachability; block-level CPS/indirect entry
+            // handling above remains independent of this static metadata.
             const BasicBlock& last = cfg.blocks.at(cfg.block_order.back());
-            bool is_reachable = last.is_entry || !last.predecessors.empty();
+            bool is_reachable = last.is_entry || last.is_reachable;
             if (is_reachable) {
                 body_ss << emit_stale_static_guard_named(fallthrough_name, "    ");
                 body_ss << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
@@ -2860,7 +2861,7 @@ GeneratedFunction CodeGenerator::generate_function(
             ((last_block.exit_instr.type == ControlFlowType::Branch ||
               last_block.exit_instr.type == ControlFlowType::Jump) &&
              last_block.successors.empty());
-        bool is_reachable = last_block.is_entry || !last_block.predecessors.empty();
+        bool is_reachable = last_block.is_entry || last_block.is_reachable;
         if (runs_off_end && is_reachable) {
             body_ss << fmt::format(
                 "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",

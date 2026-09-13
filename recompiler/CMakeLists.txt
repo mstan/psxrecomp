@@ -346,6 +346,13 @@ target_include_directories(emitter_directive_line_test PRIVATE
 target_link_libraries(emitter_directive_line_test PRIVATE fmt rabbitizer)
 
 if(BUILD_TESTING)
+    add_executable(control_flow_metadata_test
+        tests/control_flow_metadata_test.cpp
+        src/control_flow.cpp)
+    target_include_directories(control_flow_metadata_test PRIVATE include)
+    target_link_libraries(control_flow_metadata_test PRIVATE fmt)
+    add_test(NAME control_flow_metadata_test COMMAND control_flow_metadata_test)
+
     add_test(NAME emitter_directive_line_test
              COMMAND emitter_directive_line_test)
     add_executable(debug_trace_ranges_test
