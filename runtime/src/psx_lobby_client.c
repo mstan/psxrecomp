@@ -1,5 +1,4 @@
 #include "psx_lobby_client.h"
-#include "recomp_net/chat_report.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -173,6 +172,7 @@ void psx_lobby_clear_launch_pending(void) {}
 #include "recomp_net/lan_beacon.h"
 #include "recomp_net/rtt_probe.h"
 #include "recomp_net/chat_filter.h"
+#include "recomp_net/chat_report.h"
 #include "recomp_net/auth.h"   /* optional Discord session for `hello` */
 #include "host_time.h"
 
