@@ -14,6 +14,7 @@ endif()
 # costly PGO rebuild/train cycle a silent no-op.
 set(PSX_PGO "" CACHE STRING "PGO mode: empty, generate, or use")
 set_property(CACHE PSX_PGO PROPERTY STRINGS "" generate use)
+include("${PSXRECOMP_ROOT}/cmake/psx_runtime_ipo.cmake")
 
 include("${PSXRECOMP_ROOT}/cmake/psx_dependency_archive.cmake")
 include("${PSXRECOMP_ROOT}/runtime/chd_dependency.cmake")
@@ -1389,6 +1390,7 @@ function(psxrecomp_add_runtime_target target)
     # CMAKE_C_STANDARD setting. cxx_std_17 likewise — game CMakeLists may omit
     # CMAKE_CXX_STANDARD; mod_packages.cpp must not compile as a pre-17 dialect.
     target_compile_features(${target} PRIVATE c_std_11 cxx_std_17)
+    psxrecomp_apply_runtime_ipo(${target})
 
     if(NOT PSX_PGO STREQUAL "")
         if(NOT PSX_PGO STREQUAL "generate" AND NOT PSX_PGO STREQUAL "use")
