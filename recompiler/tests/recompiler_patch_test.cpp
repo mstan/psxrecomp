@@ -1125,6 +1125,40 @@ void cfg_codegen_load_delay_test() {
           "CFG codegen preserves MIPS-I dependent load-delay value semantics");
 }
 
+void cfg_fallthrough_reachability_test() {
+    constexpr uint32_t base = 0x80010000u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = exe.header.initial_pc = base;
+    exe.header.file_size = 24;
+    append_word(exe.code_data, 0x03e00008u); // entry returns
+    append_word(exe.code_data, 0);
+    append_word(exe.code_data, 0x08004004u); // unreachable jump to final block
+    append_word(exe.code_data, 0);
+    append_word(exe.code_data, 0x24020001u);
+    append_word(exe.code_data, 0);
+    PSXRecomp::Function f{};
+    f.start_addr = base; f.end_addr = base + 24; f.size = 24;
+    auto check_tail = [&](bool reachable, const char* name) {
+        const auto cfg = PSXRecomp::ControlFlowAnalyzer(exe).analyze_function(f);
+        check(!cfg.blocks.at(base + 16).predecessors.empty(),
+              std::string(name) + " retains the real incoming edge");
+        PSXRecomp::CodeGenerator generator(exe);
+        const auto named = generator.generate_function(f, cfg, "func_80010018").full_code;
+        const auto edge = generator.generate_function(f, cfg).full_code;
+        check((named.find("/* fallthrough to next function */") != std::string::npos) == reachable,
+              std::string(name) + " named final safety net uses entry reachability");
+        check((edge.find("/* image-edge fallthrough: tail-transfer */") != std::string::npos) == reachable,
+              std::string(name) + " image-edge final safety net uses entry reachability");
+    };
+    check_tail(false, "unreachable predecessor");
+    write_word(exe, base, 0x08004002u); // entry now reaches +8 -> +16
+    check_tail(true, "reachable predecessor");
+    write_word(exe, base, 0x03e00008u);
+    f.alias_walk_lo = base; f.start_addr = base + 16;
+    f.alias_group_entries = {base + 16};
+    check_tail(true, "independent alias entry");
+}
+
 } // namespace
 
 int main() {
@@ -1140,6 +1174,7 @@ int main() {
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();
         cfg_codegen_load_delay_test();
+        cfg_fallthrough_reachability_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

@@ -41,12 +41,13 @@ struct BasicBlock {
     // Control flow information
     ControlFlowInstr exit_instr; // How this block exits (branch/jump/return)
     std::vector<uint32_t> successors; // Next basic blocks (targets + fall-through)
-    std::vector<uint32_t> predecessors; // Blocks that jump to this one
+    std::vector<uint32_t> predecessors; // Unique in-graph sources, including unreachable ones
 
     // Block properties
     bool is_entry;              // Function entry point
     bool is_exit;               // Contains return instruction
-    bool is_loop_header;        // Target of back edge (loop entry)
+    bool is_loop_header;        // Header dominates a reachable back-edge source
+    bool is_reachable = false;  // Reachable through known edges from a declared entry
 };
 
 // Control flow graph for a function
@@ -58,10 +59,18 @@ struct ControlFlowGraph {
     std::map<uint32_t, BasicBlock> blocks; // Map: block start address -> block
     std::vector<uint32_t> block_order;     // Blocks in address order
 
-    // Loop information
-    std::vector<std::pair<uint32_t, uint32_t>> loops; // (header, back_edge_source)
-    int loop_count;
+    // Natural back edges in the KNOWN static graph, not backward addresses.
+    // Missing indirect edges / runtime CPS entries mean this is NOT proof that
+    // a block is private or that IRQ, I-cache or device checks may be removed.
+    std::vector<std::pair<uint32_t, uint32_t>> loops; // (dominating header, source)
+    int loop_count = 0; // Number of back edges, not distinct/nested loop bodies
 };
+
+// Rebuild reverse edges, static reachability and dominance-proven back edges.
+// function_start, is_entry blocks and extra_entries are independent roots.
+// Does not change block ownership, instruction ranges or successor ordering.
+void rebuild_control_flow_metadata(
+    ControlFlowGraph& cfg, const std::vector<uint32_t>& extra_entries = {});
 
 class ControlFlowAnalyzer {
 public:
@@ -108,9 +117,6 @@ private:
     // Link basic blocks (build CFG edges)
     void link_basic_blocks(std::map<uint32_t, BasicBlock>& blocks);
 
-    // Detect loops (back edges in CFG)
-    std::vector<std::pair<uint32_t, uint32_t>> detect_loops(
-        const std::map<uint32_t, BasicBlock>& blocks);
 };
 
 } // namespace PSXRecomp

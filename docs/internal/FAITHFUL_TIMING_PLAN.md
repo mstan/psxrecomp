@@ -213,6 +213,21 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-12 (FMV brief follow-ups, correctness separated from experiments):**
+  `fix/cfg-metadata-integrity` repairs missing live reverse edges and replaces
+  address-order loop guesses with multi-entry reachability/dominance metadata.
+  Final fallthrough safety nets consume reachability, not predecessor presence;
+  no IRQ, slice, I-cache, guest cycle or device check is suppressed. A separate
+  offline netplay-header build regression is fixed in PR #355. All 67 enabled
+  recompiler tests pass, including 1000 independent-oracle random CFGs. Fresh
+  Tomba/MMX6/Ape builds preserve dispatch tables and code ranges; twelve cold/
+  warm 11,000-frame SCPH-1001 LLE runs exit 0 with inspected screenshots and
+  native overlay coverage. No performance or full-playthrough claim. Tomba2
+  and game repository pins are untouched. See [validation](CFG_METADATA_VALIDATION.md)
+  and PR #354. IPO/PGO experiment #356 and IRQ-batching RFC/counterexample #357
+  remain drafts pending evidence, not shipping timing optimizations.
+  Tracking: `beads-eio.3.148` through `beads-eio.3.151`.
+
 - **2026-09-12 (WO-3 observed overlay interior recovery):**
   Branch `fix/observed-overlay-interiors` preserves validated, executed dispatch
   demands even when shared CFG ownership rejects their hostless interior seeds.
