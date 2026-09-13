@@ -320,6 +320,11 @@ static void          gl_swap_with_osd(void);
 static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
 static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
 static GLint         s_present_uSharp = -1;
+static GLint         s_present_uGamma = -1;
+/* Host-side presentation state. The shader applies this only to the source
+ * image being presented; overlays and already-composed hold-last images set
+ * the uniform back to the identity explicitly. */
+static float         s_present_gamma = 1.0f;
 /* Scanline post-process state (host display setting; see gl_renderer_set_scanlines).
  * s_scanline_on/strength are pushed to whichever program draws game content;
  * OSD/bezel and the already-composed hold-last re-present force it off so the
@@ -331,7 +336,7 @@ static GLint         s_present_uScanLines = -1, s_present_uScanScale = -1;
 static GLuint        s_interp_prog = 0, s_interp_tex[3];
 static GLint         s_interp_uPrev = -1, s_interp_uCurr = -1;
 static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
-static GLint         s_interp_uBlendMode = -1;
+static GLint         s_interp_uBlendMode = -1, s_interp_uGamma = -1;
 static GLint         s_interp_uScanline = -1, s_interp_uScanStrength = -1;
 static GLint         s_interp_uScanLines = -1, s_interp_uScanScale = -1;
 static int           s_interp_enabled = 0, s_interp_valid = 0;
@@ -776,7 +781,8 @@ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h);
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
-                                int lx, int ly, int lw, int lh, int v_flip);
+                                int lx, int ly, int lw, int lh, int v_flip,
+                                int apply_gamma);
 
 static void coh_record(int kind, int x0, int y0, int x1, int y1) {
     GlCohEvent *e = &s_coh_ring[s_coh_seq % GL_COH_RING_CAP];
@@ -917,6 +923,7 @@ static const char *PRESENT_FS =
     "uniform vec2 u_tex_size;\n"
     "uniform vec2 u_sharp_scale;\n"
     "uniform int  u_sharp;\n"
+    "uniform float u_gamma;\n"
     PSX_SCANLINE_UNIFORMS
     /* Catmull-Rom bicubic via 9 bilinear taps. Sharper than plain bilinear at
      * the same smoothness, with mild overshoot that reads as edge definition.
@@ -967,12 +974,13 @@ static const char *PRESENT_FS =
     "    c = texture(u_tex, uv);\n"
     "  }\n"
     "  c.rgb = psx_scanline(c.rgb, v_uv.y);\n"
+    "  if (u_gamma > 0.0 && u_gamma != 1.0) c.rgb = pow(max(c.rgb, vec3(0.0)), vec3(1.0 / u_gamma));\n"
     "  frag = c;\n"
     "}\n";
 static const char *INTERP_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_prev; uniform sampler2D u_curr;\n"
-    "uniform float u_alpha; uniform int u_blend_mode; out vec4 frag;\n"
+    "uniform float u_alpha; uniform int u_blend_mode; uniform float u_gamma; out vec4 frag;\n"
     PSX_SCANLINE_UNIFORMS
     PSX_SCANLINE_FUNC
     "void main(){\n"
@@ -986,6 +994,7 @@ static const char *INTERP_FS =
     "  }\n"
     "  vec4 c=mix(prev,curr,alpha);\n"
     "  c.rgb=psx_scanline(c.rgb, v_uv.y);\n"
+    "  if (u_gamma > 0.0 && u_gamma != 1.0) c.rgb=pow(max(c.rgb, vec3(0.0)), vec3(1.0/u_gamma));\n"
     "  frag=c;\n"
     "}\n";
 
@@ -2664,6 +2673,15 @@ static void present_set_sharp(int mode, int tex_w, int tex_h,
                       (float)out_h / (float)tex_h);
 }
 
+/* The presentation shader is shared by game content, bezel art, host OSD, and
+ * hold-last redraws. Uniform state persists across draws, so every draw must
+ * explicitly choose whether it is raw game content or an already-composed
+ * image. */
+static void present_set_gamma(GLint uniform, int apply) {
+    if (uniform >= 0)
+        p_glUniform1f(uniform, apply ? s_present_gamma : 1.0f);
+}
+
 /* Push scanline uniforms into the currently-bound present or interpolation
  * program.
  *   pitch_lines = the height of the TEXTURE that v_uv is normalized against
@@ -2722,6 +2740,29 @@ void gl_renderer_set_scanlines(int on, float strength) {
 int gl_renderer_get_scanlines(float *strength) {
     if (strength) *strength = s_scanline_strength;
     return s_scanline_on;
+}
+
+void gl_renderer_set_post_gamma(float gamma) {
+    if (!isfinite(gamma))
+        gamma = 1.0f;
+    if (gamma < 0.5f) gamma = 0.5f;
+    if (gamma > 3.0f) gamma = 3.0f;
+    if (fabsf(gamma - 1.0f) < 0.005f) gamma = 1.0f;
+    if (gamma == s_present_gamma)
+        return;
+    s_present_gamma = gamma;
+
+    /* Gamma is presentation state, not guest VRAM state. Invalidate the
+     * presentation latches so a hot change is visible on an unchanged frame.
+     * Force at least 2 frames so all backbuffers in the swapchain update. */
+    for (int i = 0; i < PRES_ROWS; i++) s_present_dirty[i] = ~0ull;
+    s_last_present_path = -1;
+    s_force_present_remaining = 2;
+    hold_invalidate();
+}
+
+float gl_renderer_get_post_gamma(void) {
+    return s_present_gamma;
 }
 
 /* Letterbox: largest num:den rect centered in the drawable. */
@@ -2985,6 +3026,8 @@ int gl_renderer_init_context(SDL_Window *win) {
                 p_glGetUniformLocation(s_present_prog, "u_sharp_scale");
             s_present_uSharp =
                 p_glGetUniformLocation(s_present_prog, "u_sharp");
+            s_present_uGamma =
+                p_glGetUniformLocation(s_present_prog, "u_gamma");
             s_present_uScanline =
                 p_glGetUniformLocation(s_present_prog, "u_scanline");
             s_present_uScanStrength =
@@ -3007,6 +3050,8 @@ int gl_renderer_init_context(SDL_Window *win) {
             s_interp_uUvRect = p_glGetUniformLocation(s_interp_prog, "u_uv_rect");
             s_interp_uBlendMode =
                 p_glGetUniformLocation(s_interp_prog, "u_blend_mode");
+            s_interp_uGamma =
+                p_glGetUniformLocation(s_interp_prog, "u_gamma");
             glGenTextures(3, s_interp_tex);
             for (int i = 0; i < 3; i++) {
                 glBindTexture(GL_TEXTURE_2D, s_interp_tex[i]);
@@ -3127,6 +3172,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+    present_set_gamma(s_present_uGamma, 1);
     present_set_sharp(filt_mode, src_w, src_h, lw, lh);
     /* CPU present texture holds exactly the display rect, so v_uv spans it and
      * pitch == display height == src_h. */
@@ -3961,6 +4007,7 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
     p_glUniform1i(s_interp_uCurr, 1);
     p_glUniform1f(s_interp_uAlpha, alpha);
     p_glUniform1i(s_interp_uBlendMode, s_interp_blend_mode);
+    present_set_gamma(s_interp_uGamma, 1);
     p_glUniform4f(s_interp_uUvRect, 0.f, 0.f, 1.f, 1.f);
     /* Interp textures hold exactly the display rect (uv_rect is 0..1), so pitch
      * == display height == s_interp_h. */
@@ -4090,6 +4137,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     glViewport(vx, wh - vy - dh, dw, dh);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
+    present_set_gamma(s_present_uGamma, 0);
     present_set_sharp(0, 0, 0, 0, 0);   /* OSD is authored at output res */
     PRESENT_SCANLINE(0, 0, 0);          /* never scanline the host OSD */
     /* Host OSD bitmaps are top-down (row 0 = top), same as guest CPU
@@ -4182,7 +4230,8 @@ static void gl_swap_with_osd(void) {
 
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
-                                int lx, int ly, int lw, int lh, int v_flip) {
+                                int lx, int ly, int lw, int lh, int v_flip,
+                                int apply_gamma) {
     float u0, v0, u1, v1;
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glViewport(lx, ly, lw, lh);
@@ -4192,6 +4241,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
+    present_set_gamma(s_present_uGamma, apply_gamma);
     /* The rasterized path already renders at the internal scale, so it has no
      * low-res source to reconstruct — keep the plain sample. */
     present_set_sharp(0, 0, 0, 0, 0);
@@ -4264,6 +4314,7 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
     glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
+    present_set_gamma(s_present_uGamma, 0);
     p_glUniform4f(s_present_uUvRect, 0.0f, 0.0f, 1.0f, 1.0f);
     PRESENT_SCANLINE(0, 0, 0);          /* bezel art is not scanlined */
     p_glBindVertexArray(s_present_vao);
@@ -4309,7 +4360,7 @@ int gl_renderer_present_hold_last(void) {
         }
         /* v_flip=0: drawable capture is already screen-oriented. */
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
-                            0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0);
+                            0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0, 0);
     } else {
         if (s_hold_force_4_3)
             letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
@@ -4317,7 +4368,7 @@ int gl_renderer_present_hold_last(void) {
             letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
                             0, 0, s_hold_tw, s_hold_th, s_hold_linear,
-                            lx, ly, lw, lh, 1);
+                            lx, ly, lw, lh, 1, 1);
         /* Upgrade to drawable after letterboxing once. Live+interp leaves
          * HOLD_NATIVE (no Swap on main); drawable path is the soak-proven
          * full-window image (GL without interp). */
@@ -4382,7 +4433,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     present_bezel(ww, wh, lx, ly, lw, lh);
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
-                        disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1);
+                        disp_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, 1);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -4486,7 +4537,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         return 1;
     }
     present_target_quad(tex, g_wide_w, VRAM_H,
-                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1);
+                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     hold_capture_drawable();
     latency_ring_mark(LAT_SWAP_BEGIN);
