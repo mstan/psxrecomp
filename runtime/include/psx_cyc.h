@@ -34,6 +34,7 @@
 #endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
 #include "psx_cycles.h"  /* inline psx_advance_cycles */
+#include "psx_ram.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -250,7 +251,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + psx_ram_map_read(phys), sizeof(value));
         return value;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
@@ -280,7 +281,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint16_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + psx_ram_map_read(phys), sizeof(value));
         return value;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);

@@ -59,6 +59,7 @@ extern "C" uint32_t psx_mod_memory_alloc(uint32_t, uint32_t) { return 0; }
 extern "C" uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t, uint32_t) {
     return 0;
 }
+extern "C" void psx_ram_reset_size_request(void) {}
 extern "C" int psx_ws_x_margin(void) { return 0; }
 
 /* Stand-in for the GPU's display geometry. psx_mod_display_width/height must

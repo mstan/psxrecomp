@@ -55,6 +55,13 @@ uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
  */
 uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size, uint32_t alignment);
 
+/*
+ * Opt into expanded 8 MiB main RAM for this launch. Default runtime behavior
+ * remains stock 2 MiB mirroring unless a trusted activation plugin requests
+ * this before memory_init().
+ */
+int psx_mod_set_main_ram_8mb(int enabled);
+
 /* Current per-side widescreen reveal in native game pixels (zero at 4:3). */
 int32_t psx_mod_widescreen_x_margin(void);
 

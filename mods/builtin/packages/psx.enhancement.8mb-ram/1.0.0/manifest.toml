@@ -1,0 +1,17 @@
+id = "psx.enhancement.8mb-ram"
+version = "1.0.0"
+name = "8 MB Main RAM"
+author = "psxrecomp"
+description = "Enables an opt-in 8 MB main RAM map for patches that require expanded PS1 memory. Disabled by default."
+
+[[feature]]
+id = "8mb-ram"
+name = "8 MB Main RAM"
+description = "Use expanded 8 MB main RAM instead of stock 2 MB mirroring. Both netplay peers must use the same setting."
+category = "enhancement"
+default_enabled = false
+hidden = true
+
+[[plugin]]
+feature = "8mb-ram"
+id = "psx.8mb-ram"
