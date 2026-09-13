@@ -52,7 +52,7 @@ Use isolated project/build/save directories and record profile identities.
 The real IPO smoke check explicitly reports a skip when the tested compiler
 cannot support IPO; that does not count as a positive link/run validation.
 
-## Evidence needed before promotion
+## Evidence needed before a default-on or performance promotion
 
 1. Repeated content-aligned LTO off/on trials with the same PGO profile, compiler,
    debug flags, assets, input and cache state. LTO-only/full-factorial trials can
@@ -69,5 +69,16 @@ cannot support IPO; that does not count as a positive link/run validation.
    the contributor. Their project-wide IPO result is not a guarantee for this
    narrower runtime-only option or other titles.
 
-Leave this PR in draft pending that feedback. Do not claim a performance win or
-enable IPO by default merely because the isolated compiler test passes.
+## Independent merge review
+
+The opt-in path was rebuilt with Clang 22.1.8 and ThinLTO, then exercised for
+more than 11,000 frames each in Tomba, Mega Man X6 and Ape Escape. All three
+runs completed normally with LLE boot, native overlay dispatch, nonzero SPU
+output, zero audio underruns and no kernel-state mismatch; representative
+screenshots also showed normal output. The automated IPO and mocked PGO checks
+above passed in the same review.
+
+This establishes a reasonable correctness baseline for merging the experimental
+option while it remains OFF by default. It does not establish a performance win,
+validate real PGO profile collection, or justify enabling IPO by default. The
+remaining evidence above is still required for either claim.
