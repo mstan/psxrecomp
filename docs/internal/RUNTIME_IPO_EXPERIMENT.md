@@ -1,4 +1,4 @@
-# Draft: opt-in runtime IPO/LTO validation
+# Experimental opt-in runtime IPO/LTO validation
 
 Status: experimental, OFF by default. Tracking: `beads-eio.3.149`.
 The PE report is supplemental evidence, not a locally reproduced benchmark.
