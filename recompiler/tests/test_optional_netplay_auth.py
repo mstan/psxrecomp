@@ -50,7 +50,20 @@ def main():
             else:
                 assert "rnet_account_" not in p.stdout, "offline launcher retained account linkage"
                 assert "RNET_ACCOUNT_" not in p.stdout, "offline launcher retained account state dependency"
-        print("PASS: offline launcher needs no auth headers/symbols; enabled account path retained")
+        # Compile the REAL offline lobby TU too: its early chat-report include
+        # used to leak an independent optional dependency before the #else.
+        lobby = args.source.parent / "psx_lobby_client.c"
+        includes = args.source.parent.parent / "include"
+        if is_msvc:
+            cmd = [args.cxx, "/nologo", "/TC", "/c", "/I"+str(includes),
+                   str(lobby), "/Fo"+str(root / "lobby.obj")]
+        else:
+            cmd = [args.cxx, "-x", "c", "-c", "-I", str(includes), str(lobby),
+                   "-o", str(root / "lobby.obj")]
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
+        assert p.returncode == 0, p.stderr
+        print("PASS: offline launcher/auth guards and real offline lobby compilation; enabled account path retained")
 
 if __name__ == "__main__":
     main()
