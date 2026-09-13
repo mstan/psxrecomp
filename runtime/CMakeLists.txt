@@ -99,6 +99,13 @@ if(BUILD_TESTING)
         PSX_OVERLAY_DLL_BUILD=1)
     add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
 
+    add_executable(psx_icache_elision_guard_test
+        tests/test_psx_icache_elision_guard.c src/psx_icache.c)
+    target_include_directories(psx_icache_elision_guard_test PRIVATE include)
+    target_compile_definitions(psx_icache_elision_guard_test PRIVATE
+        PSX_ENABLE_BLOCK_CYCLES=1 PSX_OVERLAY_DLL_BUILD=1)
+    add_test(NAME psx_icache_elision_guard_test COMMAND psx_icache_elision_guard_test)
+
     foreach(_ram_geometry IN ITEMS retail expanded)
         add_executable(psx_memory_geometry_${_ram_geometry}_test
             tests/test_psx_memory_geometry.c)
