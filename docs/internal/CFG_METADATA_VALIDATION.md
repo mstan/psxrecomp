@@ -66,6 +66,13 @@ Polling captures nearby frames, not identical deterministic snapshots; no
 frame-perfect or guest-state equivalence claim follows from those pictures.
 Headless host audio output is inactive: guest SPU activity is not a listening test.
 
+Four additional input smoke runs (`results/retail-input`) reach 14,000 frames
+and exit 0: Tomba baseline/fixed 14004/14011; MMX6 14005/14020. Tomba enters
+its initial scene/dialogue and responds to pause; MMX6 enters the new-game story
+sequence. These are not complete gameplay routes. Inputs are wall-clock polled,
+not lockstep: actual injection frames and dialogue boundaries differ, so this
+does not establish deterministic input/state equivalence.
+
 Dispatch tables, declarations and guest code-range manifests are byte-identical
 between variants for each title. Codegen identity changes from `30317be3` to
 `4fe894d2`, so their generated overlay caches are separated. Added final safety-net
