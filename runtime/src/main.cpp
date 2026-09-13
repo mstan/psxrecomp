@@ -57,8 +57,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "psx_netplay_rb.h"
 #include "psx_selfcheck.h"
 #include "psx_lobby_client.h"
-#include "recomp_net/auth.h"
 #if defined(PSX_HAS_RECOMP_NET)
+#include "recomp_net/auth.h"
 #include "recomp_net/chat_filter.h" /* chat profanity mask, LAN rooms too */
 #endif
 #include "spu.h"
@@ -10024,6 +10024,7 @@ namespace {
         }
         return psx_lobby_send_chat(line);
     }
+#if defined(PSX_HAS_RECOMP_NET)
     /* ---- optional Discord sign-in -------------------------------------
      * Thin adapters over psx_netplay_auth, which owns the HTTP, the worker
      * thread and the device key. Nothing here blocks a frame except the
@@ -10060,6 +10061,8 @@ namespace {
         s_auth_url = url;
         rnet_account_init(url.c_str());
     }
+
+#endif /* PSX_HAS_RECOMP_NET: account client is not linked in offline builds */
 
     /* ---- list scope --------------------------------------------------------
      * The launcher forks LAN / Direct IP from online before the browser, and
@@ -10971,6 +10974,7 @@ namespace {
     }
 
     void ae_np_pump(void*) {
+#if defined(PSX_HAS_RECOMP_NET)
         /* Redeems a stored device key on the first pump, so a machine that has
          * signed in once comes up signed in with no player action. */
         ae_np_account_sync();
@@ -10991,6 +10995,7 @@ namespace {
             if (handle && handle[0] && (!shown || std::strcmp(shown, handle) != 0))
                 psx_lobby_set_display_name(handle);
         }
+#endif
         psx_lobby_pump();
         ae_np_lan_browse_pump();
         ae_np_lan_udp_pump();

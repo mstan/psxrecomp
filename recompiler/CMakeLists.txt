@@ -496,6 +496,10 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME optional_netplay_auth
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_optional_netplay_auth.py
+                --cxx ${CMAKE_CXX_COMPILER})
         add_test(
             NAME cli_project_packaging
             COMMAND ${Python3_EXECUTABLE}
