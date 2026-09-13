@@ -1,4 +1,4 @@
-# Draft RFC: FMV callback overhead without guest-state changes
+# RFC: FMV callback overhead without guest-state changes
 
 Status: design review only. No IRQ batching implementation or runtime flag is
 added. Tracking: `beads-eio.3.150`. The contributor's actual prototype patch,
