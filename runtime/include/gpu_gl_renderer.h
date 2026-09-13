@@ -130,6 +130,15 @@ void gl_renderer_set_display_aspect(int num, int den);
 void gl_renderer_set_scanlines(int on, float strength);
 int  gl_renderer_get_scanlines(float *strength);
 
+/* Presentation-only gamma adjustment. gamma = 1.0 is the identity; values
+ * above 1.0 lift shadow detail and values below 1.0 darken it. The adjustment
+ * is applied once to game content in the final GL presentation pass, including
+ * temporal interpolation, but not to the bezel, host OSD, black margins, or an
+ * already-composed hold-last image. Non-finite and out-of-range values are
+ * clamped to a safe range. Safe to call before GL context creation. */
+void  gl_renderer_set_post_gamma(float gamma);
+float gl_renderer_get_post_gamma(void);
+
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */
 void gl_renderer_set_wide_fast(int on);
